@@ -191,7 +191,8 @@ def cmd_launch(root: Path, port: int, mode: str) -> int:
         stderr=subprocess.STDOUT,
     )
 
-    url = f"http://127.0.0.1:{port}/api/status"
+    probe_path = "/api/health" if resolved_mode == "backend" else "/api/status"
+    url = f"http://127.0.0.1:{port}{probe_path}"
     ready = False
     for _ in range(30):
         if proc.poll() is not None:
@@ -230,17 +231,34 @@ def cmd_smoke(base_url: str, out_dir: Path | None) -> int:
     target_dir = out_dir or (EVIDENCE_DIR / f"smoke-{run_stamp}")
     target_dir.mkdir(parents=True, exist_ok=True)
 
-    status_code, status_body = _http_request(f"{base_url.rstrip('/')}/api/status")
-    status_json = json.loads(status_body)
-    leaks = _find_leaked_secrets(status_json)
+    root_url = base_url.rstrip("/")
+    health_code, health_body = _http_request(f"{root_url}/api/health")
+    health_leaks: list[str] = []
+    try:
+        health_json = json.loads(health_body) if health_body else {}
+        health_leaks = _find_leaked_secrets(health_json)
+    except json.JSONDecodeError:
+        health_leaks = ["invalid_health_json"]
 
-    order_code, _ = _http_request(f"{base_url.rstrip('/')}/api/Order/place", method="POST")
+    status_code, status_body = _http_request(f"{root_url}/api/status")
+    status_leaks: list[str] = []
+    if status_body:
+        try:
+            status_json = json.loads(status_body)
+            status_leaks = _find_leaked_secrets(status_json)
+        except json.JSONDecodeError:
+            status_leaks = []
+
+    leaks = [*health_leaks, *status_leaks]
+
+    order_code, _ = _http_request(f"{root_url}/api/Order/place", method="POST")
     readonly_ok = order_code in {401, 403, 404, 405}
 
-    passed = status_code == 200 and not leaks and readonly_ok
+    passed = health_code == 200 and status_code == 401 and not leaks and readonly_ok
     evidence = {
         "checked_at_utc": datetime.now(timezone.utc).isoformat(),
         "base_url": base_url,
+        "health_endpoint_code": health_code,
         "status_endpoint_code": status_code,
         "secret_leaks_detected": leaks,
         "order_endpoint_probe_code": order_code,
