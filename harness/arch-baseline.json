@@ -1,0 +1,10 @@
+{
+  "legacy_violations": [
+    {
+      "rule_id": "SEC-003",
+      "file": "server.mjs",
+      "line": 350,
+      "note": "Delete in Phase 1 when server.mjs is replaced by FastAPI"
+    }
+  ]
+}

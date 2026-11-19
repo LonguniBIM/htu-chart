@@ -1,0 +1,794 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+	<meta charset="UTF-8" />
+	<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+	<title>TopstepX Futures Charts — MES · MNQ · MYM · MGC</title>
+	<script src="/vendor/lightweight-charts.js"></script>
+	<style>
+		:root {
+			--bg: #0f131a;
+			--panel: #161b26;
+			--panel-2: #1e2534;
+			--border: #2a3346;
+			--text: #e2e8f0;
+			--muted: #94a3b8;
+			--accent: #2962ff;
+			--accent-hover: #1e53e5;
+			--up: #26a69a;
+			--down: #ef5350;
+			--warn: #f59e0b;
+		}
+		* { box-sizing: border-box; }
+		html, body {
+			margin: 0;
+			padding: 0;
+			height: 100%;
+			background: var(--bg);
+			color: var(--text);
+			font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Inter, sans-serif;
+			overflow: hidden;
+		}
+		.app {
+			display: flex;
+			flex-direction: column;
+			height: 100vh;
+		}
+		.topbar {
+			display: flex;
+			align-items: center;
+			gap: 10px;
+			padding: 8px 14px;
+			background: var(--panel);
+			border-bottom: 1px solid var(--border);
+			flex-wrap: wrap;
+		}
+		.brand {
+			font-weight: 700;
+			font-size: 14px;
+			letter-spacing: 0.3px;
+			color: #fff;
+			margin-right: 4px;
+			white-space: nowrap;
+		}
+		.brand span { color: #60a5fa; }
+		.group {
+			display: flex;
+			align-items: center;
+			gap: 4px;
+			background: var(--bg);
+			padding: 3px;
+			border-radius: 6px;
+			border: 1px solid var(--border);
+		}
+		.btn {
+			background: transparent;
+			color: var(--muted);
+			border: none;
+			border-radius: 4px;
+			padding: 5px 10px;
+			font-size: 12px;
+			font-weight: 600;
+			cursor: pointer;
+			transition: 0.15s;
+		}
+		.btn:hover { color: var(--text); background: var(--panel-2); }
+		.btn.active { background: var(--accent); color: #fff; }
+		.btn-outline {
+			background: var(--panel-2);
+			color: var(--text);
+			border: 1px solid var(--border);
+			border-radius: 6px;
+			padding: 5px 10px;
+			font-size: 12px;
+			font-weight: 600;
+			cursor: pointer;
+		}
+		.btn-outline:hover { border-color: #475569; }
+		.btn-primary {
+			background: var(--accent);
+			color: #fff;
+			border: none;
+			border-radius: 6px;
+			padding: 7px 14px;
+			font-size: 13px;
+			font-weight: 600;
+			cursor: pointer;
+		}
+		.btn-primary:hover { background: var(--accent-hover); }
+		.btn-primary:disabled { opacity: 0.55; cursor: not-allowed; }
+		select {
+			background: var(--panel-2);
+			color: var(--text);
+			border: 1px solid var(--border);
+			border-radius: 6px;
+			padding: 5px 8px;
+			font-size: 12px;
+			outline: none;
+		}
+		.spacer { flex: 1; }
+		.status-pill {
+			display: inline-flex;
+			align-items: center;
+			gap: 6px;
+			padding: 4px 10px;
+			border-radius: 999px;
+			font-size: 12px;
+			font-weight: 600;
+			background: var(--panel-2);
+			border: 1px solid var(--border);
+			cursor: pointer;
+		}
+		.dot {
+			width: 8px;
+			height: 8px;
+			border-radius: 50%;
+			background: #64748b;
+		}
+		.dot.ok { background: var(--up); box-shadow: 0 0 8px var(--up); }
+		.dot.err { background: var(--down); }
+
+		.workspace {
+			flex: 1;
+			min-height: 0;
+			display: grid;
+			gap: 6px;
+			padding: 6px;
+			background: var(--bg);
+		}
+		.workspace.single {
+			grid-template-columns: 1fr;
+			grid-template-rows: 1fr;
+		}
+		.workspace.grid {
+			grid-template-columns: 1fr 1fr;
+			grid-template-rows: 1fr 1fr;
+		}
+		.chart-card {
+			position: relative;
+			display: flex;
+			flex-direction: column;
+			background: var(--panel);
+			border: 1px solid var(--border);
+			border-radius: 8px;
+			overflow: hidden;
+			min-height: 0;
+			min-width: 0;
+		}
+		.chart-header {
+			display: flex;
+			align-items: center;
+			justify-content: space-between;
+			gap: 8px;
+			padding: 6px 10px;
+			background: var(--panel);
+			border-bottom: 1px solid var(--border);
+			font-size: 12px;
+			z-index: 2;
+		}
+		.chart-title {
+			display: flex;
+			align-items: center;
+			gap: 8px;
+			font-weight: 700;
+		}
+		.sym-badge {
+			background: #1d4ed8;
+			color: #fff;
+			padding: 2px 7px;
+			border-radius: 4px;
+			font-size: 11px;
+		}
+		.contract-meta {
+			color: var(--muted);
+			font-weight: 500;
+			font-size: 11px;
+		}
+		.ohlc-legend {
+			display: flex;
+			align-items: center;
+			gap: 10px;
+			font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+			font-size: 11px;
+			color: var(--muted);
+		}
+		.ohlc-legend b { color: var(--text); font-weight: 600; }
+		.ohlc-legend .up { color: var(--up); }
+		.ohlc-legend .down { color: var(--down); }
+		.chart-container {
+			flex: 1;
+			min-height: 0;
+			position: relative;
+		}
+		.chart-overlay {
+			position: absolute;
+			inset: 0;
+			display: flex;
+			align-items: center;
+			justify-content: center;
+			background: rgba(15, 19, 26, 0.72);
+			color: var(--muted);
+			font-size: 13px;
+			text-align: center;
+			padding: 16px;
+			z-index: 5;
+		}
+		.chart-overlay.hidden { display: none; }
+
+		/* Modal */
+		.modal-backdrop {
+			position: fixed;
+			inset: 0;
+			background: rgba(5, 8, 14, 0.78);
+			display: flex;
+			align-items: center;
+			justify-content: center;
+			z-index: 50;
+			padding: 16px;
+		}
+		.modal-backdrop.hidden { display: none; }
+		.modal {
+			width: 100%;
+			max-width: 440px;
+			background: var(--panel);
+			border: 1px solid var(--border);
+			border-radius: 12px;
+			padding: 20px;
+			box-shadow: 0 20px 50px rgba(0, 0, 0, 0.55);
+		}
+		.modal h2 {
+			margin: 0 0 6px 0;
+			font-size: 17px;
+			color: #fff;
+		}
+		.modal p {
+			margin: 0 0 14px 0;
+			font-size: 12.5px;
+			line-height: 1.5;
+			color: var(--muted);
+		}
+		.modal a { color: #60a5fa; text-decoration: none; }
+		.modal a:hover { text-decoration: underline; }
+		.field { margin-bottom: 12px; }
+		.field label {
+			display: block;
+			font-size: 12px;
+			font-weight: 600;
+			margin-bottom: 5px;
+			color: var(--text);
+		}
+		.field input[type="text"],
+		.field input[type="password"] {
+			width: 100%;
+			background: var(--bg);
+			color: var(--text);
+			border: 1px solid var(--border);
+			border-radius: 6px;
+			padding: 8px 10px;
+			font-size: 13px;
+			outline: none;
+		}
+		.field input:focus { border-color: var(--accent); }
+		.checkbox-row {
+			display: flex;
+			align-items: center;
+			gap: 8px;
+			font-size: 12px;
+			color: var(--muted);
+			margin-bottom: 10px;
+		}
+		.error-box {
+			background: rgba(239, 83, 80, 0.14);
+			border: 1px solid rgba(239, 83, 80, 0.45);
+			color: #fca5a5;
+			padding: 8px 10px;
+			border-radius: 6px;
+			font-size: 12px;
+			margin-bottom: 12px;
+			display: none;
+		}
+		.error-box.show { display: block; }
+		.modal-actions {
+			display: flex;
+			justify-content: flex-end;
+			gap: 8px;
+			margin-top: 14px;
+		}
+	</style>
+</head>
+<body>
+<div class="app">
+	<div class="topbar">
+		<div class="brand">TopstepX <span>Lightweight Charts</span></div>
+
+		<div class="group" id="symbolTabs">
+			<button class="btn active" data-mode="MES">MES</button>
+			<button class="btn" data-mode="MNQ">MNQ</button>
+			<button class="btn" data-mode="MYM">MYM</button>
+			<button class="btn" data-mode="MGC">MGC</button>
+			<button class="btn" data-mode="GRID">Grid 2×2</button>
+		</div>
+
+		<div class="group" id="tfTabs">
+			<button class="btn" data-tf="1m">1m</button>
+			<button class="btn active" data-tf="5m">5m</button>
+			<button class="btn" data-tf="15m">15m</button>
+			<button class="btn" data-tf="1h">1H</button>
+			<button class="btn" data-tf="4h">4H</button>
+			<button class="btn" data-tf="1d">1D</button>
+		</div>
+
+		<select id="autoRefreshSelect" title="Tự động cập nhật">
+			<option value="0">Auto: Tắt</option>
+			<option value="5000">Auto: 5s</option>
+			<option value="15000" selected>Auto: 15s</option>
+			<option value="30000">Auto: 30s</option>
+		</select>
+
+		<button class="btn-outline" id="reloadBtn">↻ Tải lại</button>
+
+		<div class="spacer"></div>
+
+		<button class="status-pill" id="connectBtn" title="Cấu hình kết nối TopstepX API">
+			<span class="dot" id="statusDot"></span>
+			<span id="statusText">Chưa kết nối</span>
+		</button>
+	</div>
+
+	<div class="workspace single" id="workspace"></div>
+</div>
+
+<!-- Connection Modal -->
+<div class="modal-backdrop hidden" id="connectModal">
+	<div class="modal">
+		<h2>Kết nối TopstepX (ProjectX API)</h2>
+		<p>
+			Nhập <b>Username</b> đăng nhập TopstepX (không phải email) và <b>API Key</b> lấy tại
+			<a href="https://topstepx.com/settings?tab=api" target="_blank" rel="noopener">topstepx.com/settings?tab=api</a>.
+			Thông tin chỉ gửi trực tiếp từ máy local của bạn tới <code>api.topstepx.com</code>.
+		</p>
+		<div class="error-box" id="modalError"></div>
+		<form id="connectForm">
+			<div class="field">
+				<label for="userNameInput">TopstepX Username</label>
+				<input id="userNameInput" type="text" placeholder="ví dụ: trader.name" autocomplete="username" required />
+			</div>
+			<div class="field">
+				<label for="apiKeyInput">API Key</label>
+				<input id="apiKeyInput" type="password" placeholder="Dán API Key từ TopstepX..." autocomplete="current-password" required />
+			</div>
+			<label class="checkbox-row">
+				<input id="liveModeInput" type="checkbox" />
+				<span>Dùng dữ liệu Live (<code>live=true</code>). Bỏ chọn nếu dùng Combine / Practice (<code>live=false</code>).</span>
+			</label>
+			<label class="checkbox-row">
+				<input id="saveEnvInput" type="checkbox" checked />
+				<span>Lưu vào file <code>.env</code> cục bộ để tự kết nối cho lần sau</span>
+			</label>
+			<div class="modal-actions">
+				<button type="button" class="btn-outline" id="closeModalBtn">Đóng</button>
+				<button type="submit" class="btn-primary" id="submitConnectBtn">Kết nối & Tải dữ liệu</button>
+			</div>
+		</form>
+	</div>
+</div>
+
+<script>
+const SYMBOLS = ['MES', 'MNQ', 'MYM', 'MGC'];
+const SYMBOL_NAMES = {
+	MES: 'Micro E-mini S&P 500',
+	MNQ: 'Micro E-mini Nasdaq-100',
+	MYM: 'Micro E-mini Dow',
+	MGC: 'Micro Gold',
+};
+
+const TIMEFRAMES = {
+	'1m':  { unit: 2, unitNumber: 1,  days: 2,   limit: 1000 },
+	'5m':  { unit: 2, unitNumber: 5,  days: 7,   limit: 1000 },
+	'15m': { unit: 2, unitNumber: 15, days: 14,  limit: 1000 },
+	'1h':  { unit: 3, unitNumber: 1,  days: 45,  limit: 1000 },
+	'4h':  { unit: 3, unitNumber: 4,  days: 120, limit: 1000 },
+	'1d':  { unit: 4, unitNumber: 1,  days: 365, limit: 500  },
+};
+
+const state = {
+	connected: false,
+	userName: null,
+	live: false,
+	mode: 'MES', // 'MES' | 'MNQ' | 'MYM' | 'MGC' | 'GRID'
+	tf: '5m',
+	contracts: {}, // { MES: { selected, all, error } }
+	selectedContractIds: {}, // { MES: 'CON.F.US.MES.Z26' }
+	charts: new Map(), // symbol -> { chart, candleSeries, volSeries, card, legendEl, overlayEl, resizeObserver, barsByTime }
+	refreshTimer: null,
+};
+
+const workspaceEl = document.getElementById('workspace');
+const connectModal = document.getElementById('connectModal');
+const modalError = document.getElementById('modalError');
+const statusDot = document.getElementById('statusDot');
+const statusText = document.getElementById('statusText');
+
+function showModal(errMsg = '') {
+	if (errMsg) {
+		modalError.textContent = errMsg;
+		modalError.classList.add('show');
+	} else {
+		modalError.classList.remove('show');
+	}
+	connectModal.classList.remove('hidden');
+}
+
+function hideModal() {
+	connectModal.classList.add('hidden');
+}
+
+function updateStatusUI() {
+	if (state.connected) {
+		statusDot.className = 'dot ok';
+		statusText.textContent = `${state.userName} (${state.live ? 'Live' : 'Sim'})`;
+	} else {
+		statusDot.className = 'dot err';
+		statusText.textContent = 'Chưa kết nối TopstepX';
+	}
+}
+
+function destroyAllCharts() {
+	for (const entry of state.charts.values()) {
+		entry.resizeObserver?.disconnect();
+		entry.chart?.remove();
+	}
+	state.charts.clear();
+	workspaceEl.innerHTML = '';
+}
+
+function formatPrice(val) {
+	if (val == null || !Number.isFinite(val)) return '-';
+	return Number(val).toFixed(2);
+}
+
+function updateLegend(legendEl, bar) {
+	if (!bar) {
+		legendEl.innerHTML = '';
+		return;
+	}
+	const cls = bar.close >= bar.open ? 'up' : 'down';
+	legendEl.innerHTML = `
+		<span>O <b class="${cls}">${formatPrice(bar.open)}</b></span>
+		<span>H <b class="${cls}">${formatPrice(bar.high)}</b></span>
+		<span>L <b class="${cls}">${formatPrice(bar.low)}</b></span>
+		<span>C <b class="${cls}">${formatPrice(bar.close)}</b></span>
+		<span>V <b>${bar.volume ?? 0}</b></span>
+	`;
+}
+
+function createChartCard(symbol) {
+	const card = document.createElement('div');
+	card.className = 'chart-card';
+
+	const header = document.createElement('div');
+	header.className = 'chart-header';
+
+	const titleWrap = document.createElement('div');
+	titleWrap.className = 'chart-title';
+	titleWrap.innerHTML = `<span class="sym-badge">${symbol}</span><span>${SYMBOL_NAMES[symbol] || symbol}</span>`;
+
+	const contractSelect = document.createElement('select');
+	contractSelect.style.maxWidth = '200px';
+	const cInfo = state.contracts[symbol];
+	if (cInfo && Array.isArray(cInfo.all) && cInfo.all.length > 0) {
+		for (const c of cInfo.all) {
+			const opt = document.createElement('option');
+			opt.value = c.id;
+			opt.textContent = `${c.name || c.id}${c.activeContract ? ' ★' : ''}`;
+			if (c.id === state.selectedContractIds[symbol]) {
+				opt.selected = true;
+			}
+			contractSelect.appendChild(opt);
+		}
+	} else {
+		const opt = document.createElement('option');
+		opt.value = '';
+		opt.textContent = state.connected ? 'Không tìm thấy contract' : 'Chưa kết nối';
+		contractSelect.appendChild(opt);
+	}
+	contractSelect.addEventListener('change', () => {
+		state.selectedContractIds[symbol] = contractSelect.value;
+		loadBarsForSymbol(symbol, true);
+	});
+	titleWrap.appendChild(contractSelect);
+
+	const legendEl = document.createElement('div');
+	legendEl.className = 'ohlc-legend';
+
+	header.appendChild(titleWrap);
+	header.appendChild(legendEl);
+
+	const container = document.createElement('div');
+	container.className = 'chart-container';
+
+	const overlayEl = document.createElement('div');
+	overlayEl.className = 'chart-overlay';
+	overlayEl.textContent = state.connected
+		? `Đang tải dữ liệu ${symbol}...`
+		: 'Nhấn "Chưa kết nối TopstepX" ở góc phải để nhập Username & API Key.';
+	container.appendChild(overlayEl);
+
+	card.appendChild(header);
+	card.appendChild(container);
+	workspaceEl.appendChild(card);
+
+	const chart = LightweightCharts.createChart(container, {
+		layout: {
+			background: { type: 'solid', color: '#131722' },
+			textColor: '#cbd5e1',
+		},
+		grid: {
+			vertLines: { color: '#1f2937' },
+			horzLines: { color: '#1f2937' },
+		},
+		crosshair: {
+			mode: LightweightCharts.CrosshairMode.Normal,
+		},
+		rightPriceScale: {
+			borderColor: '#2a3346',
+		},
+		timeScale: {
+			borderColor: '#2a3346',
+			timeVisible: true,
+			secondsVisible: false,
+		},
+		width: container.clientWidth || 600,
+		height: container.clientHeight || 360,
+	});
+
+	const candleSeries = chart.addSeries(LightweightCharts.CandlestickSeries, {
+		upColor: '#26a69a',
+		downColor: '#ef5350',
+		borderVisible: false,
+		wickUpColor: '#26a69a',
+		wickDownColor: '#ef5350',
+	});
+
+	const volSeries = chart.addSeries(LightweightCharts.HistogramSeries, {
+		priceFormat: { type: 'volume' },
+		priceScaleId: '',
+	});
+	volSeries.priceScale().applyOptions({
+		scaleMargins: { top: 0.82, bottom: 0 },
+	});
+
+	const entry = {
+		chart,
+		candleSeries,
+		volSeries,
+		card,
+		legendEl,
+		overlayEl,
+		barsByTime: new Map(),
+		lastBar: null,
+		resizeObserver: null,
+	};
+
+	chart.subscribeCrosshairMove(param => {
+		if (!param || !param.time) {
+			updateLegend(legendEl, entry.lastBar);
+			return;
+		}
+		const bar = entry.barsByTime.get(param.time);
+		if (bar) {
+			updateLegend(legendEl, bar);
+		}
+	});
+
+	const ro = new ResizeObserver(entries => {
+		for (const r of entries) {
+			const { width, height } = r.contentRect;
+			if (width > 0 && height > 0) {
+				chart.applyOptions({ width: Math.floor(width), height: Math.floor(height) });
+			}
+		}
+	});
+	ro.observe(container);
+	entry.resizeObserver = ro;
+
+	state.charts.set(symbol, entry);
+}
+
+function getVisibleSymbols() {
+	return state.mode === 'GRID' ? SYMBOLS : [state.mode];
+}
+
+function renderLayout() {
+	destroyAllCharts();
+	workspaceEl.className = state.mode === 'GRID' ? 'workspace grid' : 'workspace single';
+	for (const sym of getVisibleSymbols()) {
+		createChartCard(sym);
+	}
+	if (state.connected) {
+		loadVisibleSymbols(true);
+	}
+}
+
+async function fetchContracts() {
+	const res = await fetch(`/api/contracts?symbols=${SYMBOLS.join(',')}&live=${state.live}`);
+	const data = await res.json();
+	if (!res.ok) {
+		throw new Error(data.error || 'Không thể lấy danh sách contract.');
+	}
+	state.contracts = data.contracts || {};
+	for (const sym of SYMBOLS) {
+		const sel = state.contracts[sym]?.selected;
+		if (sel?.id) {
+			state.selectedContractIds[sym] = sel.id;
+		}
+	}
+}
+
+async function loadBarsForSymbol(symbol, fitContent = false) {
+	const entry = state.charts.get(symbol);
+	if (!entry) return;
+
+	const contractId = state.selectedContractIds[symbol];
+	if (!contractId) {
+		const errMsg = state.contracts[symbol]?.error || `Không tìm thấy contract hoạt động cho ${symbol}.`;
+		entry.overlayEl.textContent = errMsg;
+		entry.overlayEl.classList.remove('hidden');
+		return;
+	}
+
+	const tfCfg = TIMEFRAMES[state.tf];
+	try {
+		const url = `/api/bars?contractId=${encodeURIComponent(contractId)}&unit=${tfCfg.unit}&unitNumber=${tfCfg.unitNumber}&days=${tfCfg.days}&limit=${tfCfg.limit}&live=${state.live}`;
+		const res = await fetch(url);
+		const data = await res.json();
+		if (!res.ok) {
+			throw new Error(data.error || `HTTP ${res.status}`);
+		}
+
+		const bars = data.bars || [];
+		if (bars.length === 0) {
+			entry.overlayEl.textContent = `Chưa có dữ liệu nến cho ${contractId} (${state.tf}).`;
+			entry.overlayEl.classList.remove('hidden');
+			return;
+		}
+
+		entry.barsByTime.clear();
+		const candles = [];
+		const volumes = [];
+		for (const b of bars) {
+			entry.barsByTime.set(b.time, b);
+			candles.push({ time: b.time, open: b.open, high: b.high, low: b.low, close: b.close });
+			volumes.push({
+				time: b.time,
+				value: b.volume,
+				color: b.close >= b.open ? 'rgba(38, 166, 154, 0.42)' : 'rgba(239, 83, 80, 0.42)',
+			});
+		}
+
+		entry.candleSeries.setData(candles);
+		entry.volSeries.setData(volumes);
+		entry.lastBar = bars[bars.length - 1];
+		updateLegend(entry.legendEl, entry.lastBar);
+		entry.overlayEl.classList.add('hidden');
+
+		if (fitContent) {
+			entry.chart.timeScale().fitContent();
+		}
+	} catch (err) {
+		entry.overlayEl.textContent = `Lỗi tải ${symbol}: ${err.message}`;
+		entry.overlayEl.classList.remove('hidden');
+	}
+}
+
+async function loadVisibleSymbols(fitContent = false) {
+	if (!state.connected) return;
+	await Promise.all(getVisibleSymbols().map(sym => loadBarsForSymbol(sym, fitContent)));
+}
+
+function resetAutoRefresh() {
+	if (state.refreshTimer) {
+		clearInterval(state.refreshTimer);
+		state.refreshTimer = null;
+	}
+	const ms = Number(document.getElementById('autoRefreshSelect').value);
+	if (ms > 0) {
+		state.refreshTimer = setInterval(() => {
+			if (state.connected) {
+				loadVisibleSymbols(false);
+			}
+		}, ms);
+	}
+}
+
+// Event bindings
+document.getElementById('symbolTabs').addEventListener('click', e => {
+	const btn = e.target.closest('button[data-mode]');
+	if (!btn) return;
+	document.querySelectorAll('#symbolTabs .btn').forEach(b => b.classList.remove('active'));
+	btn.classList.add('active');
+	state.mode = btn.dataset.mode;
+	renderLayout();
+});
+
+document.getElementById('tfTabs').addEventListener('click', e => {
+	const btn = e.target.closest('button[data-tf]');
+	if (!btn) return;
+	document.querySelectorAll('#tfTabs .btn').forEach(b => b.classList.remove('active'));
+	btn.classList.add('active');
+	state.tf = btn.dataset.tf;
+	loadVisibleSymbols(true);
+});
+
+document.getElementById('autoRefreshSelect').addEventListener('change', resetAutoRefresh);
+document.getElementById('reloadBtn').addEventListener('click', () => loadVisibleSymbols(true));
+document.getElementById('connectBtn').addEventListener('click', () => showModal());
+document.getElementById('closeModalBtn').addEventListener('click', hideModal);
+
+document.getElementById('connectForm').addEventListener('submit', async e => {
+	e.preventDefault();
+	const submitBtn = document.getElementById('submitConnectBtn');
+	submitBtn.disabled = true;
+	submitBtn.textContent = 'Đang kết nối...';
+	modalError.classList.remove('show');
+
+	try {
+		const userName = document.getElementById('userNameInput').value.trim();
+		const apiKey = document.getElementById('apiKeyInput').value.trim();
+		const live = document.getElementById('liveModeInput').checked;
+		const saveToEnv = document.getElementById('saveEnvInput').checked;
+
+		const res = await fetch('/api/connect', {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json' },
+			body: JSON.stringify({ userName, apiKey, live, saveToEnv }),
+		});
+		const data = await res.json();
+		if (!res.ok) {
+			throw new Error(data.error || 'Kết nối thất bại.');
+		}
+
+		state.connected = true;
+		state.userName = data.userName;
+		state.live = data.live;
+		updateStatusUI();
+		hideModal();
+
+		await fetchContracts();
+		renderLayout();
+	} catch (err) {
+		modalError.textContent = err.message;
+		modalError.classList.add('show');
+	} finally {
+		submitBtn.disabled = false;
+		submitBtn.textContent = 'Kết nối & Tải dữ liệu';
+	}
+});
+
+async function bootstrap() {
+	resetAutoRefresh();
+	try {
+		const res = await fetch('/api/status');
+		const data = await res.json();
+		state.connected = Boolean(data.connected);
+		state.userName = data.userName;
+		state.live = Boolean(data.live);
+		updateStatusUI();
+
+		if (state.connected) {
+			await fetchContracts();
+			renderLayout();
+		} else {
+			renderLayout();
+			showModal();
+		}
+	} catch (err) {
+		renderLayout();
+		showModal(`Không thể kết nối server local: ${err.message}`);
+	}
+}
+
+bootstrap();
+</script>
+</body>
+</html>

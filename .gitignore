@@ -1,0 +1,30 @@
+# Secrets & local env
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+auth.json
+
+# Data & runtime artifacts
+data/
+*.parquet
+*.db
+*.db-wal
+*.db-shm
+
+# Python / Node artifacts
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+node_modules/
+dist/
+.vite/
+
+# Harness transient outputs
+.codex-runtime/
+harness/evidence/
+harness/runs/
