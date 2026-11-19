@@ -13,7 +13,7 @@ from argon2 import PasswordHasher
 from app.config import Settings
 from app.main import create_app
 from app.topstep.auth import TopstepAuthService, build_httpx_timeout
-from app.topstep.errors import UpstreamHTTPError, UpstreamTimeoutError
+from app.topstep.errors import TopstepAuthError, UpstreamHTTPError, UpstreamTimeoutError
 from app.topstep.rest_client import TopstepRestClient
 
 
@@ -171,5 +171,134 @@ async def test_r03_non_blocking_lifespan_starts_disconnected_when_login_hangs() 
                     assert body["connected"] is False
                     assert body["connection_state"] == "DISCONNECTED"
                     assert login_started.is_set()
+    finally:
+        release_login.set()
+
+
+async def test_r03_login_retries_transient_503_and_fails_fast_on_401() -> None:
+    """Contract: TopstepAuthService.login retries transient 5xx/timeouts, not 401/403.
+
+    Defect caught: Permanent DISCONNECTED startup on transient 503 or retrying bad credentials.
+    """
+    mode = "retry_then_ok"
+    attempts = 0
+
+    async def handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal attempts
+        attempts += 1
+        if mode == "retry_then_ok":
+            if attempts == 1:
+                return httpx.Response(503, json={"errorMessage": "Upstream busy"})
+            return httpx.Response(200, json={"success": True, "token": "jwt-recovered"})
+        if mode == "always_401":
+            return httpx.Response(401, json={"errorMessage": "Invalid key"})
+        if mode == "always_503":
+            return httpx.Response(503, json={"errorMessage": "Still down"})
+        raise httpx.ReadTimeout("socket read timed out")
+
+    settings = Settings(upstream_max_retries=2, upstream_total_timeout_sec=5.0)
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        auth = TopstepAuthService(settings, client)
+        await auth.login("alice", "key-1")
+        assert attempts == 2
+        assert auth.is_connected is True
+
+        mode = "always_401"
+        attempts = 0
+        with pytest.raises(TopstepAuthError):
+            await auth.login("alice", "bad-key")
+        assert attempts == 1
+        assert auth.is_connected is False
+
+        mode = "always_503"
+        attempts = 0
+        with pytest.raises(UpstreamHTTPError):
+            await auth.login("alice", "key-1")
+        assert attempts == 3
+        assert auth.is_connected is False
+
+        mode = "always_timeout"
+        attempts = 0
+        with pytest.raises(UpstreamTimeoutError):
+            await auth.login("alice", "key-1")
+        assert attempts == 3
+        assert auth.is_connected is False
+
+
+async def test_r03_total_deadline_includes_semaphore_wait_for_queued_calls() -> None:
+    """Contract: Total operation deadline caps queued semaphore waiting plus HTTP execution.
+
+    Defect caught: Queued calls bypassing upstream_total_timeout_sec while waiting on semaphore.
+    """
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/Auth/loginKey":
+            return httpx.Response(200, json={"success": True, "token": "jwt-ok"})
+        await asyncio.sleep(0.09)
+        return httpx.Response(200, json={"contracts": []})
+
+    settings = Settings(
+        upstream_max_concurrency=1,
+        upstream_total_timeout_sec=0.12,
+        upstream_max_retries=0,
+    )
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        auth = TopstepAuthService(settings, client)
+        await auth.login("alice", "key-1")
+        rest = TopstepRestClient(settings, auth, client)
+
+        started = time.monotonic()
+        results = await asyncio.gather(
+            *(rest.search_contracts(f"SYM{i}") for i in range(4)),
+            return_exceptions=True,
+        )
+        elapsed = time.monotonic() - started
+
+        assert elapsed < 0.25
+        successes = [r for r in results if isinstance(r, list)]
+        timeouts = [r for r in results if isinstance(r, UpstreamTimeoutError)]
+        assert len(successes) == 1
+        assert len(timeouts) == 3
+
+
+async def test_r03_lifespan_shutdown_cancels_auth_task_and_closes_owned_client(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Contract: Lifespan shutdown cancels pending auto-connect task and closes owned AsyncClient.
+
+    Defect caught: Leaked background tasks or unclosed httpx connection pools on app shutdown.
+    """
+    release_login = asyncio.Event()
+
+    async def hanging_handler(_request: httpx.Request) -> httpx.Response:
+        await release_login.wait()
+        return httpx.Response(200, json={"success": True, "token": "late"})
+
+    created_clients: list[httpx.AsyncClient] = []
+    orig_async_client = httpx.AsyncClient
+
+    def fake_async_client(*args: object, **kwargs: object) -> httpx.AsyncClient:
+        client = orig_async_client(transport=httpx.MockTransport(hanging_handler))
+        created_clients.append(client)
+        return client
+
+    monkeypatch.setattr("app.main.httpx.AsyncClient", fake_async_client)
+
+    settings = Settings(
+        topstepx_username="alice",
+        topstepx_api_key="key-123456",
+        upstream_total_timeout_sec=10.0,
+    )
+    app = create_app(settings=settings)
+    try:
+        async with app.router.lifespan_context(app):
+            await asyncio.sleep(0)
+            task = app.state.auto_connect_task
+            assert task is not None and not task.done()
+            assert len(created_clients) == 1
+            assert created_clients[0].is_closed is False
+        assert task.done()
+        assert task.cancelled()
+        assert created_clients[0].is_closed is True
     finally:
         release_login.set()

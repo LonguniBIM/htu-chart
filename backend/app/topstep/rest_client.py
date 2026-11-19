@@ -111,20 +111,23 @@ class TopstepRestClient:
         if endpoint not in ALLOWED_READONLY_ENDPOINTS:
             raise ValueError(f"Endpoint {endpoint!r} is not on the read-only allowlist")
 
-        token = await self._auth.ensure_token()
         url = f"{self._settings.topstepx_base_url.rstrip('/')}{endpoint}"
 
+        try:
+            return await asyncio.wait_for(
+                self._run_under_deadline(url, payload),
+                timeout=self._settings.upstream_total_timeout_sec,
+            )
+        except TimeoutError as exc:
+            deadline = self._settings.upstream_total_timeout_sec
+            raise UpstreamTimeoutError(
+                f"Upstream request to {endpoint} exceeded {deadline}s deadline"
+            ) from exc
+
+    async def _run_under_deadline(self, url: str, payload: dict[str, Any]) -> dict[str, Any]:
+        token = await self._auth.ensure_token()
         async with self._semaphore:
-            try:
-                return await asyncio.wait_for(
-                    self._execute_with_retries(url, payload, token),
-                    timeout=self._settings.upstream_total_timeout_sec,
-                )
-            except TimeoutError as exc:
-                deadline = self._settings.upstream_total_timeout_sec
-                raise UpstreamTimeoutError(
-                    f"Upstream request to {endpoint} exceeded {deadline}s deadline"
-                ) from exc
+            return await self._execute_with_retries(url, payload, token)
 
     async def _execute_with_retries(
         self,

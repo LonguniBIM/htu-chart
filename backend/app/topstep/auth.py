@@ -93,13 +93,25 @@ class TopstepAuthService:
             key_rotation_enforced=self._settings.key_rotation_enforce,
         )
 
+    def _clear_session_state(
+        self,
+        error_msg: str | None = None,
+        *,
+        clear_credentials: bool = False,
+    ) -> None:
+        self._token = None
+        self._token_acquired_at = None
+        self._connected_at = None
+        self._connection_state = "DISCONNECTED"
+        self._last_error = error_msg
+        if clear_credentials:
+            self._username = None
+            self._api_key = None
+
     def _enforce_key_rotation(self, now: datetime | None = None) -> None:
         rotation = self.compute_key_rotation(now=now)
         if rotation.key_rotation_enforced and rotation.key_rotation_due:
-            self._token = None
-            self._token_acquired_at = None
-            self._connection_state = "DISCONNECTED"
-            self._last_error = "TopstepX API key rotation is due and enforced"
+            self._clear_session_state("TopstepX API key rotation is due and enforced")
             raise KeyRotationRequiredError(
                 f"TopstepX API key age ({rotation.key_age_days}d) meets or exceeds "
                 f"KEY_ROTATION_DAYS ({self._settings.key_rotation_days}d); "
@@ -137,6 +149,7 @@ class TopstepAuthService:
         cleaned_user = username.strip()
         cleaned_key = api_key.strip()
         if not cleaned_user or not cleaned_key:
+            self._clear_session_state("TopstepX username and API key are required")
             raise TopstepAuthError("TopstepX username and API key are required")
 
         target_live = self._settings.topstepx_live if live is None else bool(live)
@@ -144,41 +157,32 @@ class TopstepAuthService:
 
         try:
             data = await asyncio.wait_for(
-                self._post_login(url, cleaned_user, cleaned_key),
+                self._post_login_with_retries(url, cleaned_user, cleaned_key),
                 timeout=self._settings.upstream_total_timeout_sec,
             )
         except TimeoutError as exc:
-            self._connection_state = "DISCONNECTED"
-            self._last_error = "TopstepX login timed out"
+            self._clear_session_state("TopstepX login timed out")
             raise UpstreamTimeoutError("TopstepX login timed out") from exc
-        except httpx.TimeoutException as exc:
-            self._connection_state = "DISCONNECTED"
-            self._last_error = "TopstepX login timed out"
-            raise UpstreamTimeoutError("TopstepX login timed out") from exc
-        except httpx.TransportError as exc:
-            safe_msg = redact_secrets(str(exc), (cleaned_key, cleaned_user))
-            self._connection_state = "DISCONNECTED"
-            self._last_error = f"TopstepX login transport error: {safe_msg}"
-            raise UpstreamHTTPError(self._last_error) from exc
+        except UpstreamTimeoutError as exc:
+            self._clear_session_state(redact_secrets(str(exc), (cleaned_key, cleaned_user)))
+            raise
         except TopstepAuthError as exc:
             safe_msg = redact_secrets(str(exc), (cleaned_key, cleaned_user))
-            self._connection_state = "DISCONNECTED"
-            self._last_error = safe_msg
+            self._clear_session_state(safe_msg, clear_credentials=True)
             raise
         except UpstreamHTTPError as exc:
             safe_msg = redact_secrets(str(exc), (cleaned_key, cleaned_user))
-            self._connection_state = "DISCONNECTED"
-            self._last_error = safe_msg
+            self._clear_session_state(safe_msg)
             raise
 
         token = data.get("token")
         if not token or not isinstance(token, str):
-            self._connection_state = "DISCONNECTED"
-            self._last_error = redact_secrets(
+            err_msg = redact_secrets(
                 str(data.get("errorMessage") or "TopstepX login did not return a token"),
                 (cleaned_key, cleaned_user),
             )
-            raise TopstepAuthError(self._last_error)
+            self._clear_session_state(err_msg)
+            raise TopstepAuthError(err_msg)
 
         acquired = now or datetime.now(UTC)
         self._token = token
@@ -189,6 +193,42 @@ class TopstepAuthService:
         self._token_acquired_at = acquired
         self._connection_state = "CONNECTED"
         self._last_error = None
+
+    async def _post_login_with_retries(
+        self,
+        url: str,
+        username: str,
+        api_key: str,
+    ) -> dict[str, Any]:
+        max_attempts = self._settings.upstream_max_retries + 1
+        last_exc: Exception | None = None
+
+        for attempt in range(max_attempts):
+            try:
+                return await self._post_login(url, username, api_key)
+            except TopstepAuthError:
+                raise
+            except UpstreamHTTPError as exc:
+                if exc.status_code is not None and 400 <= exc.status_code < 500:
+                    raise
+                last_exc = exc
+                if attempt + 1 < max_attempts:
+                    await asyncio.sleep(0.05 * (2**attempt))
+                    continue
+                raise
+            except (httpx.TimeoutException, httpx.TransportError) as exc:
+                last_exc = exc
+                if attempt + 1 < max_attempts:
+                    await asyncio.sleep(0.05 * (2**attempt))
+                    continue
+                if isinstance(exc, httpx.TimeoutException):
+                    raise UpstreamTimeoutError("TopstepX login timed out") from exc
+                safe_msg = redact_secrets(str(exc), (api_key, username))
+                raise UpstreamHTTPError(f"TopstepX login transport error: {safe_msg}") from exc
+
+        if isinstance(last_exc, UpstreamHTTPError):
+            raise last_exc
+        raise UpstreamTimeoutError("TopstepX login failed after bounded retries")
 
     async def _post_login(self, url: str, username: str, api_key: str) -> dict[str, Any]:
         async with self._client.stream(

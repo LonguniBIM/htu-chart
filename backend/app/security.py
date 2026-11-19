@@ -79,6 +79,51 @@ class SecretRedactionFilter(logging.Filter):
         return True
 
 
+_BASE_LOG_RECORD_FACTORY = logging.getLogRecordFactory()
+_ACTIVE_EXTRA_SECRETS: set[str] = set()
+_REDACTING_FACTORY_INSTALLED = False
+
+
+def install_global_log_redaction(extra_secrets: Iterable[str] = ()) -> None:
+    """Install log-record factory and handler filters to redact secrets across all loggers."""
+    global _REDACTING_FACTORY_INSTALLED
+    for secret in extra_secrets:
+        if secret and len(secret) >= 6:
+            _ACTIVE_EXTRA_SECRETS.add(secret)
+
+    if not _REDACTING_FACTORY_INSTALLED:
+        base_factory = _BASE_LOG_RECORD_FACTORY
+
+        def _redacting_record_factory(*args: object, **kwargs: object) -> logging.LogRecord:
+            record = base_factory(*args, **kwargs)
+            SecretRedactionFilter(_ACTIVE_EXTRA_SECRETS).filter(record)
+            return record
+
+        logging.setLogRecordFactory(_redacting_record_factory)
+        _REDACTING_FACTORY_INSTALLED = True
+
+    logger_names = (
+        "",
+        "topstep_chart",
+        "uvicorn",
+        "uvicorn.error",
+        "uvicorn.access",
+        "fastapi",
+        "httpx",
+    )
+    for name in logger_names:
+        target_logger = logging.getLogger(name)
+        target_logger.filters = [
+            flt for flt in target_logger.filters if not isinstance(flt, SecretRedactionFilter)
+        ]
+        target_logger.addFilter(SecretRedactionFilter(_ACTIVE_EXTRA_SECRETS))
+        for handler in target_logger.handlers:
+            handler.filters = [
+                flt for flt in handler.filters if not isinstance(flt, SecretRedactionFilter)
+            ]
+            handler.addFilter(SecretRedactionFilter(_ACTIVE_EXTRA_SECRETS))
+
+
 @dataclass(frozen=True)
 class SessionData:
     """Server-side authenticated caller session."""
@@ -141,7 +186,10 @@ class SessionManager:
         """Verify X-CSRF-Token in constant time."""
         if not token:
             return False
-        return hmac.compare_digest(session.csrf_token, token)
+        return hmac.compare_digest(
+            session.csrf_token.encode("utf-8"),
+            token.encode("utf-8"),
+        )
 
 
 def _strip_host_port(host_header: str) -> tuple[str, str | None]:

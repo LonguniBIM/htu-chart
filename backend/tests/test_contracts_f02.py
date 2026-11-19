@@ -17,6 +17,7 @@ from app.topstep.errors import (
     AmbiguousContractError,
     ContractNotFoundError,
     KeyRotationRequiredError,
+    TopstepAuthError,
 )
 from app.topstep.rest_client import resolve_contract
 
@@ -249,3 +250,33 @@ async def test_f02_contracts_endpoint_reports_per_symbol_typed_errors() -> None:
                 assert payload["MES"]["error_type"] is None
                 assert payload["MNQ"]["selected"] is None
                 assert payload["MNQ"]["error_type"] == "ContractNotFoundError"
+
+
+async def test_f02_failed_jwt_refresh_clears_stale_token_and_disconnects() -> None:
+    """Contract: Failed JWT refresh clears stale _token and sets connection_state=DISCONNECTED.
+
+    Defect caught: Reporting connected=True alongside connection_state=DISCONNECTED after 401.
+    """
+    calls = 0
+
+    async def handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return httpx.Response(200, json={"success": True, "token": "jwt-initial"})
+        return httpx.Response(401, json={"errorMessage": "Revoked apiKey"})
+
+    now = datetime(2026, 11, 20, 12, 0, tzinfo=UTC)
+    settings = Settings(jwt_refresh_hours=23.0)
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        auth = TopstepAuthService(settings, client)
+        await auth.login("alice", "key-1", now=now)
+        assert auth.is_connected is True
+
+        with pytest.raises(TopstepAuthError):
+            await auth.ensure_token(now=now + timedelta(hours=23))
+
+        assert auth.is_connected is False
+        status = auth.get_status(now=now + timedelta(hours=23))
+        assert status["connected"] is False
+        assert status["connection_state"] == "DISCONNECTED"

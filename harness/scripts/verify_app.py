@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -41,6 +42,10 @@ SECRET_FIELD_NAMES = (
     "botToken",
     "token",
     "password",
+)
+RAW_SECRET_VALUE_RE = re.compile(
+    r"(?i)(?:\bBearer\s+[A-Za-z0-9._~+/=-]+|"
+    r"\b(?:apiKey|api_key|TOPSTEPX_API_KEY|TELEGRAM_BOT_TOKEN|botToken|access_token|password)\b\s*[:=]\s*\S+)"
 )
 
 
@@ -141,6 +146,8 @@ def _find_leaked_secrets(payload: Any, path: str = "$") -> list[str]:
     elif isinstance(payload, list):
         for idx, item in enumerate(payload):
             leaks.extend(_find_leaked_secrets(item, f"{path}[{idx}]"))
+    elif isinstance(payload, str) and RAW_SECRET_VALUE_RE.search(payload):
+        leaks.append(f"{path}:raw_secret_pattern")
     return leaks
 
 
@@ -242,19 +249,29 @@ def cmd_smoke(base_url: str, out_dir: Path | None) -> int:
 
     status_code, status_body = _http_request(f"{root_url}/api/status")
     status_leaks: list[str] = []
-    if status_body:
+    status_json_ok = False
+    if not status_body:
+        status_leaks = ["empty_status_body"]
+    else:
         try:
             status_json = json.loads(status_body)
+            status_json_ok = True
             status_leaks = _find_leaked_secrets(status_json)
         except json.JSONDecodeError:
-            status_leaks = []
+            status_leaks = ["unparseable_status_body"]
+            lowered_body = status_body.lower()
+            for field in SECRET_FIELD_NAMES:
+                if field.lower() in lowered_body:
+                    status_leaks.append(f"raw_body:{field}")
+            if RAW_SECRET_VALUE_RE.search(status_body):
+                status_leaks.append("raw_body:secret_pattern")
 
     leaks = [*health_leaks, *status_leaks]
 
     order_code, _ = _http_request(f"{root_url}/api/Order/place", method="POST")
     readonly_ok = order_code in {401, 403, 404, 405}
 
-    passed = health_code == 200 and status_code == 401 and not leaks and readonly_ok
+    passed = health_code == 200 and status_code == 401 and status_json_ok and not leaks and readonly_ok
     evidence = {
         "checked_at_utc": datetime.now(timezone.utc).isoformat(),
         "base_url": base_url,

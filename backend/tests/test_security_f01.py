@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import io
 import logging
 from contextlib import asynccontextmanager
 from typing import Any
@@ -363,3 +364,97 @@ async def test_f01_secret_redaction_and_hard_readonly_order_boundary(
         assert not any(
             forbidden in p for p in route_paths for forbidden in ("order", "position", "hubs/user")
         )
+
+
+def test_f01_descendant_logger_redaction_and_tracebacks_on_attached_root_handler() -> None:
+    """Contract: Descendant loggers and newly attached root handlers never emit raw secrets.
+
+    Defect caught: Ancestor logger filters bypassed on propagated uvicorn.error/worker logs.
+    """
+    raw_api_key = "descendant-secret-api-key-777"
+    raw_bearer = "descendant-jwt-token-888"
+    create_app(
+        settings=Settings(
+            app_password_hash=TEST_PASSWORD_HASH,
+            topstepx_api_key=raw_api_key,
+        )
+    )
+
+    buf = io.StringIO()
+    handler = logging.StreamHandler(buf)
+    handler.setLevel(logging.DEBUG)
+    root_logger = logging.getLogger()
+    prev_level = root_logger.level
+    root_logger.setLevel(logging.DEBUG)
+    root_logger.addHandler(handler)
+    try:
+        logging.getLogger("uvicorn.error").warning(
+            "Upstream auth failed apiKey=%s Authorization: Bearer %s",
+            raw_api_key,
+            raw_bearer,
+        )
+        try:
+            raise RuntimeError(f"Crash with secret {raw_api_key} and token={raw_bearer}")
+        except RuntimeError:
+            logging.getLogger("topstep_chart.worker").exception(
+                "Worker exception with apiKey=%s", raw_api_key
+            )
+    finally:
+        root_logger.removeHandler(handler)
+        root_logger.setLevel(prev_level)
+
+    emitted = buf.getvalue()
+    assert "***REDACTED***" in emitted
+    assert raw_api_key not in emitted
+    assert raw_bearer not in emitted
+
+
+async def test_f01_validation_errors_and_non_ascii_csrf_never_leak_or_crash() -> None:
+    """Contract: 422 validation errors strip raw input secrets; non-ASCII CSRF returns 403.
+
+    Defect caught: FastAPI echoing raw submitted passwords in 422 JSON or 500 on non-ASCII CSRF.
+    """
+    settings = Settings(app_env="development", app_password_hash=TEST_PASSWORD_HASH)
+    async with _async_client(settings, client_ip="127.0.0.1") as (client, _):
+        malformed_login_1 = await client.post(
+            "/api/auth/login",
+            json=[{"password": "probe-actual-password-111"}],
+        )
+        assert malformed_login_1.status_code == 422
+        assert "probe-actual-password-111" not in malformed_login_1.text
+
+        malformed_login_2 = await client.post(
+            "/api/auth/login",
+            json={"password": {"private": "probe-actual-password-222"}},
+        )
+        assert malformed_login_2.status_code == 422
+        assert "probe-actual-password-222" not in malformed_login_2.text
+
+        csrf = await _login_and_get_csrf(client)
+
+        malformed_connect = await client.post(
+            "/api/connect",
+            json=[{"apiKey": "probe-connect-secret-333"}],
+            headers={"X-CSRF-Token": csrf},
+        )
+        assert malformed_connect.status_code == 422
+        assert "probe-connect-secret-333" not in malformed_connect.text
+
+        non_ascii_csrf = await client.post(
+            "/api/disconnect",
+            headers=[(b"x-csrf-token", "bài-kiểm-tra-không-ascii".encode())],
+        )
+        assert non_ascii_csrf.status_code == 403
+
+        conn = await client.post(
+            "/api/connect",
+            json={"userName": "alice", "apiKey": "secret-key-999"},
+            headers={"X-CSRF-Token": csrf},
+        )
+        assert conn.status_code == 200
+        assert conn.json()["connected"] is True
+
+        disc = await client.post("/api/disconnect", headers={"X-CSRF-Token": csrf})
+        assert disc.status_code == 200
+        assert disc.json()["connected"] is False
+        assert disc.json()["connection_state"] == "DISCONNECTED"

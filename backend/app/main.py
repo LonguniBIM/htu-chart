@@ -7,15 +7,22 @@ import contextlib
 import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from typing import Any
 
 import httpx
 import uvicorn
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, status
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
 from app.api import routes_market, routes_status
 from app.config import Settings, load_settings
-from app.security import HostOriginMiddleware, SecretRedactionFilter, SessionManager, redact_secrets
+from app.security import (
+    HostOriginMiddleware,
+    SessionManager,
+    install_global_log_redaction,
+    redact_secrets,
+)
 from app.topstep.auth import TopstepAuthService, build_httpx_timeout
 from app.topstep.errors import TopstepError
 from app.topstep.rest_client import TopstepRestClient
@@ -25,11 +32,7 @@ logger = logging.getLogger("topstep_chart")
 
 def _install_redaction_filter(settings: Settings) -> None:
     extra = (settings.topstepx_api_key, settings.app_password_hash, settings.app_session_secret)
-    for target_logger in (logging.getLogger(), logger, logging.getLogger("uvicorn")):
-        target_logger.filters = [
-            flt for flt in target_logger.filters if not isinstance(flt, SecretRedactionFilter)
-        ]
-        target_logger.addFilter(SecretRedactionFilter(extra_secrets=extra))
+    install_global_log_redaction(extra_secrets=extra)
 
 
 async def _background_auto_connect(auth_service: TopstepAuthService, settings: Settings) -> None:
@@ -104,6 +107,29 @@ def create_app(
     )
     application.state.settings = resolved_settings
     application.add_middleware(HostOriginMiddleware, settings=resolved_settings)
+
+    @application.exception_handler(RequestValidationError)
+    async def _validation_exception_handler(
+        _request: Request, exc: RequestValidationError
+    ) -> JSONResponse:
+        extra = (
+            resolved_settings.topstepx_api_key,
+            resolved_settings.app_password_hash,
+            resolved_settings.app_session_secret,
+        )
+        sanitized: list[dict[str, Any]] = []
+        for err in exc.errors():
+            sanitized.append(
+                {
+                    "type": err.get("type"),
+                    "loc": err.get("loc"),
+                    "msg": redact_secrets(str(err.get("msg", "Validation error")), extra),
+                }
+            )
+        return JSONResponse(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            content={"detail": sanitized},
+        )
 
     @application.exception_handler(Exception)
     async def _redacted_exception_handler(_request: Request, exc: Exception) -> JSONResponse:
