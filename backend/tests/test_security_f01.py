@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
 import io
 import logging
+import time
 from contextlib import asynccontextmanager
 from typing import Any
 
@@ -14,6 +16,7 @@ from fastapi import WebSocket
 from fastapi.testclient import TestClient
 from pydantic import ValidationError
 from starlette.websockets import WebSocketDisconnect
+from uvicorn.logging import AccessFormatter
 
 from app.config import Settings
 from app.main import create_app
@@ -458,3 +461,84 @@ async def test_f01_validation_errors_and_non_ascii_csrf_never_leak_or_crash() ->
         assert disc.status_code == 200
         assert disc.json()["connected"] is False
         assert disc.json()["connection_state"] == "DISCONNECTED"
+
+
+def test_f01_uvicorn_access_formatter_preserves_5_args_and_redacts_secrets() -> None:
+    """Contract: SecretRedactionFilter preserves 5-tuple record.args for Uvicorn AccessFormatter.
+
+    Defect caught: Flattening record.args=() causing ValueError in Uvicorn AccessFormatter.
+    """
+    create_app(settings=Settings(app_password_hash=TEST_PASSWORD_HASH))
+
+    buf = io.StringIO()
+    handler = logging.StreamHandler(buf)
+    handler.setFormatter(AccessFormatter("%(client_addr)s - %(request_line)s %(status_code)s"))
+    access_logger = logging.getLogger("uvicorn.access")
+    prev_level = access_logger.level
+    prev_propagate = access_logger.propagate
+    access_logger.setLevel(logging.INFO)
+    access_logger.propagate = False
+    access_logger.addHandler(handler)
+    try:
+        access_logger.info(
+            '%s - "%s %s HTTP/%s" %d',
+            "127.0.0.1:51234",
+            "GET",
+            "/api/contracts?apiKey=raw-access-key&token=raw-jwt-value",
+            "1.1",
+            200,
+        )
+    finally:
+        access_logger.removeHandler(handler)
+        access_logger.setLevel(prev_level)
+        access_logger.propagate = prev_propagate
+
+    output = buf.getvalue()
+    assert "200" in output
+    assert "raw-access-key" not in output
+    assert "raw-jwt-value" not in output
+    assert "***REDACTED***" in output
+
+
+async def test_f01_login_rate_limits_failures_and_offloads_argon2_off_event_loop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Contract: Failed logins rate-limit at 429 and Argon2 verification runs off the event loop.
+
+    Defect caught: CPU-heavy Argon2 blocking /api/health or unauthenticated brute-force flooding.
+    """
+    settings = Settings(
+        app_password_hash=TEST_PASSWORD_HASH,
+        login_rate_limit_attempts=2,
+        login_rate_limit_window_sec=60.0,
+        login_max_concurrency=2,
+    )
+    async with _async_client(settings, client_ip="127.0.0.1") as (client, app):
+        for _ in range(2):
+            bad = await client.post("/api/auth/login", json={"password": "wrong"})
+            assert bad.status_code == 401
+
+        limited = await client.post("/api/auth/login", json={"password": TEST_PASSWORD})
+        assert limited.status_code == 429
+
+        # Test off-loop execution from a second IP: slow verify_password must not block /api/health
+        orig_verify = app.state.session_manager.verify_password
+
+        def slow_verify(pw: str) -> bool:
+            time.sleep(0.15)
+            return orig_verify(pw)
+
+        monkeypatch.setattr(app.state.session_manager, "verify_password", slow_verify)
+        asgi_other = httpx.ASGITransport(app=app, client=("127.0.0.2", 54321))
+        async with httpx.AsyncClient(transport=asgi_other, base_url="http://127.0.0.1:8000") as c2:
+            login_task = asyncio.create_task(
+                c2.post("/api/auth/login", json={"password": TEST_PASSWORD})
+            )
+            await asyncio.sleep(0.02)
+            t0 = time.monotonic()
+            health_resp = await c2.get("/api/health")
+            health_elapsed = time.monotonic() - t0
+            assert health_resp.status_code == 200
+            assert health_elapsed < 0.08
+            ok_resp = await login_task
+            assert ok_resp.status_code == 200

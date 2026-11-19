@@ -46,9 +46,15 @@ class TopstepAuthService:
 
     LOGIN_ENDPOINT = "/api/Auth/loginKey"
 
-    def __init__(self, settings: Settings, client: httpx.AsyncClient) -> None:
+    def __init__(
+        self,
+        settings: Settings,
+        client: httpx.AsyncClient,
+        semaphore: asyncio.Semaphore | None = None,
+    ) -> None:
         self._settings = settings
         self._client = client
+        self._semaphore = semaphore or asyncio.Semaphore(settings.upstream_max_concurrency)
         self._lock = asyncio.Lock()
         self._token: str | None = None
         self._username: str | None = None
@@ -135,6 +141,26 @@ class TopstepAuthService:
         now: datetime | None = None,
     ) -> None:
         """Authenticate with TopstepX /api/Auth/loginKey under total deadline."""
+        try:
+            await asyncio.wait_for(
+                self._acquire_and_login(
+                    username=username,
+                    api_key=api_key,
+                    live=live,
+                    now=now,
+                ),
+                timeout=self._settings.upstream_total_timeout_sec,
+            )
+        except TimeoutError as exc:
+            raise UpstreamTimeoutError("TopstepX login timed out") from exc
+
+    async def _acquire_and_login(
+        self,
+        username: str,
+        api_key: str,
+        live: bool | None = None,
+        now: datetime | None = None,
+    ) -> None:
         async with self._lock:
             await self._login_locked(username=username, api_key=api_key, live=live, now=now)
 
@@ -156,10 +182,10 @@ class TopstepAuthService:
         url = f"{self._settings.topstepx_base_url.rstrip('/')}{self.LOGIN_ENDPOINT}"
 
         try:
-            data = await asyncio.wait_for(
-                self._post_login_with_retries(url, cleaned_user, cleaned_key),
-                timeout=self._settings.upstream_total_timeout_sec,
-            )
+            data = await self._post_login_with_retries(url, cleaned_user, cleaned_key)
+        except asyncio.CancelledError:
+            self._clear_session_state("TopstepX login timed out")
+            raise
         except TimeoutError as exc:
             self._clear_session_state("TopstepX login timed out")
             raise UpstreamTimeoutError("TopstepX login timed out") from exc
@@ -231,12 +257,18 @@ class TopstepAuthService:
         raise UpstreamTimeoutError("TopstepX login failed after bounded retries")
 
     async def _post_login(self, url: str, username: str, api_key: str) -> dict[str, Any]:
-        async with self._client.stream(
-            "POST",
-            url,
-            json={"userName": username, "apiKey": api_key},
-            headers={"Accept": "application/json, text/plain", "Content-Type": "application/json"},
-        ) as resp:
+        async with (
+            self._semaphore,
+            self._client.stream(
+                "POST",
+                url,
+                json={"userName": username, "apiKey": api_key},
+                headers={
+                    "Accept": "application/json, text/plain",
+                    "Content-Type": "application/json",
+                },
+            ) as resp,
+        ):
             raw_body = await resp.aread()
         text = raw_body.decode("utf-8", errors="replace")
         try:
@@ -246,6 +278,23 @@ class TopstepAuthService:
                 f"Invalid JSON from TopstepX auth (HTTP {resp.status_code})",
                 status_code=resp.status_code,
             ) from exc
+
+        if resp.status_code >= 500:
+            err_msg = (
+                (data.get("errorMessage") or data.get("message"))
+                if isinstance(data, dict)
+                else None
+            )
+            msg = err_msg or f"HTTP {resp.status_code}"
+            raise UpstreamHTTPError(
+                redact_secrets(str(msg), (api_key, username)),
+                status_code=resp.status_code,
+            )
+
+        if not isinstance(data, dict):
+            if resp.status_code >= 400:
+                raise TopstepAuthError(f"HTTP {resp.status_code}")
+            raise TopstepAuthError("TopstepX auth returned unexpected non-object JSON payload")
 
         if resp.status_code >= 400:
             msg = data.get("errorMessage") or data.get("message") or f"HTTP {resp.status_code}"
@@ -267,21 +316,30 @@ class TopstepAuthService:
         if self._token is None:
             raise TopstepAuthError("Not connected to TopstepX")
         if self.needs_refresh(now=now):
-            async with self._lock:
-                if self._token is None:
-                    raise TopstepAuthError("Not connected to TopstepX")
-                if self.needs_refresh(now=now):
-                    if not self._username or not self._api_key:
-                        raise TopstepAuthError("Cannot refresh JWT without credentials")
-                    await self._login_locked(
-                        username=self._username,
-                        api_key=self._api_key,
-                        live=self._live,
-                        now=now,
-                    )
+            try:
+                await asyncio.wait_for(
+                    self._refresh_locked(now=now),
+                    timeout=self._settings.upstream_total_timeout_sec,
+                )
+            except TimeoutError as exc:
+                raise UpstreamTimeoutError("TopstepX token refresh timed out") from exc
         if self._token is None:
             raise TopstepAuthError("Not connected to TopstepX")
         return self._token
+
+    async def _refresh_locked(self, now: datetime | None = None) -> None:
+        async with self._lock:
+            if self._token is None:
+                raise TopstepAuthError("Not connected to TopstepX")
+            if self.needs_refresh(now=now):
+                if not self._username or not self._api_key:
+                    raise TopstepAuthError("Cannot refresh JWT without credentials")
+                await self._login_locked(
+                    username=self._username,
+                    api_key=self._api_key,
+                    live=self._live,
+                    now=now,
+                )
 
     async def disconnect(self) -> None:
         """Clear in-memory TopstepX credentials and transition to DISCONNECTED."""

@@ -133,6 +133,17 @@ def test_f02_resolve_contract_enforces_strict_identity_without_fallback() -> Non
     with pytest.raises(AmbiguousContractError):
         resolve_contract("MYM", two_inactive)
 
+    # Separate OR branches: symbolId-only match and id-only match must both succeed independently
+    symbol_id_only = [
+        {"id": "CUSTOM-CONTRACT-1", "symbolId": "F.US.MGC", "activeContract": True},
+    ]
+    assert resolve_contract("MGC", symbol_id_only)["id"] == "CUSTOM-CONTRACT-1"
+
+    id_only = [
+        {"id": "CON.F.US.MNQ.Z26", "symbolId": "CME.LEGACY", "activeContract": True},
+    ]
+    assert resolve_contract("MNQ", id_only)["id"] == "CON.F.US.MNQ.Z26"
+
 
 async def test_f02_key_rotation_soft_vs_enforced_and_jwt_auto_refresh() -> None:
     """Contract: Stale key blocks auth only when KEY_ROTATION_ENFORCE=true; JWT refreshes >= 23h.

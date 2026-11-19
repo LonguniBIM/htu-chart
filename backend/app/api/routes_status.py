@@ -10,6 +10,7 @@ from pydantic import BaseModel
 from app.config import Settings
 from app.security import (
     SESSION_COOKIE_NAME,
+    LoginGuard,
     SessionData,
     SessionManager,
     get_session_manager,
@@ -49,6 +50,10 @@ def _get_topstep_auth(request: Request) -> TopstepAuthService:
     return request.app.state.topstep_auth
 
 
+def _get_login_guard(request: Request) -> LoginGuard:
+    return request.app.state.login_guard
+
+
 @router.get("/health")
 async def health() -> dict[str, str]:
     """Minimal unauthenticated liveness probe (zero TopstepX or business metadata)."""
@@ -62,14 +67,25 @@ async def login(
     response: Response,
     settings: Annotated[Settings, Depends(get_settings)],
     session_manager: Annotated[SessionManager, Depends(get_session_manager)],
+    login_guard: Annotated[LoginGuard, Depends(_get_login_guard)],
 ) -> dict[str, Any]:
     """Authenticate caller with Argon2id password and issue HttpOnly SameSite=Strict cookie."""
-    if not session_manager.verify_password(body.password):
+    client_key = request.client.host if request.client else "unknown"
+    if login_guard.is_rate_limited(client_key):
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="Too many failed login attempts; please wait before retrying",
+        )
+
+    verified = await login_guard.verify_password_offload(session_manager, body.password)
+    if not verified:
+        login_guard.record_failure(client_key)
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid credentials",
         )
 
+    login_guard.reset(client_key)
     session = session_manager.create_session()
     response.set_cookie(
         key=SESSION_COOKIE_NAME,

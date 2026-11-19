@@ -2,14 +2,17 @@
 
 from __future__ import annotations
 
+import asyncio
 import hmac
 import logging
 import re
 import secrets
+import time
+from collections import defaultdict, deque
 from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from typing import Annotated
+from typing import Annotated, Any
 from urllib.parse import urlparse
 
 from argon2 import PasswordHasher
@@ -37,6 +40,86 @@ _KV_SECRET_RE = re.compile(
     r"""TOPSTEPX_API_KEY|TELEGRAM_BOT_TOKEN|APP_PASSWORD_HASH|password)"""
     r"""\b(\s*[:=]\s*)(?!\*\*\*REDACTED\*\*\*)([^\s,;'"}\]]+)"""
 )
+_SENSITIVE_DICT_KEYS = frozenset({
+    "access_token",
+    "apikey",
+    "api_key",
+    "token",
+    "topstepx_api_key",
+    "telegram_bot_token",
+    "app_password_hash",
+    "password",
+})
+_PRINTF_SPEC_RE = re.compile(
+    r"%(?:\([^)]+\))?[-#0 +]*(?:\d+|\*)?(?:\.(?:\d+|\*))?[hlL]?[diouxXeEfFgGcrsa%]"
+)
+_MSG_SECRET_PREFIX_RE = re.compile(
+    r"(?i)(?:\bBearer\s+|"
+    r"\b(?:Authorization|access_token|apiKey|api_key|token|"
+    r"TOPSTEPX_API_KEY|TELEGRAM_BOT_TOKEN|APP_PASSWORD_HASH|password)\b\s*[:=]\s*)$"
+)
+
+
+def _redact_arg(value: Any, extra_secrets: tuple[str, ...]) -> Any:
+    if isinstance(value, str):
+        return redact_secrets(value, extra_secrets)
+    if isinstance(value, tuple):
+        return tuple(_redact_arg(item, extra_secrets) for item in value)
+    if isinstance(value, list):
+        return [_redact_arg(item, extra_secrets) for item in value]
+    if isinstance(value, dict):
+        redacted_dict: dict[Any, Any] = {}
+        for k, v in value.items():
+            if (
+                isinstance(k, str)
+                and k.lower() in _SENSITIVE_DICT_KEYS
+                and v not in (None, "", False)
+            ):
+                redacted_dict[k] = "***REDACTED***"
+            else:
+                redacted_dict[k] = _redact_arg(v, extra_secrets)
+        return redacted_dict
+    return value
+
+
+def _sensitive_positional_slots(msg: str) -> set[int]:
+    slots: set[int] = set()
+    pos_idx = 0
+    for match in _PRINTF_SPEC_RE.finditer(msg):
+        spec = match.group(0)
+        if spec == "%%":
+            continue
+        if spec.startswith("%("):
+            continue
+        prefix = msg[: match.start()]
+        if _MSG_SECRET_PREFIX_RE.search(prefix):
+            slots.add(pos_idx)
+        pos_idx += 1
+    return slots
+
+
+def _redact_log_message_template(msg: str, extra_secrets: tuple[str, ...]) -> str:
+    """Redact literal secrets in a logging template while preserving % format specifiers."""
+
+    def _safe_sub(pattern: re.Pattern[str], repl: str, text: str) -> str:
+        current_spans = [(m.start(), m.end()) for m in _PRINTF_SPEC_RE.finditer(text)]
+
+        def _cb(match: re.Match[str]) -> str:
+            m_start, m_end = match.span()
+            if any(s < m_end and m_start < e for s, e in current_spans):
+                return match.group(0)
+            return match.expand(repl)
+
+        return pattern.sub(_cb, text)
+
+    redacted = _safe_sub(_AUTH_HEADER_RE, r"Authorization\1 ***REDACTED***", msg)
+    redacted = _safe_sub(_BEARER_RE, "Bearer ***REDACTED***", redacted)
+    redacted = _safe_sub(_JSON_SECRET_RE, r"\1***REDACTED***\3", redacted)
+    redacted = _safe_sub(_KV_SECRET_RE, r"\1\2***REDACTED***", redacted)
+    for secret in extra_secrets:
+        if secret and len(secret) >= 6:
+            redacted = redacted.replace(secret, "***REDACTED***")
+    return redacted
 
 
 def redact_secrets(text: str, extra_secrets: Iterable[str] = ()) -> str:
@@ -61,12 +144,31 @@ class SecretRedactionFilter(logging.Filter):
         self._extra_secrets = tuple(s for s in extra_secrets if s and len(s) >= 6)
 
     def filter(self, record: logging.LogRecord) -> bool:
-        try:
-            rendered = record.getMessage()
-        except Exception:
-            rendered = str(record.msg)
-        record.msg = redact_secrets(rendered, self._extra_secrets)
-        record.args = ()
+        if isinstance(record.msg, str):
+            sensitive_slots = (
+                _sensitive_positional_slots(record.msg)
+                if isinstance(record.args, tuple)
+                else set()
+            )
+            if record.args:
+                record.msg = _redact_log_message_template(record.msg, self._extra_secrets)
+            else:
+                record.msg = redact_secrets(record.msg, self._extra_secrets)
+        else:
+            sensitive_slots = set()
+            record.msg = _redact_arg(record.msg, self._extra_secrets)
+
+        if isinstance(record.args, tuple):
+            redacted_items = []
+            for idx, item in enumerate(record.args):
+                if idx in sensitive_slots:
+                    redacted_items.append("***REDACTED***")
+                else:
+                    redacted_items.append(_redact_arg(item, self._extra_secrets))
+            record.args = tuple(redacted_items)
+        elif record.args:
+            record.args = _redact_arg(record.args, self._extra_secrets)
+
         if record.exc_info:
             formatter = logging.Formatter()
             record.exc_text = redact_secrets(
@@ -190,6 +292,68 @@ class SessionManager:
             session.csrf_token.encode("utf-8"),
             token.encode("utf-8"),
         )
+
+
+class LoginGuard:
+    """Sliding-window failed-login rate limiter and bounded Argon2id thread admission."""
+
+    def __init__(
+        self,
+        max_attempts: int = 5,
+        window_seconds: float = 60.0,
+        max_concurrency: int = 2,
+    ) -> None:
+        self._max_attempts = max_attempts
+        self._window_seconds = window_seconds
+        self._failures: dict[str, deque[float]] = defaultdict(deque)
+        self._semaphore = asyncio.Semaphore(max_concurrency)
+
+    def _prune(self, bucket: deque[float], now: float) -> None:
+        cutoff = now - self._window_seconds
+        while bucket and bucket[0] <= cutoff:
+            bucket.popleft()
+
+    def is_rate_limited(self, client_key: str) -> bool:
+        """Return True if client_key has exhausted failed login attempts in window."""
+        now = time.monotonic()
+        bucket = self._failures.get(client_key)
+        if not bucket:
+            return False
+        self._prune(bucket, now)
+        if not bucket:
+            self._failures.pop(client_key, None)
+            return False
+        return len(bucket) >= self._max_attempts
+
+    def record_failure(self, client_key: str) -> None:
+        """Record a failed login timestamp for client_key."""
+        now = time.monotonic()
+        bucket = self._failures[client_key]
+        self._prune(bucket, now)
+        bucket.append(now)
+
+    def reset(self, client_key: str) -> None:
+        """Clear failed login history after successful authentication."""
+        self._failures.pop(client_key, None)
+
+    async def verify_password_offload(
+        self,
+        session_manager: SessionManager,
+        password: str,
+        acquire_timeout: float = 1.0,
+    ) -> bool:
+        """Run Argon2id verification off the event loop with bounded concurrency."""
+        try:
+            await asyncio.wait_for(self._semaphore.acquire(), timeout=acquire_timeout)
+        except TimeoutError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                detail="Too many concurrent login attempts; try again shortly",
+            ) from exc
+        try:
+            return await asyncio.to_thread(session_manager.verify_password, password)
+        finally:
+            self._semaphore.release()
 
 
 def _strip_host_port(host_header: str) -> tuple[str, str | None]:

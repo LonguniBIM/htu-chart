@@ -45,7 +45,7 @@ SECRET_FIELD_NAMES = (
 )
 RAW_SECRET_VALUE_RE = re.compile(
     r"(?i)(?:\bBearer\s+[A-Za-z0-9._~+/=-]+|"
-    r"\b(?:apiKey|api_key|TOPSTEPX_API_KEY|TELEGRAM_BOT_TOKEN|botToken|access_token|password)\b\s*[:=]\s*\S+)"
+    r"\b(?:apiKey|api_key|TOPSTEPX_API_KEY|TELEGRAM_BOT_TOKEN|botToken|access_token|token|password)\b\s*[:=]\s*\S+)"
 )
 
 

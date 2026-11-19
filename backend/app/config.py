@@ -59,6 +59,9 @@ class Settings(BaseSettings):
     app_session_secret: str = ""
     app_cookie_secure: bool = False
     session_ttl_seconds: int = Field(default=86400, ge=60)
+    login_rate_limit_attempts: int = Field(default=5, ge=1, le=100)
+    login_rate_limit_window_sec: float = Field(default=60.0, gt=0.0)
+    login_max_concurrency: int = Field(default=2, ge=1, le=16)
 
     topstepx_username: str = ""
     topstepx_api_key: str = ""

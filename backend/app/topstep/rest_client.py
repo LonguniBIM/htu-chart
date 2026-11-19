@@ -74,11 +74,12 @@ class TopstepRestClient:
         settings: Settings,
         auth_service: TopstepAuthService,
         client: httpx.AsyncClient,
+        semaphore: asyncio.Semaphore | None = None,
     ) -> None:
         self._settings = settings
         self._auth = auth_service
         self._client = client
-        self._semaphore = asyncio.Semaphore(settings.upstream_max_concurrency)
+        self._semaphore = semaphore or asyncio.Semaphore(settings.upstream_max_concurrency)
 
     async def search_contracts(
         self,
@@ -126,8 +127,7 @@ class TopstepRestClient:
 
     async def _run_under_deadline(self, url: str, payload: dict[str, Any]) -> dict[str, Any]:
         token = await self._auth.ensure_token()
-        async with self._semaphore:
-            return await self._execute_with_retries(url, payload, token)
+        return await self._execute_with_retries(url, payload, token)
 
     async def _execute_with_retries(
         self,
@@ -145,7 +145,10 @@ class TopstepRestClient:
         last_exc: Exception | None = None
         for attempt in range(max_attempts):
             try:
-                async with self._client.stream("POST", url, json=payload, headers=headers) as resp:
+                async with (
+                    self._semaphore,
+                    self._client.stream("POST", url, json=payload, headers=headers) as resp,
+                ):
                     raw_body = await resp.aread()
 
                 text = raw_body.decode("utf-8", errors="replace")
@@ -174,14 +177,20 @@ class TopstepRestClient:
                         status_code=resp.status_code,
                     ) from exc
 
-                if isinstance(data, dict) and data.get("success") is False:
+                if not isinstance(data, dict):
+                    raise UpstreamHTTPError(
+                        f"Unexpected non-object JSON response (HTTP {resp.status_code})",
+                        status_code=resp.status_code,
+                    )
+
+                if data.get("success") is False:
                     err_msg = data.get("errorMessage") or (
                         f"TopstepX errorCode={data.get('errorCode')}"
                     )
                     msg = redact_secrets(str(err_msg), (token,))
                     raise UpstreamHTTPError(msg, status_code=resp.status_code)
 
-                return data if isinstance(data, dict) else {"data": data}
+                return data
             except (httpx.TimeoutException, httpx.TransportError) as exc:
                 last_exc = exc
                 if attempt + 1 < max_attempts:

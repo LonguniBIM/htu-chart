@@ -19,6 +19,7 @@ from app.api import routes_market, routes_status
 from app.config import Settings, load_settings
 from app.security import (
     HostOriginMiddleware,
+    LoginGuard,
     SessionManager,
     install_global_log_redaction,
     redact_secrets,
@@ -66,18 +67,35 @@ def create_app(
     async def lifespan(app_instance: FastAPI) -> AsyncIterator[None]:
         owns_client = http_client is None
         client = http_client or httpx.AsyncClient(timeout=build_httpx_timeout(resolved_settings))
-        auth_service = TopstepAuthService(resolved_settings, client)
-        rest_client = TopstepRestClient(resolved_settings, auth_service, client)
+        upstream_semaphore = asyncio.Semaphore(resolved_settings.upstream_max_concurrency)
+        auth_service = TopstepAuthService(
+            resolved_settings,
+            client,
+            semaphore=upstream_semaphore,
+        )
+        rest_client = TopstepRestClient(
+            resolved_settings,
+            auth_service,
+            client,
+            semaphore=upstream_semaphore,
+        )
         session_manager = SessionManager(
             password_hash=resolved_settings.app_password_hash,
             ttl_seconds=resolved_settings.session_ttl_seconds,
         )
+        login_guard = LoginGuard(
+            max_attempts=resolved_settings.login_rate_limit_attempts,
+            window_seconds=resolved_settings.login_rate_limit_window_sec,
+            max_concurrency=resolved_settings.login_max_concurrency,
+        )
 
         app_instance.state.settings = resolved_settings
         app_instance.state.http_client = client
+        app_instance.state.upstream_semaphore = upstream_semaphore
         app_instance.state.topstep_auth = auth_service
         app_instance.state.rest_client = rest_client
         app_instance.state.session_manager = session_manager
+        app_instance.state.login_guard = login_guard
 
         auth_task: asyncio.Task[None] | None = None
         has_creds = bool(

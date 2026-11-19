@@ -302,3 +302,100 @@ async def test_r03_lifespan_shutdown_cancels_auth_task_and_closes_owned_client(
         assert created_clients[0].is_closed is True
     finally:
         release_login.set()
+
+
+async def test_r03_concurrent_login_calls_enforce_single_total_deadline() -> None:
+    """Contract: Concurrent login() calls include _lock wait in upstream_total_timeout_sec.
+
+    Defect caught: Queued login() callers waiting linearly for multiples of total timeout.
+    """
+
+    async def stalled_login(_request: httpx.Request) -> httpx.Response:
+        await asyncio.sleep(5.0)
+        return httpx.Response(200, json={"success": True, "token": "late"})
+
+    settings = Settings(upstream_total_timeout_sec=0.12, upstream_max_retries=0)
+    async with httpx.AsyncClient(transport=httpx.MockTransport(stalled_login)) as client:
+        auth = TopstepAuthService(settings, client)
+        started = time.monotonic()
+        results = await asyncio.gather(
+            *(auth.login("alice", "key-1") for _ in range(3)),
+            return_exceptions=True,
+        )
+        elapsed = time.monotonic() - started
+
+        assert elapsed < 0.25
+        assert all(isinstance(r, UpstreamTimeoutError) for r in results)
+        assert auth.is_connected is False
+
+
+async def test_r03_auth_handles_non_dict_json_responses_without_attribute_error() -> None:
+    """Contract: Non-dict JSON payloads (503 [] -> 200 ok, or 200 []) never raise AttributeError.
+
+    Defect caught: Calling data.get(...) on JSON list [] bypassing retries and state cleanup.
+    """
+    calls = 0
+
+    async def retry_list_handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return httpx.Response(503, json=[])
+        return httpx.Response(200, json={"success": True, "token": "jwt-after-503-list"})
+
+    settings = Settings(upstream_max_retries=2, upstream_total_timeout_sec=5.0)
+    async with httpx.AsyncClient(transport=httpx.MockTransport(retry_list_handler)) as client:
+        auth = TopstepAuthService(settings, client)
+        await auth.login("alice", "key-1")
+        assert calls == 2
+        assert auth.is_connected is True
+
+    async def ok_list_handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=[])
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(ok_list_handler)) as client:
+        auth = TopstepAuthService(settings, client)
+        with pytest.raises(TopstepAuthError):
+            await auth.login("alice", "key-1")
+        assert auth.is_connected is False
+        assert auth.get_status()["connection_state"] == "DISCONNECTED"
+
+
+async def test_r03_shared_semaphore_caps_overlapping_auth_and_rest_requests() -> None:
+    """Contract: TopstepAuthService and TopstepRestClient share one upstream concurrency semaphore.
+
+    Defect caught: Overlapping loginKey and Contract/search exceeding upstream_max_concurrency.
+    """
+    active = 0
+    peak_active = 0
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal active, peak_active
+        active += 1
+        peak_active = max(peak_active, active)
+        try:
+            await asyncio.sleep(0.05)
+            if request.url.path == "/api/Auth/loginKey":
+                return httpx.Response(200, json={"success": True, "token": "jwt-shared"})
+            return httpx.Response(200, json={"contracts": []})
+        finally:
+            active -= 1
+
+    settings = Settings(
+        upstream_max_concurrency=1,
+        upstream_total_timeout_sec=5.0,
+        upstream_max_retries=0,
+    )
+    shared_sem = asyncio.Semaphore(settings.upstream_max_concurrency)
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        auth = TopstepAuthService(settings, client, semaphore=shared_sem)
+        await auth.login("alice", "key-1")
+        rest = TopstepRestClient(settings, auth, client, semaphore=shared_sem)
+
+        peak_active = 0
+        await asyncio.gather(
+            auth.login("alice", "key-1"),
+            rest.search_contracts("MES"),
+            rest.search_contracts("MNQ"),
+        )
+        assert peak_active <= 1
