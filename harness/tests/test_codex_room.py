@@ -29,6 +29,11 @@ def test_sync_isolates_runtime_forces_readonly_and_never_touches_base_home(tmp_p
             'sandbox_mode = "danger-full-access"',
             'approval_policy = "on-request"',
             "",
+            "http_headers = {",
+            '  x-openai-actor-authorization = "cockpit-tools",',
+            '  x-cockpit-instance-id = ".codex",',
+            "}",
+            "",
             "[features]",
             "multi_agent = true",
             "multi_agent_v2 = true",
@@ -39,6 +44,9 @@ def test_sync_isolates_runtime_forces_readonly_and_never_touches_base_home(tmp_p
             "",
             '[projects."D:\\\\01_DCMvn\\\\Workspace\\\\Lightchart"]',
             'trust_level = "trusted"',
+            "",
+            "[mcp_servers.node_repl.env]",
+            """NODE_REPL_TRUSTED_SERVICES = '{"browser":"C:/a/b.mjs","sky":"@oai/sky"}'""",
         ]
     )
     (base_home / "config.toml").write_text(base_toml, encoding="utf-8")
@@ -61,6 +69,8 @@ def test_sync_isolates_runtime_forces_readonly_and_never_touches_base_home(tmp_p
         assert parsed["features"]["agent_message_board"] is False
         assert "agents" not in parsed
         assert parsed["projects"][r"D:\01_DCMvn\Workspace\Lightchart"]["trust_level"] == "trusted"
+        assert parsed["http_headers"]["x-cockpit-instance-id"] == ".codex"
+        assert parsed["mcp_servers"]["node_repl"]["env"]["NODE_REPL_TRUSTED_SERVICES"].startswith('{"browser"')
         assert "READ-ONLY" in parsed["developer_instructions"]
         assert (runtime_dir / "auth.json").read_text(encoding="utf-8") == '{"token":"synthetic-auth"}\n'
 

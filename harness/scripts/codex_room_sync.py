@@ -66,8 +66,111 @@ def apply_safety_locks(cfg: dict[str, Any], model_override: str | None = None) -
     features["multi_agent"] = False
     features["multi_agent_v2"] = False
     features["agent_message_board"] = False
+    features.pop("dangerously-bypass-approvals-and-sandbox", None)
     locked["features"] = features
     return locked
+
+
+def normalize_toml_v11(src: str) -> str:
+    """Normalize TOML 1.1 multiline inline tables so Python 3.14 tomllib (TOML 1.0) parses them."""
+    out: list[str] = []
+    i = 0
+    n = len(src)
+    brace_depth = 0
+    string_mode: str | None = None
+
+    while i < n:
+        ch = src[i]
+
+        if string_mode is not None:
+            if string_mode in ('"""', "'''"):
+                if src.startswith(string_mode, i):
+                    out.append(string_mode)
+                    i += 3
+                    string_mode = None
+                    continue
+                if string_mode == '"""' and ch == "\\" and i + 1 < n:
+                    out.append(src[i : i + 2])
+                    i += 2
+                    continue
+                out.append(ch)
+                i += 1
+                continue
+
+            if string_mode == '"' and ch == "\\" and i + 1 < n:
+                out.append(src[i : i + 2])
+                i += 2
+                continue
+            out.append(ch)
+            if ch == string_mode:
+                string_mode = None
+            i += 1
+            continue
+
+        if src.startswith('"""', i) or src.startswith("'''", i):
+            delim = src[i : i + 3]
+            out.append(delim)
+            string_mode = delim
+            i += 3
+            continue
+
+        if ch in ('"', "'"):
+            out.append(ch)
+            string_mode = ch
+            i += 1
+            continue
+
+        if ch == "#":
+            end_nl = src.find("\n", i)
+            if brace_depth > 0:
+                if end_nl == -1:
+                    break
+                out.append(" ")
+                i = end_nl + 1
+                continue
+            if end_nl == -1:
+                out.append(src[i:])
+                break
+            out.append(src[i : end_nl + 1])
+            i = end_nl + 1
+            continue
+
+        if ch == "{":
+            brace_depth += 1
+            out.append(ch)
+            i += 1
+            continue
+
+        if ch == "}":
+            if brace_depth > 0:
+                # Drop trailing comma before '}' permitted in TOML 1.1 inline tables.
+                j = len(out) - 1
+                while j >= 0 and out[j] in (" ", "\t"):
+                    j -= 1
+                if j >= 0 and out[j] == ",":
+                    del out[j:]
+                brace_depth -= 1
+            out.append(ch)
+            i += 1
+            continue
+
+        if brace_depth > 0 and ch in ("\r", "\n"):
+            out.append(" ")
+            i += 1
+            continue
+
+        out.append(ch)
+        i += 1
+
+    return "".join(out)
+
+
+def loads_toml(src: str) -> dict[str, Any]:
+    """Parse TOML string, normalizing TOML 1.1 inline tables when needed."""
+    try:
+        return tomllib.loads(src)
+    except tomllib.TOMLDecodeError:
+        return tomllib.loads(normalize_toml_v11(src))
 
 
 def _escape_basic_string(val: str) -> str:
@@ -255,9 +358,9 @@ def sync_role(
     base_config_path = base_home / "config.toml"
     base_cfg: dict[str, Any] = {}
     if base_config_path.is_file():
-        base_cfg = tomllib.loads(base_config_path.read_text(encoding="utf-8"))
+        base_cfg = loads_toml(base_config_path.read_text(encoding="utf-8"))
 
-    overlay_cfg = tomllib.loads(overlay_path.read_text(encoding="utf-8"))
+    overlay_cfg = loads_toml(overlay_path.read_text(encoding="utf-8"))
     merged = apply_safety_locks(deep_merge(base_cfg, overlay_cfg), model_override=model_override)
     rendered_toml = dumps_toml(merged)
 
