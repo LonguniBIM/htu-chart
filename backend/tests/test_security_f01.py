@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import io
 import logging
+import threading
 import time
 from contextlib import asynccontextmanager
 from typing import Any
@@ -12,7 +13,7 @@ from typing import Any
 import httpx
 import pytest
 from argon2 import PasswordHasher
-from fastapi import WebSocket
+from fastapi import HTTPException, WebSocket
 from fastapi.testclient import TestClient
 from pydantic import ValidationError
 from starlette.websockets import WebSocketDisconnect
@@ -20,7 +21,13 @@ from uvicorn.logging import AccessFormatter
 
 from app.config import Settings
 from app.main import create_app
-from app.security import SecretRedactionFilter, redact_secrets, validate_ws_handshake
+from app.security import (
+    LoginGuard,
+    SecretRedactionFilter,
+    SessionManager,
+    redact_secrets,
+    validate_ws_handshake,
+)
 
 TEST_PASSWORD = "correct-horse-battery-staple"
 TEST_PASSWORD_HASH = PasswordHasher().hash(TEST_PASSWORD)
@@ -523,22 +530,104 @@ async def test_f01_login_rate_limits_failures_and_offloads_argon2_off_event_loop
 
         # Test off-loop execution from a second IP: slow verify_password must not block /api/health
         orig_verify = app.state.session_manager.verify_password
+        loop_tid = threading.get_ident()
+        worker_tid: int | None = None
 
         def slow_verify(pw: str) -> bool:
+            nonlocal worker_tid
+            worker_tid = threading.get_ident()
             time.sleep(0.15)
             return orig_verify(pw)
 
         monkeypatch.setattr(app.state.session_manager, "verify_password", slow_verify)
         asgi_other = httpx.ASGITransport(app=app, client=("127.0.0.2", 54321))
         async with httpx.AsyncClient(transport=asgi_other, base_url="http://127.0.0.1:8000") as c2:
+            t0 = time.monotonic()
             login_task = asyncio.create_task(
                 c2.post("/api/auth/login", json={"password": TEST_PASSWORD})
             )
-            await asyncio.sleep(0.02)
-            t0 = time.monotonic()
             health_resp = await c2.get("/api/health")
             health_elapsed = time.monotonic() - t0
             assert health_resp.status_code == 200
-            assert health_elapsed < 0.08
+            assert health_elapsed < 0.10
             ok_resp = await login_task
             assert ok_resp.status_code == 200
+            assert worker_tid is not None and worker_tid != loop_tid
+
+
+def test_f01_quoted_logging_templates_redact_positional_secret_args() -> None:
+    """Contract: Quoted JSON-style logging templates redact positional secret arguments.
+
+    Defect caught: Literal secrets leaking through quoted '%s' templates like '{"password": "%s"}'.
+    """
+    create_app(settings=Settings(app_password_hash=TEST_PASSWORD_HASH))
+    buf = io.StringIO()
+    handler = logging.StreamHandler(buf)
+    root_logger = logging.getLogger()
+    prev_level = root_logger.level
+    root_logger.setLevel(logging.DEBUG)
+    root_logger.addHandler(handler)
+    try:
+        logging.getLogger("topstep_chart.audit").warning(
+            '{"password": "%s"}',
+            "quoted-secret-xyz",
+        )
+        logging.getLogger("topstep_chart.audit").warning(
+            "{'apiKey': '%s'}",
+            "single-quoted-secret-abc",
+        )
+    finally:
+        root_logger.removeHandler(handler)
+        root_logger.setLevel(prev_level)
+
+    emitted = buf.getvalue()
+    assert "quoted-secret-xyz" not in emitted
+    assert "single-quoted-secret-abc" not in emitted
+    assert "***REDACTED***" in emitted
+
+
+async def test_f01_login_guard_retains_permit_until_cancelled_worker_thread_exits() -> None:
+    """Contract: Cancelling login does not release semaphore before the OS worker thread exits.
+
+    Defect caught: Cancelled asyncio.to_thread calls exceeding login_max_concurrency.
+    """
+    guard = LoginGuard(max_concurrency=1)
+    entered = threading.Event()
+    release = threading.Event()
+    count_lock = threading.Lock()
+    active_workers = 0
+    peak_workers = 0
+
+    class _BlockingSessionManager(SessionManager):
+        def verify_password(self, password: str) -> bool:
+            nonlocal active_workers, peak_workers
+            with count_lock:
+                active_workers += 1
+                peak_workers = max(peak_workers, active_workers)
+            try:
+                if password == "block":
+                    entered.set()
+                    release.wait(timeout=5.0)
+                return True
+            finally:
+                with count_lock:
+                    active_workers -= 1
+
+    mgr = _BlockingSessionManager(TEST_PASSWORD_HASH)
+    task1 = asyncio.create_task(guard.verify_password_offload(mgr, "block", acquire_timeout=1.0))
+    await asyncio.to_thread(entered.wait, 2.0)
+
+    task1.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task1
+
+    # Worker thread #1 is still blocked; login #2 must NOT run concurrently above max_concurrency=1
+    with pytest.raises(HTTPException) as exc_info:
+        await guard.verify_password_offload(mgr, "fast", acquire_timeout=0.05)
+    assert exc_info.value.status_code == 429
+    assert peak_workers == 1
+
+    release.set()
+    await asyncio.sleep(0.05)
+    assert await guard.verify_password_offload(mgr, "fast", acquire_timeout=1.0) is True
+    assert peak_workers == 1

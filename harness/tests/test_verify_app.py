@@ -110,3 +110,28 @@ def test_cmd_smoke_fails_on_json_status_with_inline_token_assignment(
     report = json.loads((out_dir / "smoke.json").read_text(encoding="utf-8"))
     assert report["passed"] is False
     assert "$.detail:raw_secret_pattern" in report["secret_leaks_detected"]
+
+
+def test_cmd_smoke_fails_on_json_status_with_quoted_token_assignment(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """Contract: cmd_smoke detects quoted JSON-style secret assignments inside JSON detail strings.
+
+    Defect caught: RAW_SECRET_VALUE_RE missing closing quote in '{"token":"raw-jwt-leak"}'.
+    """
+
+    def fake_request(url: str, method: str = "GET", timeout: float = 4.0) -> tuple[int, str]:
+        if url.endswith("/api/health"):
+            return 200, '{"status": "ok"}'
+        if url.endswith("/api/status"):
+            return 401, '{"detail": "{\\"token\\":\\"raw-jwt-leak\\"}"}'
+        return 404, '{"detail": "Not Found"}'
+
+    monkeypatch.setattr(verify_app, "_http_request", fake_request)
+    out_dir = tmp_path / "smoke_quoted_token"
+    exit_code = verify_app.cmd_smoke("http://127.0.0.1:18456", out_dir)
+    assert exit_code == 1
+    report = json.loads((out_dir / "smoke.json").read_text(encoding="utf-8"))
+    assert report["passed"] is False
+    assert "$.detail:raw_secret_pattern" in report["secret_leaks_detected"]

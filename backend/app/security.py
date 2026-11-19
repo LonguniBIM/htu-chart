@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import hmac
 import logging
 import re
 import secrets
+import threading
 import time
 from collections import defaultdict, deque
 from collections.abc import Iterable
@@ -54,9 +56,10 @@ _PRINTF_SPEC_RE = re.compile(
     r"%(?:\([^)]+\))?[-#0 +]*(?:\d+|\*)?(?:\.(?:\d+|\*))?[hlL]?[diouxXeEfFgGcrsa%]"
 )
 _MSG_SECRET_PREFIX_RE = re.compile(
-    r"(?i)(?:\bBearer\s+|"
-    r"\b(?:Authorization|access_token|apiKey|api_key|token|"
-    r"TOPSTEPX_API_KEY|TELEGRAM_BOT_TOKEN|APP_PASSWORD_HASH|password)\b\s*[:=]\s*)$"
+    r"""(?i)(?:\bBearer\s+|"""
+    r"""\b(?:Authorization|access_token|apiKey|api_key|token|"""
+    r"""TOPSTEPX_API_KEY|TELEGRAM_BOT_TOKEN|APP_PASSWORD_HASH|password)\b"""
+    r"""["']?\s*(?:[:=]\s*|\s+)["']?)$"""
 )
 
 
@@ -336,6 +339,12 @@ class LoginGuard:
         """Clear failed login history after successful authentication."""
         self._failures.pop(client_key, None)
 
+    def _release_permit_threadsafe(self, loop: asyncio.AbstractEventLoop) -> None:
+        if loop.is_closed():
+            return
+        with contextlib.suppress(RuntimeError):
+            loop.call_soon_threadsafe(self._semaphore.release)
+
     async def verify_password_offload(
         self,
         session_manager: SessionManager,
@@ -350,10 +359,32 @@ class LoginGuard:
                 status_code=status.HTTP_429_TOO_MANY_REQUESTS,
                 detail="Too many concurrent login attempts; try again shortly",
             ) from exc
+
+        loop = asyncio.get_running_loop()
+        state_lock = threading.Lock()
+        state = {"started": False, "aborted": False}
+
+        def _worker() -> bool:
+            with state_lock:
+                if state["aborted"]:
+                    return False
+                state["started"] = True
+            try:
+                return session_manager.verify_password(password)
+            finally:
+                self._release_permit_threadsafe(loop)
+
         try:
-            return await asyncio.to_thread(session_manager.verify_password, password)
-        finally:
-            self._semaphore.release()
+            return await asyncio.to_thread(_worker)
+        except BaseException:
+            should_release = False
+            with state_lock:
+                if not state["started"]:
+                    state["aborted"] = True
+                    should_release = True
+            if should_release:
+                self._semaphore.release()
+            raise
 
 
 def _strip_host_port(host_header: str) -> tuple[str, str | None]:
