@@ -287,7 +287,7 @@ class TopstepAuthService:
             )
             msg = err_msg or f"HTTP {resp.status_code}"
             raise UpstreamHTTPError(
-                redact_secrets(str(msg), (api_key, username)),
+                redact_secrets(str(msg), (api_key, username))[:300],
                 status_code=resp.status_code,
             )
 
@@ -299,15 +299,15 @@ class TopstepAuthService:
         if resp.status_code >= 400:
             msg = data.get("errorMessage") or data.get("message") or f"HTTP {resp.status_code}"
             if resp.status_code in {401, 403}:
-                raise TopstepAuthError(redact_secrets(str(msg), (api_key, username)))
+                raise TopstepAuthError(redact_secrets(str(msg), (api_key, username))[:300])
             raise UpstreamHTTPError(
-                redact_secrets(str(msg), (api_key, username)),
+                redact_secrets(str(msg), (api_key, username))[:300],
                 status_code=resp.status_code,
             )
 
         if data.get("success") is False:
             msg = data.get("errorMessage") or f"TopstepX errorCode={data.get('errorCode')}"
-            raise TopstepAuthError(redact_secrets(str(msg), (api_key, username)))
+            raise TopstepAuthError(redact_secrets(str(msg), (api_key, username))[:300])
         return data
 
     async def ensure_token(self, now: datetime | None = None) -> str:

@@ -152,6 +152,61 @@ async def test_r03_truncated_400_error_body_redacts_unterminated_quoted_token() 
         assert "***REDACTED***" in str(exc_info.value)
 
 
+async def test_r03_redacts_unlabeled_long_jwt_before_slicing_and_sends_expected_wire_auth() -> None:
+    """Contract: Redact full upstream text before 300-char slicing; verify login/REST wire auth.
+
+    Defect caught: Slicing before exact JWT replacement leaking prefix of unlabeled >300-char JWT.
+    """
+    pw = "wire-check-pw"
+    pw_hash = PasswordHasher().hash(pw)
+    long_jwt = "eyJ-unlabeled-secret-jwt-" + ("a" * 340)
+    captured_login_json: dict[str, object] = {}
+    captured_auth_header: str | None = None
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal captured_auth_header
+        if request.url.path == "/api/Auth/loginKey":
+            import json as _json
+
+            captured_login_json.update(_json.loads(request.content.decode("utf-8")))
+            return httpx.Response(200, json={"success": True, "token": long_jwt})
+        captured_auth_header = request.headers.get("Authorization")
+        return httpx.Response(400, text=f"Rejected credential {long_jwt}")
+
+    settings = Settings(app_env="development", app_password_hash=pw_hash, upstream_max_retries=0)
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as upstream:
+        auth = TopstepAuthService(settings, upstream)
+        await auth.login("alice", "wire-api-key")
+        assert captured_login_json == {"userName": "alice", "apiKey": "wire-api-key"}
+
+        rest = TopstepRestClient(settings, auth, upstream)
+        with pytest.raises(UpstreamHTTPError) as exc_info:
+            await rest.search_contracts("MES")
+        assert captured_auth_header == f"Bearer {long_jwt}"
+        assert "eyJ-unlabeled-secret-jwt-" not in str(exc_info.value)
+        assert "***REDACTED***" in str(exc_info.value)
+
+        app = create_app(settings=settings, http_client=upstream)
+        async with app.router.lifespan_context(app):
+            asgi = httpx.ASGITransport(app=app, client=("127.0.0.1", 50000))
+            async with httpx.AsyncClient(
+                transport=asgi,
+                base_url="http://127.0.0.1:8000",
+            ) as client:
+                login_resp = await client.post("/api/auth/login", json={"password": pw})
+                csrf = login_resp.json()["csrf_token"]
+                conn = await client.post(
+                    "/api/connect",
+                    json={"userName": "alice", "apiKey": "wire-api-key"},
+                    headers={"X-CSRF-Token": csrf},
+                )
+                assert conn.status_code == 200
+                contracts_resp = await client.get("/api/contracts?symbols=MES")
+                assert contracts_resp.status_code == 200
+                assert "eyJ-unlabeled-secret-jwt-" not in contracts_resp.text
+                assert "***REDACTED***" in contracts_resp.text
+
+
 async def test_r03_non_blocking_lifespan_starts_disconnected_when_login_hangs() -> None:
     """Contract: Hanging TopstepX auto-connect does not delay startup and leaves DISCONNECTED state.
 

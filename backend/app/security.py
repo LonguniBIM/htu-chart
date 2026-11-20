@@ -491,7 +491,11 @@ def _normalize_origin(origin_header: str) -> str | None:
     raw = origin_header.strip()
     if not raw or raw.lower() == "null":
         return None
-    parsed = urlparse(raw)
+    try:
+        parsed = urlparse(raw)
+        _ = parsed.port
+    except ValueError:
+        return None
     if parsed.scheme not in {"http", "https"} or not parsed.netloc:
         return None
     if parsed.path not in {"", "/"} or parsed.query or parsed.fragment:

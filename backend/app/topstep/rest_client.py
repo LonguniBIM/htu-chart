@@ -163,7 +163,7 @@ class TopstepRestClient:
                     raise last_exc
 
                 if resp.status_code >= 400:
-                    safe_detail = redact_secrets(text[:300], (token,))
+                    safe_detail = redact_secrets(text, (token,))[:300]
                     raise UpstreamHTTPError(
                         f"Upstream client error HTTP {resp.status_code}: {safe_detail}",
                         status_code=resp.status_code,

@@ -178,6 +178,9 @@ async def test_f01_host_and_origin_allowlist_blocks_dns_rebinding_and_foreign_or
         )
         assert null_origin.status_code == 403
 
+        malformed_origin = await client.get("/api/health", headers={"Origin": "http://["})
+        assert malformed_origin.status_code == 403
+
         ok_origin = await client.get("/api/health", headers={"Origin": "http://127.0.0.1:8000"})
         assert ok_origin.status_code == 200
 
@@ -239,6 +242,18 @@ def test_f01_websocket_handshake_validates_origin_and_session_before_accept() ->
             ):
                 pass
         assert exc_origin.value.code == 1008
+
+        with pytest.raises(WebSocketDisconnect) as exc_malformed_origin:
+            with client.websocket_connect(
+                "/ws/test",
+                headers={
+                    "Host": "127.0.0.1:8000",
+                    "Origin": "http://[",
+                    "Cookie": f"topstep_session={session_cookie}",
+                },
+            ):
+                pass
+        assert exc_malformed_origin.value.code == 1008
 
         with client.websocket_connect(
             "/ws/test",
