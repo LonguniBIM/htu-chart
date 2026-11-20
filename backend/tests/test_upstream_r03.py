@@ -126,6 +126,32 @@ async def test_r03_semaphore_bounds_concurrency_and_retries_transient_503_only()
         assert bad_req_attempts == 1
 
 
+async def test_r03_truncated_400_error_body_redacts_unterminated_quoted_token() -> None:
+    """Contract: 4xx error slicing at 300 chars still masks truncated quoted token secrets.
+
+    Defect caught: Unterminated quoted token leaked when HTTP error detail is sliced at 300 chars.
+    """
+    long_secret = "very-sensitive-jwt-" + ("x" * 350)
+    long_body = f'{{"error": "rejected", "token": "{long_secret}"}}'
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/Auth/loginKey":
+            return httpx.Response(200, json={"success": True, "token": "jwt-ok"})
+        return httpx.Response(400, text=long_body)
+
+    settings = Settings(upstream_max_retries=0, upstream_total_timeout_sec=5.0)
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        auth = TopstepAuthService(settings, client)
+        await auth.login("alice", "key-1")
+        rest = TopstepRestClient(settings, auth, client)
+
+        with pytest.raises(UpstreamHTTPError) as exc_info:
+            await rest.search_contracts("MES")
+        assert exc_info.value.status_code == 400
+        assert "very-sensitive-jwt-" not in str(exc_info.value)
+        assert "***REDACTED***" in str(exc_info.value)
+
+
 async def test_r03_non_blocking_lifespan_starts_disconnected_when_login_hangs() -> None:
     """Contract: Hanging TopstepX auto-connect does not delay startup and leaves DISCONNECTED state.
 

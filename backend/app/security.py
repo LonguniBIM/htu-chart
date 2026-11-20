@@ -35,7 +35,7 @@ _REDACTED_FIELD_PATTERN = (
     r"TOPSTEPX_API_KEY|TELEGRAM_BOT_TOKEN|botToken|APP_PASSWORD_HASH|APP_SESSION_SECRET|password"
 )
 _AUTH_SCHEMES = r"Bearer|Basic|Token|Digest|ApiKey|OAuth|Negotiate|NTLM|AWS4-HMAC-SHA256"
-_QUOTED_VALUE_ALT = r'(?:"(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\')'
+_QUOTED_VALUE_ALT = r'(?:"(?:\\.|[^"\\])*"?(?:\\$)?|\'(?:\\.|[^\'\\])*\'?(?:\\$)?)'
 _BEARER_RE = re.compile(r"(?i)\bBearer\s+[A-Za-z0-9._~+/=-]+")
 _AUTH_HEADER_RE = re.compile(
     rf"""(?i)\bAuthorization\s*([:=])\s*(?!['"])(?:(?:{_AUTH_SCHEMES})\s+)?[^\s,;'"]+"""
@@ -125,14 +125,26 @@ def _sensitive_named_keys(msg: str) -> frozenset[str]:
     return frozenset(keys)
 
 
+def _closing_quote(val: str, quote: str) -> str:
+    if len(val) < 2 or val[-1] != quote:
+        return ""
+    preceding = val[:-1]
+    slash_count = len(preceding) - len(preceding.rstrip("\\"))
+    return quote if slash_count % 2 == 0 else ""
+
+
 def _redact_json_match(match: re.Match[str]) -> str:
-    quote = match.group("val")[0]
-    return f"{match.group('prefix')}{quote}***REDACTED***{quote}"
+    val = match.group("val")
+    quote = val[0]
+    closing = _closing_quote(val, quote)
+    return f"{match.group('prefix')}{quote}***REDACTED***{closing}"
 
 
 def _redact_kv_quoted_match(match: re.Match[str]) -> str:
-    quote = match.group("val")[0]
-    return f"{match.group('key')}{match.group('sep')}{quote}***REDACTED***{quote}"
+    val = match.group("val")
+    quote = val[0]
+    closing = _closing_quote(val, quote)
+    return f"{match.group('key')}{match.group('sep')}{quote}***REDACTED***{closing}"
 
 
 def _redact_log_message_template(msg: str, extra_secrets: tuple[str, ...]) -> str:

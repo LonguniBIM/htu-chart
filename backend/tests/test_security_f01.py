@@ -798,12 +798,25 @@ def test_f01_redaction_is_linear_time_on_unterminated_backslashes_and_masks_basi
     """
     adversarial_kv = 'password="' + ("\\" * 100)
     adversarial_json = '{"password": "' + ("\\" * 100)
+    unterminated_kv = 'password="private-value-987'
+    unterminated_json = '{"password": "truncated-secret-999'
 
     t0 = time.monotonic()
-    redact_secrets(adversarial_kv)
-    redact_secrets(adversarial_json)
+    redacted_adv_kv = redact_secrets(adversarial_kv)
+    redacted_adv_json = redact_secrets(adversarial_json)
     elapsed_direct = time.monotonic() - t0
     assert elapsed_direct < 0.05
+    assert "\\" not in redacted_adv_kv
+    assert "\\" not in redacted_adv_json
+    assert "***REDACTED***" in redacted_adv_kv
+    assert "***REDACTED***" in redacted_adv_json
+
+    redacted_unterm_kv = redact_secrets(unterminated_kv)
+    redacted_unterm_json = redact_secrets(unterminated_json)
+    assert "private-value-987" not in redacted_unterm_kv
+    assert "truncated-secret-999" not in redacted_unterm_json
+    assert "***REDACTED***" in redacted_unterm_kv
+    assert "***REDACTED***" in redacted_unterm_json
 
     create_app(settings=Settings(app_password_hash=TEST_PASSWORD_HASH))
     buf = io.StringIO()
