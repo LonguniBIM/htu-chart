@@ -157,12 +157,15 @@ class ParquetStore:
         self._data_dir = Path(data_dir)
         self._parquet_root = (self._data_dir / "parquet").resolve()
         self._sqlite_store = sqlite_store
-        self._locks: dict[tuple[str, bool, str, str], asyncio.Lock] = {}
-        self._thread_locks: dict[tuple[str, bool, str, str], threading.Lock] = {}
+        self._locks: dict[str, asyncio.Lock] = {}
+        self._thread_locks: dict[str, threading.Lock] = {}
         self._locks_guard = threading.Lock()
 
+    def _path_lock_key(self, key: StorageDatasetKey) -> str:
+        return os.path.normcase(str(self.resolve_path(key)))
+
     def _get_lock(self, key: StorageDatasetKey) -> asyncio.Lock:
-        lock_key = key.lock_key()
+        lock_key = self._path_lock_key(key)
         with self._locks_guard:
             lock = self._locks.get(lock_key)
             if lock is None:
@@ -171,7 +174,7 @@ class ParquetStore:
             return lock
 
     def _get_thread_lock(self, key: StorageDatasetKey) -> threading.Lock:
-        lock_key = key.lock_key()
+        lock_key = self._path_lock_key(key)
         with self._locks_guard:
             lock = self._thread_locks.get(lock_key)
             if lock is None:

@@ -152,11 +152,11 @@ async def test_r04_end_to_end_quarantine_corrupts_coverage_and_exposes_redacted_
                         },
                         {
                             "t": t2,
-                            "o": 5901.0,
+                            "o": f"apiKey={raw_secret}",  # invalid price embedding raw secret
                             "h": 5903.0,
                             "l": 5900.0,
                             "c": 5902.5,
-                            "v": -3,  # invalid: negative volume
+                            "v": -3,
                         },
                     ],
                 },
@@ -208,9 +208,13 @@ async def test_r04_end_to_end_quarantine_corrupts_coverage_and_exposes_redacted_
                 issues = await sqlite_store.list_quality_issues(key)
                 assert len(issues) == 2
                 issue_codes = {item["issue_code"] for item in issues}
-                assert issue_codes == {"ohlc_bounds_violation", "negative_volume"}
-                assert raw_secret not in str(issues)
-                assert "***REDACTED***" in str(issues)
+                assert issue_codes == {"ohlc_bounds_violation", "non_finite_price"}
+                for item in issues:
+                    assert raw_secret not in item["detail"]
+                    assert raw_secret not in item["raw_payload"]
+                price_issue = next(i for i in issues if i["issue_code"] == "non_finite_price")
+                assert "***REDACTED***" in price_issue["detail"]
+                assert "***REDACTED***" in price_issue["raw_payload"]
 
                 # Check GET /api/status reflects quality summary without secrets
                 status_resp = await client.get("/api/status")
@@ -221,7 +225,7 @@ async def test_r04_end_to_end_quarantine_corrupts_coverage_and_exposes_redacted_
                 assert dq["quarantined_bars"] == 2
                 assert dq["corrupted_intervals"] == 1
                 assert dq["by_issue_code"] == {
-                    "negative_volume": 1,
+                    "non_finite_price": 1,
                     "ohlc_bounds_violation": 1,
                 }
 

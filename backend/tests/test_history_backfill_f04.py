@@ -885,3 +885,67 @@ async def test_f04_out_of_window_upstream_bars_are_quarantined_and_never_marked_
                 )
     finally:
         sqlite_store.close()
+
+
+async def test_f04_right_edge_bar_at_r_end_does_not_mark_empty_interval_complete(
+    tmp_path: Path,
+) -> None:
+    """Contract: A bar at fetch_end (14:05) never confirms [14:00, 14:05) as COMPLETE.
+
+    Defect caught: Query [14:00, 14:04] when upstream returns only bar(14:05) caching empty range.
+    """
+    req_start = int(datetime(2026, 11, 10, 14, 0, tzinfo=UTC).timestamp())
+    req_end = req_start + 240  # 14:04 -> fetch_end = 14:05
+    next_bucket_ts = req_start + 300  # 14:05 (belongs to [14:05, 14:10), NOT [14:00, 14:05))
+    calls = 0
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        if request.url.path == "/api/Auth/loginKey":
+            return httpx.Response(200, json={"success": True, "token": "jwt-ok"})
+        if request.url.path == "/api/History/retrieveBars":
+            calls += 1
+            return httpx.Response(
+                200,
+                json={"success": True, "bars": [_wire_bar(next_bucket_ts, 5910.0)]},
+            )
+        return httpx.Response(404)
+
+    settings = Settings(data_dir=tmp_path / "data")
+    sqlite_store = SqliteStore(tmp_path / "meta.db")
+    sqlite_store.initialize()
+    try:
+        parquet_store = ParquetStore(tmp_path / "data", sqlite_store=sqlite_store)
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            auth = TopstepAuthService(settings, client)
+            await auth.login("alice", "key-1")
+            rest = TopstepRestClient(settings, auth, client)
+            svc = HistoryBackfillService(settings, rest, parquet_store, sqlite_store)
+
+            res1 = await svc.sync_and_read_bars(
+                contract_id="CON.F.US.MES.Z26",
+                live=False,
+                timeframe="5m",
+                start_ts=req_start,
+                end_ts=req_end,
+                now_utc=req_start + 3600,
+            )
+            assert res1.bars == []
+            assert res1.provider_gap is True
+            assert res1.is_complete is False
+            assert calls == 1
+
+            # Subsequent query must NOT treat [14:00, 14:05) as a COMPLETE cache hit
+            res2 = await svc.sync_and_read_bars(
+                contract_id="CON.F.US.MES.Z26",
+                live=False,
+                timeframe="5m",
+                start_ts=req_start,
+                end_ts=req_end,
+                now_utc=req_start + 3600,
+            )
+            assert res2.upstream_requests > 0
+            assert calls == 2
+            assert res2.is_complete is False
+    finally:
+        sqlite_store.close()

@@ -162,6 +162,17 @@ async def test_f05_arrow_metadata_persisted_and_mismatch_raises_value_error(
     with pytest.raises(ValueError, match="Parquet metadata mismatch"):
         await store.read_bars(key)
 
+    with pytest.raises(ValueError, match="Parquet metadata mismatch"):
+        await store.upsert_bars(
+            key,
+            [_bar(t0 + 300, 21005.0, 21015.0, 21000.0, 21010.0, 8.0)],
+            root_symbol="MNQ",
+            now_utc=NOW_TS,
+        )
+    after_table = pq.read_table(target)
+    assert after_table.num_rows == 1
+    assert after_table.schema.metadata[b"topstep_contract_id"] == b"CON.F.US.MES.Z26"
+
     # Also test invalid bar rejection inside upsert_bars defense-in-depth
     clean_key = StorageDatasetKey("topstepx", False, "CON.F.US.MYM.Z26", "1m")
     up = await store.upsert_bars(
@@ -470,3 +481,38 @@ async def test_f05_cancellation_keeps_lock_held_until_worker_exits_and_serialize
     bars = await task3
     assert peak_workers == 1
     assert [b.time for b in bars] == [t0, t0 + 60]
+
+
+async def test_f05_case_alias_keys_unify_lock_and_storage_identity(tmp_path: Path) -> None:
+    """Contract: Mixed-case StorageDatasetKey aliases share canonical identity and lock on Windows.
+
+    Defect caught: CON.F.US.MES.Z26 vs con.f.us.mes.z26 bypassing locks on case-insensitive NTFS.
+    """
+    store = ParquetStore(tmp_path / "data")
+    upper_key = StorageDatasetKey("TOPSTEPX", False, "CON.F.US.MES.Z26", "1M")
+    lower_key = StorageDatasetKey("topstepx", False, "con.f.us.mes.z26", "1m")
+    assert upper_key == lower_key
+    assert upper_key.lock_key() == lower_key.lock_key()
+
+    t0 = int(datetime(2026, 11, 10, 14, 0, tzinfo=UTC).timestamp())
+    slice_a = [
+        _bar(t0 + i * 60, 5900.0 + i, 5902.0 + i, 5899.0 + i, 5901.0 + i, 10.0)
+        for i in range(5)
+    ]
+    slice_b = [
+        _bar(t0 + (5 + i) * 60, 5905.0 + i, 5907.0 + i, 5904.0 + i, 5906.0 + i, 12.0)
+        for i in range(5)
+    ]
+
+    await asyncio.gather(
+        store.upsert_bars(upper_key, slice_a, root_symbol="MES", now_utc=NOW_TS),
+        store.upsert_bars(lower_key, slice_b, root_symbol="mes", now_utc=NOW_TS),
+    )
+
+    merged = await store.read_bars(upper_key)
+    assert [b.time for b in merged] == [t0 + i * 60 for i in range(10)]
+    meta = pq.read_schema(store.resolve_path(lower_key)).metadata
+    assert meta[b"topstep_provider"] == b"topstepx"
+    assert meta[b"topstep_contract_id"] == b"CON.F.US.MES.Z26"
+    assert meta[b"topstep_timeframe"] == b"1m"
+    assert meta[b"topstep_root_symbol"] == b"MES"

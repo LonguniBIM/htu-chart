@@ -283,6 +283,10 @@ class TopstepRestClient:
                 break
 
             if len(page_bars) < eff_limit:
+                if page_min_ts >= end_ts and has_open_session_in_range(
+                    start_ts, cursor_end, root_symbol=root_symbol
+                ):
+                    provider_gap = True
                 break
 
             if pages_fetched >= eff_max_pages:

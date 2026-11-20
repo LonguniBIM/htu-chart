@@ -134,9 +134,12 @@ class StorageDatasetKey:
     def __post_init__(self) -> None:
         if not isinstance(self.live_mode, bool):
             raise ValueError(f"live_mode must be a bool, got {type(self.live_mode).__name__}")
-        _validate_segment("provider", self.provider)
-        _validate_segment("contract_id", self.contract_id)
-        _validate_segment("timeframe", self.timeframe)
+        provider = _validate_segment("provider", self.provider).lower()
+        contract_id = _validate_segment("contract_id", self.contract_id).upper()
+        timeframe = _validate_segment("timeframe", self.timeframe).lower()
+        object.__setattr__(self, "provider", provider)
+        object.__setattr__(self, "contract_id", contract_id)
+        object.__setattr__(self, "timeframe", timeframe)
 
     @property
     def mode_label(self) -> str:
