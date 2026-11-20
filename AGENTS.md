@@ -43,3 +43,9 @@
 - Harness Operations & Runbook: [harness/README.md](./harness/README.md)
 - Non-Mechanizable Judgment Lessons: [harness/lessons.md](./harness/lessons.md)
 - Master Plan & Checklist: [implementation_plan.md](./implementation_plan.md) · [task.md](./task.md)
+
+## 5. Working language
+
+- **Discuss with me in Vietnamese.** All conversation, explanations, questions and result reports to the user are in Vietnamese.
+- **Write all plan amendments, task packets, evidence records, and handoffs in English.** This includes every file in the
+  repository: source comments, doc comments, scripts, commit messages, user-facing strings, SETUP.md and this file.
