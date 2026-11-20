@@ -3,13 +3,29 @@
 from __future__ import annotations
 
 import math
+import re
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
 
 DEFAULT_MIN_BAR_TIMESTAMP = 946684800  # 2000-01-01T00:00:00Z
+MAX_QUERY_TIMESTAMP = 4102444800  # 2100-01-01T00:00:00Z
 DEFAULT_MAX_FUTURE_SKEW_SEC = 300
+
+_FRACTIONAL_SEC_RE = re.compile(r"[.,](\d+)")
+
+
+def validate_query_timestamp(ts: int, field_name: str = "timestamp") -> int:
+    """Validate that a query timestamp is a non-bool integer within supported bounds."""
+    if isinstance(ts, bool) or not isinstance(ts, int):
+        raise ValueError(f"{field_name} must be an integer Unix timestamp")
+    if ts < DEFAULT_MIN_BAR_TIMESTAMP or ts > MAX_QUERY_TIMESTAMP:
+        raise ValueError(
+            f"{field_name} ({ts}) out of supported range "
+            f"[{DEFAULT_MIN_BAR_TIMESTAMP}, {MAX_QUERY_TIMESTAMP}]"
+        )
+    return ts
 
 
 @dataclass(frozen=True)
@@ -78,7 +94,8 @@ def _parse_timestamp_strict(raw_ts: Any) -> tuple[int | None, str | None, str | 
             return None, "invalid_timestamp", f"Unparseable ISO timestamp: {raw_ts!r}"
         if dt.tzinfo is None or dt.utcoffset() is None:
             return None, "naive_timestamp", f"Naive ISO timestamp missing timezone: {raw_ts!r}"
-        if dt.microsecond != 0:
+        frac_match = _FRACTIONAL_SEC_RE.search(cleaned)
+        if (frac_match and set(frac_match.group(1)) != {"0"}) or dt.microsecond != 0:
             return None, "invalid_timestamp", f"Fractional timestamp unsupported: {raw_ts!r}"
         return int(dt.timestamp()), None, None
     return None, "invalid_timestamp", f"Unsupported timestamp type: {type(raw_ts).__name__}"

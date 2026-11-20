@@ -101,7 +101,8 @@ async def test_f05_atomic_replace_failure_preserves_original_and_cleans_temp_fil
     store = ParquetStore(tmp_path / "data")
     key = StorageDatasetKey("topstepx", False, "CON.F.US.MES.Z26", "1m")
     t0 = int(datetime(2026, 11, 10, 14, 0, tzinfo=UTC).timestamp())
-    await store.upsert_bars(key, [_bar(t0, 5900.0, 5901.0, 5899.0, 5900.5, 25.0)], now_utc=NOW_TS)
+    orig_bar = _bar(t0, 5900.0, 5901.0, 5899.0, 5900.5, 25.0)
+    await store.upsert_bars(key, [orig_bar], now_utc=NOW_TS)
 
     def fail_replace(_src: object, _dst: object) -> None:
         raise OSError("Simulated replace failure")
@@ -116,8 +117,7 @@ async def test_f05_atomic_replace_failure_preserves_original_and_cleans_temp_fil
 
     monkeypatch.undo()
     bars = await store.read_bars(key)
-    assert len(bars) == 1
-    assert bars[0].time == t0
+    assert bars == [orig_bar]
     assert list((tmp_path / "data" / "parquet").rglob("*.tmp")) == []
 
 
@@ -348,6 +348,38 @@ async def test_f05_cme_globex_resample_across_est_edt_dst_and_provisional_bucket
     assert len(full_5m) == 1
     assert mid_slice_5m == full_5m
     assert mid_slice_5m[0] == _bar(b_1400, 6000.0, 6006.0, 5998.0, 6005.5, 70.0, closed=True)
+
+    # Open 1m input bar inside a 5m bucket keeps resampled bar provisional even past bucket close
+    b_1405 = b_1400 + 300
+    await store.upsert_bars(
+        key_1m,
+        [
+            _bar(b_1405, 6005.5, 6007.0, 6004.0, 6006.0, 10.0, closed=True),
+            _bar(b_1405 + 60, 6006.0, 6008.0, 6005.0, 6007.0, 12.0, closed=False),
+        ],
+        root_symbol="MES",
+        now_utc=NOW_TS,
+    )
+    assert (
+        await store.resample(
+            key_1m,
+            "5m",
+            start_ts=b_1405,
+            end_ts=b_1405 + 240,
+            include_provisional=False,
+            now_utc=NOW_TS,
+        )
+        == []
+    )
+    prov_5m = await store.resample(
+        key_1m,
+        "5m",
+        start_ts=b_1405,
+        end_ts=b_1405 + 240,
+        include_provisional=True,
+        now_utc=NOW_TS,
+    )
+    assert prov_5m == [_bar(b_1405, 6005.5, 6008.0, 6004.0, 6007.0, 22.0, closed=False)]
 
     # Invalid coarsening paths rejected
     key_15m = StorageDatasetKey("topstepx", False, "CON.F.US.MES.Z26", "15m")

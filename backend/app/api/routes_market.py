@@ -7,6 +7,7 @@ from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 
+from app.engine.ohlcv import validate_query_timestamp
 from app.engine.session_calendar import normalize_timeframe, timeframe_from_topstep_unit
 from app.security import SessionData, redact_secrets, require_session
 from app.services.history_service import HistoryBackfillService
@@ -47,14 +48,14 @@ def _parse_query_timestamp(raw: str | None, field_name: str) -> int | None:
     if not cleaned:
         raise ValueError(f"{field_name} cannot be empty")
     if cleaned.lstrip("+-").isdigit():
-        return int(cleaned)
+        return validate_query_timestamp(int(cleaned), field_name)
     try:
         dt = datetime.fromisoformat(cleaned)
     except ValueError as exc:
         raise ValueError(f"Invalid {field_name}: {raw!r}") from exc
     if dt.tzinfo is None or dt.utcoffset() is None:
         raise ValueError(f"{field_name} ISO string must include timezone offset")
-    return int(dt.timestamp())
+    return validate_query_timestamp(int(dt.timestamp()), field_name)
 
 
 @router.get("/contracts")

@@ -16,10 +16,12 @@ from app.engine.ohlcv import (
     extract_raw_bar_timestamp,
     parse_topstep_bar,
     validate_ohlcv_bar,
+    validate_query_timestamp,
 )
 from app.engine.session_calendar import (
     bucket_bounds,
     bucket_open_utc,
+    has_open_session_in_range,
     is_bar_closed,
     latest_closed_bucket_end_utc,
     normalize_timeframe,
@@ -77,6 +79,7 @@ class HistoryBackfillService:
         valid_bars: list[OHLCVBar] = []
         issues: list[QualityIssueInput] = []
         max_valid_ts = eff_now + DEFAULT_MAX_FUTURE_SKEW_SEC
+        valid_window_start = bucket_open_utc(interval_start, source_tf)
 
         for raw in page_result.raw_bars:
             if not isinstance(raw, Mapping):
@@ -101,7 +104,27 @@ class HistoryBackfillService:
                 bar_closed = False
             val = validate_ohlcv_bar(parsed, is_closed=bar_closed, now_utc=eff_now)
             if val.is_valid and val.bar is not None:
-                valid_bars.append(val.bar)
+                if val.bar.time < valid_window_start or val.bar.time > interval_end:
+                    safe_bar_time = (
+                        val.bar.time
+                        if _SQLITE_INT64_MIN <= val.bar.time <= _SQLITE_INT64_MAX
+                        else None
+                    )
+                    issues.append(
+                        QualityIssueInput(
+                            bar_time=safe_bar_time,
+                            interval_start=interval_start,
+                            interval_end=interval_end,
+                            issue_code="out_of_window_timestamp",
+                            detail=(
+                                f"Bar timestamp {val.bar.time} outside "
+                                f"[{valid_window_start}, {interval_end}]"
+                            ),
+                            raw_payload=redact_secrets(json.dumps(raw, default=str))[:2048],
+                        )
+                    )
+                else:
+                    valid_bars.append(val.bar)
             else:
                 safe_bar_time = (
                     bar_ts
@@ -137,6 +160,8 @@ class HistoryBackfillService:
         allow_upstream: bool = True,
     ) -> HistoryQueryResult:
         """Backfill missing closed intervals, preserve provisional tail, and read bars."""
+        validate_query_timestamp(start_ts, "start_ts")
+        validate_query_timestamp(end_ts, "end_ts")
         if start_ts >= end_ts:
             raise ValueError(f"start_ts ({start_ts}) must be strictly less than end_ts ({end_ts})")
 
@@ -155,12 +180,8 @@ class HistoryBackfillService:
             stored_root_symbol=stored_root,
         )
 
-        if is_resampled:
-            fetch_start = bucket_open_utc(start_ts, tf)
-            _, fetch_end = bucket_bounds(end_ts, tf, root_symbol=eff_root)
-        else:
-            fetch_start = start_ts
-            fetch_end = end_ts
+        fetch_start = bucket_open_utc(start_ts, tf) if is_resampled else start_ts
+        _, fetch_end = bucket_bounds(end_ts, tf, root_symbol=eff_root)
 
         eff_now = now_utc if now_utc is not None else int(datetime.now(UTC).timestamp())
         closed_horizon = min(
@@ -260,6 +281,17 @@ class HistoryBackfillService:
                         provider_gap=page_res.provider_gap,
                     )
             elif page_res.provider_gap:
+                await self._sqlite.record_coverage(
+                    source_key,
+                    r_start,
+                    r_end,
+                    status="PROVIDER_GAP",
+                    provider_gap=True,
+                )
+            elif not valid_bars and has_open_session_in_range(
+                r_start, r_end, root_symbol=eff_root
+            ):
+                any_provider_gap = True
                 await self._sqlite.record_coverage(
                     source_key,
                     r_start,

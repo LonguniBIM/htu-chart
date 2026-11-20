@@ -16,8 +16,10 @@ from app.engine.ohlcv import (
     DEFAULT_MAX_FUTURE_SKEW_SEC,
     DEFAULT_MIN_BAR_TIMESTAMP,
     extract_raw_bar_timestamp,
+    validate_query_timestamp,
 )
 from app.engine.session_calendar import (
+    bucket_open_utc,
     has_open_session_in_range,
     normalize_timeframe,
     timeframe_to_topstep_unit,
@@ -151,6 +153,8 @@ class TopstepRestClient:
         root_symbol: str | None = None,
     ) -> PaginatedBarsResult:
         """Paginate /api/History/retrieveBars backward until bounds are covered or capped."""
+        validate_query_timestamp(start_ts, "start_ts")
+        validate_query_timestamp(end_ts, "end_ts")
         if start_ts >= end_ts:
             raise ValueError(f"start_ts ({start_ts}) must be strictly less than end_ts ({end_ts})")
         tf = normalize_timeframe(timeframe)
@@ -165,6 +169,7 @@ class TopstepRestClient:
                 self._paginate_bars_loop(
                     contract_id=contract_id,
                     live=live,
+                    tf=tf,
                     unit=unit,
                     unit_number=unit_number,
                     start_ts=start_ts,
@@ -187,6 +192,7 @@ class TopstepRestClient:
         *,
         contract_id: str,
         live: bool,
+        tf: str,
         unit: int,
         unit_number: int,
         start_ts: int,
@@ -204,6 +210,7 @@ class TopstepRestClient:
         latest_bar_time: int | None = None
         seen_min_ts: int | None = None
         cursor_end = end_ts
+        aligned_start = bucket_open_utc(start_ts, tf)
 
         for page_idx in range(eff_max_pages):
             payload = {
@@ -250,13 +257,14 @@ class TopstepRestClient:
                 )
             else:
                 page_min_ts = None
+                page_max_ts = None
 
             if len(page_bars) == 0:
                 if has_open_session_in_range(start_ts, cursor_end, root_symbol=root_symbol):
                     provider_gap = True
                 break
 
-            if page_min_ts is None:
+            if page_min_ts is None or page_max_ts is None:
                 provider_gap = True
                 truncated = True
                 break
@@ -264,6 +272,11 @@ class TopstepRestClient:
             if (seen_min_ts is not None and page_min_ts >= seen_min_ts) or page_min_ts > cursor_end:
                 provider_gap = True
                 truncated = True
+                break
+
+            if page_max_ts < aligned_start:
+                if has_open_session_in_range(start_ts, cursor_end, root_symbol=root_symbol):
+                    provider_gap = True
                 break
 
             if page_min_ts <= start_ts:

@@ -92,6 +92,7 @@ def test_r04_validate_ohlcv_bar_strict_matrix() -> None:
         ({**_valid_raw(), "time": "2026-11-10T14:55:00"}, "naive_timestamp"),
         ({**_valid_raw(), "time": True}, "invalid_timestamp"),
         ({**_valid_raw(), "time": 1700000000.5}, "invalid_timestamp"),
+        ({**_valid_raw(), "time": "2026-11-10T14:55:00.0000001Z"}, "invalid_timestamp"),
         ({**_valid_raw(), "time": DEFAULT_MIN_BAR_TIMESTAMP - 1}, "timestamp_out_of_bounds"),
         ({**_valid_raw(), "time": NOW_TS + 3600}, "timestamp_out_of_bounds"),
         ({**_valid_raw(), "is_closed": "yes"}, "invalid_is_closed"),
@@ -102,6 +103,7 @@ def test_r04_validate_ohlcv_bar_strict_matrix() -> None:
         assert res.issue_code == expected_code
 
     assert extract_raw_bar_timestamp({"t": True}) is None
+    assert extract_raw_bar_timestamp({"t": "2026-11-10T14:55:00.0000001Z"}) is None
     assert extract_raw_bar_timestamp({"t": "2026-11-10T14:55:00+00:00"}) == int(
         datetime(2026, 11, 10, 14, 55, tzinfo=UTC).timestamp()
     )

@@ -76,6 +76,9 @@ def test_r05_dst_spring_forward_and_fall_back_transitions() -> None:
     assert mon_sched.open_utc == sun_edt
     assert mon_sched.close_utc == _ts(datetime(2026, 3, 9, 17, 0, tzinfo=NY_TZ))
     assert mon_sched.vwap_reset_utc == sun_edt
+    spring_mon_mid = _ts(datetime(2026, 3, 9, 9, 30, tzinfo=NY_TZ))
+    assert bucket_open_utc(spring_mon_mid, "1d") == sun_edt
+    assert vwap_session_open_utc(spring_mon_mid) == sun_edt
 
     # 4h bar just before Sunday 18:00 EDT clamps to 23h boundary
     pre_open = sun_edt - 60
@@ -87,6 +90,11 @@ def test_r05_dst_spring_forward_and_fall_back_transitions() -> None:
     sat_edt = _ts(datetime(2026, 10, 31, 18, 0, tzinfo=NY_TZ))
     sun_est = _ts(datetime(2026, 11, 1, 18, 0, tzinfo=NY_TZ))
     assert sun_est - sat_edt == 25 * 3600
+
+    # 4h buckets across Fall Back 25h weekend transition
+    assert bucket_open_utc(sat_edt + 24 * 3600, "4h") == sat_edt + 24 * 3600
+    assert bucket_bounds(sun_est - 60, "4h") == (sat_edt + 24 * 3600, sun_est)
+    assert bucket_open_utc(sun_est + 3600, "4h") == sun_est
 
     nov2_sched = get_session_schedule(date(2026, 11, 2))
     assert nov2_sched.open_utc == sun_est

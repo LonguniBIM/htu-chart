@@ -281,22 +281,42 @@ async def test_f04_incremental_cache_hit_partial_extension_and_provisional_upgra
             assert res_hit.is_complete is True
             assert [b.time for b in res_hit.bars] == [bar_0]
 
-            # Advance clock past bar_1 close (14:05:10) and update close -> upgrades to closed
+            # Advance clock past bar_1 close (14:05:10) and re-query EXACT same [bar_0, bar_1]
+            # (P1-001/P2-002: bar_1 at end_ts must upgrade from provisional -> closed)
             current_close_for_bar1 = 5954.25
             calls_before_upgrade = len(history_calls)
-            res_up = await svc.sync_and_read_bars(
+            res_same_end = await svc.sync_and_read_bars(
                 contract_id="CON.F.US.MES.Z26",
                 live=False,
                 timeframe="5m",
                 start_ts=bar_0,
-                end_ts=bar_2,
+                end_ts=bar_1,
                 include_partial=False,
-                now_utc=bar_2 + 10,
+                now_utc=bar_2 + 300,
             )
+            assert res_same_end.upstream_requests == 1
             assert len(history_calls) == calls_before_upgrade + 1
-            # Only missing closed sub-range [bar_1, bar_2] was fetched
             assert history_calls[-1] == (bar_1, bar_2)
-            assert [(b.time, b.is_closed, b.close) for b in res_up.bars] == [
+            assert res_same_end.is_complete is True
+            assert [(b.time, b.is_closed, b.close) for b in res_same_end.bars] == [
+                (bar_0, True, 5941.0),
+                (bar_1, True, 5954.25),
+            ]
+
+            # Re-querying exact same [bar_0, bar_1] again hits cache with 0 upstream calls
+            res_same_cached = await svc.sync_and_read_bars(
+                contract_id="CON.F.US.MES.Z26",
+                live=False,
+                timeframe="5m",
+                start_ts=bar_0,
+                end_ts=bar_1,
+                include_partial=False,
+                now_utc=bar_2 + 300,
+                allow_upstream=False,
+            )
+            assert res_same_cached.upstream_requests == 0
+            assert res_same_cached.is_complete is True
+            assert [(b.time, b.is_closed, b.close) for b in res_same_cached.bars] == [
                 (bar_0, True, 5941.0),
                 (bar_1, True, 5954.25),
             ]
@@ -333,6 +353,7 @@ async def test_f04_bars_http_endpoint_auth_validation_offline_and_resample(
     t0 = int(datetime(2026, 11, 10, 14, 0, tzinfo=UTC).timestamp())
     bars_1m = [_wire_bar(t0 + i * 60, 5900.0 + i) for i in range(5)]
     t_end = t0 + 300
+    upstream_history_calls = 0
 
     # Deterministic current UTC clock inside an active 5m bar (15:02:00 UTC)
     fixed_now = int(datetime(2026, 11, 10, 15, 2, 0, tzinfo=UTC).timestamp())
@@ -347,6 +368,8 @@ async def test_f04_bars_http_endpoint_auth_validation_offline_and_resample(
                 return httpx.Response(401, json={"errorMessage": "Revoked"})
             return httpx.Response(200, json={"success": True, "token": "jwt-ok"})
         if request.url.path == "/api/History/retrieveBars":
+            nonlocal upstream_history_calls
+            upstream_history_calls += 1
             if history_mode == "timeout":
                 await asyncio.sleep(0.3)
                 return httpx.Response(200, json={"success": True, "bars": []})
@@ -447,6 +470,32 @@ async def test_f04_bars_http_endpoint_auth_validation_offline_and_resample(
                     headers={"X-CSRF-Token": csrf},
                 )
                 assert conn.status_code == 200
+
+                # P1-002: extreme query timestamps return 400 with 0 upstream calls even connected
+                calls_before_extreme = upstream_history_calls
+                assert (
+                    await client.get(
+                        "/api/bars",
+                        params={
+                            "contractId": "CON.F.US.MES.Z26",
+                            "timeframe": "1m",
+                            "startTime": "-1000000000000000000000000000000",
+                            "endTime": str(t_end),
+                        },
+                    )
+                ).status_code == 400
+                assert (
+                    await client.get(
+                        "/api/bars",
+                        params={
+                            "contractId": "CON.F.US.MES.Z26",
+                            "timeframe": "1m",
+                            "startTime": str(t0),
+                            "endTime": str(10**30),
+                        },
+                    )
+                ).status_code == 400
+                assert upstream_history_calls == calls_before_extreme
 
                 resampled = await client.get(
                     "/api/bars",
@@ -772,3 +821,67 @@ async def test_f04_rest_client_deadline_non_list_and_unparseable_pages() -> None
         assert bad_page.provider_gap is True
         assert bad_page.truncated is True
         assert len(bad_page.raw_bars) == 1
+
+
+async def test_f04_out_of_window_upstream_bars_are_quarantined_and_never_marked_complete(
+    tmp_path: Path,
+) -> None:
+    """Contract: Bars outside requested window are quarantined and interval stays CORRUPTED.
+
+    Defect caught: Upstream returning bar(13:00) for 14:00..14:05 marking [14:00, 14:05] COMPLETE.
+    """
+    req_start = int(datetime(2026, 11, 10, 14, 0, tzinfo=UTC).timestamp())
+    req_end = req_start + 300  # 14:05
+    stale_bar_ts = req_start - 3600  # 13:00
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/Auth/loginKey":
+            return httpx.Response(200, json={"success": True, "token": "jwt-ok"})
+        if request.url.path == "/api/History/retrieveBars":
+            return httpx.Response(
+                200,
+                json={"success": True, "bars": [_wire_bar(stale_bar_ts, 5880.0)]},
+            )
+        return httpx.Response(404)
+
+    settings = Settings(data_dir=tmp_path / "data")
+    sqlite_store = SqliteStore(tmp_path / "meta.db")
+    sqlite_store.initialize()
+    try:
+        parquet_store = ParquetStore(tmp_path / "data", sqlite_store=sqlite_store)
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            auth = TopstepAuthService(settings, client)
+            await auth.login("alice", "key-1")
+            rest = TopstepRestClient(settings, auth, client)
+            svc = HistoryBackfillService(settings, rest, parquet_store, sqlite_store)
+
+            res = await svc.sync_and_read_bars(
+                contract_id="CON.F.US.MES.Z26",
+                live=False,
+                timeframe="5m",
+                start_ts=req_start,
+                end_ts=req_end,
+                now_utc=req_end + 600,
+            )
+            assert res.bars == []
+            assert res.is_complete is False
+            assert res.quarantined_count == 1
+
+            key = StorageDatasetKey("topstepx", False, "CON.F.US.MES.Z26", "5m")
+            assert await parquet_store.read_bars(key, include_provisional=True) == []
+            issues = await sqlite_store.list_quality_issues(key)
+            assert [item["issue_code"] for item in issues] == ["out_of_window_timestamp"]
+
+            # Offline query on this unhealed interval must fail closed with TopstepAuthError (503)
+            with pytest.raises(TopstepAuthError):
+                await svc.sync_and_read_bars(
+                    contract_id="CON.F.US.MES.Z26",
+                    live=False,
+                    timeframe="5m",
+                    start_ts=req_start,
+                    end_ts=req_end,
+                    now_utc=req_end + 600,
+                    allow_upstream=False,
+                )
+    finally:
+        sqlite_store.close()
