@@ -22,6 +22,7 @@ from app.security import (
     require_dev_loopback,
     require_session,
 )
+from app.storage.sqlite_store import SqliteStore
 from app.topstep.auth import TopstepAuthService
 from app.topstep.errors import (
     KeyRotationRequiredError,
@@ -53,6 +54,10 @@ def _get_topstep_auth(request: Request) -> TopstepAuthService:
 
 def _get_login_guard(request: Request) -> LoginGuard:
     return request.app.state.login_guard
+
+
+def _get_sqlite_store(request: Request) -> SqliteStore:
+    return request.app.state.sqlite_store
 
 
 @router.get("/health")
@@ -130,9 +135,12 @@ async def logout(
 async def get_status(
     _session: Annotated[SessionData, Depends(require_session)],
     topstep_auth: Annotated[TopstepAuthService, Depends(_get_topstep_auth)],
+    sqlite_store: Annotated[SqliteStore, Depends(_get_sqlite_store)],
 ) -> dict[str, Any]:
-    """Return strictly redacted TopstepX connection and key rotation status."""
-    return topstep_auth.get_status()
+    """Return strictly redacted TopstepX connection, rotation, and data quality status."""
+    payload = topstep_auth.get_status()
+    payload["data_quality"] = await sqlite_store.get_quality_summary()
+    return payload
 
 
 @router.post("/connect")

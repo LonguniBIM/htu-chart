@@ -24,6 +24,9 @@ from app.security import (
     install_global_log_redaction,
     redact_secrets,
 )
+from app.services.history_service import HistoryBackfillService
+from app.storage.parquet_store import ParquetStore
+from app.storage.sqlite_store import SqliteStore
 from app.topstep.auth import TopstepAuthService, build_httpx_timeout
 from app.topstep.errors import TopstepError
 from app.topstep.rest_client import TopstepRestClient
@@ -79,6 +82,18 @@ def create_app(
             client,
             semaphore=upstream_semaphore,
         )
+        sqlite_store = SqliteStore(resolved_settings.data_dir / "metadata.db")
+        sqlite_store.initialize()
+        parquet_store = ParquetStore(
+            resolved_settings.data_dir,
+            sqlite_store=sqlite_store,
+        )
+        history_service = HistoryBackfillService(
+            resolved_settings,
+            rest_client,
+            parquet_store,
+            sqlite_store,
+        )
         session_manager = SessionManager(
             password_hash=resolved_settings.app_password_hash,
             ttl_seconds=resolved_settings.session_ttl_seconds,
@@ -94,6 +109,9 @@ def create_app(
         app_instance.state.upstream_semaphore = upstream_semaphore
         app_instance.state.topstep_auth = auth_service
         app_instance.state.rest_client = rest_client
+        app_instance.state.sqlite_store = sqlite_store
+        app_instance.state.parquet_store = parquet_store
+        app_instance.state.history_service = history_service
         app_instance.state.session_manager = session_manager
         app_instance.state.login_guard = login_guard
 
@@ -115,6 +133,7 @@ def create_app(
                 auth_task.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
                     await auth_task
+            sqlite_store.close()
             if owns_client:
                 await client.aclose()
 

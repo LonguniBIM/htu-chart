@@ -404,6 +404,14 @@ async def test_f01_secret_redaction_and_hard_readonly_order_boundary(
             "key_rotation_enforced",
             "has_env_credentials",
             "last_error",
+            "data_quality",
+        }
+        assert set(status_json["data_quality"].keys()) == {
+            "quarantined_bars",
+            "corrupted_intervals",
+            "truncated_intervals",
+            "provider_gap_intervals",
+            "by_issue_code",
         }
 
         order_probe = await client.post("/api/Order/place", json={})

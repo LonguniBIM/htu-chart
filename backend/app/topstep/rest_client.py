@@ -4,11 +4,20 @@ from __future__ import annotations
 
 import asyncio
 import json
+from collections.abc import Mapping
+from dataclasses import dataclass
+from datetime import UTC, datetime
 from typing import Any
 
 import httpx
 
 from app.config import Settings
+from app.engine.ohlcv import extract_raw_bar_timestamp
+from app.engine.session_calendar import (
+    has_open_session_in_range,
+    normalize_timeframe,
+    timeframe_to_topstep_unit,
+)
 from app.security import redact_secrets
 from app.topstep.auth import TopstepAuthService
 from app.topstep.errors import (
@@ -22,6 +31,22 @@ ALLOWED_READONLY_ENDPOINTS = frozenset({
     "/api/Contract/search",
     "/api/History/retrieveBars",
 })
+
+
+@dataclass(frozen=True)
+class PaginatedBarsResult:
+    """Result of bounded backward window pagination over /api/History/retrieveBars."""
+
+    raw_bars: list[dict[str, Any]]
+    pages_fetched: int
+    truncated: bool
+    provider_gap: bool
+    earliest_bar_time: int | None
+    latest_bar_time: int | None
+
+
+def _iso_utc(ts: int) -> str:
+    return datetime.fromtimestamp(ts, tz=UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def resolve_contract(root_symbol: str, contracts: list[dict[str, Any]]) -> dict[str, Any]:
@@ -107,6 +132,154 @@ class TopstepRestClient:
     async def retrieve_bars(self, payload: dict[str, Any]) -> dict[str, Any]:
         """Query /api/History/retrieveBars with read-only deadline and concurrency bounds."""
         return await self._post_readonly("/api/History/retrieveBars", payload)
+
+    async def retrieve_bars_paginated(
+        self,
+        *,
+        contract_id: str,
+        live: bool,
+        timeframe: str,
+        start_ts: int,
+        end_ts: int,
+        page_limit: int | None = None,
+        max_pages: int | None = None,
+        include_partial_bar: bool = True,
+        root_symbol: str | None = None,
+    ) -> PaginatedBarsResult:
+        """Paginate /api/History/retrieveBars backward until bounds are covered or capped."""
+        if start_ts >= end_ts:
+            raise ValueError(f"start_ts ({start_ts}) must be strictly less than end_ts ({end_ts})")
+        tf = normalize_timeframe(timeframe)
+        unit, unit_number = timeframe_to_topstep_unit(tf)
+        eff_limit = page_limit if page_limit is not None else self._settings.history_page_limit
+        eff_max_pages = max_pages if max_pages is not None else self._settings.history_max_pages
+        if eff_limit < 1 or eff_max_pages < 1:
+            raise ValueError("page_limit and max_pages must be >= 1")
+
+        try:
+            return await asyncio.wait_for(
+                self._paginate_bars_loop(
+                    contract_id=contract_id,
+                    live=live,
+                    unit=unit,
+                    unit_number=unit_number,
+                    start_ts=start_ts,
+                    end_ts=end_ts,
+                    eff_limit=eff_limit,
+                    eff_max_pages=eff_max_pages,
+                    include_partial_bar=include_partial_bar,
+                    root_symbol=root_symbol,
+                ),
+                timeout=self._settings.history_backfill_timeout_sec,
+            )
+        except TimeoutError as exc:
+            timeout_sec = self._settings.history_backfill_timeout_sec
+            raise UpstreamTimeoutError(
+                f"Paginated bar backfill for {contract_id} exceeded {timeout_sec}s deadline"
+            ) from exc
+
+    async def _paginate_bars_loop(
+        self,
+        *,
+        contract_id: str,
+        live: bool,
+        unit: int,
+        unit_number: int,
+        start_ts: int,
+        end_ts: int,
+        eff_limit: int,
+        eff_max_pages: int,
+        include_partial_bar: bool,
+        root_symbol: str | None,
+    ) -> PaginatedBarsResult:
+        raw_bars: list[dict[str, Any]] = []
+        pages_fetched = 0
+        truncated = False
+        provider_gap = False
+        earliest_bar_time: int | None = None
+        latest_bar_time: int | None = None
+        seen_min_ts: int | None = None
+        cursor_end = end_ts
+
+        for page_idx in range(eff_max_pages):
+            payload = {
+                "contractId": contract_id,
+                "live": bool(live),
+                "startTime": _iso_utc(start_ts),
+                "endTime": _iso_utc(cursor_end),
+                "unit": unit,
+                "unitNumber": unit_number,
+                "limit": eff_limit,
+                "includePartialBar": bool(include_partial_bar if page_idx == 0 else False),
+            }
+            resp = await self.retrieve_bars(payload)
+            page_bars = resp.get("bars")
+            if not isinstance(page_bars, list):
+                raise UpstreamHTTPError(
+                    "Unexpected /api/History/retrieveBars response: 'bars' must be a list",
+                    status_code=200,
+                )
+
+            pages_fetched += 1
+            raw_bars.extend(page_bars)
+
+            page_times = [
+                ts
+                for item in page_bars
+                if isinstance(item, Mapping) and (ts := extract_raw_bar_timestamp(item)) is not None
+            ]
+            if page_times:
+                page_min_ts = min(page_times)
+                page_max_ts = max(page_times)
+                earliest_bar_time = (
+                    page_min_ts
+                    if earliest_bar_time is None
+                    else min(earliest_bar_time, page_min_ts)
+                )
+                latest_bar_time = (
+                    page_max_ts
+                    if latest_bar_time is None
+                    else max(latest_bar_time, page_max_ts)
+                )
+            else:
+                page_min_ts = None
+
+            if len(page_bars) == 0:
+                if has_open_session_in_range(start_ts, cursor_end, root_symbol=root_symbol):
+                    provider_gap = True
+                break
+
+            if page_min_ts is None:
+                provider_gap = True
+                truncated = True
+                break
+
+            if (seen_min_ts is not None and page_min_ts >= seen_min_ts) or page_min_ts > cursor_end:
+                provider_gap = True
+                truncated = True
+                break
+
+            if page_min_ts <= start_ts:
+                break
+
+            if len(page_bars) < eff_limit:
+                break
+
+            if pages_fetched >= eff_max_pages:
+                truncated = True
+                break
+
+            seen_min_ts = page_min_ts if seen_min_ts is None else min(seen_min_ts, page_min_ts)
+            cursor_end = page_min_ts - 1
+
+        return PaginatedBarsResult(
+            raw_bars=raw_bars,
+            pages_fetched=pages_fetched,
+            truncated=truncated,
+            provider_gap=provider_gap,
+            earliest_bar_time=earliest_bar_time,
+            latest_bar_time=latest_bar_time,
+        )
 
     async def _post_readonly(self, endpoint: str, payload: dict[str, Any]) -> dict[str, Any]:
         if endpoint not in ALLOWED_READONLY_ENDPOINTS:

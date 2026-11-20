@@ -84,6 +84,10 @@ class Settings(BaseSettings):
     upstream_max_concurrency: int = Field(default=4, ge=1, le=32)
     upstream_max_retries: int = Field(default=2, ge=0, le=5)
 
+    history_page_limit: int = Field(default=5000, ge=1, le=20000)
+    history_max_pages: int = Field(default=50, ge=1, le=500)
+    history_backfill_timeout_sec: float = Field(default=120.0, gt=0.0)
+
     data_dir: Path = Path("data")
 
     @field_validator("app_env", mode="before")
