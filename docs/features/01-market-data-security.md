@@ -7,12 +7,12 @@
 - **Key Rotation & Log Redaction**: `KEY_ROTATION_DAYS=30`, `KEY_ROTATION_ENFORCE=false` (default soft reminder), redaction of `Authorization`, `access_token`, `apiKey`, `token`.
 
 ## 2. Entry Points
-- `backend/app/main.py` (`FastAPI` lifespan, single worker `--workers 1`)
-- `backend/app/security.py`, `backend/app/config.py`
-- `backend/app/topstep/auth.py`, `backend/app/topstep/rest_client.py`
-- `backend/app/storage/parquet_store.py`, `backend/app/storage/sqlite_store.py`
-- `backend/app/engine/instruments.py`, `backend/app/engine/session_calendar.py`
-- `backend/app/api/routes_status.py`, `backend/app/api/routes_market.py`
+- `backend/app/main.py` (`FastAPI` lifespan, single worker `--workers 1`, sanitized `RequestValidationError` handler, global log redaction)
+- `backend/app/security.py`, `backend/app/config.py` (`LoginGuard`, `SessionManager`, `HostOriginMiddleware`, `SecretRedactionFilter`, `validate_ws_handshake`)
+- `backend/app/topstep/errors.py`, `backend/app/topstep/auth.py`, `backend/app/topstep/rest_client.py`
+- `backend/app/storage/parquet_store.py`, `backend/app/storage/sqlite_store.py` *(Phase 1 Part 2)*
+- `backend/app/engine/instruments.py` (`InstrumentSpec`, `StorageDatasetKey`), `backend/app/engine/session_calendar.py` *(Phase 1 Part 2)*
+- `backend/app/api/routes_status.py` (`GET /api/health`, `POST /api/auth/login`, `POST /api/auth/logout`, `GET /api/status`, `POST /api/connect`, `POST /api/disconnect`), `backend/app/api/routes_market.py` (`GET /api/contracts`)
 
 ## 3. Driving & Verification
 - Static gates: `python harness/scripts/arch_check.py` (`SEC-001`, `SEC-003`, `ARCH-001..003`, `ARCH-005`).
