@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import Any
 
 import httpx
 import pytest
@@ -85,6 +86,16 @@ def test_f02_storage_dataset_key_isolates_expiries_modes_and_blocks_traversal() 
                 provider="topstepx",
                 live_mode=False,
                 contract_id=bad_id,
+                timeframe="1m",
+            )
+
+    bad_modes: list[Any] = ["false", "true", 1, 0]
+    for bad_mode in bad_modes:
+        with pytest.raises(ValueError):
+            StorageDatasetKey(
+                provider="topstepx",
+                live_mode=bad_mode,
+                contract_id="CON.F.US.MES.Z26",
                 timeframe="1m",
             )
 
@@ -191,6 +202,25 @@ async def test_f02_key_rotation_soft_vs_enforced_and_jwt_auto_refresh() -> None:
             await strict_auth.login("alice", "key-1", live=False, now=now)
         assert strict_auth.get_status(now=now)["connected"] is False
 
+        unset_strict = Settings(
+            topstepx_key_updated_at=None,
+            key_rotation_days=30,
+            key_rotation_enforce=True,
+        )
+        unset_strict_auth = TopstepAuthService(unset_strict, client)
+        with pytest.raises(KeyRotationRequiredError):
+            await unset_strict_auth.login("alice", "key-1", live=False, now=now)
+        assert unset_strict_auth.get_status(now=now)["connected"] is False
+
+        unset_soft = Settings(
+            topstepx_key_updated_at=None,
+            key_rotation_days=30,
+            key_rotation_enforce=False,
+        )
+        unset_soft_auth = TopstepAuthService(unset_soft, client)
+        await unset_soft_auth.login("alice", "key-1", live=False, now=now)
+        assert unset_soft_auth.get_status(now=now)["connected"] is True
+
 
 async def test_f02_contracts_endpoint_reports_per_symbol_typed_errors() -> None:
     """Contract: GET /api/contracts returns 503 disconnected and typed errors per symbol connected.
@@ -291,3 +321,49 @@ async def test_f02_failed_jwt_refresh_clears_stale_token_and_disconnects() -> No
         status = auth.get_status(now=now + timedelta(hours=23))
         assert status["connected"] is False
         assert status["connection_state"] == "DISCONNECTED"
+
+
+async def test_f02_contracts_returns_503_when_jwt_refresh_fails_and_disconnects() -> None:
+    """Contract: GET /api/contracts returns HTTP 503 if JWT refresh fails and disconnects.
+
+    Defect caught: Returning HTTP 200 with per-symbol errors when TopstepX auth fails on refresh.
+    """
+    pw = "refresh-fail-pw"
+    pw_hash = PasswordHasher().hash(pw)
+    login_attempts = 0
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal login_attempts
+        if request.url.path == "/api/Auth/loginKey":
+            login_attempts += 1
+            if login_attempts == 1:
+                return httpx.Response(200, json={"success": True, "token": "jwt-first"})
+            return httpx.Response(401, json={"errorMessage": "Key revoked"})
+        return httpx.Response(200, json={"contracts": []})
+
+    settings = Settings(app_env="development", app_password_hash=pw_hash, jwt_refresh_hours=23.0)
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as upstream:
+        app = create_app(settings=settings, http_client=upstream)
+        async with app.router.lifespan_context(app):
+            asgi = httpx.ASGITransport(app=app, client=("127.0.0.1", 50000))
+            async with httpx.AsyncClient(
+                transport=asgi,
+                base_url="http://127.0.0.1:8000",
+            ) as client:
+                login_resp = await client.post("/api/auth/login", json={"password": pw})
+                csrf = login_resp.json()["csrf_token"]
+                conn = await client.post(
+                    "/api/connect",
+                    json={"userName": "alice", "apiKey": "key-1"},
+                    headers={"X-CSRF-Token": csrf},
+                )
+                assert conn.status_code == 200
+                assert app.state.topstep_auth.is_connected is True
+
+                # Age cached JWT past 23h so GET /api/contracts triggers refresh
+                assert app.state.topstep_auth._token_acquired_at is not None
+                app.state.topstep_auth._token_acquired_at -= timedelta(hours=23, minutes=5)
+
+                res = await client.get("/api/contracts?symbols=MES,MNQ")
+                assert res.status_code == 503
+                assert app.state.topstep_auth.is_connected is False

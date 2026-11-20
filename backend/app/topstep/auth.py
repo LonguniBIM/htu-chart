@@ -116,6 +116,10 @@ class TopstepAuthService:
 
     def _enforce_key_rotation(self, now: datetime | None = None) -> None:
         rotation = self.compute_key_rotation(now=now)
+        if rotation.key_rotation_enforced and rotation.key_age_days is None:
+            msg = "TOPSTEPX_KEY_UPDATED_AT must be configured when KEY_ROTATION_ENFORCE=true"
+            self._clear_session_state(msg)
+            raise KeyRotationRequiredError(msg)
         if rotation.key_rotation_enforced and rotation.key_rotation_due:
             self._clear_session_state("TopstepX API key rotation is due and enforced")
             raise KeyRotationRequiredError(

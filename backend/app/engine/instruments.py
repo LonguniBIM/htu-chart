@@ -83,6 +83,8 @@ class StorageDatasetKey:
     timeframe: str
 
     def __post_init__(self) -> None:
+        if not isinstance(self.live_mode, bool):
+            raise ValueError(f"live_mode must be a bool, got {type(self.live_mode).__name__}")
         _validate_segment("provider", self.provider)
         _validate_segment("contract_id", self.contract_id)
         _validate_segment("timeframe", self.timeframe)

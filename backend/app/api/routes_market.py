@@ -57,11 +57,14 @@ async def get_contracts(
                 "error_type": None,
                 "error": None,
             }
+        except (KeyRotationRequiredError, TopstepAuthError) as exc:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail=redact_secrets(str(exc)),
+            ) from exc
         except (
             ContractNotFoundError,
             AmbiguousContractError,
-            KeyRotationRequiredError,
-            TopstepAuthError,
             UpstreamTimeoutError,
             UpstreamHTTPError,
         ) as exc:
