@@ -296,3 +296,130 @@ async def test_r04_end_to_end_quarantine_corrupts_coverage_and_exposes_redacted_
             }
         finally:
             direct_sqlite.close()
+
+
+async def test_r04_http_resample_volume_overflow_returns_200_and_deduplicates_quarantine(
+    tmp_path: Path,
+) -> None:
+    """Contract: Post-resample Float64 overflow returns HTTP 200 and deduplicates SQLite issues.
+
+    Defect caught: Resampled volume=inf causing HTTP 500 or inflating /api/status on cache reads.
+    """
+    pw = "resample-overflow-pw"
+    pw_hash = PasswordHasher().hash(pw)
+    b_1400 = int(datetime(2026, 11, 10, 14, 0, tzinfo=UTC).timestamp())
+    b_1405 = b_1400 + 300
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/Auth/loginKey":
+            return httpx.Response(200, json={"success": True, "token": "jwt-ok"})
+        if request.url.path == "/api/History/retrieveBars":
+            return httpx.Response(
+                200,
+                json={
+                    "success": True,
+                    "bars": [
+                        {
+                            "t": b_1400,
+                            "o": 5900.0,
+                            "h": 5902.0,
+                            "l": 5899.0,
+                            "c": 5901.0,
+                            "v": 1e308,
+                        },
+                        {
+                            "t": b_1400 + 60,
+                            "o": 5901.0,
+                            "h": 5903.0,
+                            "l": 5900.0,
+                            "c": 5902.0,
+                            "v": 1e308,
+                        },
+                        {
+                            "t": b_1405,
+                            "o": 5902.0,
+                            "h": 5904.0,
+                            "l": 5901.0,
+                            "c": 5903.0,
+                            "v": 25.0,
+                        },
+                    ],
+                },
+            )
+        return httpx.Response(404)
+
+    settings = Settings(
+        app_env="development",
+        app_password_hash=pw_hash,
+        data_dir=tmp_path / "data",
+    )
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as upstream:
+        app = create_app(settings=settings, http_client=upstream)
+        async with app.router.lifespan_context(app):
+            asgi = httpx.ASGITransport(app=app, client=("127.0.0.1", 50000))
+            async with httpx.AsyncClient(
+                transport=asgi,
+                base_url="http://127.0.0.1:8000",
+            ) as client:
+                login_resp = await client.post("/api/auth/login", json={"password": pw})
+                csrf = login_resp.json()["csrf_token"]
+                conn = await client.post(
+                    "/api/connect",
+                    json={"userName": "alice", "apiKey": "key-1"},
+                    headers={"X-CSRF-Token": csrf},
+                )
+                assert conn.status_code == 200
+
+                # First call backfills 1m, resamples 5m, quarantines overflow 14:00, returns 200
+                r1 = await client.get(
+                    "/api/bars",
+                    params={
+                        "contractId": "CON.F.US.MES.Z26",
+                        "timeframe": "5m",
+                        "resampleFrom": "1m",
+                        "startTime": str(b_1400),
+                        "endTime": str(b_1405),
+                    },
+                )
+                assert r1.status_code == 200
+                body1 = r1.json()
+                assert [b["time"] for b in body1["bars"]] == [b_1405]
+                assert body1["quality"]["is_complete"] is False
+                assert body1["quality"]["quarantined_count"] == 1
+
+                s1 = await client.get("/api/status")
+                assert s1.status_code == 200
+                assert s1.json()["data_quality"] == {
+                    "quarantined_bars": 1,
+                    "corrupted_intervals": 1,
+                    "truncated_intervals": 0,
+                    "provider_gap_intervals": 0,
+                    "by_issue_code": {"non_finite_volume": 1},
+                }
+
+                # Second cached call also returns 200 and does NOT inflate /api/status counters
+                r2 = await client.get(
+                    "/api/bars",
+                    params={
+                        "contractId": "CON.F.US.MES.Z26",
+                        "timeframe": "5m",
+                        "resampleFrom": "1m",
+                        "startTime": str(b_1400),
+                        "endTime": str(b_1405),
+                    },
+                )
+                assert r2.status_code == 200
+                body2 = r2.json()
+                assert [b["time"] for b in body2["bars"]] == [b_1405]
+                assert body2["quality"]["is_complete"] is False
+                assert body2["quality"]["quarantined_count"] == 1
+
+                s2 = await client.get("/api/status")
+                assert s2.status_code == 200
+                assert s2.json()["data_quality"] == {
+                    "quarantined_bars": 1,
+                    "corrupted_intervals": 1,
+                    "truncated_intervals": 0,
+                    "provider_gap_intervals": 0,
+                    "by_issue_code": {"non_finite_volume": 1},
+                }

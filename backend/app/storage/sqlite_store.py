@@ -612,25 +612,35 @@ class SqliteStore:
         self,
         key: StorageDatasetKey,
         issues: Sequence[QualityIssueInput],
+        *,
+        deduplicate: bool = False,
     ) -> int:
         if not issues:
             return 0
         now_ts = self._now_utc()
         key_params = self._key_params(key)
+        inserted = 0
         with self._lock:
             conn = self._ensure_conn_locked()
-            conn.executemany(
-                """
-                INSERT INTO data_quality_issues (
-                    provider, live_mode, contract_id, timeframe,
-                    bar_time, interval_start, interval_end,
-                    issue_code, detail, raw_payload, created_at_utc
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                [
+            rows_to_insert: list[tuple[Any, ...]] = []
+            for issue in issues:
+                safe_bar_time = _clamp_sqlite_int64(issue.bar_time)
+                if deduplicate:
+                    existing = conn.execute(
+                        """
+                        SELECT 1 FROM data_quality_issues
+                        WHERE provider = ? AND live_mode = ? AND contract_id = ? AND timeframe = ?
+                          AND bar_time IS ? AND issue_code = ?
+                        LIMIT 1
+                        """,
+                        (*key_params, safe_bar_time, issue.issue_code),
+                    ).fetchone()
+                    if existing is not None:
+                        continue
+                rows_to_insert.append(
                     (
                         *key_params,
-                        _clamp_sqlite_int64(issue.bar_time),
+                        safe_bar_time,
                         _clamp_sqlite_int64(issue.interval_start),
                         _clamp_sqlite_int64(issue.interval_end),
                         issue.issue_code,
@@ -638,19 +648,36 @@ class SqliteStore:
                         issue.raw_payload[:_MAX_RAW_PAYLOAD_CHARS],
                         now_ts,
                     )
-                    for issue in issues
-                ],
-            )
-            conn.commit()
-        return len(issues)
+                )
+            if rows_to_insert:
+                conn.executemany(
+                    """
+                    INSERT INTO data_quality_issues (
+                        provider, live_mode, contract_id, timeframe,
+                        bar_time, interval_start, interval_end,
+                        issue_code, detail, raw_payload, created_at_utc
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    rows_to_insert,
+                )
+                conn.commit()
+                inserted = len(rows_to_insert)
+        return inserted
 
     async def record_quality_issues(
         self,
         key: StorageDatasetKey,
         issues: Sequence[QualityIssueInput],
+        *,
+        deduplicate: bool = False,
     ) -> int:
         """Persist quarantined OHLCV validation issues for auditability."""
-        return await asyncio.to_thread(self._record_quality_issues_sync, key, issues)
+        return await asyncio.to_thread(
+            self._record_quality_issues_sync,
+            key,
+            issues,
+            deduplicate=deduplicate,
+        )
 
     def _list_quality_issues_sync(
         self,

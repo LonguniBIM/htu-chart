@@ -13,6 +13,7 @@ from app.engine.session_calendar import (
     assign_bucket_open_utc,
     bucket_bounds,
     bucket_open_utc,
+    first_bucket_open_at_or_after,
     get_session_schedule,
     globex_day_open_utc,
     has_open_session_in_range,
@@ -216,3 +217,26 @@ def test_r05_latest_closed_bucket_end_and_timeframe_validation() -> None:
     for bad_unit in ((9, 1), (2, 99), (True, 1)):
         with pytest.raises(ValueError):
             timeframe_from_topstep_unit(*bad_unit)
+
+    # first_bucket_open_at_or_after across aligned, mid-bar, pre-halt, 1d, and DST
+    aligned_1400 = _ts(datetime(2026, 4, 15, 14, 0, tzinfo=NY_TZ))
+    mid_1402 = _ts(datetime(2026, 4, 15, 14, 2, tzinfo=NY_TZ))
+    assert first_bucket_open_at_or_after(aligned_1400, "5m") == aligned_1400
+    assert first_bucket_open_at_or_after(mid_1402, "5m") == _ts(
+        datetime(2026, 4, 15, 14, 5, tzinfo=NY_TZ)
+    )
+    pre_halt_1430 = _ts(datetime(2026, 4, 15, 14, 30, tzinfo=NY_TZ))
+    day_reopen_1800 = _ts(datetime(2026, 4, 15, 18, 0, tzinfo=NY_TZ))
+    assert first_bucket_open_at_or_after(pre_halt_1430, "4h") == day_reopen_1800
+    assert first_bucket_open_at_or_after(pre_halt_1430, "1d") == day_reopen_1800
+    assert first_bucket_open_at_or_after(day_reopen_1800, "1d") == day_reopen_1800
+
+    # Spring Forward 2026-03-08 & Fall Back 2026-11-01 clamp to 18:00 ET
+    spring_pre = _ts(datetime(2026, 3, 8, 17, 15, tzinfo=NY_TZ))
+    assert first_bucket_open_at_or_after(spring_pre, "4h") == _ts(
+        datetime(2026, 3, 8, 18, 0, tzinfo=NY_TZ)
+    )
+    fall_pre = _ts(datetime(2026, 11, 1, 17, 30, tzinfo=NY_TZ))
+    assert first_bucket_open_at_or_after(fall_pre, "4h") == _ts(
+        datetime(2026, 11, 1, 18, 0, tzinfo=NY_TZ)
+    )

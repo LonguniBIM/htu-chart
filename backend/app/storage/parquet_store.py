@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import json
+import math
 import os
 import tempfile
 import threading
@@ -18,7 +20,12 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 from app.engine.instruments import StorageDatasetKey, validate_root_symbol
-from app.engine.ohlcv import OHLCVBar, ValidationResult, validate_ohlcv_bar
+from app.engine.ohlcv import (
+    DEFAULT_MAX_FUTURE_SKEW_SEC,
+    OHLCVBar,
+    ValidationResult,
+    validate_ohlcv_bar,
+)
 from app.engine.session_calendar import (
     TIMEFRAME_SECONDS,
     HolidaySpec,
@@ -68,6 +75,32 @@ class UpsertResult:
     min_bar_time: int | None
     max_bar_time: int | None
     last_closed_bar_time: int | None
+
+
+@dataclass(frozen=True)
+class ResampleIssue:
+    """Post-resample OHLCV validation issue (for example Float64 volume overflow)."""
+
+    bar_time: int
+    interval_start: int
+    interval_end: int
+    issue_code: str
+    detail: str
+    raw_payload: str
+
+
+@dataclass(frozen=True)
+class ResampleResult:
+    """Resampled OHLCV bars paired with any quarantined post-resample issues."""
+
+    bars: list[OHLCVBar]
+    issues: list[ResampleIssue]
+
+
+def _json_safe_value(value: Any) -> Any:
+    if isinstance(value, float) and not math.isfinite(value):
+        return str(value)
+    return value
 
 
 def validate_resample_path(source_tf: str, target_tf: str) -> tuple[str, str]:
@@ -456,10 +489,10 @@ class ParquetStore:
         root_symbol: str | None,
         holiday_overrides: Mapping[date, HolidaySpec] | None,
         limit: int | None,
-    ) -> list[OHLCVBar]:
+    ) -> ResampleResult:
         with self._get_thread_lock(source_key):
             if not target.exists():
-                return []
+                return ResampleResult(bars=[], issues=[])
             df, existing_root = self._read_table_sync(target, source_key)
             eff_root = validate_root_symbol(
                 source_key.contract_id,
@@ -468,7 +501,7 @@ class ParquetStore:
             )
 
             if df.is_empty():
-                return []
+                return ResampleResult(bars=[], issues=[])
             if start_ts is not None:
                 aligned_start = bucket_open_utc(start_ts, target_tf)
                 df = df.filter(pl.col("time") >= aligned_start)
@@ -481,7 +514,7 @@ class ParquetStore:
                 )
                 df = df.filter(pl.col("time") < aligned_end)
             if df.is_empty():
-                return []
+                return ResampleResult(bars=[], issues=[])
 
             df = df.sort("time")
             times = [int(t) for t in df["time"].to_list()]
@@ -502,6 +535,7 @@ class ParquetStore:
             )
 
             out: list[OHLCVBar] = []
+            issues: list[ResampleIssue] = []
             for row in grouped.iter_rows(named=True):
                 b_open = int(row["bucket_open"])
                 _, b_end = bucket_bounds(
@@ -523,24 +557,44 @@ class ParquetStore:
                 )
                 if not include_provisional and not bar_closed:
                     continue
-                out.append(
-                    OHLCVBar(
-                        time=b_open,
-                        open=float(row["open"]),
-                        high=float(row["high"]),
-                        low=float(row["low"]),
-                        close=float(row["close"]),
-                        volume=float(row["volume"]),
-                        is_closed=bar_closed,
-                    )
+                candidate = {
+                    "time": b_open,
+                    "open": float(row["open"]),
+                    "high": float(row["high"]),
+                    "low": float(row["low"]),
+                    "close": float(row["close"]),
+                    "volume": float(row["volume"]),
+                    "is_closed": bar_closed,
+                }
+                val = validate_ohlcv_bar(
+                    candidate,
+                    is_closed=bar_closed,
+                    max_timestamp=max(now_utc, b_open) + DEFAULT_MAX_FUTURE_SKEW_SEC,
                 )
+                if val.is_valid and val.bar is not None:
+                    out.append(val.bar)
+                else:
+                    safe_payload = json.dumps(
+                        {k: _json_safe_value(v) for k, v in candidate.items()},
+                        allow_nan=False,
+                    )
+                    issues.append(
+                        ResampleIssue(
+                            bar_time=b_open,
+                            interval_start=b_open,
+                            interval_end=b_end,
+                            issue_code=val.issue_code or "invalid_ohlcv",
+                            detail=val.issue_detail or "Post-resample OHLCV validation failed",
+                            raw_payload=safe_payload[:2048],
+                        )
+                    )
             if limit is not None:
                 if limit <= 0:
-                    return []
+                    return ResampleResult(bars=[], issues=issues)
                 out = out[-limit:]
-            return out
+            return ResampleResult(bars=out, issues=issues)
 
-    async def resample(
+    async def resample_with_issues(
         self,
         source_key: StorageDatasetKey,
         target_timeframe: str,
@@ -552,14 +606,14 @@ class ParquetStore:
         root_symbol: str | None = None,
         holiday_overrides: Mapping[date, HolidaySpec] | None = None,
         limit: int | None = None,
-    ) -> list[OHLCVBar]:
-        """Resample cached source bars onto CME Globex 18:00 ET buckets in Polars."""
+    ) -> ResampleResult:
+        """Resample cached source bars onto CME Globex 18:00 ET buckets and quarantine anomalies."""
         _, target_tf = validate_resample_path(source_key.timeframe, target_timeframe)
         validate_root_symbol(source_key.contract_id, root_symbol)
         target = self.resolve_path(source_key)
         eff_now = now_utc if now_utc is not None else int(datetime.now(UTC).timestamp())
 
-        async def _work() -> list[OHLCVBar]:
+        async def _work() -> ResampleResult:
             return await asyncio.to_thread(
                 self._resample_sync,
                 target,
@@ -575,3 +629,30 @@ class ParquetStore:
             )
 
         return await self._run_locked(source_key, _work)
+
+    async def resample(
+        self,
+        source_key: StorageDatasetKey,
+        target_timeframe: str,
+        *,
+        start_ts: int | None = None,
+        end_ts: int | None = None,
+        include_provisional: bool = False,
+        now_utc: int | None = None,
+        root_symbol: str | None = None,
+        holiday_overrides: Mapping[date, HolidaySpec] | None = None,
+        limit: int | None = None,
+    ) -> list[OHLCVBar]:
+        """Resample cached source bars onto CME Globex 18:00 ET buckets in Polars."""
+        res = await self.resample_with_issues(
+            source_key,
+            target_timeframe,
+            start_ts=start_ts,
+            end_ts=end_ts,
+            include_provisional=include_provisional,
+            now_utc=now_utc,
+            root_symbol=root_symbol,
+            holiday_overrides=holiday_overrides,
+            limit=limit,
+        )
+        return res.bars

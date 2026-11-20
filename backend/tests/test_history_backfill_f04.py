@@ -80,6 +80,7 @@ async def test_f04_three_page_backward_pagination_and_max_pages_truncation(
         )
         assert full.pages_fetched == 3
         assert len(full.raw_bars) == 250
+        assert sorted(int(b["t"]) for b in full.raw_bars) == [BASE_T + i * 60 for i in range(250)]
         assert full.truncated is False
         assert full.provider_gap is False
         assert full.earliest_bar_time == BASE_T
@@ -947,5 +948,77 @@ async def test_f04_right_edge_bar_at_r_end_does_not_mark_empty_interval_complete
             assert res2.upstream_requests > 0
             assert calls == 2
             assert res2.is_complete is False
+    finally:
+        sqlite_store.close()
+
+
+async def test_f04_mid_bar_start_ts_pagination_terminates_without_false_provider_gap(
+    tmp_path: Path,
+) -> None:
+    """Contract: Mid-bar start_ts stops pagination at first_bucket_open_at_or_after without gap.
+
+    Defect caught: Querying [14:02:00, 14:04:59] on 5m returning [] and setting provider_gap=True.
+    """
+    start_ts = int(datetime(2026, 11, 10, 14, 2, tzinfo=UTC).timestamp())  # mid-bar 14:02Z
+    end_ts = int(datetime(2026, 11, 10, 14, 9, tzinfo=UTC).timestamp())  # 14:09Z -> fetch_end 14:10
+    now_ts = int(datetime(2026, 11, 10, 14, 20, tzinfo=UTC).timestamp())
+    bar_1405 = int(datetime(2026, 11, 10, 14, 5, tzinfo=UTC).timestamp())
+    bar_1410 = int(datetime(2026, 11, 10, 14, 10, tzinfo=UTC).timestamp())
+    pool = [_wire_bar(bar_1405, 5910.0), _wire_bar(bar_1410, 5920.0)]
+    upstream_calls = 0
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal upstream_calls
+        if request.url.path == "/api/Auth/loginKey":
+            return httpx.Response(200, json={"success": True, "token": "jwt-ok"})
+        if request.url.path == "/api/History/retrieveBars":
+            upstream_calls += 1
+            payload = json.loads(request.content.decode("utf-8"))
+            req_s = int(datetime.fromisoformat(str(payload["startTime"])).timestamp())
+            req_e = int(datetime.fromisoformat(str(payload["endTime"])).timestamp())
+            lim = int(payload["limit"])
+            matched = [b for b in pool if req_s <= int(b["t"]) <= req_e][-lim:]
+            return httpx.Response(200, json={"success": True, "bars": matched})
+        return httpx.Response(404)
+
+    settings = Settings(data_dir=tmp_path / "data", history_page_limit=1, history_max_pages=10)
+    sqlite_store = SqliteStore(tmp_path / "meta.db")
+    sqlite_store.initialize()
+    try:
+        parquet_store = ParquetStore(tmp_path / "data", sqlite_store=sqlite_store)
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            auth = TopstepAuthService(settings, client)
+            await auth.login("alice", "key-1")
+            rest = TopstepRestClient(settings, auth, client)
+            svc = HistoryBackfillService(settings, rest, parquet_store, sqlite_store)
+
+            res = await svc.sync_and_read_bars(
+                contract_id="CON.F.US.MES.Z26",
+                live=False,
+                timeframe="5m",
+                start_ts=start_ts,
+                end_ts=end_ts,
+                now_utc=now_ts,
+            )
+            assert [b.time for b in res.bars] == [bar_1405]
+            assert res.provider_gap is False
+            assert res.truncated is False
+            assert res.is_complete is True
+            assert res.upstream_requests == 2
+            assert upstream_calls == 2
+
+            # Offline follow-up succeeds with 0 upstream calls
+            res_offline = await svc.sync_and_read_bars(
+                contract_id="CON.F.US.MES.Z26",
+                live=False,
+                timeframe="5m",
+                start_ts=start_ts,
+                end_ts=end_ts,
+                now_utc=now_ts,
+                allow_upstream=False,
+            )
+            assert [b.time for b in res_offline.bars] == [bar_1405]
+            assert res_offline.upstream_requests == 0
+            assert upstream_calls == 2
     finally:
         sqlite_store.close()

@@ -20,6 +20,7 @@ from app.engine.ohlcv import (
 )
 from app.engine.session_calendar import (
     bucket_open_utc,
+    first_bucket_open_at_or_after,
     has_open_session_in_range,
     normalize_timeframe,
     timeframe_to_topstep_unit,
@@ -211,6 +212,7 @@ class TopstepRestClient:
         seen_min_ts: int | None = None
         cursor_end = end_ts
         aligned_start = bucket_open_utc(start_ts, tf)
+        first_expected_open = first_bucket_open_at_or_after(start_ts, tf)
 
         for page_idx in range(eff_max_pages):
             payload = {
@@ -260,7 +262,9 @@ class TopstepRestClient:
                 page_max_ts = None
 
             if len(page_bars) == 0:
-                if has_open_session_in_range(start_ts, cursor_end, root_symbol=root_symbol):
+                if first_expected_open <= cursor_end and has_open_session_in_range(
+                    first_expected_open, cursor_end + 1, root_symbol=root_symbol
+                ):
                     provider_gap = True
                 break
 
@@ -279,12 +283,16 @@ class TopstepRestClient:
                     provider_gap = True
                 break
 
-            if page_min_ts <= start_ts:
+            if page_min_ts <= first_expected_open:
                 break
 
             if len(page_bars) < eff_limit:
-                if page_min_ts >= end_ts and has_open_session_in_range(
-                    start_ts, cursor_end, root_symbol=root_symbol
+                if (
+                    page_min_ts >= end_ts
+                    and first_expected_open < end_ts
+                    and has_open_session_in_range(
+                        first_expected_open, end_ts, root_symbol=root_symbol
+                    )
                 ):
                     provider_gap = True
                 break

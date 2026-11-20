@@ -368,6 +368,20 @@ def bucket_open_utc(ts: int, timeframe: str) -> int:
     return session_open + ((ts - session_open) // step) * step
 
 
+def first_bucket_open_at_or_after(ts: int, timeframe: str) -> int:
+    """Return the first canonical CME Globex bar-open timestamp >= ts for timeframe."""
+    tf = normalize_timeframe(timeframe)
+    b_start = bucket_open_utc(ts, tf)
+    if b_start == ts:
+        return ts
+    anchor = _globex_anchor_date(ts)
+    next_day_open = _next_globex_day_open_utc(anchor)
+    if tf == "1d":
+        return next_day_open
+    step = TIMEFRAME_SECONDS[tf]
+    return min(b_start + step, next_day_open)
+
+
 def assign_bucket_open_utc(timestamps: Sequence[int], timeframe: str) -> list[int]:
     """Batch-assign canonical bar-open timestamps identical to scalar bucket_open_utc."""
     tf = normalize_timeframe(timeframe)

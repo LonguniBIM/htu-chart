@@ -516,3 +516,41 @@ async def test_f05_case_alias_keys_unify_lock_and_storage_identity(tmp_path: Pat
     assert meta[b"topstep_contract_id"] == b"CON.F.US.MES.Z26"
     assert meta[b"topstep_timeframe"] == b"1m"
     assert meta[b"topstep_root_symbol"] == b"MES"
+
+
+async def test_f05_post_resample_volume_overflow_is_omitted_and_quarantined(
+    tmp_path: Path,
+) -> None:
+    """Contract: Post-resample Float64 overflow to +inf is omitted and emitted as ResampleIssue.
+
+    Defect caught: Two 1e308 1m volumes summing to inf causing JSONResponse 500s on resample.
+    """
+    store = ParquetStore(tmp_path / "data")
+    key_1m = StorageDatasetKey("topstepx", False, "CON.F.US.MES.Z26", "1m")
+    b_1400 = int(datetime(2026, 11, 10, 14, 0, tzinfo=UTC).timestamp())
+    b_1405 = b_1400 + 300
+
+    await store.upsert_bars(
+        key_1m,
+        [
+            _bar(b_1400, 5900.0, 5902.0, 5899.0, 5901.0, 1e308),
+            _bar(b_1400 + 60, 5901.0, 5903.0, 5900.0, 5902.0, 1e308),
+            _bar(b_1405, 5902.0, 5904.0, 5901.0, 5903.0, 25.0),
+        ],
+        root_symbol="MES",
+        now_utc=NOW_TS,
+    )
+
+    res = await store.resample_with_issues(
+        key_1m, "5m", start_ts=b_1400, end_ts=b_1405, now_utc=NOW_TS
+    )
+    assert [b.time for b in res.bars] == [b_1405]
+    assert res.bars[0] == _bar(b_1405, 5902.0, 5904.0, 5901.0, 5903.0, 25.0, closed=True)
+    assert len(res.issues) == 1
+    assert res.issues[0].bar_time == b_1400
+    assert res.issues[0].issue_code == "non_finite_volume"
+
+    bars_only = await store.resample(
+        key_1m, "5m", start_ts=b_1400, end_ts=b_1405, now_utc=NOW_TS
+    )
+    assert bars_only == res.bars

@@ -22,6 +22,7 @@ from app.engine.ohlcv import (
 from app.engine.session_calendar import (
     bucket_bounds,
     bucket_open_utc,
+    first_bucket_open_at_or_after,
     has_open_session_in_range,
     is_bar_closed,
     latest_closed_bucket_end_utc,
@@ -302,11 +303,13 @@ class HistoryBackfillService:
                     provider_gap=True,
                 )
             else:
+                first_open = first_bucket_open_at_or_after(r_start, source_tf)
                 window_start = bucket_open_utc(r_start, source_tf)
                 has_in_range_bar = any(window_start <= b.time < r_end for b in valid_bars)
-                if not has_in_range_bar and has_open_session_in_range(
-                    r_start, r_end, root_symbol=eff_root
-                ):
+                expects_in_range_bar = first_open < r_end and has_open_session_in_range(
+                    first_open, r_end, root_symbol=eff_root
+                )
+                if not has_in_range_bar and expects_in_range_bar:
                     any_provider_gap = True
                     await self._sqlite.record_coverage(
                         source_key,
@@ -372,8 +375,9 @@ class HistoryBackfillService:
             any_truncated = any_truncated or tail_truncated
             any_provider_gap = any_provider_gap or tail_provider_gap
 
+        resample_issues = []
         if is_resampled:
-            bars = await self._parquet.resample(
+            resample_res = await self._parquet.resample_with_issues(
                 source_key,
                 tf,
                 start_ts=start_ts,
@@ -383,6 +387,34 @@ class HistoryBackfillService:
                 root_symbol=eff_root,
                 limit=limit,
             )
+            bars = resample_res.bars
+            resample_issues = resample_res.issues
+            if resample_issues:
+                target_key = StorageDatasetKey("topstepx", bool(live), contract_id, tf)
+                await self._sqlite.record_quality_issues(
+                    target_key,
+                    [
+                        QualityIssueInput(
+                            bar_time=issue.bar_time,
+                            interval_start=issue.interval_start,
+                            interval_end=issue.interval_end,
+                            issue_code=issue.issue_code,
+                            detail=self._redact(issue.detail),
+                            raw_payload=self._redact(issue.raw_payload)[:2048],
+                        )
+                        for issue in resample_issues
+                    ],
+                    deduplicate=True,
+                )
+                for issue in resample_issues:
+                    await self._sqlite.record_coverage(
+                        target_key,
+                        issue.interval_start,
+                        issue.interval_end,
+                        status="CORRUPTED",
+                        quarantined_count=1,
+                    )
+                total_quarantined += len(resample_issues)
         else:
             bars = await self._parquet.read_bars(
                 source_key,
@@ -392,13 +424,16 @@ class HistoryBackfillService:
                 limit=limit,
             )
 
+        has_resample_issues = bool(resample_issues)
         if fetch_end <= closed_horizon:
-            is_complete = await self._sqlite.is_interval_complete(
-                source_key, fetch_start, fetch_end
+            is_complete = (
+                not has_resample_issues
+                and await self._sqlite.is_interval_complete(source_key, fetch_start, fetch_end)
             )
         else:
             is_complete = (
-                closed_horizon > fetch_start
+                not has_resample_issues
+                and closed_horizon > fetch_start
                 and await self._sqlite.is_interval_complete(
                     source_key, fetch_start, closed_horizon
                 )
