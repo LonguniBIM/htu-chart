@@ -61,6 +61,55 @@ def get_instrument_spec(root_symbol: str) -> InstrumentSpec:
     return INSTRUMENTS[normalized]
 
 
+def infer_root_symbol(contract_id: str) -> str | None:
+    """Infer supported CME root symbol from a TopstepX contract ID segment."""
+    upper_id = contract_id.strip().upper()
+    if not upper_id:
+        return None
+    for root in INSTRUMENTS:
+        if f".{root}." in upper_id or upper_id.endswith(f".{root}"):
+            return root
+    return None
+
+
+def validate_root_symbol(
+    contract_id: str,
+    root_symbol: str | None,
+    *,
+    stored_root_symbol: str | None = None,
+) -> str | None:
+    """Validate optional caller/stored root_symbol against contract_id and INSTRUMENTS."""
+    inferred = infer_root_symbol(contract_id)
+    stored = (
+        stored_root_symbol.strip().upper()
+        if stored_root_symbol and stored_root_symbol.strip()
+        else None
+    )
+    if stored is not None:
+        stored = get_instrument_spec(stored).root_symbol
+
+    if root_symbol is not None and root_symbol.strip():
+        candidate = get_instrument_spec(root_symbol).root_symbol
+        if inferred is not None and candidate != inferred:
+            raise ValueError(
+                f"root_symbol {candidate!r} conflicts with contract_id {contract_id!r} "
+                f"(expected {inferred!r})"
+            )
+        if stored is not None and candidate != stored:
+            raise ValueError(
+                f"root_symbol {candidate!r} conflicts with stored root_symbol {stored!r} "
+                f"for contract_id {contract_id!r}"
+            )
+        return candidate
+
+    if inferred is not None and stored is not None and inferred != stored:
+        raise ValueError(
+            f"Stored root_symbol {stored!r} conflicts with contract_id {contract_id!r} "
+            f"(expected {inferred!r})"
+        )
+    return inferred or stored
+
+
 def _validate_segment(field_name: str, value: str) -> str:
     if not isinstance(value, str):
         raise ValueError(f"{field_name} must be a string")

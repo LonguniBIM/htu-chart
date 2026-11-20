@@ -16,6 +16,16 @@ from app.engine.instruments import StorageDatasetKey
 CoverageStatus = Literal["COMPLETE", "CORRUPTED", "TRUNCATED", "PROVIDER_GAP"]
 _VALID_COVERAGE_STATUSES = frozenset({"COMPLETE", "CORRUPTED", "TRUNCATED", "PROVIDER_GAP"})
 _MAX_RAW_PAYLOAD_CHARS = 2048
+_SQLITE_INT64_MIN = -(2**63)
+_SQLITE_INT64_MAX = 2**63 - 1
+
+
+def _clamp_sqlite_int64(value: int | None) -> int | None:
+    if value is None:
+        return None
+    if _SQLITE_INT64_MIN <= value <= _SQLITE_INT64_MAX:
+        return value
+    return None
 
 
 @dataclass(frozen=True)
@@ -276,6 +286,58 @@ class SqliteStore:
         """Fetch dataset summary metadata for a StorageDatasetKey, or None if absent."""
         return await asyncio.to_thread(self._get_dataset_metadata_sync, key)
 
+    @staticmethod
+    def _trim_non_complete_rows_locked(
+        conn: sqlite3.Connection,
+        key_params: tuple[str, int, str, str],
+        non_complete_rows: list[sqlite3.Row],
+        cut_start: int,
+        cut_end: int,
+        now_ts: int,
+    ) -> None:
+        if cut_start >= cut_end:
+            return
+        for row in non_complete_rows:
+            rem = _subtract_interval(
+                [(int(row["start_ts"]), int(row["end_ts"]))],
+                cut_start,
+                cut_end,
+            )
+            if not rem:
+                conn.execute("DELETE FROM coverage_intervals WHERE id = ?", (row["id"],))
+            elif len(rem) == 1:
+                if rem[0] != (int(row["start_ts"]), int(row["end_ts"])):
+                    conn.execute(
+                        """
+                        UPDATE coverage_intervals
+                        SET start_ts = ?, end_ts = ?, updated_at_utc = ?
+                        WHERE id = ?
+                        """,
+                        (rem[0][0], rem[0][1], now_ts, row["id"]),
+                    )
+            else:
+                conn.execute("DELETE FROM coverage_intervals WHERE id = ?", (row["id"],))
+                for r_s, r_e in rem:
+                    conn.execute(
+                        """
+                        INSERT INTO coverage_intervals (
+                            provider, live_mode, contract_id, timeframe,
+                            start_ts, end_ts, status, quarantined_count,
+                            truncated, provider_gap, updated_at_utc
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            *key_params,
+                            r_s,
+                            r_e,
+                            row["status"],
+                            int(row["quarantined_count"]),
+                            int(row["truncated"]),
+                            int(row["provider_gap"]),
+                            now_ts,
+                        ),
+                    )
+
     def _record_coverage_sync(
         self,
         key: StorageDatasetKey,
@@ -322,52 +384,9 @@ class SqliteStore:
 
             if status == "COMPLETE":
                 if heal_existing:
-                    for row in non_complete_rows:
-                        rem = _subtract_interval(
-                            [(int(row["start_ts"]), int(row["end_ts"]))],
-                            start_ts,
-                            end_ts,
-                        )
-                        if not rem:
-                            conn.execute(
-                                "DELETE FROM coverage_intervals WHERE id = ?",
-                                (row["id"],),
-                            )
-                        elif len(rem) == 1:
-                            if rem[0] != (int(row["start_ts"]), int(row["end_ts"])):
-                                conn.execute(
-                                    """
-                                    UPDATE coverage_intervals
-                                    SET start_ts = ?, end_ts = ?, updated_at_utc = ?
-                                    WHERE id = ?
-                                    """,
-                                    (rem[0][0], rem[0][1], now_ts, row["id"]),
-                                )
-                        else:
-                            conn.execute(
-                                "DELETE FROM coverage_intervals WHERE id = ?",
-                                (row["id"],),
-                            )
-                            for r_s, r_e in rem:
-                                conn.execute(
-                                    """
-                                    INSERT INTO coverage_intervals (
-                                        provider, live_mode, contract_id, timeframe,
-                                        start_ts, end_ts, status, quarantined_count,
-                                        truncated, provider_gap, updated_at_utc
-                                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                                    """,
-                                    (
-                                        *key_params,
-                                        r_s,
-                                        r_e,
-                                        row["status"],
-                                        int(row["quarantined_count"]),
-                                        int(row["truncated"]),
-                                        int(row["provider_gap"]),
-                                        now_ts,
-                                    ),
-                                )
+                    self._trim_non_complete_rows_locked(
+                        conn, key_params, non_complete_rows, start_ts, end_ts, now_ts
+                    )
                     candidate_pieces = [(start_ts, end_ts)] if start_ts < end_ts else []
                 else:
                     candidate_pieces = [(start_ts, end_ts)] if start_ts < end_ts else []
@@ -399,6 +418,9 @@ class SqliteStore:
                         (*key_params, c_s, c_e, now_ts),
                     )
             else:
+                self._trim_non_complete_rows_locked(
+                    conn, key_params, non_complete_rows, start_ts, end_ts, now_ts
+                )
                 trimmed_complete: list[tuple[int, int]] = []
                 for c_s, c_e in complete_ranges:
                     trimmed_complete.extend(_subtract_interval([(c_s, c_e)], start_ts, end_ts))
@@ -608,9 +630,9 @@ class SqliteStore:
                 [
                     (
                         *key_params,
-                        issue.bar_time,
-                        issue.interval_start,
-                        issue.interval_end,
+                        _clamp_sqlite_int64(issue.bar_time),
+                        _clamp_sqlite_int64(issue.interval_start),
+                        _clamp_sqlite_int64(issue.interval_end),
                         issue.issue_code,
                         issue.detail,
                         issue.raw_payload[:_MAX_RAW_PAYLOAD_CHARS],

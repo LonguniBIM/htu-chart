@@ -2,13 +2,16 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import httpx
+import pytest
 from argon2 import PasswordHasher
 
+from app.api import routes_market
 from app.config import Settings
 from app.engine.instruments import StorageDatasetKey
 from app.engine.session_calendar import NY_TZ
@@ -17,6 +20,7 @@ from app.services.history_service import HistoryBackfillService
 from app.storage.parquet_store import ParquetStore
 from app.storage.sqlite_store import SqliteStore
 from app.topstep.auth import TopstepAuthService
+from app.topstep.errors import TopstepAuthError, UpstreamHTTPError, UpstreamTimeoutError
 from app.topstep.rest_client import TopstepRestClient
 
 BASE_T = int(datetime(2026, 11, 10, 14, 0, tzinfo=UTC).timestamp())
@@ -316,22 +320,26 @@ async def test_f04_incremental_cache_hit_partial_extension_and_provisional_upgra
 
 async def test_f04_bars_http_endpoint_auth_validation_offline_and_resample(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Contract: /api/bars enforces 401/400/503, offline cache, resample_from, and refresh errors.
+    """Contract: /api/bars enforces 401/400/503/504, offline cache, resample, and refresh errors.
 
-    Defect caught: Unauthenticated bars access, traversal 500s, or offline failure on cached ranges.
+    Defect caught: Unauthenticated bars access, traversal 500s, clock flakiness, or offline bugs.
     """
     pw = "bars-endpoint-pw"
     pw_hash = PasswordHasher().hash(pw)
     login_mode = "ok"
+    history_mode = "ok"
     t0 = int(datetime(2026, 11, 10, 14, 0, tzinfo=UTC).timestamp())
     bars_1m = [_wire_bar(t0 + i * 60, 5900.0 + i) for i in range(5)]
     t_end = t0 + 300
 
-    # Also build a live open bar around actual current UTC clock for includePartial test
-    now_epoch = int(datetime.now(UTC).timestamp())
-    open_5m_start = now_epoch - (now_epoch % 300)
+    # Deterministic current UTC clock inside an active 5m bar (15:02:00 UTC)
+    fixed_now = int(datetime(2026, 11, 10, 15, 2, 0, tzinfo=UTC).timestamp())
+    open_5m_start = int(datetime(2026, 11, 10, 15, 0, 0, tzinfo=UTC).timestamp())
+    closed_5m_start = open_5m_start - 300
     live_end = open_5m_start + 300
+    monkeypatch.setattr(routes_market, "_utc_now_ts", lambda: fixed_now)
 
     async def handler(request: httpx.Request) -> httpx.Response:
         if request.url.path == "/api/Auth/loginKey":
@@ -339,10 +347,16 @@ async def test_f04_bars_http_endpoint_auth_validation_offline_and_resample(
                 return httpx.Response(401, json={"errorMessage": "Revoked"})
             return httpx.Response(200, json={"success": True, "token": "jwt-ok"})
         if request.url.path == "/api/History/retrieveBars":
+            if history_mode == "timeout":
+                await asyncio.sleep(0.3)
+                return httpx.Response(200, json={"success": True, "bars": []})
             payload = json.loads(request.content.decode("utf-8"))
             req_s = int(datetime.fromisoformat(str(payload["startTime"])).timestamp())
             req_e = int(datetime.fromisoformat(str(payload["endTime"])).timestamp())
-            pool = bars_1m + [_wire_bar(open_5m_start, 6010.0)]
+            pool = bars_1m + [
+                _wire_bar(closed_5m_start, 6000.0),
+                _wire_bar(open_5m_start, 6010.0),
+            ]
             matched = [b for b in pool if req_s <= int(b["t"]) <= req_e]
             return httpx.Response(200, json={"success": True, "bars": matched})
         return httpx.Response(404)
@@ -352,6 +366,8 @@ async def test_f04_bars_http_endpoint_auth_validation_offline_and_resample(
         app_password_hash=pw_hash,
         data_dir=tmp_path / "data",
         jwt_refresh_hours=23.0,
+        history_backfill_timeout_sec=0.1,
+        upstream_max_retries=0,
     )
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as upstream:
         app = create_app(settings=settings, http_client=upstream)
@@ -399,6 +415,18 @@ async def test_f04_bars_http_endpoint_auth_validation_offline_and_resample(
                         },
                     )
                 ).status_code == 400
+                assert (
+                    await client.get(
+                        "/api/bars",
+                        params={
+                            "contractId": "CON.F.US.MGC.Z26",
+                            "timeframe": "1m",
+                            "rootSymbol": "MES",
+                            "startTime": str(t0),
+                            "endTime": str(t_end),
+                        },
+                    )
+                ).status_code == 400
 
                 # Offline uncached -> 503
                 uncached = await client.get(
@@ -412,7 +440,7 @@ async def test_f04_bars_http_endpoint_auth_validation_offline_and_resample(
                 )
                 assert uncached.status_code == 503
 
-                # Connect TopstepX, backfill 1m, then query resampled 5m
+                # Connect TopstepX, backfill 1m, then query resampled 5m on mid-bucket slice
                 conn = await client.post(
                     "/api/connect",
                     json={"userName": "alice", "apiKey": "key-1"},
@@ -426,8 +454,8 @@ async def test_f04_bars_http_endpoint_auth_validation_offline_and_resample(
                         "contractId": "CON.F.US.MES.Z26",
                         "timeframe": "5m",
                         "resampleFrom": "1m",
-                        "startTime": str(t0),
-                        "endTime": str(t_end),
+                        "startTime": str(t0 + 120),
+                        "endTime": str(t0 + 240),
                     },
                 )
                 assert resampled.status_code == 200
@@ -438,33 +466,53 @@ async def test_f04_bars_http_endpoint_auth_validation_offline_and_resample(
                 assert r_body["bars"][0]["close"] == 5905.0
                 assert r_body["quality"]["is_complete"] is True
 
-                # includePartial=false vs true around active 5m bar
+                # includePartial=false vs true around deterministic active 5m bar
                 partial_off = await client.get(
                     "/api/bars",
                     params={
                         "contractId": "CON.F.US.MES.Z26",
                         "timeframe": "5m",
-                        "startTime": str(open_5m_start - 300),
+                        "startTime": str(closed_5m_start),
                         "endTime": str(live_end),
                         "includePartial": "false",
                     },
                 )
                 assert partial_off.status_code == 200
-                assert all(b["is_closed"] is True for b in partial_off.json()["bars"])
+                off_bars = partial_off.json()["bars"]
+                assert [(b["time"], b["is_closed"]) for b in off_bars] == [
+                    (closed_5m_start, True)
+                ]
 
                 partial_on = await client.get(
                     "/api/bars",
                     params={
                         "contractId": "CON.F.US.MES.Z26",
                         "timeframe": "5m",
-                        "startTime": str(open_5m_start - 300),
+                        "startTime": str(closed_5m_start),
                         "endTime": str(live_end),
                         "includePartial": "true",
                     },
                 )
                 assert partial_on.status_code == 200
                 p_bars = partial_on.json()["bars"]
-                assert any(b["time"] == open_5m_start and b["is_closed"] is False for b in p_bars)
+                assert [(b["time"], b["is_closed"]) for b in p_bars] == [
+                    (closed_5m_start, True),
+                    (open_5m_start, False),
+                ]
+
+                # Backfill deadline -> HTTP 504 when connected
+                history_mode = "timeout"
+                timeout_resp = await client.get(
+                    "/api/bars",
+                    params={
+                        "contractId": "CON.F.US.MGC.Z26",
+                        "timeframe": "1m",
+                        "startTime": str(t0),
+                        "endTime": str(t_end),
+                    },
+                )
+                assert timeout_resp.status_code == 504
+                history_mode = "ok"
 
                 # Disconnect -> cached COMPLETE 1m/5m range still serves 200 offline
                 disc = await client.post("/api/disconnect", headers={"X-CSRF-Token": csrf})
@@ -476,7 +524,7 @@ async def test_f04_bars_http_endpoint_auth_validation_offline_and_resample(
                         "timeframe": "5m",
                         "resampleFrom": "1m",
                         "startTime": str(t0),
-                        "endTime": str(t_end),
+                        "endTime": str(t0 + 240),
                     },
                 )
                 assert offline_cached.status_code == 200
@@ -490,8 +538,6 @@ async def test_f04_bars_http_endpoint_auth_validation_offline_and_resample(
                 )
                 assert conn2.status_code == 200
                 login_mode = "fail"
-                from datetime import timedelta
-
                 app.state.topstep_auth._token_acquired_at -= timedelta(hours=23, minutes=5)
                 refresh_fail = await client.get(
                     "/api/bars",
@@ -509,3 +555,220 @@ async def test_f04_bars_http_endpoint_auth_validation_offline_and_resample(
                 assert not any(
                     bad in p for p in route_paths for bad in ("order", "position", "hubs/user")
                 )
+
+
+async def test_f04_end_to_end_healing_recovery_and_extreme_timestamp_quarantine(
+    tmp_path: Path,
+) -> None:
+    """Contract: Clean retry heals PROVIDER_GAP/CORRUPTED; 10**30 timestamps quarantine safely.
+
+    Defect caught: Unhealed intervals stuck incomplete forever, or OverflowError crashing backfill.
+    """
+    scenario = "provider_gap"
+    t0 = BASE_T
+    t1 = t0 + 60
+    t2 = t0 + 120
+    t_end = t0 + 180
+    upstream_calls = 0
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal upstream_calls
+        if request.url.path == "/api/Auth/loginKey":
+            return httpx.Response(200, json={"success": True, "token": "jwt-ok"})
+        if request.url.path == "/api/History/retrieveBars":
+            upstream_calls += 1
+            if scenario == "provider_gap":
+                return httpx.Response(200, json={"success": True, "bars": []})
+            if scenario == "corrupted_extreme_ts":
+                return httpx.Response(
+                    200,
+                    json={
+                        "success": True,
+                        "bars": [
+                            _wire_bar(t0, 5900.0),
+                            {
+                                "t": 10**30,
+                                "o": 5901.0,
+                                "h": 5902.0,
+                                "l": 5900.0,
+                                "c": 5901.5,
+                                "v": 10,
+                            },
+                            {
+                                "t": -(10**30),
+                                "o": 5901.0,
+                                "h": 5902.0,
+                                "l": 5900.0,
+                                "c": 5901.5,
+                                "v": 10,
+                            },
+                        ],
+                    },
+                )
+            if scenario == "clean_recover":
+                return httpx.Response(
+                    200,
+                    json={
+                        "success": True,
+                        "bars": [
+                            _wire_bar(t0, 5900.0),
+                            _wire_bar(t1, 5902.0),
+                            _wire_bar(t2, 5904.0),
+                        ],
+                    },
+                )
+        return httpx.Response(404)
+
+    settings = Settings(data_dir=tmp_path / "data")
+    sqlite_store = SqliteStore(tmp_path / "meta.db")
+    sqlite_store.initialize()
+    try:
+        parquet_store = ParquetStore(tmp_path / "data", sqlite_store=sqlite_store)
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            auth = TopstepAuthService(settings, client)
+            await auth.login("alice", "key-1")
+            rest = TopstepRestClient(settings, auth, client)
+            svc = HistoryBackfillService(settings, rest, parquet_store, sqlite_store)
+
+            # 1. PROVIDER_GAP -> is_complete=False
+            res_gap = await svc.sync_and_read_bars(
+                contract_id="CON.F.US.MES.Z26",
+                live=False,
+                timeframe="1m",
+                start_ts=t0,
+                end_ts=t_end,
+                now_utc=t_end + 120,
+            )
+            assert res_gap.provider_gap is True
+            assert res_gap.is_complete is False
+
+            # 2. Retry returns 10**30 and -10**30 alongside valid t0 -> quarantines without crash
+            scenario = "corrupted_extreme_ts"
+            res_bad = await svc.sync_and_read_bars(
+                contract_id="CON.F.US.MES.Z26",
+                live=False,
+                timeframe="1m",
+                start_ts=t0,
+                end_ts=t_end,
+                now_utc=t_end + 120,
+            )
+            assert res_bad.is_complete is False
+            assert res_bad.quarantined_count == 2
+            assert [b.time for b in res_bad.bars] == [t0]
+
+            # 3. Clean retry heals prior PROVIDER_GAP / CORRUPTED coverage
+            scenario = "clean_recover"
+            res_ok = await svc.sync_and_read_bars(
+                contract_id="CON.F.US.MES.Z26",
+                live=False,
+                timeframe="1m",
+                start_ts=t0,
+                end_ts=t_end,
+                now_utc=t_end + 120,
+            )
+            assert res_ok.is_complete is True
+            assert [b.time for b in res_ok.bars] == [t0, t1, t2]
+
+            # 4. Subsequent read uses 0 upstream calls and succeeds offline
+            calls_before_cache = upstream_calls
+            res_cached = await svc.sync_and_read_bars(
+                contract_id="CON.F.US.MES.Z26",
+                live=False,
+                timeframe="1m",
+                start_ts=t0,
+                end_ts=t_end,
+                now_utc=t_end + 120,
+                allow_upstream=False,
+            )
+            assert upstream_calls == calls_before_cache
+            assert res_cached.upstream_requests == 0
+            assert res_cached.is_complete is True
+            assert [b.time for b in res_cached.bars] == [t0, t1, t2]
+
+            # 5. Conflicting root_symbol raises ValueError; offline uncached raises TopstepAuthError
+            with pytest.raises(ValueError, match="conflicts"):
+                await svc.sync_and_read_bars(
+                    contract_id="CON.F.US.MGC.Z26",
+                    live=False,
+                    timeframe="1m",
+                    start_ts=t0,
+                    end_ts=t_end,
+                    root_symbol="MES",
+                    now_utc=t_end + 120,
+                )
+            with pytest.raises(TopstepAuthError):
+                await svc.sync_and_read_bars(
+                    contract_id="CON.F.US.MGC.Z26",
+                    live=False,
+                    timeframe="1m",
+                    start_ts=t0,
+                    end_ts=t_end,
+                    now_utc=t_end + 120,
+                    allow_upstream=False,
+                )
+    finally:
+        sqlite_store.close()
+
+
+async def test_f04_rest_client_deadline_non_list_and_unparseable_pages() -> None:
+    """Contract: retrieve_bars_paginated enforces deadline, non-list guard, and unparseable halt.
+
+    Defect caught: Hung pagination bypassing deadline, AttributeError on bad payload, or loops.
+    """
+    mode = "timeout"
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/Auth/loginKey":
+            return httpx.Response(200, json={"success": True, "token": "jwt-ok"})
+        if request.url.path == "/api/History/retrieveBars":
+            if mode == "timeout":
+                await asyncio.sleep(0.3)
+                return httpx.Response(200, json={"success": True, "bars": []})
+            if mode == "non_list":
+                return httpx.Response(200, json={"success": True, "bars": {"bad": 1}})
+            if mode == "unparseable":
+                return httpx.Response(
+                    200,
+                    json={
+                        "success": True,
+                        "bars": [{"t": "not-a-timestamp", "o": 1, "h": 2, "l": 1, "c": 2, "v": 1}],
+                    },
+                )
+        return httpx.Response(404)
+
+    settings = Settings(history_backfill_timeout_sec=0.1, upstream_max_retries=0)
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        auth = TopstepAuthService(settings, client)
+        await auth.login("alice", "key-1")
+        rest = TopstepRestClient(settings, auth, client)
+
+        with pytest.raises(UpstreamTimeoutError):
+            await rest.retrieve_bars_paginated(
+                contract_id="CON.F.US.MES.Z26",
+                live=False,
+                timeframe="1m",
+                start_ts=BASE_T,
+                end_ts=BASE_T + 300,
+            )
+
+        mode = "non_list"
+        with pytest.raises(UpstreamHTTPError):
+            await rest.retrieve_bars_paginated(
+                contract_id="CON.F.US.MES.Z26",
+                live=False,
+                timeframe="1m",
+                start_ts=BASE_T,
+                end_ts=BASE_T + 300,
+            )
+
+        mode = "unparseable"
+        bad_page = await rest.retrieve_bars_paginated(
+            contract_id="CON.F.US.MES.Z26",
+            live=False,
+            timeframe="1m",
+            start_ts=BASE_T,
+            end_ts=BASE_T + 300,
+        )
+        assert bad_page.provider_gap is True
+        assert bad_page.truncated is True
+        assert len(bad_page.raw_bars) == 1

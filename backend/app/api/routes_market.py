@@ -36,6 +36,10 @@ def _get_history_service(request: Request) -> HistoryBackfillService:
     return request.app.state.history_service
 
 
+def _utc_now_ts() -> int:
+    return int(datetime.now(UTC).timestamp())
+
+
 def _parse_query_timestamp(raw: str | None, field_name: str) -> int | None:
     if raw is None:
         return None
@@ -162,7 +166,7 @@ async def get_bars(
         else:
             eff_timeframe = "1m"
 
-        now_ts = int(datetime.now(UTC).timestamp())
+        now_ts = _utc_now_ts()
         parsed_end = _parse_query_timestamp(eff_end_raw, "end_time")
         eff_end = parsed_end if parsed_end is not None else now_ts
         parsed_start = _parse_query_timestamp(eff_start_raw, "start_time")
@@ -178,6 +182,7 @@ async def get_bars(
             limit=limit,
             resample_from=eff_resample_from,
             root_symbol=eff_root_symbol,
+            now_utc=now_ts,
             allow_upstream=topstep_auth.is_connected,
         )
     except ValueError as exc:

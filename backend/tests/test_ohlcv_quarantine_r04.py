@@ -78,6 +78,7 @@ def test_r04_validate_ohlcv_bar_strict_matrix() -> None:
         ({**_valid_raw(), "high": False}, "non_finite_price"),
         ({**_valid_raw(), "open": math.nan}, "non_finite_price"),
         ({**_valid_raw(), "high": math.inf}, "non_finite_price"),
+        ({**_valid_raw(), "open": 10**400}, "non_finite_price"),
         ({**_valid_raw(), "low": 0.0}, "non_positive_price"),
         ({**_valid_raw(), "open": -10.0}, "non_positive_price"),
         ({**_valid_raw(), "low": 5950.75}, "ohlc_bounds_violation"),  # low > min(open, close)
@@ -86,6 +87,7 @@ def test_r04_validate_ohlcv_bar_strict_matrix() -> None:
         ({**_valid_raw(), "volume": None}, "missing_volume"),
         ({**_valid_raw(), "volume": True}, "non_finite_volume"),
         ({**_valid_raw(), "volume": math.nan}, "non_finite_volume"),
+        ({**_valid_raw(), "volume": 10**400}, "non_finite_volume"),
         ({**_valid_raw(), "volume": -1.0}, "negative_volume"),
         ({**_valid_raw(), "time": "2026-11-10T14:55:00"}, "naive_timestamp"),
         ({**_valid_raw(), "time": True}, "invalid_timestamp"),
@@ -221,8 +223,46 @@ async def test_r04_end_to_end_quarantine_corrupts_coverage_and_exposes_redacted_
                     "ohlc_bounds_violation": 1,
                 }
 
-    # Verify direct HistoryBackfillService quarantine when called directly
-    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as upstream2:
+    # Verify direct HistoryBackfillService quarantine when called directly (including 10**400)
+    async def overflow_handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/Auth/loginKey":
+            return httpx.Response(200, json={"success": True, "token": "jwt-ok"})
+        if request.url.path == "/api/History/retrieveBars":
+            return httpx.Response(
+                200,
+                json={
+                    "success": True,
+                    "bars": [
+                        {
+                            "t": t0,
+                            "o": 5900.0,
+                            "h": 5902.0,
+                            "l": 5899.0,
+                            "c": 5901.0,
+                            "v": 10,
+                        },
+                        {
+                            "t": t1,
+                            "o": 10**400,
+                            "h": 5902.0,
+                            "l": 5899.0,
+                            "c": 5901.0,
+                            "v": 5,
+                        },
+                        {
+                            "t": t2,
+                            "o": 5901.0,
+                            "h": 5903.0,
+                            "l": 5900.0,
+                            "c": 5902.5,
+                            "v": 10**400,
+                        },
+                    ],
+                },
+            )
+        return httpx.Response(404)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(overflow_handler)) as upstream2:
         direct_sqlite = SqliteStore(tmp_path / "direct.db")
         direct_sqlite.initialize()
         try:
@@ -241,6 +281,12 @@ async def test_r04_end_to_end_quarantine_corrupts_coverage_and_exposes_redacted_
             )
             assert res.is_complete is False
             assert res.quarantined_count == 2
-            assert len(res.bars) == 1
+            assert [b.time for b in res.bars] == [t0]
+            key = StorageDatasetKey("topstepx", False, "CON.F.US.MES.Z26", "1m")
+            q_issues = await direct_sqlite.list_quality_issues(key)
+            assert {item["issue_code"] for item in q_issues} == {
+                "non_finite_price",
+                "non_finite_volume",
+            }
         finally:
             direct_sqlite.close()

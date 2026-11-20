@@ -12,7 +12,11 @@ from typing import Any
 import httpx
 
 from app.config import Settings
-from app.engine.ohlcv import extract_raw_bar_timestamp
+from app.engine.ohlcv import (
+    DEFAULT_MAX_FUTURE_SKEW_SEC,
+    DEFAULT_MIN_BAR_TIMESTAMP,
+    extract_raw_bar_timestamp,
+)
 from app.engine.session_calendar import (
     has_open_session_in_range,
     normalize_timeframe,
@@ -223,10 +227,13 @@ class TopstepRestClient:
             pages_fetched += 1
             raw_bars.extend(page_bars)
 
+            max_page_ts = end_ts + DEFAULT_MAX_FUTURE_SKEW_SEC
             page_times = [
                 ts
                 for item in page_bars
-                if isinstance(item, Mapping) and (ts := extract_raw_bar_timestamp(item)) is not None
+                if isinstance(item, Mapping)
+                and (ts := extract_raw_bar_timestamp(item)) is not None
+                and DEFAULT_MIN_BAR_TIMESTAMP <= ts <= max_page_ts
             ]
             if page_times:
                 page_min_ts = min(page_times)

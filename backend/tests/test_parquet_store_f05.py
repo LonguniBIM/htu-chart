@@ -3,10 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import threading
 from datetime import UTC, datetime
 from pathlib import Path
 
-import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 
@@ -164,18 +164,6 @@ async def test_f05_arrow_metadata_persisted_and_mismatch_raises_value_error(
 
     # Also test invalid bar rejection inside upsert_bars defense-in-depth
     clean_key = StorageDatasetKey("topstepx", False, "CON.F.US.MYM.Z26", "1m")
-    bad_table = pa.table(
-        {
-            "time": pa.array([t0], type=pa.int64()),
-            "open": pa.array([44000.0], type=pa.float64()),
-            "high": pa.array([44010.0], type=pa.float64()),
-            "low": pa.array([43990.0], type=pa.float64()),
-            "close": pa.array([44005.0], type=pa.float64()),
-            "volume": pa.array([1.0], type=pa.float64()),
-            "is_closed": pa.array([True], type=pa.bool_()),
-        }
-    )
-    assert bad_table.num_rows == 1
     up = await store.upsert_bars(
         clean_key,
         [
@@ -195,6 +183,8 @@ async def test_f05_arrow_metadata_persisted_and_mismatch_raises_value_error(
     assert up.accepted_count == 1
     assert len(up.rejected) == 1
     assert up.rejected[0].issue_code == "ohlc_bounds_violation"
+    stored_bars = await store.read_bars(clean_key, include_provisional=True)
+    assert [b.time for b in stored_bars] == [t0 + 60]
 
 
 async def test_f05_provisional_bar_precedence_and_read_filtering(tmp_path: Path) -> None:
@@ -305,11 +295,12 @@ async def test_f05_cme_globex_resample_across_est_edt_dst_and_provisional_bucket
     assert m5[0].low == 5899.0 and m5[0].close == 5906.0
     assert m5[0].volume == 25.0
 
-    # 1m -> 4h puts sun_open_est..mon_0100z into sun_open_est (18:00-22:00 EST)
+    # 1m -> 4h puts sun_open_est..mon_0100z into sun_open_est (18:00-22:00 EST) with full OHLCV
     h4 = await store.resample(key_1m, "4h", start_ts=sun_open_est, end_ts=mon_0100z, now_utc=NOW_TS)
-    assert len(h4) == 1 and h4[0].time == sun_open_est
+    assert len(h4) == 1
+    assert h4[0] == _bar(sun_open_est, 5900.0, 5912.0, 5895.0, 5897.0, 70.0, closed=True)
 
-    # 1m -> 1h splits 23:00Z, 00:00Z, 01:00Z into 3 hourly bars; open bar excluded when closed-only
+    # 1m -> 1h splits 23:00Z, 00:00Z, 01:00Z into 3 hourly bars; verify full OHLCV & provisional
     mid_1h_now = mon_0100z + 120
     h1_closed = await store.resample(
         key_1m,
@@ -319,7 +310,10 @@ async def test_f05_cme_globex_resample_across_est_edt_dst_and_provisional_bucket
         include_provisional=False,
         now_utc=mid_1h_now,
     )
-    assert [(b.time, b.is_closed) for b in h1_closed] == [(sun_open_est, True), (mon_0000z, True)]
+    assert h1_closed == [
+        _bar(sun_open_est, 5900.0, 5908.0, 5899.0, 5906.0, 25.0, closed=True),
+        _bar(mon_0000z, 5906.0, 5912.0, 5905.0, 5910.0, 20.0, closed=True),
+    ]
 
     h1_prov = await store.resample(
         key_1m,
@@ -329,11 +323,31 @@ async def test_f05_cme_globex_resample_across_est_edt_dst_and_provisional_bucket
         include_provisional=True,
         now_utc=mid_1h_now,
     )
-    assert [(b.time, b.is_closed) for b in h1_prov] == [
-        (sun_open_est, True),
-        (mon_0000z, True),
-        (mon_0100z, False),
+    assert h1_prov == [
+        _bar(sun_open_est, 5900.0, 5908.0, 5899.0, 5906.0, 25.0, closed=True),
+        _bar(mon_0000z, 5906.0, 5912.0, 5905.0, 5910.0, 20.0, closed=True),
+        _bar(mon_0100z, 5910.0, 5911.0, 5895.0, 5897.0, 25.0, closed=False),
     ]
+
+    # Boundary-slice resample test: mid-bucket start_ts=14:02..14:04 matches full 14:00..14:04
+    b_1400 = int(datetime(2026, 11, 10, 14, 0, tzinfo=UTC).timestamp())
+    slice_bars = [
+        _bar(b_1400, 6000.0, 6002.0, 5999.0, 6001.0, 10.0),
+        _bar(b_1400 + 60, 6001.0, 6003.0, 6000.0, 6002.0, 12.0),
+        _bar(b_1400 + 120, 6002.0, 6005.0, 6001.5, 6004.0, 14.0),
+        _bar(b_1400 + 180, 6004.0, 6004.5, 5998.0, 5999.5, 16.0),
+        _bar(b_1400 + 240, 5999.5, 6006.0, 5999.0, 6005.5, 18.0),
+    ]
+    await store.upsert_bars(key_1m, slice_bars, root_symbol="MES", now_utc=NOW_TS)
+    full_5m = await store.resample(
+        key_1m, "5m", start_ts=b_1400, end_ts=b_1400 + 240, now_utc=NOW_TS
+    )
+    mid_slice_5m = await store.resample(
+        key_1m, "5m", start_ts=b_1400 + 120, end_ts=b_1400 + 240, now_utc=NOW_TS
+    )
+    assert len(full_5m) == 1
+    assert mid_slice_5m == full_5m
+    assert mid_slice_5m[0] == _bar(b_1400, 6000.0, 6006.0, 5998.0, 6005.5, 70.0, closed=True)
 
     # Invalid coarsening paths rejected
     key_15m = StorageDatasetKey("topstepx", False, "CON.F.US.MES.Z26", "15m")
@@ -345,3 +359,82 @@ async def test_f05_cme_globex_resample_across_est_edt_dst_and_provisional_bucket
         await store.resample(key_3m, "5m")
     with pytest.raises(ValueError):
         await store.resample(key_1d, "4h")
+
+
+async def test_f05_cancellation_keeps_lock_held_until_worker_exits_and_serializes_reads(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Contract: Cancelling an in-flight upsert does not release lock before worker thread finishes.
+
+    Defect caught: asyncio.CancelledError releasing asyncio.Lock early and overlapping writes/reads.
+    """
+    store = ParquetStore(tmp_path / "data")
+    key = StorageDatasetKey("topstepx", False, "CON.F.US.MES.Z26", "1m")
+    t0 = int(datetime(2026, 11, 10, 14, 0, tzinfo=UTC).timestamp())
+
+    worker1_entered = threading.Event()
+    release_worker1 = threading.Event()
+    active_workers = 0
+    peak_workers = 0
+    count_guard = threading.Lock()
+    orig_upsert_sync = store._upsert_sync
+
+    def guarded_upsert_sync(
+        target: Path,
+        k: StorageDatasetKey,
+        valid_bars: list[OHLCVBar],
+        root_symbol: str | None,
+    ) -> tuple[int, int | None, int | None, int | None, str | None]:
+        nonlocal active_workers, peak_workers
+        with count_guard:
+            active_workers += 1
+            peak_workers = max(peak_workers, active_workers)
+        try:
+            if valid_bars and valid_bars[0].time == t0:
+                worker1_entered.set()
+                release_worker1.wait(timeout=5.0)
+            return orig_upsert_sync(target, k, valid_bars, root_symbol)
+        finally:
+            with count_guard:
+                active_workers -= 1
+
+    monkeypatch.setattr(store, "_upsert_sync", guarded_upsert_sync)
+
+    task1 = asyncio.create_task(
+        store.upsert_bars(
+            key,
+            [_bar(t0, 5900.0, 5901.0, 5899.0, 5900.5, 10.0)],
+            root_symbol="MES",
+            now_utc=NOW_TS,
+        )
+    )
+    await asyncio.to_thread(worker1_entered.wait, 2.0)
+
+    # Cancel task1 while its worker thread is still blocked
+    task1.cancel()
+    await asyncio.sleep(0.05)
+
+    # Launch concurrent upsert + read on the SAME key; neither may run until worker1 exits
+    task2 = asyncio.create_task(
+        store.upsert_bars(
+            key,
+            [_bar(t0 + 60, 5900.5, 5902.0, 5900.0, 5901.5, 20.0)],
+            root_symbol="MES",
+            now_utc=NOW_TS,
+        )
+    )
+    task3 = asyncio.create_task(store.read_bars(key))
+    await asyncio.sleep(0.05)
+    assert task2.done() is False
+    assert task3.done() is False
+    assert peak_workers == 1
+
+    # Unblock worker1; task1 cancels cleanly and task2/task3 complete with both bars intact
+    release_worker1.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task1
+    await task2
+    bars = await task3
+    assert peak_workers == 1
+    assert [b.time for b in bars] == [t0, t0 + 60]

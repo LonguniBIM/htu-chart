@@ -8,14 +8,18 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 
 from app.config import Settings
-from app.engine.instruments import INSTRUMENTS, StorageDatasetKey
+from app.engine.instruments import StorageDatasetKey, validate_root_symbol
 from app.engine.ohlcv import (
+    DEFAULT_MAX_FUTURE_SKEW_SEC,
+    DEFAULT_MIN_BAR_TIMESTAMP,
     OHLCVBar,
     extract_raw_bar_timestamp,
     parse_topstep_bar,
     validate_ohlcv_bar,
 )
 from app.engine.session_calendar import (
+    bucket_bounds,
+    bucket_open_utc,
     is_bar_closed,
     latest_closed_bucket_end_utc,
     normalize_timeframe,
@@ -25,6 +29,9 @@ from app.storage.parquet_store import ParquetStore, validate_resample_path
 from app.storage.sqlite_store import QualityIssueInput, SqliteStore
 from app.topstep.errors import TopstepAuthError
 from app.topstep.rest_client import PaginatedBarsResult, TopstepRestClient
+
+_SQLITE_INT64_MIN = -(2**63)
+_SQLITE_INT64_MAX = 2**63 - 1
 
 
 @dataclass(frozen=True)
@@ -40,17 +47,6 @@ class HistoryQueryResult:
     provider_gap: bool
     quarantined_count: int
     upstream_requests: int
-
-
-def infer_root_symbol(contract_id: str) -> str | None:
-    """Infer supported CME root symbol from a TopstepX contract ID segment."""
-    upper_id = contract_id.strip().upper()
-    if not upper_id:
-        return None
-    for root in INSTRUMENTS:
-        if f".{root}." in upper_id or upper_id.endswith(f".{root}"):
-            return root
-    return None
 
 
 class HistoryBackfillService:
@@ -80,6 +76,7 @@ class HistoryBackfillService:
     ) -> tuple[list[OHLCVBar], list[QualityIssueInput]]:
         valid_bars: list[OHLCVBar] = []
         issues: list[QualityIssueInput] = []
+        max_valid_ts = eff_now + DEFAULT_MAX_FUTURE_SKEW_SEC
 
         for raw in page_result.raw_bars:
             if not isinstance(raw, Mapping):
@@ -98,18 +95,22 @@ class HistoryBackfillService:
 
             parsed = parse_topstep_bar(raw)
             bar_ts = extract_raw_bar_timestamp(parsed)
-            bar_closed = (
-                is_bar_closed(bar_ts, source_tf, eff_now, root_symbol=eff_root)
-                if bar_ts is not None
-                else False
-            )
+            if bar_ts is not None and DEFAULT_MIN_BAR_TIMESTAMP <= bar_ts <= max_valid_ts:
+                bar_closed = is_bar_closed(bar_ts, source_tf, eff_now, root_symbol=eff_root)
+            else:
+                bar_closed = False
             val = validate_ohlcv_bar(parsed, is_closed=bar_closed, now_utc=eff_now)
             if val.is_valid and val.bar is not None:
                 valid_bars.append(val.bar)
             else:
+                safe_bar_time = (
+                    bar_ts
+                    if bar_ts is not None and _SQLITE_INT64_MIN <= bar_ts <= _SQLITE_INT64_MAX
+                    else None
+                )
                 issues.append(
                     QualityIssueInput(
-                        bar_time=bar_ts,
+                        bar_time=safe_bar_time,
                         interval_start=interval_start,
                         interval_end=interval_end,
                         issue_code=val.issue_code or "invalid_ohlcv",
@@ -141,27 +142,38 @@ class HistoryBackfillService:
 
         tf = normalize_timeframe(timeframe)
         source_tf = normalize_timeframe(resample_from) if resample_from else tf
+        is_resampled = bool(resample_from and source_tf != tf)
         if resample_from:
             validate_resample_path(source_tf, tf)
 
         source_key = StorageDatasetKey("topstepx", bool(live), contract_id, source_tf)
-        eff_root = (
-            root_symbol.strip().upper()
-            if root_symbol and root_symbol.strip()
-            else infer_root_symbol(contract_id)
+        dataset_meta = await self._sqlite.get_dataset_metadata(source_key)
+        stored_root = dataset_meta["root_symbol"] if dataset_meta else None
+        eff_root = validate_root_symbol(
+            contract_id,
+            root_symbol,
+            stored_root_symbol=stored_root,
         )
+
+        if is_resampled:
+            fetch_start = bucket_open_utc(start_ts, tf)
+            _, fetch_end = bucket_bounds(end_ts, tf, root_symbol=eff_root)
+        else:
+            fetch_start = start_ts
+            fetch_end = end_ts
+
         eff_now = now_utc if now_utc is not None else int(datetime.now(UTC).timestamp())
         closed_horizon = min(
-            end_ts,
+            fetch_end,
             latest_closed_bucket_end_utc(eff_now, source_tf, root_symbol=eff_root),
         )
 
         missing_closed = (
-            await self._sqlite.compute_missing_ranges(source_key, start_ts, closed_horizon)
-            if closed_horizon > start_ts
+            await self._sqlite.compute_missing_ranges(source_key, fetch_start, closed_horizon)
+            if closed_horizon > fetch_start
             else []
         )
-        need_live_tail = bool(include_partial and end_ts > closed_horizon)
+        need_live_tail = bool(include_partial and fetch_end > closed_horizon)
 
         if (missing_closed or need_live_tail) and not allow_upstream:
             raise TopstepAuthError("TopstepX is not connected")
@@ -178,7 +190,7 @@ class HistoryBackfillService:
                 timeframe=source_tf,
                 start_ts=r_start,
                 end_ts=r_end,
-                include_partial_bar=bool(include_partial and r_end == end_ts),
+                include_partial_bar=bool(include_partial and r_end == fetch_end),
                 root_symbol=eff_root,
             )
             upstream_requests += page_res.pages_fetched
@@ -236,6 +248,7 @@ class HistoryBackfillService:
                         earliest_valid_ts,
                         r_end,
                         status="COMPLETE",
+                        heal_existing=True,
                     )
                 else:
                     await self._sqlite.record_coverage(
@@ -260,19 +273,20 @@ class HistoryBackfillService:
                     r_start,
                     r_end,
                     status="COMPLETE",
+                    heal_existing=True,
                 )
 
         tail_truncated = False
         tail_provider_gap = False
         tail_quarantined = 0
         if need_live_tail:
-            tail_start = max(start_ts, closed_horizon)
+            tail_start = max(fetch_start, closed_horizon)
             tail_res = await self._rest.retrieve_bars_paginated(
                 contract_id=contract_id,
                 live=bool(live),
                 timeframe=source_tf,
                 start_ts=tail_start,
-                end_ts=end_ts,
+                end_ts=fetch_end,
                 include_partial_bar=True,
                 root_symbol=eff_root,
             )
@@ -283,7 +297,7 @@ class HistoryBackfillService:
                 eff_now=eff_now,
                 eff_root=eff_root,
                 interval_start=tail_start,
-                interval_end=end_ts,
+                interval_end=fetch_end,
             )
             await self._parquet.upsert_bars(
                 source_key,
@@ -296,7 +310,7 @@ class HistoryBackfillService:
                 await self._sqlite.record_coverage(
                     source_key,
                     tail_start,
-                    end_ts,
+                    fetch_end,
                     status="CORRUPTED",
                     quarantined_count=len(tail_issues),
                     truncated=tail_res.truncated,
@@ -310,7 +324,7 @@ class HistoryBackfillService:
             any_truncated = any_truncated or tail_truncated
             any_provider_gap = any_provider_gap or tail_provider_gap
 
-        if resample_from and source_tf != tf:
+        if is_resampled:
             bars = await self._parquet.resample(
                 source_key,
                 tf,
@@ -330,12 +344,16 @@ class HistoryBackfillService:
                 limit=limit,
             )
 
-        if end_ts <= closed_horizon:
-            is_complete = await self._sqlite.is_interval_complete(source_key, start_ts, end_ts)
+        if fetch_end <= closed_horizon:
+            is_complete = await self._sqlite.is_interval_complete(
+                source_key, fetch_start, fetch_end
+            )
         else:
             is_complete = (
-                closed_horizon > start_ts
-                and await self._sqlite.is_interval_complete(source_key, start_ts, closed_horizon)
+                closed_horizon > fetch_start
+                and await self._sqlite.is_interval_complete(
+                    source_key, fetch_start, closed_horizon
+                )
                 and not tail_truncated
                 and not tail_provider_gap
                 and tail_quarantined == 0

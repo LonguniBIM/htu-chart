@@ -108,7 +108,10 @@ def _validate_price(
     val = raw[field]
     if isinstance(val, bool) or not isinstance(val, (int, float)):
         return None, "non_finite_price", f"Invalid price type for '{field}': {val!r}"
-    fval = float(val)
+    try:
+        fval = float(val)
+    except OverflowError:
+        return None, "non_finite_price", f"Overflow price for '{field}': {val!r}"
     if not math.isfinite(fval):
         return None, "non_finite_price", f"Non-finite price for '{field}': {val!r}"
     if fval <= 0.0:
@@ -122,7 +125,10 @@ def _validate_volume(raw: Mapping[str, Any]) -> tuple[float | None, str | None, 
     val = raw["volume"]
     if isinstance(val, bool) or not isinstance(val, (int, float)):
         return None, "non_finite_volume", f"Invalid volume type: {val!r}"
-    fvol = float(val)
+    try:
+        fvol = float(val)
+    except OverflowError:
+        return None, "non_finite_volume", f"Overflow volume: {val!r}"
     if not math.isfinite(fvol):
         return None, "non_finite_volume", f"Non-finite volume: {val!r}"
     if fvol < 0.0:

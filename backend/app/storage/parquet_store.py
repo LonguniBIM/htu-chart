@@ -7,28 +7,32 @@ import os
 import tempfile
 import threading
 import time
-from collections.abc import Mapping, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, TypeVar
 
 import polars as pl
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-from app.engine.instruments import StorageDatasetKey
+from app.engine.instruments import StorageDatasetKey, validate_root_symbol
 from app.engine.ohlcv import OHLCVBar, ValidationResult, validate_ohlcv_bar
 from app.engine.session_calendar import (
     TIMEFRAME_SECONDS,
     HolidaySpec,
     assign_bucket_open_utc,
+    bucket_bounds,
+    bucket_open_utc,
     is_bar_closed,
     normalize_timeframe,
 )
 
 if TYPE_CHECKING:
     from app.storage.sqlite_store import SqliteStore
+
+_T = TypeVar("_T")
 
 PARQUET_ARROW_SCHEMA = pa.schema(
     [
@@ -154,6 +158,7 @@ class ParquetStore:
         self._parquet_root = (self._data_dir / "parquet").resolve()
         self._sqlite_store = sqlite_store
         self._locks: dict[tuple[str, bool, str, str], asyncio.Lock] = {}
+        self._thread_locks: dict[tuple[str, bool, str, str], threading.Lock] = {}
         self._locks_guard = threading.Lock()
 
     def _get_lock(self, key: StorageDatasetKey) -> asyncio.Lock:
@@ -164,6 +169,39 @@ class ParquetStore:
                 lock = asyncio.Lock()
                 self._locks[lock_key] = lock
             return lock
+
+    def _get_thread_lock(self, key: StorageDatasetKey) -> threading.Lock:
+        lock_key = key.lock_key()
+        with self._locks_guard:
+            lock = self._thread_locks.get(lock_key)
+            if lock is None:
+                lock = threading.Lock()
+                self._thread_locks[lock_key] = lock
+            return lock
+
+    async def _run_locked(
+        self,
+        key: StorageDatasetKey,
+        work: Callable[[], Awaitable[_T]],
+    ) -> _T:
+        async with self._get_lock(key):
+            task = asyncio.create_task(work())
+            cancelled_exc: asyncio.CancelledError | None = None
+            while not task.done():
+                try:
+                    await asyncio.shield(task)
+                except asyncio.CancelledError as exc:
+                    if cancelled_exc is None:
+                        cancelled_exc = exc
+                except BaseException:
+                    if cancelled_exc is not None:
+                        break
+                    raise
+            if cancelled_exc is not None:
+                if not task.cancelled():
+                    _ = task.exception()
+                raise cancelled_exc
+            return task.result()
 
     def resolve_path(self, key: StorageDatasetKey) -> Path:
         """Resolve and path-traversal-verify the target Parquet file path."""
@@ -192,90 +230,91 @@ class ParquetStore:
         valid_bars: list[OHLCVBar],
         root_symbol: str | None,
     ) -> tuple[int, int | None, int | None, int | None, str | None]:
-        existing_df = pl.DataFrame(schema=_POLARS_SCHEMA)
-        existing_root: str | None = None
-        if target.exists():
-            existing_df, existing_root = self._read_table_sync(target, key)
+        with self._get_thread_lock(key):
+            existing_df = pl.DataFrame(schema=_POLARS_SCHEMA)
+            existing_root: str | None = None
+            if target.exists():
+                existing_df, existing_root = self._read_table_sync(target, key)
 
-        eff_root = (
-            root_symbol.strip().upper()
-            if root_symbol and root_symbol.strip()
-            else existing_root
-        )
-
-        if not valid_bars:
-            if existing_df.is_empty():
-                return 0, None, None, None, eff_root
-            min_t = int(existing_df["time"].min())
-            max_t = int(existing_df["time"].max())
-            closed_df = existing_df.filter(pl.col("is_closed"))
-            last_closed = int(closed_df["time"].max()) if not closed_df.is_empty() else None
-            return existing_df.height, min_t, max_t, last_closed, eff_root
-
-        incoming_df = pl.DataFrame(
-            {
-                "time": [b.time for b in valid_bars],
-                "open": [b.open for b in valid_bars],
-                "high": [b.high for b in valid_bars],
-                "low": [b.low for b in valid_bars],
-                "close": [b.close for b in valid_bars],
-                "volume": [b.volume for b in valid_bars],
-                "is_closed": [b.is_closed for b in valid_bars],
-            },
-            schema=_POLARS_SCHEMA,
-        ).with_columns(
-            pl.col("is_closed").cast(pl.Int8).alias("_closed_rank"),
-            pl.arange(1, len(valid_bars) + 1, dtype=pl.Int64).alias("_source_order"),
-        )
-
-        if existing_df.is_empty():
-            combined = incoming_df
-        else:
-            existing_tagged = existing_df.with_columns(
-                pl.col("is_closed").cast(pl.Int8).alias("_closed_rank"),
-                pl.lit(0, dtype=pl.Int64).alias("_source_order"),
+            eff_root = validate_root_symbol(
+                key.contract_id,
+                root_symbol,
+                stored_root_symbol=existing_root,
             )
-            combined = pl.concat([existing_tagged, incoming_df], how="vertical")
 
-        merged = (
-            combined.sort(["time", "_closed_rank", "_source_order"])
-            .unique(subset=["time"], keep="last")
-            .drop(["_closed_rank", "_source_order"])
-            .sort("time")
-        )
+            if not valid_bars:
+                if existing_df.is_empty():
+                    return 0, None, None, None, eff_root
+                min_t = int(existing_df["time"].min())
+                max_t = int(existing_df["time"].max())
+                closed_df = existing_df.filter(pl.col("is_closed"))
+                last_closed = int(closed_df["time"].max()) if not closed_df.is_empty() else None
+                return existing_df.height, min_t, max_t, last_closed, eff_root
 
-        arrow_table = merged.to_arrow().cast(PARQUET_ARROW_SCHEMA)
-        metadata = {
-            b"topstep_provider": key.provider.encode("utf-8"),
-            b"topstep_live_mode": key.mode_label.encode("utf-8"),
-            b"topstep_contract_id": key.contract_id.encode("utf-8"),
-            b"topstep_timeframe": key.timeframe.encode("utf-8"),
-            b"topstep_root_symbol": (eff_root or "").encode("utf-8"),
-        }
-        arrow_table = arrow_table.replace_schema_metadata(metadata)
+            incoming_df = pl.DataFrame(
+                {
+                    "time": [b.time for b in valid_bars],
+                    "open": [b.open for b in valid_bars],
+                    "high": [b.high for b in valid_bars],
+                    "low": [b.low for b in valid_bars],
+                    "close": [b.close for b in valid_bars],
+                    "volume": [b.volume for b in valid_bars],
+                    "is_closed": [b.is_closed for b in valid_bars],
+                },
+                schema=_POLARS_SCHEMA,
+            ).with_columns(
+                pl.col("is_closed").cast(pl.Int8).alias("_closed_rank"),
+                pl.arange(1, len(valid_bars) + 1, dtype=pl.Int64).alias("_source_order"),
+            )
 
-        target.parent.mkdir(parents=True, exist_ok=True)
-        tmp_file = tempfile.NamedTemporaryFile(
-            dir=target.parent,
-            prefix=f".{target.stem}.",
-            suffix=".tmp",
-            delete=False,
-        )
-        tmp_path = Path(tmp_file.name)
-        tmp_file.close()
+            if existing_df.is_empty():
+                combined = incoming_df
+            else:
+                existing_tagged = existing_df.with_columns(
+                    pl.col("is_closed").cast(pl.Int8).alias("_closed_rank"),
+                    pl.lit(0, dtype=pl.Int64).alias("_source_order"),
+                )
+                combined = pl.concat([existing_tagged, incoming_df], how="vertical")
 
-        try:
-            pq.write_table(arrow_table, tmp_path, compression="zstd")
-            _atomic_replace_with_retry(tmp_path, target)
-        finally:
-            if tmp_path.exists():
-                tmp_path.unlink(missing_ok=True)
+            merged = (
+                combined.sort(["time", "_closed_rank", "_source_order"])
+                .unique(subset=["time"], keep="last")
+                .drop(["_closed_rank", "_source_order"])
+                .sort("time")
+            )
 
-        min_t = int(merged["time"].min()) if not merged.is_empty() else None
-        max_t = int(merged["time"].max()) if not merged.is_empty() else None
-        closed_df = merged.filter(pl.col("is_closed"))
-        last_closed = int(closed_df["time"].max()) if not closed_df.is_empty() else None
-        return merged.height, min_t, max_t, last_closed, eff_root
+            arrow_table = merged.to_arrow().cast(PARQUET_ARROW_SCHEMA)
+            metadata = {
+                b"topstep_provider": key.provider.encode("utf-8"),
+                b"topstep_live_mode": key.mode_label.encode("utf-8"),
+                b"topstep_contract_id": key.contract_id.encode("utf-8"),
+                b"topstep_timeframe": key.timeframe.encode("utf-8"),
+                b"topstep_root_symbol": (eff_root or "").encode("utf-8"),
+            }
+            arrow_table = arrow_table.replace_schema_metadata(metadata)
+
+            target.parent.mkdir(parents=True, exist_ok=True)
+            tmp_file = tempfile.NamedTemporaryFile(
+                dir=target.parent,
+                prefix=f".{target.stem}.",
+                suffix=".tmp",
+                delete=False,
+            )
+            tmp_path = Path(tmp_file.name)
+            tmp_file.close()
+
+            try:
+                pq.write_table(arrow_table, tmp_path, compression="zstd")
+                _atomic_replace_with_retry(tmp_path, target)
+            finally:
+                if tmp_path.exists():
+                    tmp_path.unlink(missing_ok=True)
+
+            min_t = int(merged["time"].min()) if not merged.is_empty() else None
+            max_t = int(merged["time"].max()) if not merged.is_empty() else None
+            closed_df = merged.filter(pl.col("is_closed"))
+            last_closed = int(closed_df["time"].max()) if not closed_df.is_empty() else None
+            return merged.height, min_t, max_t, last_closed, eff_root
 
     async def upsert_bars(
         self,
@@ -287,6 +326,7 @@ class ParquetStore:
     ) -> UpsertResult:
         """Validate, merge with provisional-bar precedence, and atomically persist bars."""
         normalize_timeframe(key.timeframe)
+        validate_root_symbol(key.contract_id, root_symbol)
         target = self.resolve_path(key)
 
         valid_bars: list[OHLCVBar] = []
@@ -314,7 +354,7 @@ class ParquetStore:
             else:
                 rejected.append(res)
 
-        async with self._get_lock(key):
+        async def _work() -> tuple[int, int | None, int | None, int | None]:
             written_rows, min_t, max_t, last_closed, eff_root = await asyncio.to_thread(
                 self._upsert_sync,
                 target,
@@ -332,6 +372,9 @@ class ParquetStore:
                     max_bar_time=max_t,
                     last_closed_bar_time=last_closed,
                 )
+            return written_rows, min_t, max_t, last_closed
+
+        written_rows, min_t, max_t, last_closed = await self._run_locked(key, _work)
 
         return UpsertResult(
             key=key,
@@ -353,23 +396,24 @@ class ParquetStore:
         include_provisional: bool,
         limit: int | None,
     ) -> list[OHLCVBar]:
-        if not target.exists():
-            return []
-        df, _ = self._read_table_sync(target, key)
-        if df.is_empty():
-            return []
-        if not include_provisional:
-            df = df.filter(pl.col("is_closed"))
-        if start_ts is not None:
-            df = df.filter(pl.col("time") >= start_ts)
-        if end_ts is not None:
-            df = df.filter(pl.col("time") <= end_ts)
-        df = df.sort("time")
-        if limit is not None:
-            if limit <= 0:
+        with self._get_thread_lock(key):
+            if not target.exists():
                 return []
-            df = df.tail(limit)
-        return _df_to_bars(df)
+            df, _ = self._read_table_sync(target, key)
+            if df.is_empty():
+                return []
+            if not include_provisional:
+                df = df.filter(pl.col("is_closed"))
+            if start_ts is not None:
+                df = df.filter(pl.col("time") >= start_ts)
+            if end_ts is not None:
+                df = df.filter(pl.col("time") <= end_ts)
+            df = df.sort("time")
+            if limit is not None:
+                if limit <= 0:
+                    return []
+                df = df.tail(limit)
+            return _df_to_bars(df)
 
     async def read_bars(
         self,
@@ -382,7 +426,8 @@ class ParquetStore:
     ) -> list[OHLCVBar]:
         """Read cached bars under dataset lock, excluding provisional bars by default."""
         target = self.resolve_path(key)
-        async with self._get_lock(key):
+
+        async def _work() -> list[OHLCVBar]:
             return await asyncio.to_thread(
                 self._read_bars_sync,
                 target,
@@ -392,6 +437,8 @@ class ParquetStore:
                 include_provisional=include_provisional,
                 limit=limit,
             )
+
+        return await self._run_locked(key, _work)
 
     def _resample_sync(
         self,
@@ -407,72 +454,88 @@ class ParquetStore:
         holiday_overrides: Mapping[date, HolidaySpec] | None,
         limit: int | None,
     ) -> list[OHLCVBar]:
-        if not target.exists():
-            return []
-        df, existing_root = self._read_table_sync(target, source_key)
-        eff_root = (
-            root_symbol.strip().upper()
-            if root_symbol and root_symbol.strip()
-            else existing_root
-        )
-
-        if df.is_empty():
-            return []
-        if not include_provisional:
-            df = df.filter(pl.col("is_closed"))
-        if start_ts is not None:
-            df = df.filter(pl.col("time") >= start_ts)
-        if end_ts is not None:
-            df = df.filter(pl.col("time") <= end_ts)
-        if df.is_empty():
-            return []
-
-        df = df.sort("time")
-        times = [int(t) for t in df["time"].to_list()]
-        bucket_opens = assign_bucket_open_utc(times, target_tf)
-
-        grouped = (
-            df.with_columns(pl.Series("bucket_open", bucket_opens, dtype=pl.Int64))
-            .group_by("bucket_open", maintain_order=True)
-            .agg(
-                pl.col("open").first().alias("open"),
-                pl.col("high").max().alias("high"),
-                pl.col("low").min().alias("low"),
-                pl.col("close").last().alias("close"),
-                pl.col("volume").sum().alias("volume"),
-                pl.col("is_closed").all().alias("all_inputs_closed"),
-            )
-            .sort("bucket_open")
-        )
-
-        out: list[OHLCVBar] = []
-        for row in grouped.iter_rows(named=True):
-            b_open = int(row["bucket_open"])
-            bar_closed = bool(row["all_inputs_closed"]) and is_bar_closed(
-                b_open,
-                target_tf,
-                now_utc,
-                root_symbol=eff_root,
-                holiday_overrides=holiday_overrides,
-            )
-            if not include_provisional and not bar_closed:
-                continue
-            out.append(
-                OHLCVBar(
-                    time=b_open,
-                    open=float(row["open"]),
-                    high=float(row["high"]),
-                    low=float(row["low"]),
-                    close=float(row["close"]),
-                    volume=float(row["volume"]),
-                    is_closed=bar_closed,
-                )
-            )
-        if limit is not None:
-            if limit <= 0:
+        with self._get_thread_lock(source_key):
+            if not target.exists():
                 return []
-            out = out[-limit:]
-        return out
+            df, existing_root = self._read_table_sync(target, source_key)
+            eff_root = validate_root_symbol(
+                source_key.contract_id,
+                root_symbol,
+                stored_root_symbol=existing_root,
+            )
+
+            if df.is_empty():
+                return []
+            if start_ts is not None:
+                aligned_start = bucket_open_utc(start_ts, target_tf)
+                df = df.filter(pl.col("time") >= aligned_start)
+            if end_ts is not None:
+                _, aligned_end = bucket_bounds(
+                    end_ts,
+                    target_tf,
+                    root_symbol=eff_root,
+                    holiday_overrides=holiday_overrides,
+                )
+                df = df.filter(pl.col("time") < aligned_end)
+            if df.is_empty():
+                return []
+
+            df = df.sort("time")
+            times = [int(t) for t in df["time"].to_list()]
+            bucket_opens = assign_bucket_open_utc(times, target_tf)
+
+            grouped = (
+                df.with_columns(pl.Series("bucket_open", bucket_opens, dtype=pl.Int64))
+                .group_by("bucket_open", maintain_order=True)
+                .agg(
+                    pl.col("open").first().alias("open"),
+                    pl.col("high").max().alias("high"),
+                    pl.col("low").min().alias("low"),
+                    pl.col("close").last().alias("close"),
+                    pl.col("volume").sum().alias("volume"),
+                    pl.col("is_closed").all().alias("all_inputs_closed"),
+                )
+                .sort("bucket_open")
+            )
+
+            out: list[OHLCVBar] = []
+            for row in grouped.iter_rows(named=True):
+                b_open = int(row["bucket_open"])
+                _, b_end = bucket_bounds(
+                    b_open,
+                    target_tf,
+                    root_symbol=eff_root,
+                    holiday_overrides=holiday_overrides,
+                )
+                if start_ts is not None and b_end <= start_ts:
+                    continue
+                if end_ts is not None and b_open > end_ts:
+                    continue
+                bar_closed = bool(row["all_inputs_closed"]) and is_bar_closed(
+                    b_open,
+                    target_tf,
+                    now_utc,
+                    root_symbol=eff_root,
+                    holiday_overrides=holiday_overrides,
+                )
+                if not include_provisional and not bar_closed:
+                    continue
+                out.append(
+                    OHLCVBar(
+                        time=b_open,
+                        open=float(row["open"]),
+                        high=float(row["high"]),
+                        low=float(row["low"]),
+                        close=float(row["close"]),
+                        volume=float(row["volume"]),
+                        is_closed=bar_closed,
+                    )
+                )
+            if limit is not None:
+                if limit <= 0:
+                    return []
+                out = out[-limit:]
+            return out
 
     async def resample(
         self,
@@ -489,10 +552,11 @@ class ParquetStore:
     ) -> list[OHLCVBar]:
         """Resample cached source bars onto CME Globex 18:00 ET buckets in Polars."""
         _, target_tf = validate_resample_path(source_key.timeframe, target_timeframe)
+        validate_root_symbol(source_key.contract_id, root_symbol)
         target = self.resolve_path(source_key)
         eff_now = now_utc if now_utc is not None else int(datetime.now(UTC).timestamp())
 
-        async with self._get_lock(source_key):
+        async def _work() -> list[OHLCVBar]:
             return await asyncio.to_thread(
                 self._resample_sync,
                 target,
@@ -506,3 +570,5 @@ class ParquetStore:
                 holiday_overrides=holiday_overrides,
                 limit=limit,
             )
+
+        return await self._run_locked(source_key, _work)
