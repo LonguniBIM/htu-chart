@@ -77,37 +77,38 @@ async def get_contracts(
     symbol_list = [s.strip().upper() for s in symbols.split(",") if s.strip()]
     results: dict[str, dict[str, Any]] = {}
 
-    for symbol in symbol_list:
-        try:
-            raw_contracts = await rest_client.search_contracts(symbol, live=effective_live)
-            selected = resolve_contract(symbol, raw_contracts)
-            results[symbol] = {
-                "selected": selected,
-                "error_type": None,
-                "error": None,
-            }
-        except (KeyRotationRequiredError, TopstepAuthError) as exc:
-            raise HTTPException(
-                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                detail=redact_secrets(str(exc), topstep_auth.active_redaction_secrets()),
-            ) from exc
-        except (
-            ContractNotFoundError,
-            AmbiguousContractError,
-            UpstreamTimeoutError,
-            UpstreamHTTPError,
-        ) as exc:
-            active_secrets = topstep_auth.active_redaction_secrets()
-            if not topstep_auth.is_connected:
+    with topstep_auth.redaction_scope() as redaction_scope:
+        for symbol in symbol_list:
+            try:
+                raw_contracts = await rest_client.search_contracts(symbol, live=effective_live)
+                selected = resolve_contract(symbol, raw_contracts)
+                results[symbol] = {
+                    "selected": selected,
+                    "error_type": None,
+                    "error": None,
+                }
+            except (KeyRotationRequiredError, TopstepAuthError) as exc:
                 raise HTTPException(
                     status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                    detail=redact_secrets(str(exc), active_secrets),
+                    detail=redact_secrets(str(exc), redaction_scope.secrets()),
                 ) from exc
-            results[symbol] = {
-                "selected": None,
-                "error_type": type(exc).__name__,
-                "error": redact_secrets(str(exc), active_secrets),
-            }
+            except (
+                ContractNotFoundError,
+                AmbiguousContractError,
+                UpstreamTimeoutError,
+                UpstreamHTTPError,
+            ) as exc:
+                active_secrets = redaction_scope.secrets()
+                if not topstep_auth.is_connected:
+                    raise HTTPException(
+                        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                        detail=redact_secrets(str(exc), active_secrets),
+                    ) from exc
+                results[symbol] = {
+                    "selected": None,
+                    "error_type": type(exc).__name__,
+                    "error": redact_secrets(str(exc), active_secrets),
+                }
 
     return {"live": effective_live, "contracts": results}
 
@@ -158,65 +159,68 @@ async def get_bars(
 
     effective_live = topstep_auth.live if live is None else bool(live)
 
-    try:
-        if timeframe is not None:
-            eff_timeframe = normalize_timeframe(timeframe)
-        elif unit is not None or eff_unit_number is not None:
-            if unit is None or eff_unit_number is None:
-                raise ValueError("Both unit and unitNumber are required when timeframe is omitted")
-            eff_timeframe = timeframe_from_topstep_unit(unit, eff_unit_number)
-        else:
-            eff_timeframe = "1m"
+    with topstep_auth.redaction_scope() as redaction_scope:
+        try:
+            if timeframe is not None:
+                eff_timeframe = normalize_timeframe(timeframe)
+            elif unit is not None or eff_unit_number is not None:
+                if unit is None or eff_unit_number is None:
+                    raise ValueError(
+                        "Both unit and unitNumber are required when timeframe is omitted"
+                    )
+                eff_timeframe = timeframe_from_topstep_unit(unit, eff_unit_number)
+            else:
+                eff_timeframe = "1m"
 
-        now_ts = _utc_now_ts()
-        parsed_end = _parse_query_timestamp(eff_end_raw, "end_time")
-        eff_end = parsed_end if parsed_end is not None else now_ts
-        parsed_start = _parse_query_timestamp(eff_start_raw, "start_time")
-        eff_start = parsed_start if parsed_start is not None else eff_end - (days * 86400)
+            now_ts = _utc_now_ts()
+            parsed_end = _parse_query_timestamp(eff_end_raw, "end_time")
+            eff_end = parsed_end if parsed_end is not None else now_ts
+            parsed_start = _parse_query_timestamp(eff_start_raw, "start_time")
+            eff_start = parsed_start if parsed_start is not None else eff_end - (days * 86400)
 
-        result = await history_service.sync_and_read_bars(
-            contract_id=eff_contract,
-            live=effective_live,
-            timeframe=eff_timeframe,
-            start_ts=eff_start,
-            end_ts=eff_end,
-            include_partial=bool(eff_include_partial),
-            limit=limit,
-            resample_from=eff_resample_from,
-            root_symbol=eff_root_symbol,
-            now_utc=now_ts,
-            allow_upstream=topstep_auth.is_connected,
-        )
-    except ValueError as exc:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=redact_secrets(str(exc), topstep_auth.active_redaction_secrets()),
-        ) from exc
-    except (KeyRotationRequiredError, TopstepAuthError) as exc:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail=redact_secrets(str(exc), topstep_auth.active_redaction_secrets()),
-        ) from exc
-    except UpstreamTimeoutError as exc:
-        code = (
-            status.HTTP_503_SERVICE_UNAVAILABLE
-            if not topstep_auth.is_connected
-            else status.HTTP_504_GATEWAY_TIMEOUT
-        )
-        raise HTTPException(
-            status_code=code,
-            detail=redact_secrets(str(exc), topstep_auth.active_redaction_secrets()),
-        ) from exc
-    except UpstreamHTTPError as exc:
-        code = (
-            status.HTTP_503_SERVICE_UNAVAILABLE
-            if not topstep_auth.is_connected
-            else status.HTTP_502_BAD_GATEWAY
-        )
-        raise HTTPException(
-            status_code=code,
-            detail=redact_secrets(str(exc), topstep_auth.active_redaction_secrets()),
-        ) from exc
+            result = await history_service.sync_and_read_bars(
+                contract_id=eff_contract,
+                live=effective_live,
+                timeframe=eff_timeframe,
+                start_ts=eff_start,
+                end_ts=eff_end,
+                include_partial=bool(eff_include_partial),
+                limit=limit,
+                resample_from=eff_resample_from,
+                root_symbol=eff_root_symbol,
+                now_utc=now_ts,
+                allow_upstream=topstep_auth.is_connected,
+            )
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=redact_secrets(str(exc), redaction_scope.secrets()),
+            ) from exc
+        except (KeyRotationRequiredError, TopstepAuthError) as exc:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail=redact_secrets(str(exc), redaction_scope.secrets()),
+            ) from exc
+        except UpstreamTimeoutError as exc:
+            code = (
+                status.HTTP_503_SERVICE_UNAVAILABLE
+                if not topstep_auth.is_connected
+                else status.HTTP_504_GATEWAY_TIMEOUT
+            )
+            raise HTTPException(
+                status_code=code,
+                detail=redact_secrets(str(exc), redaction_scope.secrets()),
+            ) from exc
+        except UpstreamHTTPError as exc:
+            code = (
+                status.HTTP_503_SERVICE_UNAVAILABLE
+                if not topstep_auth.is_connected
+                else status.HTTP_502_BAD_GATEWAY
+            )
+            raise HTTPException(
+                status_code=code,
+                detail=redact_secrets(str(exc), redaction_scope.secrets()),
+            ) from exc
 
     return {
         "provider": "topstepx",

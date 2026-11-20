@@ -5,6 +5,8 @@ from __future__ import annotations
 import asyncio
 import json
 from collections import deque
+from collections.abc import Iterable, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from typing import Any, Literal
@@ -21,6 +23,32 @@ from app.topstep.errors import (
 )
 
 ConnectionState = Literal["DISCONNECTED", "CONNECTED"]
+
+
+class CredentialRedactionScope:
+    """Request-scoped credential collector used solely for internal redaction."""
+
+    def __init__(self, initial_secrets: Iterable[str] = ()) -> None:
+        self._secrets: set[str] = {s for s in initial_secrets if s}
+
+    def record(self, *values: str | None) -> None:
+        """Record additional non-empty credentials observed while the scope is active."""
+        for value in values:
+            if value:
+                self._secrets.add(value)
+
+    def secrets(self) -> tuple[str, ...]:
+        """Return captured secrets ordered longest-first to avoid partial prefix masking."""
+        return tuple(sorted(self._secrets, key=len, reverse=True))
+
+    def clear(self) -> None:
+        """Erase captured secrets when the owning request exits."""
+        self._secrets.clear()
+
+    def __repr__(self) -> str:
+        return "CredentialRedactionScope(<redacted>)"
+
+    __str__ = __repr__
 
 
 @dataclass(frozen=True)
@@ -59,6 +87,7 @@ class TopstepAuthService:
         self._lock = asyncio.Lock()
         self._token: str | None = None
         self._session_tokens: deque[str] = deque(maxlen=8)
+        self._active_scopes: set[CredentialRedactionScope] = set()
         self._username: str | None = None
         self._api_key: str | None = None
         self._live: bool = settings.topstepx_live
@@ -101,18 +130,35 @@ class TopstepAuthService:
             key_rotation_enforced=self._settings.key_rotation_enforce,
         )
 
+    def _notify_active_scopes(self, *values: str | None) -> None:
+        for scope in tuple(self._active_scopes):
+            scope.record(*values)
+
+    @contextmanager
+    def redaction_scope(self) -> Iterator[CredentialRedactionScope]:
+        """Snapshot active credentials at entry and track credentials rotated during the block."""
+        scope = CredentialRedactionScope(self.active_redaction_secrets())
+        self._active_scopes.add(scope)
+        try:
+            yield scope
+        finally:
+            self._active_scopes.discard(scope)
+            scope.clear()
+
     def _clear_session_state(
         self,
         error_msg: str | None = None,
         *,
         clear_credentials: bool = False,
     ) -> None:
+        self._notify_active_scopes(*self._session_tokens, self._token, self._api_key)
         self._token = None
         self._token_acquired_at = None
         self._connected_at = None
         self._connection_state = "DISCONNECTED"
         self._last_error = error_msg
         if clear_credentials:
+            self._session_tokens.clear()
             self._username = None
             self._api_key = None
 
@@ -180,6 +226,7 @@ class TopstepAuthService:
         self._enforce_key_rotation(now=now)
         cleaned_user = username.strip()
         cleaned_key = api_key.strip()
+        self._notify_active_scopes(cleaned_key)
         if not cleaned_user or not cleaned_key:
             self._clear_session_state("TopstepX username and API key are required")
             raise TopstepAuthError("TopstepX username and API key are required")
@@ -220,6 +267,7 @@ class TopstepAuthService:
         self._token = token
         if token not in self._session_tokens:
             self._session_tokens.append(token)
+        self._notify_active_scopes(token, cleaned_key)
         self._username = cleaned_user
         self._api_key = cleaned_key
         self._live = target_live
@@ -333,6 +381,7 @@ class TopstepAuthService:
                 raise UpstreamTimeoutError("TopstepX token refresh timed out") from exc
         if self._token is None:
             raise TopstepAuthError("Not connected to TopstepX")
+        self._notify_active_scopes(self._token, self._api_key)
         return self._token
 
     async def _refresh_locked(self, now: datetime | None = None) -> None:
@@ -352,6 +401,7 @@ class TopstepAuthService:
     async def disconnect(self) -> None:
         """Clear in-memory TopstepX credentials and transition to DISCONNECTED."""
         async with self._lock:
+            self._notify_active_scopes(*self._session_tokens, self._token, self._api_key)
             self._token = None
             self._session_tokens.clear()
             self._username = None
@@ -364,8 +414,12 @@ class TopstepAuthService:
     def active_redaction_secrets(self) -> tuple[str, ...]:
         """Return active in-memory credentials for internal redaction only."""
         return tuple(
-            dict.fromkeys(
-                s for s in (*self._session_tokens, self._token, self._api_key) if s
+            sorted(
+                dict.fromkeys(
+                    s for s in (*self._session_tokens, self._token, self._api_key) if s
+                ),
+                key=len,
+                reverse=True,
             )
         )
 

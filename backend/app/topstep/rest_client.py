@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 from collections.abc import Mapping
+from contextlib import AbstractContextManager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
@@ -26,7 +27,7 @@ from app.engine.session_calendar import (
     timeframe_to_topstep_unit,
 )
 from app.security import redact_secrets
-from app.topstep.auth import TopstepAuthService
+from app.topstep.auth import CredentialRedactionScope, TopstepAuthService
 from app.topstep.errors import (
     AmbiguousContractError,
     ContractNotFoundError,
@@ -116,6 +117,10 @@ class TopstepRestClient:
     def active_redaction_secrets(self) -> tuple[str, ...]:
         """Return active runtime TopstepX credentials for internal redaction only."""
         return self._auth.active_redaction_secrets()
+
+    def redaction_scope(self) -> AbstractContextManager[CredentialRedactionScope]:
+        """Return a request-scoped credential redaction context from TopstepAuthService."""
+        return self._auth.redaction_scope()
 
     async def search_contracts(
         self,
@@ -335,17 +340,19 @@ class TopstepRestClient:
             ) from exc
 
     async def _run_under_deadline(self, url: str, payload: dict[str, Any]) -> dict[str, Any]:
-        token = await self._auth.ensure_token()
-        return await self._execute_with_retries(url, payload, token)
+        with self._auth.redaction_scope() as scope:
+            token = await self._auth.ensure_token()
+            scope.record(token)
+            return await self._execute_with_retries(url, payload, token, scope)
 
     async def _execute_with_retries(
         self,
         url: str,
         payload: dict[str, Any],
         token: str,
+        scope: CredentialRedactionScope,
     ) -> dict[str, Any]:
         max_attempts = self._settings.upstream_max_retries + 1
-        secrets_to_mask = (*self._auth.active_redaction_secrets(), token)
         headers = {
             "Accept": "application/json, text/plain",
             "Content-Type": "application/json",
@@ -373,7 +380,7 @@ class TopstepRestClient:
                     raise last_exc
 
                 if resp.status_code >= 400:
-                    safe_detail = redact_secrets(text, secrets_to_mask)[:300]
+                    safe_detail = redact_secrets(text, scope.secrets())[:300]
                     raise UpstreamHTTPError(
                         f"Upstream client error HTTP {resp.status_code}: {safe_detail}",
                         status_code=resp.status_code,
@@ -397,7 +404,7 @@ class TopstepRestClient:
                     err_msg = data.get("errorMessage") or (
                         f"TopstepX errorCode={data.get('errorCode')}"
                     )
-                    msg = redact_secrets(str(err_msg), secrets_to_mask)
+                    msg = redact_secrets(str(err_msg), scope.secrets())
                     raise UpstreamHTTPError(msg, status_code=resp.status_code)
 
                 return data
@@ -409,7 +416,7 @@ class TopstepRestClient:
                 if isinstance(exc, httpx.TimeoutException):
                     raise UpstreamTimeoutError("Upstream HTTP request timed out") from exc
                 raise UpstreamHTTPError(
-                    f"Upstream transport error: {redact_secrets(str(exc), secrets_to_mask)}"
+                    f"Upstream transport error: {redact_secrets(str(exc), scope.secrets())}"
                 ) from exc
 
         if isinstance(last_exc, UpstreamHTTPError):

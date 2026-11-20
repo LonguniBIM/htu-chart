@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 
@@ -68,19 +68,24 @@ class HistoryBackfillService:
         self._parquet = parquet_store
         self._sqlite = sqlite_store
 
-    def _redact(self, text: str) -> str:
+    def _redact(self, text: str, extra_secrets: Iterable[str] = ()) -> str:
         raw_extra = (
+            *extra_secrets,
             *self._rest.active_redaction_secrets(),
             self._settings.topstepx_api_key,
             self._settings.app_password_hash,
             self._settings.app_session_secret,
         )
         extra = tuple(
-            dict.fromkeys(
-                variant
-                for secret in raw_extra
-                if secret
-                for variant in (secret, json.dumps(secret)[1:-1])
+            sorted(
+                dict.fromkeys(
+                    variant
+                    for secret in raw_extra
+                    if secret
+                    for variant in (secret, json.dumps(secret)[1:-1])
+                ),
+                key=len,
+                reverse=True,
             )
         )
         return redact_secrets(text, extra)
@@ -94,6 +99,7 @@ class HistoryBackfillService:
         eff_root: str | None,
         interval_start: int,
         interval_end: int,
+        redaction_secrets: Iterable[str] = (),
     ) -> tuple[list[OHLCVBar], list[QualityIssueInput]]:
         valid_bars: list[OHLCVBar] = []
         issues: list[QualityIssueInput] = []
@@ -109,8 +115,14 @@ class HistoryBackfillService:
                         interval_start=interval_start,
                         interval_end=interval_end,
                         issue_code=val.issue_code or "invalid_record",
-                        detail=self._redact(val.issue_detail or "Non-mapping OHLCV bar record"),
-                        raw_payload=self._redact(json.dumps(raw, default=str))[:2048],
+                        detail=self._redact(
+                            val.issue_detail or "Non-mapping OHLCV bar record",
+                            redaction_secrets,
+                        ),
+                        raw_payload=self._redact(
+                            json.dumps(raw, default=str),
+                            redaction_secrets,
+                        )[:2048],
                     )
                 )
                 continue
@@ -131,7 +143,8 @@ class HistoryBackfillService:
                     )
                     detail = self._redact(
                         f"Bar timestamp {val.bar.time} outside "
-                        f"[{valid_window_start}, {interval_end}]"
+                        f"[{valid_window_start}, {interval_end}]",
+                        redaction_secrets,
                     )
                     issues.append(
                         QualityIssueInput(
@@ -140,7 +153,10 @@ class HistoryBackfillService:
                             interval_end=interval_end,
                             issue_code="out_of_window_timestamp",
                             detail=detail,
-                            raw_payload=self._redact(json.dumps(raw, default=str))[:2048],
+                            raw_payload=self._redact(
+                                json.dumps(raw, default=str),
+                                redaction_secrets,
+                            )[:2048],
                         )
                     )
                 else:
@@ -157,8 +173,14 @@ class HistoryBackfillService:
                         interval_start=interval_start,
                         interval_end=interval_end,
                         issue_code=val.issue_code or "invalid_ohlcv",
-                        detail=self._redact(val.issue_detail or "OHLCV validation failed"),
-                        raw_payload=self._redact(json.dumps(raw, default=str))[:2048],
+                        detail=self._redact(
+                            val.issue_detail or "OHLCV validation failed",
+                            redaction_secrets,
+                        ),
+                        raw_payload=self._redact(
+                            json.dumps(raw, default=str),
+                            redaction_secrets,
+                        )[:2048],
                     )
                 )
 
@@ -227,99 +249,85 @@ class HistoryBackfillService:
         total_quarantined = 0
         upstream_requests = 0
 
-        for r_start, r_end in missing_closed:
-            page_res = await self._rest.retrieve_bars_paginated(
-                contract_id=contract_id,
-                live=bool(live),
-                timeframe=source_tf,
-                start_ts=r_start,
-                end_ts=r_end,
-                include_partial_bar=bool(include_partial and r_end == fetch_end),
-                root_symbol=eff_root,
-            )
-            upstream_requests += page_res.pages_fetched
-            valid_bars, issues = self._validate_and_quarantine(
-                page_res,
-                source_tf=source_tf,
-                eff_now=eff_now,
-                eff_root=eff_root,
-                interval_start=r_start,
-                interval_end=r_end,
-            )
-
-            await self._parquet.upsert_bars(
-                source_key,
-                valid_bars,
-                root_symbol=eff_root,
-                now_utc=eff_now,
-            )
-            if issues:
-                await self._sqlite.record_quality_issues(source_key, issues)
-
-            q_count = len(issues)
-            total_quarantined += q_count
-            if page_res.truncated:
-                any_truncated = True
-            if page_res.provider_gap:
-                any_provider_gap = True
-
-            if q_count > 0:
-                await self._sqlite.record_coverage(
-                    source_key,
-                    r_start,
-                    r_end,
-                    status="CORRUPTED",
-                    quarantined_count=q_count,
-                    truncated=page_res.truncated,
-                    provider_gap=page_res.provider_gap,
+        with self._rest.redaction_scope() as redaction_scope:
+            for r_start, r_end in missing_closed:
+                page_res = await self._rest.retrieve_bars_paginated(
+                    contract_id=contract_id,
+                    live=bool(live),
+                    timeframe=source_tf,
+                    start_ts=r_start,
+                    end_ts=r_end,
+                    include_partial_bar=bool(include_partial and r_end == fetch_end),
+                    root_symbol=eff_root,
                 )
-            elif page_res.truncated:
-                earliest_valid_ts = min(b.time for b in valid_bars) if valid_bars else None
-                if (
-                    earliest_valid_ts is not None
-                    and r_start < earliest_valid_ts < r_end
-                    and not page_res.provider_gap
-                ):
+                upstream_requests += page_res.pages_fetched
+                valid_bars, issues = self._validate_and_quarantine(
+                    page_res,
+                    source_tf=source_tf,
+                    eff_now=eff_now,
+                    eff_root=eff_root,
+                    interval_start=r_start,
+                    interval_end=r_end,
+                    redaction_secrets=redaction_scope.secrets(),
+                )
+
+                await self._parquet.upsert_bars(
+                    source_key,
+                    valid_bars,
+                    root_symbol=eff_root,
+                    now_utc=eff_now,
+                )
+                if issues:
+                    await self._sqlite.record_quality_issues(source_key, issues)
+
+                q_count = len(issues)
+                total_quarantined += q_count
+                if page_res.truncated:
+                    any_truncated = True
+                if page_res.provider_gap:
+                    any_provider_gap = True
+
+                if q_count > 0:
                     await self._sqlite.record_coverage(
                         source_key,
                         r_start,
-                        earliest_valid_ts,
-                        status="TRUNCATED",
-                        truncated=True,
-                    )
-                    await self._sqlite.record_coverage(
-                        source_key,
-                        earliest_valid_ts,
                         r_end,
-                        status="COMPLETE",
-                        heal_existing=True,
-                    )
-                else:
-                    await self._sqlite.record_coverage(
-                        source_key,
-                        r_start,
-                        r_end,
-                        status="TRUNCATED",
-                        truncated=True,
+                        status="CORRUPTED",
+                        quarantined_count=q_count,
+                        truncated=page_res.truncated,
                         provider_gap=page_res.provider_gap,
                     )
-            elif page_res.provider_gap:
-                await self._sqlite.record_coverage(
-                    source_key,
-                    r_start,
-                    r_end,
-                    status="PROVIDER_GAP",
-                    provider_gap=True,
-                )
-            else:
-                first_open = first_bucket_open_at_or_after(r_start, source_tf)
-                window_start = bucket_open_utc(r_start, source_tf)
-                has_in_range_bar = any(window_start <= b.time < r_end for b in valid_bars)
-                expects_in_range_bar = first_open < r_end and has_open_session_in_range(
-                    first_open, r_end, root_symbol=eff_root
-                )
-                if not has_in_range_bar and expects_in_range_bar:
-                    any_provider_gap = True
+                elif page_res.truncated:
+                    earliest_valid_ts = min(b.time for b in valid_bars) if valid_bars else None
+                    if (
+                        earliest_valid_ts is not None
+                        and r_start < earliest_valid_ts < r_end
+                        and not page_res.provider_gap
+                    ):
+                        await self._sqlite.record_coverage(
+                            source_key,
+                            r_start,
+                            earliest_valid_ts,
+                            status="TRUNCATED",
+                            truncated=True,
+                        )
+                        await self._sqlite.record_coverage(
+                            source_key,
+                            earliest_valid_ts,
+                            r_end,
+                            status="COMPLETE",
+                            heal_existing=True,
+                        )
+                    else:
+                        await self._sqlite.record_coverage(
+                            source_key,
+                            r_start,
+                            r_end,
+                            status="TRUNCATED",
+                            truncated=True,
+                            provider_gap=page_res.provider_gap,
+                        )
+                elif page_res.provider_gap:
                     await self._sqlite.record_coverage(
                         source_key,
                         r_start,
@@ -328,110 +336,128 @@ class HistoryBackfillService:
                         provider_gap=True,
                     )
                 else:
+                    first_open = first_bucket_open_at_or_after(r_start, source_tf)
+                    window_start = bucket_open_utc(r_start, source_tf)
+                    has_in_range_bar = any(window_start <= b.time < r_end for b in valid_bars)
+                    expects_in_range_bar = first_open < r_end and has_open_session_in_range(
+                        first_open, r_end, root_symbol=eff_root
+                    )
+                    if not has_in_range_bar and expects_in_range_bar:
+                        any_provider_gap = True
+                        await self._sqlite.record_coverage(
+                            source_key,
+                            r_start,
+                            r_end,
+                            status="PROVIDER_GAP",
+                            provider_gap=True,
+                        )
+                    else:
+                        await self._sqlite.record_coverage(
+                            source_key,
+                            r_start,
+                            r_end,
+                            status="COMPLETE",
+                            heal_existing=True,
+                        )
+
+            tail_truncated = False
+            tail_provider_gap = False
+            tail_quarantined = 0
+            if need_live_tail:
+                tail_start = max(fetch_start, closed_horizon)
+                tail_res = await self._rest.retrieve_bars_paginated(
+                    contract_id=contract_id,
+                    live=bool(live),
+                    timeframe=source_tf,
+                    start_ts=tail_start,
+                    end_ts=fetch_end,
+                    include_partial_bar=True,
+                    root_symbol=eff_root,
+                )
+                upstream_requests += tail_res.pages_fetched
+                valid_tail, tail_issues = self._validate_and_quarantine(
+                    tail_res,
+                    source_tf=source_tf,
+                    eff_now=eff_now,
+                    eff_root=eff_root,
+                    interval_start=tail_start,
+                    interval_end=fetch_end,
+                    redaction_secrets=redaction_scope.secrets(),
+                )
+                await self._parquet.upsert_bars(
+                    source_key,
+                    valid_tail,
+                    root_symbol=eff_root,
+                    now_utc=eff_now,
+                )
+                if tail_issues:
+                    await self._sqlite.record_quality_issues(source_key, tail_issues)
                     await self._sqlite.record_coverage(
                         source_key,
-                        r_start,
-                        r_end,
-                        status="COMPLETE",
-                        heal_existing=True,
-                    )
-
-        tail_truncated = False
-        tail_provider_gap = False
-        tail_quarantined = 0
-        if need_live_tail:
-            tail_start = max(fetch_start, closed_horizon)
-            tail_res = await self._rest.retrieve_bars_paginated(
-                contract_id=contract_id,
-                live=bool(live),
-                timeframe=source_tf,
-                start_ts=tail_start,
-                end_ts=fetch_end,
-                include_partial_bar=True,
-                root_symbol=eff_root,
-            )
-            upstream_requests += tail_res.pages_fetched
-            valid_tail, tail_issues = self._validate_and_quarantine(
-                tail_res,
-                source_tf=source_tf,
-                eff_now=eff_now,
-                eff_root=eff_root,
-                interval_start=tail_start,
-                interval_end=fetch_end,
-            )
-            await self._parquet.upsert_bars(
-                source_key,
-                valid_tail,
-                root_symbol=eff_root,
-                now_utc=eff_now,
-            )
-            if tail_issues:
-                await self._sqlite.record_quality_issues(source_key, tail_issues)
-                await self._sqlite.record_coverage(
-                    source_key,
-                    tail_start,
-                    fetch_end,
-                    status="CORRUPTED",
-                    quarantined_count=len(tail_issues),
-                    truncated=tail_res.truncated,
-                    provider_gap=tail_res.provider_gap,
-                )
-
-            tail_quarantined = len(tail_issues)
-            tail_truncated = tail_res.truncated
-            tail_provider_gap = tail_res.provider_gap
-            total_quarantined += tail_quarantined
-            any_truncated = any_truncated or tail_truncated
-            any_provider_gap = any_provider_gap or tail_provider_gap
-
-        resample_issues = []
-        if is_resampled:
-            resample_res = await self._parquet.resample_with_issues(
-                source_key,
-                tf,
-                start_ts=start_ts,
-                end_ts=end_ts,
-                include_provisional=include_partial,
-                now_utc=eff_now,
-                root_symbol=eff_root,
-                limit=limit,
-            )
-            bars = resample_res.bars
-            resample_issues = resample_res.issues
-            if resample_issues:
-                target_key = StorageDatasetKey("topstepx", bool(live), contract_id, tf)
-                await self._sqlite.record_quality_issues(
-                    target_key,
-                    [
-                        QualityIssueInput(
-                            bar_time=issue.bar_time,
-                            interval_start=issue.interval_start,
-                            interval_end=issue.interval_end,
-                            issue_code=issue.issue_code,
-                            detail=self._redact(issue.detail),
-                            raw_payload=self._redact(issue.raw_payload)[:2048],
-                        )
-                        for issue in resample_issues
-                    ],
-                    deduplicate=True,
-                )
-                for issue in resample_issues:
-                    await self._sqlite.record_coverage(
-                        target_key,
-                        issue.interval_start,
-                        issue.interval_end,
+                        tail_start,
+                        fetch_end,
                         status="CORRUPTED",
-                        quarantined_count=1,
+                        quarantined_count=len(tail_issues),
+                        truncated=tail_res.truncated,
+                        provider_gap=tail_res.provider_gap,
                     )
-                total_quarantined += len(resample_issues)
-        else:
-            bars = await self._parquet.read_bars(
-                source_key,
-                start_ts=start_ts,
-                end_ts=end_ts,
-                include_provisional=include_partial,
-                limit=limit,
-            )
+
+                tail_quarantined = len(tail_issues)
+                tail_truncated = tail_res.truncated
+                tail_provider_gap = tail_res.provider_gap
+                total_quarantined += tail_quarantined
+                any_truncated = any_truncated or tail_truncated
+                any_provider_gap = any_provider_gap or tail_provider_gap
+
+            resample_issues = []
+            if is_resampled:
+                resample_res = await self._parquet.resample_with_issues(
+                    source_key,
+                    tf,
+                    start_ts=start_ts,
+                    end_ts=end_ts,
+                    include_provisional=include_partial,
+                    now_utc=eff_now,
+                    root_symbol=eff_root,
+                    limit=limit,
+                )
+                bars = resample_res.bars
+                resample_issues = resample_res.issues
+                if resample_issues:
+                    target_key = StorageDatasetKey("topstepx", bool(live), contract_id, tf)
+                    scope_secrets = redaction_scope.secrets()
+                    await self._sqlite.record_quality_issues(
+                        target_key,
+                        [
+                            QualityIssueInput(
+                                bar_time=issue.bar_time,
+                                interval_start=issue.interval_start,
+                                interval_end=issue.interval_end,
+                                issue_code=issue.issue_code,
+                                detail=self._redact(issue.detail, scope_secrets),
+                                raw_payload=self._redact(issue.raw_payload, scope_secrets)[:2048],
+                            )
+                            for issue in resample_issues
+                        ],
+                        deduplicate=True,
+                    )
+                    for issue in resample_issues:
+                        await self._sqlite.record_coverage(
+                            target_key,
+                            issue.interval_start,
+                            issue.interval_end,
+                            status="CORRUPTED",
+                            quarantined_count=1,
+                        )
+                    total_quarantined += len(resample_issues)
+            else:
+                bars = await self._parquet.read_bars(
+                    source_key,
+                    start_ts=start_ts,
+                    end_ts=end_ts,
+                    include_provisional=include_partial,
+                    limit=limit,
+                )
 
         has_resample_issues = bool(resample_issues)
         if fetch_end <= closed_horizon:
