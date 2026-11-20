@@ -287,7 +287,27 @@ async def test_f01_dev_connect_route_locked_to_development_and_loopback() -> Non
         assert res.status_code == 403
 
     async with _async_client(dev_settings, client_ip="127.0.0.1") as (client, _):
+        unauth_conn = await client.post(
+            "/api/connect",
+            json={"userName": "alice", "apiKey": "secret-key-123"},
+        )
+        assert unauth_conn.status_code == 401
+
         csrf = await _login_and_get_csrf(client)
+
+        no_csrf_conn = await client.post(
+            "/api/connect",
+            json={"userName": "alice", "apiKey": "secret-key-123"},
+        )
+        assert no_csrf_conn.status_code == 403
+
+        bad_csrf_conn = await client.post(
+            "/api/connect",
+            json={"userName": "alice", "apiKey": "secret-key-123"},
+            headers={"X-CSRF-Token": "wrong-csrf-token"},
+        )
+        assert bad_csrf_conn.status_code == 403
+
         res = await client.post(
             "/api/connect",
             json={"userName": "alice", "apiKey": "secret-key-123"},
@@ -769,3 +789,68 @@ def test_f01_redacts_embedded_quotes_escapes_and_basic_authorization() -> None:
     basic_auth = redact_secrets("Authorization: Basic cHJpdmF0ZS1wYXNzd29yZA==")
     assert "cHJpdmF0ZS1wYXNzd29yZA==" not in basic_auth
     assert basic_auth == "Authorization: ***REDACTED***"
+
+
+def test_f01_redaction_is_linear_time_on_unterminated_backslashes_and_masks_basic_logs() -> None:
+    """Contract: Redaction finishes in linear time on adversarial backslashes and masks Basic logs.
+
+    Defect caught: Exponential ReDoS on unterminated quotes and unmasked Basic auth log args.
+    """
+    adversarial_kv = 'password="' + ("\\" * 100)
+    adversarial_json = '{"password": "' + ("\\" * 100)
+
+    t0 = time.monotonic()
+    redact_secrets(adversarial_kv)
+    redact_secrets(adversarial_json)
+    elapsed_direct = time.monotonic() - t0
+    assert elapsed_direct < 0.05
+
+    create_app(settings=Settings(app_password_hash=TEST_PASSWORD_HASH))
+    buf = io.StringIO()
+    handler = logging.StreamHandler(buf)
+    handler.setFormatter(AccessFormatter("%(client_addr)s - %(request_line)s %(status_code)s"))
+    access_logger = logging.getLogger("uvicorn.access")
+    prev_level = access_logger.level
+    prev_propagate = access_logger.propagate
+    access_logger.setLevel(logging.INFO)
+    access_logger.propagate = False
+    access_logger.addHandler(handler)
+    try:
+        t1 = time.monotonic()
+        access_logger.info(
+            '%s - "%s %s HTTP/%s" %d',
+            "127.0.0.1:51234",
+            "GET",
+            f"/api/status?{adversarial_kv}",
+            "1.1",
+            401,
+        )
+        assert (time.monotonic() - t1) < 0.05
+    finally:
+        access_logger.removeHandler(handler)
+        access_logger.setLevel(prev_level)
+        access_logger.propagate = prev_propagate
+
+    log_buf = io.StringIO()
+    root_handler = logging.StreamHandler(log_buf)
+    root_logger = logging.getLogger()
+    prev_root_level = root_logger.level
+    root_logger.setLevel(logging.DEBUG)
+    root_logger.addHandler(root_handler)
+    try:
+        logging.getLogger("topstep_chart.auth").warning(
+            "Authorization: Basic %s",
+            "raw-basic-pos-123",
+        )
+        logging.getLogger("topstep_chart.auth").warning(
+            "Authorization: Basic %(credential)s",
+            {"credential": "raw-basic-named-456"},
+        )
+    finally:
+        root_logger.removeHandler(root_handler)
+        root_logger.setLevel(prev_root_level)
+
+    emitted = log_buf.getvalue()
+    assert "raw-basic-pos-123" not in emitted
+    assert "raw-basic-named-456" not in emitted
+    assert emitted.count("***REDACTED***") >= 2
