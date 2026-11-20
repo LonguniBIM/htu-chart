@@ -35,12 +35,18 @@ _REDACTED_FIELD_PATTERN = (
     r"TOPSTEPX_API_KEY|TELEGRAM_BOT_TOKEN|botToken|APP_PASSWORD_HASH|APP_SESSION_SECRET|password"
 )
 _BEARER_RE = re.compile(r"(?i)\bBearer\s+[A-Za-z0-9._~+/=-]+")
-_AUTH_HEADER_RE = re.compile(r"(?i)\bAuthorization\s*([:=])\s*(?:Bearer\s+)?[^\s,;'\"]+")
+_AUTH_HEADER_RE = re.compile(
+    r"""(?i)\bAuthorization\s*([:=])\s*(?!['"])"""
+    r"""(?:(?:Bearer|Basic|Token|Digest|ApiKey|OAuth|Negotiate|NTLM|AWS4-HMAC-SHA256)\s+)?"""
+    r"""[^\s,;'\"]+"""
+)
 _JSON_SECRET_RE = re.compile(
-    rf"""(?i)(["']\b(?:{_REDACTED_FIELD_PATTERN})\b["']\s*:\s*["'])([^"']*)(["'])"""
+    rf"""(?i)(?P<prefix>(?P<kq>["'])\b(?:{_REDACTED_FIELD_PATTERN})\b(?P=kq)\s*:\s*)"""
+    r"""(?P<vq>["'])(?:\\.|(?!(?P=vq)).)*(?P=vq)"""
 )
 _QUOTED_KV_SECRET_RE = re.compile(
-    rf"""(?i)\b({_REDACTED_FIELD_PATTERN})\b(\s*[:=]\s*)(["'])(?!\*\*\*REDACTED\*\*\*\3)(?:\\.|(?!\3).)*\3"""
+    rf"""(?i)\b(?P<key>{_REDACTED_FIELD_PATTERN})\b(?P<sep>\s*[:=]\s*)"""
+    r"""(?P<vq>["'])(?!\*\*\*REDACTED\*\*\*(?P=vq))(?:\\.|(?!(?P=vq)).)*(?P=vq)"""
 )
 _KV_SECRET_RE = re.compile(
     rf"""(?i)\b({_REDACTED_FIELD_PATTERN})\b(\s*[:=]\s*)(?!\*\*\*REDACTED\*\*\*)([^\s,;'"}}\]]+)"""
@@ -133,8 +139,12 @@ def _redact_log_message_template(msg: str, extra_secrets: tuple[str, ...]) -> st
 
         return pattern.sub(_cb, text)
 
-    redacted = _safe_sub(_JSON_SECRET_RE, r"\1***REDACTED***\3", msg)
-    redacted = _safe_sub(_QUOTED_KV_SECRET_RE, r"\1\2\3***REDACTED***\3", redacted)
+    redacted = _safe_sub(_JSON_SECRET_RE, r"\g<prefix>\g<vq>***REDACTED***\g<vq>", msg)
+    redacted = _safe_sub(
+        _QUOTED_KV_SECRET_RE,
+        r"\g<key>\g<sep>\g<vq>***REDACTED***\g<vq>",
+        redacted,
+    )
     redacted = _safe_sub(_AUTH_HEADER_RE, r"Authorization\1 ***REDACTED***", redacted)
     redacted = _safe_sub(_BEARER_RE, "Bearer ***REDACTED***", redacted)
     redacted = _safe_sub(_KV_SECRET_RE, r"\1\2***REDACTED***", redacted)
@@ -148,8 +158,8 @@ def redact_secrets(text: str, extra_secrets: Iterable[str] = ()) -> str:
     """Mask bearer tokens, API keys, passwords, and known secrets in text."""
     if not text:
         return text
-    redacted = _JSON_SECRET_RE.sub(r"\1***REDACTED***\3", text)
-    redacted = _QUOTED_KV_SECRET_RE.sub(r"\1\2\3***REDACTED***\3", redacted)
+    redacted = _JSON_SECRET_RE.sub(r"\g<prefix>\g<vq>***REDACTED***\g<vq>", text)
+    redacted = _QUOTED_KV_SECRET_RE.sub(r"\g<key>\g<sep>\g<vq>***REDACTED***\g<vq>", redacted)
     redacted = _AUTH_HEADER_RE.sub(r"Authorization\1 ***REDACTED***", redacted)
     redacted = _BEARER_RE.sub("Bearer ***REDACTED***", redacted)
     redacted = _KV_SECRET_RE.sub(r"\1\2***REDACTED***", redacted)

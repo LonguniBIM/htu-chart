@@ -535,10 +535,12 @@ async def test_f01_login_rate_limits_failures_and_offloads_argon2_off_event_loop
         orig_verify = app.state.session_manager.verify_password
         loop_tid = threading.get_ident()
         worker_tid: int | None = None
+        verify_started = threading.Event()
 
         def slow_verify(pw: str) -> bool:
             nonlocal worker_tid
             worker_tid = threading.get_ident()
+            verify_started.set()
             time.sleep(0.15)
             return orig_verify(pw)
 
@@ -549,6 +551,8 @@ async def test_f01_login_rate_limits_failures_and_offloads_argon2_off_event_loop
             login_task = asyncio.create_task(
                 c2.post("/api/auth/login", json={"password": TEST_PASSWORD})
             )
+            while not verify_started.is_set():
+                await asyncio.sleep(0.002)
             health_resp = await c2.get("/api/health")
             health_elapsed = time.monotonic() - t0
             assert health_resp.status_code == 200
@@ -724,3 +728,44 @@ async def test_f01_expired_session_returns_401_on_status() -> None:
 
         expired_status = await client.get("/api/status")
         assert expired_status.status_code == 401
+
+
+def test_f01_load_settings_parses_bracketed_ipv6_allowed_hosts(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Contract: Comma-separated bracketed IPv6 host lists do not crash JSON parsing.
+
+    Defect caught: Leading '[' triggering json.loads() crash on APP_ALLOWED_HOSTS=[::1],localhost.
+    """
+    env_single = tmp_path / "single.env"
+    env_single.write_text("APP_ALLOWED_HOSTS=[::1]\n", encoding="utf-8")
+    monkeypatch.setattr(config_mod, "DEFAULT_ENV_FILE", env_single)
+    single_settings = load_settings()
+    assert single_settings.app_allowed_hosts == ["[::1]"]
+
+    env_multi = tmp_path / "multi.env"
+    env_multi.write_text("APP_ALLOWED_HOSTS=[::1],localhost\n", encoding="utf-8")
+    monkeypatch.setattr(config_mod, "DEFAULT_ENV_FILE", env_multi)
+    multi_settings = load_settings()
+    assert multi_settings.app_allowed_hosts == ["[::1]", "localhost"]
+
+
+def test_f01_redacts_embedded_quotes_escapes_and_basic_authorization() -> None:
+    """Contract: Redaction handles embedded/escaped quotes and non-Bearer Authorization schemes.
+
+    Defect caught: Partial suffix leak after embedded quote or Authorization: Basic credential leak.
+    """
+    embedded = redact_secrets('{"password":"prefix\'private-suffix-987"}')
+    assert "private-suffix-987" not in embedded
+    assert "prefix" not in embedded
+    assert "***REDACTED***" in embedded
+
+    escaped = redact_secrets('{"password":"prefix\\"escaped-secret-123"}')
+    assert "escaped-secret-123" not in escaped
+    assert "prefix" not in escaped
+    assert "***REDACTED***" in escaped
+
+    basic_auth = redact_secrets("Authorization: Basic cHJpdmF0ZS1wYXNzd29yZA==")
+    assert "cHJpdmF0ZS1wYXNzd29yZA==" not in basic_auth
+    assert basic_auth == "Authorization: ***REDACTED***"

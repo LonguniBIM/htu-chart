@@ -32,10 +32,14 @@ def _parse_str_list(value: object) -> list[str] | None:
         if not stripped:
             return []
         if stripped.startswith("["):
-            parsed = json.loads(stripped)
-            if not isinstance(parsed, list):
+            try:
+                parsed = json.loads(stripped)
+            except json.JSONDecodeError:
+                parsed = None
+            if isinstance(parsed, list):
+                return [str(item).strip() for item in parsed if str(item).strip()]
+            if parsed is not None:
                 raise ValueError("Expected JSON array of strings")
-            return [str(item).strip() for item in parsed if str(item).strip()]
         return [part.strip() for part in stripped.split(",") if part.strip()]
     if isinstance(value, (list, tuple, set)):
         return [str(item).strip() for item in value if str(item).strip()]
