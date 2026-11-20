@@ -1,17 +1,17 @@
 # Task List: TopstepX Futures Terminal (`topstep-chart-app`)
 
-> **Status**: Phase 1 in progress — Part 1 (`backend/` init, `F01`, `F02`, `R03`, Key Rotation & Redaction) `VERIFIED` on `1918f9156d45`.
+> **Status**: Phase 1 `VERIFIED` — Part 1 (`backend/` init, `F01`, `F02`, `R03`, Key Rotation & Redaction) on `1918f9156d45`; Part 2 (`F04`, `R04`, `F05`, `R05`, Phase 1 `pytest` suite) on `7d724bc79a76`. Ready for Phase 2.
 
 ## Phase 1 — Backend FastAPI, Parquet Cache, Security & Contract Integrity (F01, F02, F04, F05, R03, R04, R05)
 - [x] Initialize `topstep-chart-app/backend/` with `uv` (`pyproject.toml`, FastAPI, Polars, PyArrow, SQLite, httpx, argon2-cffi, pytest) and remove temporary `server.mjs`
 - [x] **[F01]** Implement single-user caller auth (`security.py`): `HttpOnly; SameSite=Strict` session cookie, CSRF token for mutations, `AllowedHost` & `AllowedOrigin` validation, explicit loopback/Tailscale bind, dev-only credential route restricted to loopback
 - [x] **[F02]** Implement strict Read-Only TopstepX auth + contract resolver (`auth.py`, `rest_client.py`): remove unrelated-symbol fallback, key storage by `(provider, live_mode, contract_id, timeframe)`, add `instruments.py` CME tick metadata
 - [x] **[R03]** Add explicit `httpx` connect/read/write/pool timeouts + total operation deadline, bounded upstream concurrency (`asyncio.Semaphore`), and non-blocking startup (`DISCONNECTED` while background auth retries)
-- [ ] **[F04 & R04]** Implement paginated history backfill, coverage interval tracking, `is_closed` provisional-bar separation, and strict `validate_ohlcv_bar()` gate with `data_quality_issues` quarantine
-- [ ] **[F05]** Implement `ParquetStore` with per-dataset `asyncio.Lock` and Windows-safe unique temp files + atomic `os.replace`
-- [ ] **[R05]** Create shared `session_calendar.py` defining CME Globex session timezone (`America/New_York`), 18:00 ET daily/VWAP reset, bar-open UTC timestamps, and unified bucketing for resample & live aggregation
+- [x] **[F04 & R04]** Implement paginated history backfill, coverage interval tracking, `is_closed` provisional-bar separation, and strict `validate_ohlcv_bar()` gate with `data_quality_issues` quarantine
+- [x] **[F05]** Implement `ParquetStore` with per-dataset `asyncio.Lock` and Windows-safe unique temp files + atomic `os.replace`
+- [x] **[R05]** Create shared `session_calendar.py` defining CME Globex session timezone (`America/New_York`), 18:00 ET daily/VWAP reset, bar-open UTC timestamps, and unified bucketing for resample & live aggregation
 - [x] Implement Key Rotation Tracker (`KEY_ROTATION_DAYS`, `KEY_ROTATION_ENFORCE`) + log/exception secret redaction
-- [ ] Write & pass Phase 1 `pytest` suite (security, contract identity, timeouts, OHLCV validation, Parquet concurrency, pagination, CME session bucketing, zero order endpoints)
+- [x] Write & pass Phase 1 `pytest` suite (security, contract identity, timeouts, OHLCV validation, Parquet concurrency, pagination, CME session bucketing, zero order endpoints)
 
 ## Phase 2 — Single SignalR Real-Time Hub, Reconnect Recovery & Durable Telegram Outbox (F03, F07, R06)
 - [ ] **[F03]** Implement single SignalR Market Hub worker (`signalr_hub.py`) with `DISCONNECTED -> RECOVERING -> LIVE` state machine, per-contract closed-bar watermarks, bounded tick queue, overlapping REST reconciliation, and status telemetry

@@ -10,9 +10,10 @@
 - `backend/app/main.py` (`FastAPI` lifespan, single worker `--workers 1`, sanitized `RequestValidationError` handler, global log redaction)
 - `backend/app/security.py`, `backend/app/config.py` (`LoginGuard`, `SessionManager`, `HostOriginMiddleware`, `SecretRedactionFilter`, `validate_ws_handshake`)
 - `backend/app/topstep/errors.py`, `backend/app/topstep/auth.py`, `backend/app/topstep/rest_client.py`
-- `backend/app/storage/parquet_store.py`, `backend/app/storage/sqlite_store.py` *(Phase 1 Part 2)*
-- `backend/app/engine/instruments.py` (`InstrumentSpec`, `StorageDatasetKey`), `backend/app/engine/session_calendar.py` *(Phase 1 Part 2)*
-- `backend/app/api/routes_status.py` (`GET /api/health`, `POST /api/auth/login`, `POST /api/auth/logout`, `GET /api/status`, `POST /api/connect`, `POST /api/disconnect`), `backend/app/api/routes_market.py` (`GET /api/contracts`)
+- `backend/app/storage/parquet_store.py` (`ParquetStore`, per-dataset lock + atomic replace, Polars resample), `backend/app/storage/sqlite_store.py` (`SqliteStore`, dataset metadata, coverage intervals, quarantine ledger)
+- `backend/app/engine/instruments.py` (`InstrumentSpec`, `StorageDatasetKey`), `backend/app/engine/ohlcv.py` (`OHLCVBar`, `parse_topstep_bar`, `validate_ohlcv_bar`), `backend/app/engine/session_calendar.py` (CME Globex 18:00 ET session & DST bucketing)
+- `backend/app/services/history_service.py` (`HistoryBackfillService`, paginated backfill, quarantine, provisional-bar separation)
+- `backend/app/api/routes_status.py` (`GET /api/health`, `POST /api/auth/login`, `POST /api/auth/logout`, `GET /api/status` with `data_quality` summary, `POST /api/connect`, `POST /api/disconnect`), `backend/app/api/routes_market.py` (`GET /api/contracts`, `GET /api/bars`)
 
 ## 3. Driving & Verification
 - Static gates: `python harness/scripts/arch_check.py` (`SEC-001`, `SEC-003`, `ARCH-001..003`, `ARCH-005`).
