@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from collections import deque
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from typing import Any, Literal
@@ -57,6 +58,7 @@ class TopstepAuthService:
         self._semaphore = semaphore or asyncio.Semaphore(settings.upstream_max_concurrency)
         self._lock = asyncio.Lock()
         self._token: str | None = None
+        self._session_tokens: deque[str] = deque(maxlen=8)
         self._username: str | None = None
         self._api_key: str | None = None
         self._live: bool = settings.topstepx_live
@@ -216,6 +218,8 @@ class TopstepAuthService:
 
         acquired = now or datetime.now(UTC)
         self._token = token
+        if token not in self._session_tokens:
+            self._session_tokens.append(token)
         self._username = cleaned_user
         self._api_key = cleaned_key
         self._live = target_live
@@ -349,12 +353,21 @@ class TopstepAuthService:
         """Clear in-memory TopstepX credentials and transition to DISCONNECTED."""
         async with self._lock:
             self._token = None
+            self._session_tokens.clear()
             self._username = None
             self._api_key = None
             self._connected_at = None
             self._token_acquired_at = None
             self._connection_state = "DISCONNECTED"
             self._last_error = None
+
+    def active_redaction_secrets(self) -> tuple[str, ...]:
+        """Return active in-memory credentials for internal redaction only."""
+        return tuple(
+            dict.fromkeys(
+                s for s in (*self._session_tokens, self._token, self._api_key) if s
+            )
+        )
 
     def get_status(self, now: datetime | None = None) -> dict[str, Any]:
         """Return strictly redacted connection and key-rotation status."""

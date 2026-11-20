@@ -89,7 +89,7 @@ async def get_contracts(
         except (KeyRotationRequiredError, TopstepAuthError) as exc:
             raise HTTPException(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                detail=redact_secrets(str(exc)),
+                detail=redact_secrets(str(exc), topstep_auth.active_redaction_secrets()),
             ) from exc
         except (
             ContractNotFoundError,
@@ -97,15 +97,16 @@ async def get_contracts(
             UpstreamTimeoutError,
             UpstreamHTTPError,
         ) as exc:
+            active_secrets = topstep_auth.active_redaction_secrets()
             if not topstep_auth.is_connected:
                 raise HTTPException(
                     status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                    detail=redact_secrets(str(exc)),
+                    detail=redact_secrets(str(exc), active_secrets),
                 ) from exc
             results[symbol] = {
                 "selected": None,
                 "error_type": type(exc).__name__,
-                "error": redact_secrets(str(exc)),
+                "error": redact_secrets(str(exc), active_secrets),
             }
 
     return {"live": effective_live, "contracts": results}
@@ -189,12 +190,12 @@ async def get_bars(
     except ValueError as exc:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail=redact_secrets(str(exc)),
+            detail=redact_secrets(str(exc), topstep_auth.active_redaction_secrets()),
         ) from exc
     except (KeyRotationRequiredError, TopstepAuthError) as exc:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail=redact_secrets(str(exc)),
+            detail=redact_secrets(str(exc), topstep_auth.active_redaction_secrets()),
         ) from exc
     except UpstreamTimeoutError as exc:
         code = (
@@ -204,7 +205,7 @@ async def get_bars(
         )
         raise HTTPException(
             status_code=code,
-            detail=redact_secrets(str(exc)),
+            detail=redact_secrets(str(exc), topstep_auth.active_redaction_secrets()),
         ) from exc
     except UpstreamHTTPError as exc:
         code = (
@@ -214,7 +215,7 @@ async def get_bars(
         )
         raise HTTPException(
             status_code=code,
-            detail=redact_secrets(str(exc)),
+            detail=redact_secrets(str(exc), topstep_auth.active_redaction_secrets()),
         ) from exc
 
     return {

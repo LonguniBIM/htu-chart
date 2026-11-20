@@ -248,6 +248,15 @@ async def test_f05_provisional_bar_precedence_and_read_filtering(tmp_path: Path)
     with_prov = await store.read_bars(key, include_provisional=True)
     assert [(b.time, b.is_closed) for b in with_prov] == [(t0, True), (t1, False)]
 
+    # Newer is_closed=True reconciliation overwrites existing is_closed=True at t0
+    reconciled = _bar(t0, 5900.0, 5906.0, 5897.5, 5905.25, 42.0, closed=True)
+    await store.upsert_bars(key, [reconciled], now_utc=NOW_TS)
+    assert await store.read_bars(key, include_provisional=False) == [reconciled]
+    assert await store.read_bars(key, include_provisional=True) == [
+        reconciled,
+        _bar(t1, 5903.5, 5905.0, 5903.0, 5904.0, 5.0, closed=False),
+    ]
+
 
 async def test_f05_cme_globex_resample_across_est_edt_dst_and_provisional_buckets(
     tmp_path: Path,
@@ -360,7 +369,8 @@ async def test_f05_cme_globex_resample_across_est_edt_dst_and_provisional_bucket
     assert mid_slice_5m == full_5m
     assert mid_slice_5m[0] == _bar(b_1400, 6000.0, 6006.0, 5998.0, 6005.5, 70.0, closed=True)
 
-    # Open 1m input bar inside a 5m bucket keeps resampled bar provisional even past bucket close
+    # Amendment #3 (conservative bucket integrity): an open 1m source bar inside a 5m bucket
+    # keeps the resampled bar provisional (is_closed=False) even past bucket close.
     b_1405 = b_1400 + 300
     await store.upsert_bars(
         key_1m,

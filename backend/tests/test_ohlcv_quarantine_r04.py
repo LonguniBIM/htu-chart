@@ -8,8 +8,10 @@ from pathlib import Path
 from typing import Any
 
 import httpx
+import pytest
 from argon2 import PasswordHasher
 
+from app.api import routes_market
 from app.config import Settings
 from app.engine.instruments import StorageDatasetKey
 from app.engine.ohlcv import (
@@ -111,11 +113,13 @@ def test_r04_validate_ohlcv_bar_strict_matrix() -> None:
 
 async def test_r04_end_to_end_quarantine_corrupts_coverage_and_exposes_redacted_status(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Contract: Malformed bars are quarantined, excluded from Parquet, and surfaced safely.
 
     Defect caught: Corrupted bars entering Parquet, marking interval COMPLETE, or leaking secrets.
     """
+    monkeypatch.setattr(routes_market, "_utc_now_ts", lambda: NOW_TS)
     pw = "quarantine-test-pw"
     pw_hash = PasswordHasher().hash(pw)
     raw_secret = "secret-upstream-token-xyz123"
@@ -300,11 +304,13 @@ async def test_r04_end_to_end_quarantine_corrupts_coverage_and_exposes_redacted_
 
 async def test_r04_http_resample_volume_overflow_returns_200_and_deduplicates_quarantine(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Contract: Post-resample Float64 overflow returns HTTP 200 and deduplicates SQLite issues.
 
     Defect caught: Resampled volume=inf causing HTTP 500 or inflating /api/status on cache reads.
     """
+    monkeypatch.setattr(routes_market, "_utc_now_ts", lambda: NOW_TS)
     pw = "resample-overflow-pw"
     pw_hash = PasswordHasher().hash(pw)
     b_1400 = int(datetime(2026, 11, 10, 14, 0, tzinfo=UTC).timestamp())
@@ -423,3 +429,118 @@ async def test_r04_http_resample_volume_overflow_returns_200_and_deduplicates_qu
                     "provider_gap_intervals": 0,
                     "by_issue_code": {"non_finite_volume": 1},
                 }
+
+
+async def test_r04_quarantine_redacts_runtime_jwt_and_connect_api_key_in_ohlcv_fields(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Contract: Quarantine redacts unlabeled runtime JWT and /api/connect apiKey in OHLCV fields.
+
+    Defect caught: Unlabeled runtime JWT or dev-connect apiKey leaking into SQLite quarantine.
+    """
+    monkeypatch.setattr(routes_market, "_utc_now_ts", lambda: NOW_TS)
+    pw = "runtime-redact-pw"
+    pw_hash = PasswordHasher().hash(pw)
+    runtime_api_key = "runtime-connect-apikey-secret999"
+    runtime_jwt = "eyJhbGciOiJIUzI1NiJ9.runtime-topstep-jwt-payload.sig987654"
+    t0 = int(datetime(2026, 11, 10, 14, 0, tzinfo=UTC).timestamp())
+    t1 = t0 + 60
+    t2 = t0 + 120
+    t_end = t0 + 180
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/Auth/loginKey":
+            return httpx.Response(200, json={"success": True, "token": runtime_jwt})
+        if request.url.path == "/api/History/retrieveBars":
+            return httpx.Response(
+                200,
+                json={
+                    "success": True,
+                    "bars": [
+                        {
+                            "t": t0,
+                            "o": 5900.0,
+                            "h": 5902.0,
+                            "l": 5899.0,
+                            "c": 5901.0,
+                            "v": 10,
+                        },
+                        {
+                            "t": t1,
+                            "o": runtime_jwt,
+                            "h": 5902.0,
+                            "l": 5899.0,
+                            "c": 5901.0,
+                            "v": 10,
+                        },
+                        {
+                            "t": t2,
+                            "o": 5901.0,
+                            "h": 5903.0,
+                            "l": 5900.0,
+                            "c": runtime_api_key,
+                            "v": 10,
+                        },
+                    ],
+                },
+            )
+        return httpx.Response(404)
+
+    settings = Settings(
+        app_env="development",
+        app_password_hash=pw_hash,
+        topstepx_api_key="",
+        data_dir=tmp_path / "data",
+    )
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as upstream:
+        app = create_app(settings=settings, http_client=upstream)
+        async with app.router.lifespan_context(app):
+            asgi = httpx.ASGITransport(app=app, client=("127.0.0.1", 50000))
+            async with httpx.AsyncClient(
+                transport=asgi,
+                base_url="http://127.0.0.1:8000",
+            ) as client:
+                login_resp = await client.post("/api/auth/login", json={"password": pw})
+                csrf = login_resp.json()["csrf_token"]
+                conn = await client.post(
+                    "/api/connect",
+                    json={"userName": "alice", "apiKey": runtime_api_key},
+                    headers={"X-CSRF-Token": csrf},
+                )
+                assert conn.status_code == 200
+
+                bars_resp = await client.get(
+                    "/api/bars",
+                    params={
+                        "contractId": "CON.F.US.MES.Z26",
+                        "timeframe": "1m",
+                        "startTime": str(t0),
+                        "endTime": str(t_end),
+                    },
+                )
+                assert bars_resp.status_code == 200
+                body = bars_resp.json()
+                assert body["count"] == 1
+                assert [b["time"] for b in body["bars"]] == [t0]
+                assert body["quality"]["is_complete"] is False
+                assert body["quality"]["quarantined_count"] == 2
+
+                key = StorageDatasetKey("topstepx", False, "CON.F.US.MES.Z26", "1m")
+                issues = await app.state.sqlite_store.list_quality_issues(key)
+                assert len(issues) == 2
+                assert {item["issue_code"] for item in issues} == {"non_finite_price"}
+                for item in issues:
+                    assert runtime_jwt not in item["detail"]
+                    assert runtime_api_key not in item["detail"]
+                    assert runtime_jwt not in item["raw_payload"]
+                    assert runtime_api_key not in item["raw_payload"]
+                    assert "***REDACTED***" in item["detail"]
+                    assert "***REDACTED***" in item["raw_payload"]
+
+                status_resp = await client.get("/api/status")
+                assert status_resp.status_code == 200
+                status_json = status_resp.json()
+                assert status_json["data_quality"]["quarantined_bars"] == 2
+                assert runtime_jwt not in str(status_json)
+                assert runtime_api_key not in str(status_json)

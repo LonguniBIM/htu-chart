@@ -113,6 +113,10 @@ class TopstepRestClient:
         self._client = client
         self._semaphore = semaphore or asyncio.Semaphore(settings.upstream_max_concurrency)
 
+    def active_redaction_secrets(self) -> tuple[str, ...]:
+        """Return active runtime TopstepX credentials for internal redaction only."""
+        return self._auth.active_redaction_secrets()
+
     async def search_contracts(
         self,
         search_text: str,
@@ -341,6 +345,7 @@ class TopstepRestClient:
         token: str,
     ) -> dict[str, Any]:
         max_attempts = self._settings.upstream_max_retries + 1
+        secrets_to_mask = (*self._auth.active_redaction_secrets(), token)
         headers = {
             "Accept": "application/json, text/plain",
             "Content-Type": "application/json",
@@ -368,7 +373,7 @@ class TopstepRestClient:
                     raise last_exc
 
                 if resp.status_code >= 400:
-                    safe_detail = redact_secrets(text, (token,))[:300]
+                    safe_detail = redact_secrets(text, secrets_to_mask)[:300]
                     raise UpstreamHTTPError(
                         f"Upstream client error HTTP {resp.status_code}: {safe_detail}",
                         status_code=resp.status_code,
@@ -392,7 +397,7 @@ class TopstepRestClient:
                     err_msg = data.get("errorMessage") or (
                         f"TopstepX errorCode={data.get('errorCode')}"
                     )
-                    msg = redact_secrets(str(err_msg), (token,))
+                    msg = redact_secrets(str(err_msg), secrets_to_mask)
                     raise UpstreamHTTPError(msg, status_code=resp.status_code)
 
                 return data
@@ -404,7 +409,7 @@ class TopstepRestClient:
                 if isinstance(exc, httpx.TimeoutException):
                     raise UpstreamTimeoutError("Upstream HTTP request timed out") from exc
                 raise UpstreamHTTPError(
-                    f"Upstream transport error: {redact_secrets(str(exc), (token,))}"
+                    f"Upstream transport error: {redact_secrets(str(exc), secrets_to_mask)}"
                 ) from exc
 
         if isinstance(last_exc, UpstreamHTTPError):

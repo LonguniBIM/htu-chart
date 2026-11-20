@@ -69,10 +69,19 @@ class HistoryBackfillService:
         self._sqlite = sqlite_store
 
     def _redact(self, text: str) -> str:
-        extra = (
+        raw_extra = (
+            *self._rest.active_redaction_secrets(),
             self._settings.topstepx_api_key,
             self._settings.app_password_hash,
             self._settings.app_session_secret,
+        )
+        extra = tuple(
+            dict.fromkeys(
+                variant
+                for secret in raw_extra
+                if secret
+                for variant in (secret, json.dumps(secret)[1:-1])
+            )
         )
         return redact_secrets(text, extra)
 
