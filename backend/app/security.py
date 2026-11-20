@@ -358,6 +358,10 @@ class SessionManager:
         )
 
 
+class LoginRateLimitedError(Exception):
+    """Raised when caller exceeds failed login quota or concurrent verification limit."""
+
+
 class LoginGuard:
     """Sliding-window failed-login rate limiter and bounded Argon2id thread admission."""
 
@@ -400,26 +404,53 @@ class LoginGuard:
         """Clear failed login history after successful authentication."""
         self._failures.pop(client_key, None)
 
-    def _release_permit_threadsafe(self, loop: asyncio.AbstractEventLoop) -> None:
+    def _finalize_attempt_and_release(
+        self,
+        client_key: str | None,
+        verified: bool,
+    ) -> None:
+        if client_key is not None:
+            if verified:
+                self.reset(client_key)
+            else:
+                self.record_failure(client_key)
+        self._semaphore.release()
+
+    def _release_permit_threadsafe(
+        self,
+        loop: asyncio.AbstractEventLoop,
+        client_key: str | None,
+        verified: bool,
+    ) -> None:
         if loop.is_closed():
             return
         with contextlib.suppress(RuntimeError):
-            loop.call_soon_threadsafe(self._semaphore.release)
+            loop.call_soon_threadsafe(
+                self._finalize_attempt_and_release,
+                client_key,
+                verified,
+            )
 
     async def verify_password_offload(
         self,
         session_manager: SessionManager,
         password: str,
+        client_key: str | None = None,
         acquire_timeout: float = 1.0,
     ) -> bool:
         """Run Argon2id verification off the event loop with bounded concurrency."""
         try:
             await asyncio.wait_for(self._semaphore.acquire(), timeout=acquire_timeout)
         except TimeoutError as exc:
-            raise HTTPException(
-                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-                detail="Too many concurrent login attempts; try again shortly",
+            raise LoginRateLimitedError(
+                "Too many concurrent login attempts; try again shortly"
             ) from exc
+
+        if client_key is not None and self.is_rate_limited(client_key):
+            self._semaphore.release()
+            raise LoginRateLimitedError(
+                "Too many failed login attempts; please wait before retrying"
+            )
 
         loop = asyncio.get_running_loop()
         state_lock = threading.Lock()
@@ -430,10 +461,12 @@ class LoginGuard:
                 if state["aborted"]:
                     return False
                 state["started"] = True
+            verified = False
             try:
-                return session_manager.verify_password(password)
+                verified = session_manager.verify_password(password)
+                return verified
             finally:
-                self._release_permit_threadsafe(loop)
+                self._release_permit_threadsafe(loop, client_key, verified)
 
         try:
             return await asyncio.to_thread(_worker)

@@ -68,6 +68,11 @@ async def get_contracts(
             UpstreamTimeoutError,
             UpstreamHTTPError,
         ) as exc:
+            if not topstep_auth.is_connected:
+                raise HTTPException(
+                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                    detail=redact_secrets(str(exc)),
+                ) from exc
             results[symbol] = {
                 "selected": None,
                 "error_type": type(exc).__name__,

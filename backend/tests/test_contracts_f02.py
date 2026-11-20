@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -367,3 +368,57 @@ async def test_f02_contracts_returns_503_when_jwt_refresh_fails_and_disconnects(
                 res = await client.get("/api/contracts?symbols=MES,MNQ")
                 assert res.status_code == 503
                 assert app.state.topstep_auth.is_connected is False
+
+
+async def test_f02_contracts_returns_503_when_jwt_refresh_503_or_timeout_disconnects() -> None:
+    """Contract: GET /api/contracts returns 503 if JWT refresh fails via 503 or timeout.
+
+    Defect caught: Returning HTTP 200 per-symbol errors when refresh disconnects TopstepX.
+    """
+    pw = "refresh-503-pw"
+    pw_hash = PasswordHasher().hash(pw)
+
+    for mode in ("503", "timeout"):
+        login_calls = 0
+
+        async def handler(request: httpx.Request, current_mode: str = mode) -> httpx.Response:
+            nonlocal login_calls
+            if request.url.path == "/api/Auth/loginKey":
+                login_calls += 1
+                if login_calls == 1:
+                    return httpx.Response(200, json={"success": True, "token": "jwt-initial"})
+                if current_mode == "503":
+                    return httpx.Response(503, json={"errorMessage": "Upstream unavailable"})
+                await asyncio.sleep(1.0)
+                return httpx.Response(200, json={"success": True, "token": "too-late"})
+            return httpx.Response(200, json={"contracts": []})
+
+        settings = Settings(
+            app_env="development",
+            app_password_hash=pw_hash,
+            jwt_refresh_hours=23.0,
+            upstream_max_retries=0,
+            upstream_total_timeout_sec=0.15,
+        )
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as upstream:
+            app = create_app(settings=settings, http_client=upstream)
+            async with app.router.lifespan_context(app):
+                asgi = httpx.ASGITransport(app=app, client=("127.0.0.1", 50000))
+                async with httpx.AsyncClient(
+                    transport=asgi,
+                    base_url="http://127.0.0.1:8000",
+                ) as client:
+                    login_resp = await client.post("/api/auth/login", json={"password": pw})
+                    csrf = login_resp.json()["csrf_token"]
+                    conn = await client.post(
+                        "/api/connect",
+                        json={"userName": "alice", "apiKey": "key-1"},
+                        headers={"X-CSRF-Token": csrf},
+                    )
+                    assert conn.status_code == 200
+                    app.state.topstep_auth._token_acquired_at -= timedelta(hours=23, minutes=5)
+
+                    res = await client.get("/api/contracts?symbols=MES")
+                    assert res.status_code == 503
+                    assert app.state.topstep_auth.is_connected is False
+                    assert app.state.topstep_auth.get_status()["connection_state"] == "DISCONNECTED"

@@ -15,7 +15,7 @@ from typing import Any
 import httpx
 import pytest
 from argon2 import PasswordHasher
-from fastapi import HTTPException, WebSocket
+from fastapi import WebSocket
 from fastapi.testclient import TestClient
 from pydantic import ValidationError
 from starlette.websockets import WebSocketDisconnect
@@ -26,6 +26,7 @@ from app.config import DEFAULT_ENV_FILE, Settings, load_settings
 from app.main import create_app
 from app.security import (
     LoginGuard,
+    LoginRateLimitedError,
     SecretRedactionFilter,
     SessionManager,
     redact_secrets,
@@ -664,9 +665,8 @@ async def test_f01_login_guard_retains_permit_until_cancelled_worker_thread_exit
         await task1
 
     # Worker thread #1 is still blocked; login #2 must NOT run concurrently above max_concurrency=1
-    with pytest.raises(HTTPException) as exc_info:
+    with pytest.raises(LoginRateLimitedError):
         await guard.verify_password_offload(mgr, "fast", acquire_timeout=0.05)
-    assert exc_info.value.status_code == 429
     assert peak_workers == 1
 
     release.set()
@@ -882,3 +882,45 @@ def test_f01_redaction_is_linear_time_on_unterminated_backslashes_and_masks_basi
     assert "raw-basic-pos-123" not in emitted
     assert "raw-basic-named-456" not in emitted
     assert emitted.count("***REDACTED***") >= 2
+
+
+async def test_f01_concurrent_login_rechecks_rate_limit_after_permit_acquire(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Contract: Queued login rechecks failed-login rate limit after acquiring permit.
+
+    Defect caught: Two concurrent wrong logins bypassing login_max_attempts=1 before failure record.
+    """
+    settings = Settings(
+        app_password_hash=TEST_PASSWORD_HASH,
+        login_rate_limit_attempts=1,
+        login_rate_limit_window_sec=60.0,
+        login_max_concurrency=1,
+    )
+    async with _async_client(settings, client_ip="127.0.0.1") as (client, app):
+        call_count = 0
+        count_lock = threading.Lock()
+        first_entered = threading.Event()
+        release_first = threading.Event()
+
+        def slow_failing_verify(_pw: str) -> bool:
+            nonlocal call_count
+            with count_lock:
+                call_count += 1
+            first_entered.set()
+            release_first.wait(timeout=2.0)
+            return False
+
+        monkeypatch.setattr(app.state.session_manager, "verify_password", slow_failing_verify)
+
+        task1 = asyncio.create_task(client.post("/api/auth/login", json={"password": "wrong-1"}))
+        while not first_entered.is_set():
+            await asyncio.sleep(0.002)
+
+        task2 = asyncio.create_task(client.post("/api/auth/login", json={"password": "wrong-2"}))
+        await asyncio.sleep(0.02)
+        release_first.set()
+
+        r1, r2 = await asyncio.gather(task1, task2)
+        assert sorted([r1.status_code, r2.status_code]) == [401, 429]
+        assert call_count == 1

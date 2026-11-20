@@ -11,6 +11,7 @@ from app.config import Settings
 from app.security import (
     SESSION_COOKIE_NAME,
     LoginGuard,
+    LoginRateLimitedError,
     SessionData,
     SessionManager,
     get_session_manager,
@@ -77,15 +78,24 @@ async def login(
             detail="Too many failed login attempts; please wait before retrying",
         )
 
-    verified = await login_guard.verify_password_offload(session_manager, body.password)
+    try:
+        verified = await login_guard.verify_password_offload(
+            session_manager,
+            body.password,
+            client_key=client_key,
+        )
+    except LoginRateLimitedError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail=str(exc),
+        ) from exc
+
     if not verified:
-        login_guard.record_failure(client_key)
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid credentials",
         )
 
-    login_guard.reset(client_key)
     session = session_manager.create_session()
     response.set_cookie(
         key=SESSION_COOKIE_NAME,
