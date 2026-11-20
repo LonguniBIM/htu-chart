@@ -8,6 +8,8 @@ import logging
 import threading
 import time
 from contextlib import asynccontextmanager
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -19,7 +21,8 @@ from pydantic import ValidationError
 from starlette.websockets import WebSocketDisconnect
 from uvicorn.logging import AccessFormatter
 
-from app.config import Settings
+import app.config as config_mod
+from app.config import DEFAULT_ENV_FILE, Settings, load_settings
 from app.main import create_app
 from app.security import (
     LoginGuard,
@@ -631,3 +634,93 @@ async def test_f01_login_guard_retains_permit_until_cancelled_worker_thread_exit
     await asyncio.sleep(0.05)
     assert await guard.verify_password_offload(mgr, "fast", acquire_timeout=1.0) is True
     assert peak_workers == 1
+
+
+async def test_f01_load_settings_resolves_repo_root_env_and_authenticates(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Contract: DEFAULT_ENV_FILE targets topstep-chart-app/.env and load_settings() loads it.
+
+    Defect caught: Wrong Path.parents index ignoring topstep-chart-app/.env at startup.
+    """
+    assert DEFAULT_ENV_FILE == Path(__file__).resolve().parents[2] / ".env"
+    assert DEFAULT_ENV_FILE.parent.name == "topstep-chart-app"
+    assert (DEFAULT_ENV_FILE.parent / ".env.example").is_file()
+
+    env_pw = "repo-root-env-password"
+    env_hash = PasswordHasher().hash(env_pw)
+    tmp_env = tmp_path / ".env"
+    tmp_env.write_text(f"APP_PASSWORD_HASH='{env_hash}'\n", encoding="utf-8")
+
+    monkeypatch.setattr(config_mod, "DEFAULT_ENV_FILE", tmp_env)
+    loaded = load_settings()
+    assert loaded.app_password_hash == env_hash
+
+    async with _async_client(loaded) as (client, _):
+        resp = await client.post("/api/auth/login", json={"password": env_pw})
+        assert resp.status_code == 200
+        assert resp.json()["authenticated"] is True
+
+
+def test_f01_quoted_kv_and_named_logging_placeholders_are_redacted() -> None:
+    """Contract: Quoted key='val'/key=\"val\" assignments and named Bearer placeholders redact.
+
+    Defect caught: Unmasked password=\"...\", apiKey='...', or Bearer %(credential)s logs.
+    """
+    direct = redact_secrets(
+        "login failed password=\"probe-secret-value\" apiKey='probe-key-value'"
+    )
+    assert "probe-secret-value" not in direct
+    assert "probe-key-value" not in direct
+    assert "***REDACTED***" in direct
+
+    create_app(settings=Settings(app_password_hash=TEST_PASSWORD_HASH))
+    buf = io.StringIO()
+    handler = logging.StreamHandler(buf)
+    root_logger = logging.getLogger()
+    prev_level = root_logger.level
+    root_logger.setLevel(logging.DEBUG)
+    root_logger.addHandler(handler)
+    try:
+        logging.getLogger("topstep_chart.auth").warning(
+            "Rejected password=\"probe-secret-value\" apiKey='probe-key-value'"
+        )
+        logging.getLogger("topstep_chart.auth").warning(
+            "user=%(user)s Authorization: Bearer %(credential)s",
+            {"user": "alice", "credential": "raw-jwt-named-999"},
+        )
+    finally:
+        root_logger.removeHandler(handler)
+        root_logger.setLevel(prev_level)
+
+    emitted = buf.getvalue()
+    assert "probe-secret-value" not in emitted
+    assert "probe-key-value" not in emitted
+    assert "raw-jwt-named-999" not in emitted
+    assert "alice" in emitted
+    assert "***REDACTED***" in emitted
+
+
+async def test_f01_expired_session_returns_401_on_status() -> None:
+    """Contract: Expired caller session cookies are rejected with 401 Unauthorized.
+
+    Defect caught: SessionManager failing to evict or reject expired sessions.
+    """
+    settings = Settings(app_password_hash=TEST_PASSWORD_HASH, session_ttl_seconds=60)
+    async with _async_client(settings) as (client, app):
+        await _login_and_get_csrf(client)
+        ok_status = await client.get("/api/status")
+        assert ok_status.status_code == 200
+
+        session_id = client.cookies["topstep_session"]
+        active = app.state.session_manager._sessions[session_id]
+        app.state.session_manager._sessions[session_id] = type(active)(
+            session_id=active.session_id,
+            csrf_token=active.csrf_token,
+            created_at=active.created_at - timedelta(hours=2),
+            expires_at=datetime.now(UTC) - timedelta(seconds=1),
+        )
+
+        expired_status = await client.get("/api/status")
+        assert expired_status.status_code == 401

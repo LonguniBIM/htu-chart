@@ -164,9 +164,12 @@ class Settings(BaseSettings):
         return self
 
 
+DEFAULT_ENV_FILE = Path(__file__).resolve().parents[2] / ".env"
+
+
 def load_settings(env_file: Path | None = None) -> Settings:
     """Load Settings, optionally reading an explicit .env file if it exists."""
-    target_env = env_file or (Path(__file__).resolve().parents[2] / ".env")
+    target_env = env_file or DEFAULT_ENV_FILE
     if target_env.is_file():
         return Settings(_env_file=target_env)
     return Settings()

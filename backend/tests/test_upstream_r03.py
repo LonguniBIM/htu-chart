@@ -399,3 +399,7 @@ async def test_r03_shared_semaphore_caps_overlapping_auth_and_rest_requests() ->
             rest.search_contracts("MNQ"),
         )
         assert peak_active <= 1
+
+    wired_app = create_app(settings=Settings())
+    async with wired_app.router.lifespan_context(wired_app):
+        assert wired_app.state.topstep_auth._semaphore is wired_app.state.rest_client._semaphore

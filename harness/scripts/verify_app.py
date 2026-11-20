@@ -35,6 +35,10 @@ EVIDENCE_DIR = REPO_ROOT / "harness" / "evidence"
 ACTIVE_RUN_FILE = EVIDENCE_DIR / "active-run.json"
 
 SECRET_FIELD_NAMES = (
+    "access_token",
+    "app_password_hash",
+    "app_session_secret",
+    "authorization",
     "apiKey",
     "api_key",
     "TOPSTEPX_API_KEY",
@@ -43,9 +47,11 @@ SECRET_FIELD_NAMES = (
     "token",
     "password",
 )
+SECRET_FIELD_NAMES_LOWER = frozenset(name.lower() for name in SECRET_FIELD_NAMES)
 RAW_SECRET_VALUE_RE = re.compile(
     r"""(?i)(?:\bBearer\s+[A-Za-z0-9._~+/=-]+|"""
-    r"""\b(?:apiKey|api_key|TOPSTEPX_API_KEY|TELEGRAM_BOT_TOKEN|botToken|access_token|token|password)"""
+    r"""\b(?:authorization|access_token|apiKey|api_key|TOPSTEPX_API_KEY|"""
+    r"""TELEGRAM_BOT_TOKEN|botToken|app_password_hash|app_session_secret|token|password)"""
     r"""["']?\s*[:=]\s*["']?[^\s"'&,}\]]+)"""
 )
 
@@ -141,7 +147,7 @@ def _find_leaked_secrets(payload: Any, path: str = "$") -> list[str]:
     leaks: list[str] = []
     if isinstance(payload, dict):
         for k, v in payload.items():
-            if k in SECRET_FIELD_NAMES and v not in (None, "", False):
+            if k.lower() in SECRET_FIELD_NAMES_LOWER and v not in (None, "", False):
                 leaks.append(f"{path}.{k}")
             leaks.extend(_find_leaked_secrets(v, f"{path}.{k}"))
     elif isinstance(payload, list):

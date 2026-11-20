@@ -30,57 +30,66 @@ CSRF_HEADER_NAME = "X-CSRF-Token"
 MUTATING_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
 LOOPBACK_IPS = frozenset({"127.0.0.1", "::1"})
 
+_REDACTED_FIELD_PATTERN = (
+    r"Authorization|access_token|apiKey|api_key|token|"
+    r"TOPSTEPX_API_KEY|TELEGRAM_BOT_TOKEN|botToken|APP_PASSWORD_HASH|APP_SESSION_SECRET|password"
+)
 _BEARER_RE = re.compile(r"(?i)\bBearer\s+[A-Za-z0-9._~+/=-]+")
 _AUTH_HEADER_RE = re.compile(r"(?i)\bAuthorization\s*([:=])\s*(?:Bearer\s+)?[^\s,;'\"]+")
 _JSON_SECRET_RE = re.compile(
-    r"""(?i)(["']\b(?:access_token|apiKey|api_key|token|"""
-    r"""TOPSTEPX_API_KEY|TELEGRAM_BOT_TOKEN|APP_PASSWORD_HASH|password)"""
-    r"""\b["']\s*:\s*["'])([^"']*)(["'])"""
+    rf"""(?i)(["']\b(?:{_REDACTED_FIELD_PATTERN})\b["']\s*:\s*["'])([^"']*)(["'])"""
+)
+_QUOTED_KV_SECRET_RE = re.compile(
+    rf"""(?i)\b({_REDACTED_FIELD_PATTERN})\b(\s*[:=]\s*)(["'])(?!\*\*\*REDACTED\*\*\*\3)(?:\\.|(?!\3).)*\3"""
 )
 _KV_SECRET_RE = re.compile(
-    r"""(?i)\b(access_token|apiKey|api_key|token|"""
-    r"""TOPSTEPX_API_KEY|TELEGRAM_BOT_TOKEN|APP_PASSWORD_HASH|password)"""
-    r"""\b(\s*[:=]\s*)(?!\*\*\*REDACTED\*\*\*)([^\s,;'"}\]]+)"""
+    rf"""(?i)\b({_REDACTED_FIELD_PATTERN})\b(\s*[:=]\s*)(?!\*\*\*REDACTED\*\*\*)([^\s,;'"}}\]]+)"""
 )
 _SENSITIVE_DICT_KEYS = frozenset({
+    "authorization",
     "access_token",
     "apikey",
     "api_key",
     "token",
+    "bottoken",
     "topstepx_api_key",
     "telegram_bot_token",
     "app_password_hash",
+    "app_session_secret",
     "password",
 })
 _PRINTF_SPEC_RE = re.compile(
     r"%(?:\([^)]+\))?[-#0 +]*(?:\d+|\*)?(?:\.(?:\d+|\*))?[hlL]?[diouxXeEfFgGcrsa%]"
 )
+_NAMED_PRINTF_SPEC_RE = re.compile(
+    r"%\((?P<key>[A-Za-z0-9_]+)\)[-+#0 *.\dhlL]*[diouxXeEfFgGcrsa]"
+)
 _MSG_SECRET_PREFIX_RE = re.compile(
-    r"""(?i)(?:\bBearer\s+|"""
-    r"""\b(?:Authorization|access_token|apiKey|api_key|token|"""
-    r"""TOPSTEPX_API_KEY|TELEGRAM_BOT_TOKEN|APP_PASSWORD_HASH|password)\b"""
-    r"""["']?\s*(?:[:=]\s*|\s+)["']?)$"""
+    rf"""(?i)(?:\bBearer\s+|\b(?:{_REDACTED_FIELD_PATTERN})\b["']?\s*(?:[:=]\s*|\s+)["']?)$"""
 )
 
 
-def _redact_arg(value: Any, extra_secrets: tuple[str, ...]) -> Any:
+def _redact_arg(
+    value: Any,
+    extra_secrets: tuple[str, ...],
+    sensitive_keys: frozenset[str] = frozenset(),
+) -> Any:
     if isinstance(value, str):
         return redact_secrets(value, extra_secrets)
     if isinstance(value, tuple):
-        return tuple(_redact_arg(item, extra_secrets) for item in value)
+        return tuple(_redact_arg(item, extra_secrets, sensitive_keys) for item in value)
     if isinstance(value, list):
-        return [_redact_arg(item, extra_secrets) for item in value]
+        return [_redact_arg(item, extra_secrets, sensitive_keys) for item in value]
     if isinstance(value, dict):
         redacted_dict: dict[Any, Any] = {}
         for k, v in value.items():
-            if (
-                isinstance(k, str)
-                and k.lower() in _SENSITIVE_DICT_KEYS
-                and v not in (None, "", False)
-            ):
+            is_sensitive_key = isinstance(k, str) and (
+                k.lower() in _SENSITIVE_DICT_KEYS or k in sensitive_keys
+            )
+            if is_sensitive_key and v not in (None, "", False):
                 redacted_dict[k] = "***REDACTED***"
             else:
-                redacted_dict[k] = _redact_arg(v, extra_secrets)
+                redacted_dict[k] = _redact_arg(v, extra_secrets, sensitive_keys)
         return redacted_dict
     return value
 
@@ -101,6 +110,15 @@ def _sensitive_positional_slots(msg: str) -> set[int]:
     return slots
 
 
+def _sensitive_named_keys(msg: str) -> frozenset[str]:
+    keys: set[str] = set()
+    for match in _NAMED_PRINTF_SPEC_RE.finditer(msg):
+        prefix = msg[: match.start()]
+        if _MSG_SECRET_PREFIX_RE.search(prefix):
+            keys.add(match.group("key"))
+    return frozenset(keys)
+
+
 def _redact_log_message_template(msg: str, extra_secrets: tuple[str, ...]) -> str:
     """Redact literal secrets in a logging template while preserving % format specifiers."""
 
@@ -115,9 +133,10 @@ def _redact_log_message_template(msg: str, extra_secrets: tuple[str, ...]) -> st
 
         return pattern.sub(_cb, text)
 
-    redacted = _safe_sub(_AUTH_HEADER_RE, r"Authorization\1 ***REDACTED***", msg)
+    redacted = _safe_sub(_JSON_SECRET_RE, r"\1***REDACTED***\3", msg)
+    redacted = _safe_sub(_QUOTED_KV_SECRET_RE, r"\1\2\3***REDACTED***\3", redacted)
+    redacted = _safe_sub(_AUTH_HEADER_RE, r"Authorization\1 ***REDACTED***", redacted)
     redacted = _safe_sub(_BEARER_RE, "Bearer ***REDACTED***", redacted)
-    redacted = _safe_sub(_JSON_SECRET_RE, r"\1***REDACTED***\3", redacted)
     redacted = _safe_sub(_KV_SECRET_RE, r"\1\2***REDACTED***", redacted)
     for secret in extra_secrets:
         if secret and len(secret) >= 6:
@@ -129,9 +148,10 @@ def redact_secrets(text: str, extra_secrets: Iterable[str] = ()) -> str:
     """Mask bearer tokens, API keys, passwords, and known secrets in text."""
     if not text:
         return text
-    redacted = _AUTH_HEADER_RE.sub(r"Authorization\1 ***REDACTED***", text)
+    redacted = _JSON_SECRET_RE.sub(r"\1***REDACTED***\3", text)
+    redacted = _QUOTED_KV_SECRET_RE.sub(r"\1\2\3***REDACTED***\3", redacted)
+    redacted = _AUTH_HEADER_RE.sub(r"Authorization\1 ***REDACTED***", redacted)
     redacted = _BEARER_RE.sub("Bearer ***REDACTED***", redacted)
-    redacted = _JSON_SECRET_RE.sub(r"\1***REDACTED***\3", redacted)
     redacted = _KV_SECRET_RE.sub(r"\1\2***REDACTED***", redacted)
     for secret in extra_secrets:
         if secret and len(secret) >= 6:
@@ -147,12 +167,15 @@ class SecretRedactionFilter(logging.Filter):
         self._extra_secrets = tuple(s for s in extra_secrets if s and len(s) >= 6)
 
     def filter(self, record: logging.LogRecord) -> bool:
+        sensitive_named: frozenset[str] = frozenset()
         if isinstance(record.msg, str):
             sensitive_slots = (
                 _sensitive_positional_slots(record.msg)
                 if isinstance(record.args, tuple)
                 else set()
             )
+            if isinstance(record.args, dict):
+                sensitive_named = _sensitive_named_keys(record.msg)
             if record.args:
                 record.msg = _redact_log_message_template(record.msg, self._extra_secrets)
             else:
@@ -170,7 +193,11 @@ class SecretRedactionFilter(logging.Filter):
                     redacted_items.append(_redact_arg(item, self._extra_secrets))
             record.args = tuple(redacted_items)
         elif record.args:
-            record.args = _redact_arg(record.args, self._extra_secrets)
+            record.args = _redact_arg(
+                record.args,
+                self._extra_secrets,
+                sensitive_keys=sensitive_named,
+            )
 
         if record.exc_info:
             formatter = logging.Formatter()
