@@ -15,9 +15,11 @@ from fastapi import FastAPI, Request, status
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
-from app.api import routes_market, routes_status
+from app.api import routes_alerts, routes_market, routes_status
 from app.config import Settings, load_settings
-from app.engine.bar_aggregator import BarAggregator
+from app.engine.alert_engine import AlertEngine
+from app.engine.bar_aggregator import AggregatedBarEvent, BarAggregator
+from app.notify.telegram import TelegramAlertDispatcher
 from app.security import (
     HostOriginMiddleware,
     LoginGuard,
@@ -39,7 +41,12 @@ logger = logging.getLogger("topstep_chart")
 
 
 def _install_redaction_filter(settings: Settings) -> None:
-    extra = (settings.topstepx_api_key, settings.app_password_hash, settings.app_session_secret)
+    extra = (
+        settings.topstepx_api_key,
+        settings.app_password_hash,
+        settings.app_session_secret,
+        settings.telegram_bot_token,
+    )
     install_global_log_redaction(extra_secrets=extra)
 
 
@@ -124,6 +131,19 @@ def create_app(
             auth_service=auth_service,
             ws_factory=signalr_ws_factory,
         )
+        alert_engine = AlertEngine(enabled=resolved_settings.alert_scanner_enabled)
+        alert_dispatcher = TelegramAlertDispatcher(
+            resolved_settings,
+            sqlite_store,
+            http_client=client,
+            auth_service=auth_service,
+        )
+
+        async def _on_bar_signal(event: AggregatedBarEvent, tag: str | None) -> None:
+            prepared_list = alert_engine.evaluate_bar_event(event, signal_tag=tag)
+            for prepared in prepared_list:
+                await alert_dispatcher.enqueue_prepared_alert(prepared)
+
         live_feed_service = LiveFeedService(
             resolved_settings,
             auth_service,
@@ -133,6 +153,7 @@ def create_app(
             aggregator=bar_aggregator,
             broadcaster=ws_broadcaster,
             signalr_hub=signalr_hub,
+            on_bar_signal=_on_bar_signal,
         )
 
         app_instance.state.settings = resolved_settings
@@ -148,8 +169,11 @@ def create_app(
         app_instance.state.bar_aggregator = bar_aggregator
         app_instance.state.ws_broadcaster = ws_broadcaster
         app_instance.state.signalr_hub = signalr_hub
+        app_instance.state.alert_engine = alert_engine
+        app_instance.state.alert_dispatcher = alert_dispatcher
         app_instance.state.live_feed_service = live_feed_service
 
+        await alert_dispatcher.start()
         await live_feed_service.start()
 
         auth_task: asyncio.Task[None] | None = None
@@ -171,6 +195,7 @@ def create_app(
                 with contextlib.suppress(asyncio.CancelledError):
                     await auth_task
             await live_feed_service.stop()
+            await alert_dispatcher.stop()
             await ws_broadcaster.close_all()
             sqlite_store.close()
             if owns_client:
@@ -192,6 +217,7 @@ def create_app(
             resolved_settings.topstepx_api_key,
             resolved_settings.app_password_hash,
             resolved_settings.app_session_secret,
+            resolved_settings.telegram_bot_token,
         )
         sanitized: list[dict[str, Any]] = []
         for err in exc.errors():
@@ -215,6 +241,7 @@ def create_app(
     application.include_router(routes_status.router)
     application.include_router(routes_market.router)
     application.include_router(routes_market.ws_router)
+    application.include_router(routes_alerts.router)
     return application
 
 

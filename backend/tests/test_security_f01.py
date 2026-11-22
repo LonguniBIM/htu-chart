@@ -692,7 +692,7 @@ async def test_f01_load_settings_resolves_repo_root_env_and_authenticates(
     Defect caught: Wrong Path.parents index ignoring topstep-chart-app/.env at startup.
     """
     assert DEFAULT_ENV_FILE == Path(__file__).resolve().parents[2] / ".env"
-    assert DEFAULT_ENV_FILE.parent.name == "topstep-chart-app"
+    assert (DEFAULT_ENV_FILE.parent / "backend" / "pyproject.toml").is_file()
     assert (DEFAULT_ENV_FILE.parent / ".env.example").is_file()
 
     env_pw = "repo-root-env-password"

@@ -101,6 +101,14 @@ class Settings(BaseSettings):
     ws_client_queue_maxsize: int = Field(default=64, ge=1, le=4096)
     ws_send_timeout_sec: float = Field(default=5.0, gt=0.0)
 
+    telegram_bot_token: str = ""
+    telegram_chat_id: str = ""
+    telegram_api_base_url: str = "https://api.telegram.org"
+    alert_ttl_seconds: int = Field(default=90, ge=1)
+    alert_max_retries: int = Field(default=3, ge=0, le=10)
+    alert_poll_interval_sec: float = Field(default=1.0, gt=0.0)
+    alert_scanner_enabled: bool = True
+
     data_dir: Path = Path("data")
 
     @field_validator("app_env", mode="before")

@@ -15,7 +15,17 @@ from app.engine.instruments import StorageDatasetKey
 
 CoverageStatus = Literal["COMPLETE", "CORRUPTED", "TRUNCATED", "PROVIDER_GAP"]
 _VALID_COVERAGE_STATUSES = frozenset({"COMPLETE", "CORRUPTED", "TRUNCATED", "PROVIDER_GAP"})
+AlertStatus = Literal["PENDING", "DELIVERED", "EXPIRED", "FAILED", "SUPPRESSED"]
+_VALID_ALERT_STATUSES: tuple[AlertStatus, ...] = (
+    "PENDING",
+    "DELIVERED",
+    "EXPIRED",
+    "FAILED",
+    "SUPPRESSED",
+)
+_VALID_ALERT_STATUS_SET = frozenset(_VALID_ALERT_STATUSES)
 _MAX_RAW_PAYLOAD_CHARS = 2048
+_MAX_ALERT_ERROR_CHARS = 1024
 _SQLITE_INT64_MIN = -(2**63)
 _SQLITE_INT64_MAX = 2**63 - 1
 
@@ -66,6 +76,29 @@ class FeedWatermark:
     contract_id: str
     timeframe: str
     last_closed_bar_time: int
+    updated_at_utc: int
+
+
+@dataclass(frozen=True)
+class AlertOutboxRecord:
+    """Persisted transactional alert outbox row (F07)."""
+
+    id: int
+    strategy_id: str
+    strategy_version: str
+    live_mode: bool
+    contract_id: str
+    timeframe: str
+    bar_time: int
+    direction: str
+    signal_tag: str | None
+    status: AlertStatus
+    payload_json: str
+    created_at_utc: int
+    expires_at_utc: int
+    next_attempt_at_utc: int
+    attempts: int
+    last_error: str | None
     updated_at_utc: int
 
 
@@ -195,6 +228,38 @@ class SqliteStore:
                 updated_at_utc INTEGER NOT NULL,
                 PRIMARY KEY (provider, live_mode, contract_id, timeframe)
             );
+
+            CREATE TABLE IF NOT EXISTS alert_outbox (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                strategy_id TEXT NOT NULL,
+                strategy_version TEXT NOT NULL,
+                live_mode INTEGER NOT NULL,
+                contract_id TEXT NOT NULL,
+                timeframe TEXT NOT NULL,
+                bar_time INTEGER NOT NULL,
+                direction TEXT NOT NULL,
+                signal_tag TEXT,
+                status TEXT NOT NULL,
+                payload_json TEXT NOT NULL,
+                created_at_utc INTEGER NOT NULL,
+                expires_at_utc INTEGER NOT NULL,
+                next_attempt_at_utc INTEGER NOT NULL,
+                attempts INTEGER NOT NULL DEFAULT 0,
+                last_error TEXT,
+                updated_at_utc INTEGER NOT NULL,
+                UNIQUE(
+                    strategy_id,
+                    strategy_version,
+                    live_mode,
+                    contract_id,
+                    timeframe,
+                    bar_time,
+                    direction
+                )
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_alert_outbox_status_next
+                ON alert_outbox (status, next_attempt_at_utc, expires_at_utc);
             """
         )
         conn.commit()
@@ -958,3 +1023,441 @@ class SqliteStore:
             live_mode=live_mode,
             contract_id=contract_id,
         )
+
+    @staticmethod
+    def _row_to_alert_record(row: sqlite3.Row) -> AlertOutboxRecord:
+        return AlertOutboxRecord(
+            id=int(row["id"]),
+            strategy_id=str(row["strategy_id"]),
+            strategy_version=str(row["strategy_version"]),
+            live_mode=bool(row["live_mode"]),
+            contract_id=str(row["contract_id"]),
+            timeframe=str(row["timeframe"]),
+            bar_time=int(row["bar_time"]),
+            direction=str(row["direction"]),
+            signal_tag=str(row["signal_tag"]) if row["signal_tag"] is not None else None,
+            status=row["status"],
+            payload_json=str(row["payload_json"]),
+            created_at_utc=int(row["created_at_utc"]),
+            expires_at_utc=int(row["expires_at_utc"]),
+            next_attempt_at_utc=int(row["next_attempt_at_utc"]),
+            attempts=int(row["attempts"]),
+            last_error=str(row["last_error"]) if row["last_error"] is not None else None,
+            updated_at_utc=int(row["updated_at_utc"]),
+        )
+
+    @staticmethod
+    def _validate_int64(value: int, field_name: str) -> int:
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise ValueError(f"{field_name} must be an integer")
+        if not (_SQLITE_INT64_MIN <= value <= _SQLITE_INT64_MAX):
+            raise ValueError(f"{field_name} out of SQLite int64 range")
+        return value
+
+    def enqueue_alert_sync(
+        self,
+        *,
+        strategy_id: str,
+        strategy_version: str,
+        live_mode: bool,
+        contract_id: str,
+        timeframe: str,
+        bar_time: int,
+        direction: str,
+        payload_json: str,
+        expires_at_utc: int,
+        signal_tag: str | None = None,
+        status: AlertStatus = "PENDING",
+        created_at_utc: int | None = None,
+        next_attempt_at_utc: int | None = None,
+        last_error: str | None = None,
+    ) -> tuple[AlertOutboxRecord, bool]:
+        """Transactionally insert a new alert or return the existing deduplicated record."""
+        norm_strategy = strategy_id.strip()
+        norm_version = strategy_version.strip()
+        norm_contract = contract_id.strip().upper()
+        norm_tf = timeframe.strip().lower()
+        norm_dir = direction.strip().upper()
+        if not all((norm_strategy, norm_version, norm_contract, norm_tf, norm_dir)):
+            raise ValueError("Alert outbox key fields must be non-empty")
+        if status not in _VALID_ALERT_STATUS_SET:
+            raise ValueError(f"Invalid alert outbox status: {status!r}")
+
+        eff_bar_time = self._validate_int64(bar_time, "bar_time")
+        eff_created = (
+            self._validate_int64(created_at_utc, "created_at_utc")
+            if created_at_utc is not None
+            else self._now_utc()
+        )
+        eff_expires = self._validate_int64(expires_at_utc, "expires_at_utc")
+        eff_next = (
+            self._validate_int64(next_attempt_at_utc, "next_attempt_at_utc")
+            if next_attempt_at_utc is not None
+            else eff_created
+        )
+        eff_live = int(bool(live_mode))
+        safe_error = last_error[:_MAX_ALERT_ERROR_CHARS] if last_error is not None else None
+
+        with self._lock:
+            conn = self._ensure_conn_locked()
+            cursor = conn.execute(
+                """
+                INSERT OR IGNORE INTO alert_outbox (
+                    strategy_id, strategy_version, live_mode, contract_id, timeframe,
+                    bar_time, direction, signal_tag, status, payload_json,
+                    created_at_utc, expires_at_utc, next_attempt_at_utc,
+                    attempts, last_error, updated_at_utc
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)
+                """,
+                (
+                    norm_strategy,
+                    norm_version,
+                    eff_live,
+                    norm_contract,
+                    norm_tf,
+                    eff_bar_time,
+                    norm_dir,
+                    signal_tag,
+                    status,
+                    payload_json,
+                    eff_created,
+                    eff_expires,
+                    eff_next,
+                    safe_error,
+                    eff_created,
+                ),
+            )
+            created = cursor.rowcount == 1
+            if created:
+                conn.commit()
+            row = conn.execute(
+                """
+                SELECT id, strategy_id, strategy_version, live_mode, contract_id, timeframe,
+                       bar_time, direction, signal_tag, status, payload_json,
+                       created_at_utc, expires_at_utc, next_attempt_at_utc,
+                       attempts, last_error, updated_at_utc
+                FROM alert_outbox
+                WHERE strategy_id = ?
+                  AND strategy_version = ?
+                  AND live_mode = ?
+                  AND contract_id = ?
+                  AND timeframe = ?
+                  AND bar_time = ?
+                  AND direction = ?
+                """,
+                (
+                    norm_strategy,
+                    norm_version,
+                    eff_live,
+                    norm_contract,
+                    norm_tf,
+                    eff_bar_time,
+                    norm_dir,
+                ),
+            ).fetchone()
+            if row is None:
+                raise RuntimeError("Failed to read alert_outbox row after enqueue")
+            return self._row_to_alert_record(row), created
+
+    async def enqueue_alert(
+        self,
+        *,
+        strategy_id: str,
+        strategy_version: str,
+        live_mode: bool,
+        contract_id: str,
+        timeframe: str,
+        bar_time: int,
+        direction: str,
+        payload_json: str,
+        expires_at_utc: int,
+        signal_tag: str | None = None,
+        status: AlertStatus = "PENDING",
+        created_at_utc: int | None = None,
+        next_attempt_at_utc: int | None = None,
+        last_error: str | None = None,
+    ) -> tuple[AlertOutboxRecord, bool]:
+        """Enqueue a deduplicated alert into SQLite alert_outbox."""
+        return await asyncio.to_thread(
+            self.enqueue_alert_sync,
+            strategy_id=strategy_id,
+            strategy_version=strategy_version,
+            live_mode=live_mode,
+            contract_id=contract_id,
+            timeframe=timeframe,
+            bar_time=bar_time,
+            direction=direction,
+            payload_json=payload_json,
+            expires_at_utc=expires_at_utc,
+            signal_tag=signal_tag,
+            status=status,
+            created_at_utc=created_at_utc,
+            next_attempt_at_utc=next_attempt_at_utc,
+            last_error=last_error,
+        )
+
+    def claim_due_pending_alerts_sync(
+        self,
+        now_utc: int,
+        limit: int = 20,
+    ) -> list[AlertOutboxRecord]:
+        """Expire stale PENDING alerts and return due non-expired PENDING alerts."""
+        eff_now = self._validate_int64(now_utc, "now_utc")
+        safe_limit = max(1, int(limit))
+        with self._lock:
+            conn = self._ensure_conn_locked()
+            conn.execute(
+                """
+                UPDATE alert_outbox
+                SET status = 'EXPIRED',
+                    last_error = COALESCE(last_error, 'Alert TTL expired before delivery'),
+                    updated_at_utc = ?
+                WHERE status = 'PENDING'
+                  AND expires_at_utc <= ?
+                """,
+                (eff_now, eff_now),
+            )
+            rows = conn.execute(
+                """
+                SELECT id, strategy_id, strategy_version, live_mode, contract_id, timeframe,
+                       bar_time, direction, signal_tag, status, payload_json,
+                       created_at_utc, expires_at_utc, next_attempt_at_utc,
+                       attempts, last_error, updated_at_utc
+                FROM alert_outbox
+                WHERE status = 'PENDING'
+                  AND next_attempt_at_utc <= ?
+                  AND expires_at_utc > ?
+                ORDER BY next_attempt_at_utc ASC, id ASC
+                LIMIT ?
+                """,
+                (eff_now, eff_now, safe_limit),
+            ).fetchall()
+            conn.commit()
+            return [self._row_to_alert_record(row) for row in rows]
+
+    async def claim_due_pending_alerts(
+        self,
+        now_utc: int,
+        limit: int = 20,
+    ) -> list[AlertOutboxRecord]:
+        """Expire stale PENDING alerts and return due non-expired PENDING alerts."""
+        return await asyncio.to_thread(self.claim_due_pending_alerts_sync, now_utc, limit)
+
+    def mark_alert_delivered_sync(self, alert_id: int, now_utc: int) -> None:
+        """Mark an outbox alert as DELIVERED."""
+        eff_now = self._validate_int64(now_utc, "now_utc")
+        with self._lock:
+            conn = self._ensure_conn_locked()
+            conn.execute(
+                """
+                UPDATE alert_outbox
+                SET status = 'DELIVERED',
+                    last_error = NULL,
+                    updated_at_utc = ?
+                WHERE id = ?
+                """,
+                (eff_now, int(alert_id)),
+            )
+            conn.commit()
+
+    async def mark_alert_delivered(self, alert_id: int, now_utc: int) -> None:
+        """Mark an outbox alert as DELIVERED."""
+        await asyncio.to_thread(self.mark_alert_delivered_sync, alert_id, now_utc)
+
+    def mark_alert_retry_sync(
+        self,
+        alert_id: int,
+        *,
+        next_attempt_at_utc: int,
+        last_error: str,
+        now_utc: int,
+    ) -> None:
+        """Schedule a bounded retry for a transient failure while keeping status PENDING."""
+        eff_now = self._validate_int64(now_utc, "now_utc")
+        eff_next = self._validate_int64(next_attempt_at_utc, "next_attempt_at_utc")
+        safe_error = last_error[:_MAX_ALERT_ERROR_CHARS]
+        with self._lock:
+            conn = self._ensure_conn_locked()
+            conn.execute(
+                """
+                UPDATE alert_outbox
+                SET status = 'PENDING',
+                    attempts = attempts + 1,
+                    next_attempt_at_utc = ?,
+                    last_error = ?,
+                    updated_at_utc = ?
+                WHERE id = ?
+                """,
+                (eff_next, safe_error, eff_now, int(alert_id)),
+            )
+            conn.commit()
+
+    async def mark_alert_retry(
+        self,
+        alert_id: int,
+        *,
+        next_attempt_at_utc: int,
+        last_error: str,
+        now_utc: int,
+    ) -> None:
+        """Schedule a bounded retry for a transient failure while keeping status PENDING."""
+        await asyncio.to_thread(
+            self.mark_alert_retry_sync,
+            alert_id,
+            next_attempt_at_utc=next_attempt_at_utc,
+            last_error=last_error,
+            now_utc=now_utc,
+        )
+
+    def mark_alert_expired_sync(
+        self,
+        alert_id: int,
+        *,
+        last_error: str | None,
+        now_utc: int,
+    ) -> None:
+        """Mark an outbox alert as EXPIRED (staleness TTL elapsed)."""
+        eff_now = self._validate_int64(now_utc, "now_utc")
+        safe_error = last_error[:_MAX_ALERT_ERROR_CHARS] if last_error is not None else None
+        with self._lock:
+            conn = self._ensure_conn_locked()
+            conn.execute(
+                """
+                UPDATE alert_outbox
+                SET status = 'EXPIRED',
+                    last_error = COALESCE(?, last_error),
+                    updated_at_utc = ?
+                WHERE id = ?
+                """,
+                (safe_error, eff_now, int(alert_id)),
+            )
+            conn.commit()
+
+    async def mark_alert_expired(
+        self,
+        alert_id: int,
+        *,
+        last_error: str | None,
+        now_utc: int,
+    ) -> None:
+        """Mark an outbox alert as EXPIRED (staleness TTL elapsed)."""
+        await asyncio.to_thread(
+            self.mark_alert_expired_sync,
+            alert_id,
+            last_error=last_error,
+            now_utc=now_utc,
+        )
+
+    def mark_alert_failed_sync(
+        self,
+        alert_id: int,
+        *,
+        last_error: str,
+        now_utc: int,
+    ) -> None:
+        """Mark an outbox alert as permanently FAILED and increment attempts."""
+        eff_now = self._validate_int64(now_utc, "now_utc")
+        safe_error = last_error[:_MAX_ALERT_ERROR_CHARS]
+        with self._lock:
+            conn = self._ensure_conn_locked()
+            conn.execute(
+                """
+                UPDATE alert_outbox
+                SET status = 'FAILED',
+                    attempts = attempts + 1,
+                    last_error = ?,
+                    updated_at_utc = ?
+                WHERE id = ?
+                """,
+                (safe_error, eff_now, int(alert_id)),
+            )
+            conn.commit()
+
+    async def mark_alert_failed(
+        self,
+        alert_id: int,
+        *,
+        last_error: str,
+        now_utc: int,
+    ) -> None:
+        """Mark an outbox alert as permanently FAILED and increment attempts."""
+        await asyncio.to_thread(
+            self.mark_alert_failed_sync,
+            alert_id,
+            last_error=last_error,
+            now_utc=now_utc,
+        )
+
+    def list_alerts_sync(
+        self,
+        limit: int = 50,
+        status_filter: str | None = None,
+    ) -> list[AlertOutboxRecord]:
+        """List recent alert outbox records, optionally filtered by status."""
+        safe_limit = max(1, int(limit))
+        norm_status: str | None = None
+        if status_filter is not None:
+            norm_status = status_filter.strip().upper()
+            if norm_status not in _VALID_ALERT_STATUS_SET:
+                raise ValueError(f"Invalid alert status filter: {status_filter!r}")
+
+        with self._lock:
+            conn = self._ensure_conn_locked()
+            if norm_status is not None:
+                rows = conn.execute(
+                    """
+                    SELECT id, strategy_id, strategy_version, live_mode, contract_id, timeframe,
+                           bar_time, direction, signal_tag, status, payload_json,
+                           created_at_utc, expires_at_utc, next_attempt_at_utc,
+                           attempts, last_error, updated_at_utc
+                    FROM alert_outbox
+                    WHERE status = ?
+                    ORDER BY id DESC
+                    LIMIT ?
+                    """,
+                    (norm_status, safe_limit),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    """
+                    SELECT id, strategy_id, strategy_version, live_mode, contract_id, timeframe,
+                           bar_time, direction, signal_tag, status, payload_json,
+                           created_at_utc, expires_at_utc, next_attempt_at_utc,
+                           attempts, last_error, updated_at_utc
+                    FROM alert_outbox
+                    ORDER BY id DESC
+                    LIMIT ?
+                    """,
+                    (safe_limit,),
+                ).fetchall()
+            return [self._row_to_alert_record(row) for row in rows]
+
+    async def list_alerts(
+        self,
+        limit: int = 50,
+        status_filter: str | None = None,
+    ) -> list[AlertOutboxRecord]:
+        """List recent alert outbox records, optionally filtered by status."""
+        return await asyncio.to_thread(self.list_alerts_sync, limit, status_filter)
+
+    def get_alert_summary_sync(self) -> dict[str, int]:
+        """Return alert outbox row counts keyed by status."""
+        summary: dict[str, int] = {status_name: 0 for status_name in _VALID_ALERT_STATUSES}
+        with self._lock:
+            conn = self._ensure_conn_locked()
+            rows = conn.execute(
+                """
+                SELECT status, COUNT(*) AS cnt
+                FROM alert_outbox
+                GROUP BY status
+                """
+            ).fetchall()
+        for row in rows:
+            key = str(row["status"])
+            if key in summary:
+                summary[key] = int(row["cnt"])
+        return summary
+
+    async def get_alert_summary(self) -> dict[str, int]:
+        """Return alert outbox row counts keyed by status."""
+        return await asyncio.to_thread(self.get_alert_summary_sync)

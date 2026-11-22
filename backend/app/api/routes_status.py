@@ -146,6 +146,7 @@ async def get_status(
     """Return strictly redacted TopstepX connection, rotation, feed, and data quality status."""
     payload = topstep_auth.get_status()
     payload["data_quality"] = await sqlite_store.get_quality_summary()
+    payload["alerts_summary"] = await sqlite_store.get_alert_summary()
     payload.update(live_feed_service.get_status_snapshot())
     return payload
 
