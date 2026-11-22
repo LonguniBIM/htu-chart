@@ -18,7 +18,7 @@ import pytest
 from argon2 import PasswordHasher
 
 from app.config import Settings
-from app.engine.bar_aggregator import BarAggregator
+from app.engine.bar_aggregator import BarAggregator, NormalizedTick
 from app.engine.instruments import StorageDatasetKey
 from app.engine.ohlcv import OHLCVBar
 from app.engine.session_calendar import first_bucket_open_at_or_after, has_open_session_in_range
@@ -8468,6 +8468,159 @@ async def test_f03_cancelled_recovery_shields_coverage_write_lock_until_thread_f
                 assert await sqlite.is_interval_complete(key_1m, t0, t0 + 60) is True
             finally:
                 release_thread.set()
+                await svc.stop()
+    finally:
+        sqlite.close()
+
+
+def test_f03_reconcile_recovery_no_open_bar_prunes_rest_confirmed_incomplete_for_htf() -> None:
+    """Contract: P1-F03-001 prunes REST-confirmed incomplete markers even when rebuilt_open is None.
+
+    Defect caught: reconcile_recovery only pruning <= latest_hist_closed inside the
+    rebuilt_open is not None branch, leaving stale 1m markers to poison 5m HTF rebuilds.
+    """
+    t0 = first_bucket_open_at_or_after(BASE_T, "5m")
+    agg = BarAggregator(timeframes=("1m", "5m"))
+    agg.mark_open_bucket_incomplete(CID_MES, False, t0, timeframes=("1m",))
+
+    hist_1m = [
+        OHLCVBar(t0 + (i * 60), 100.0 + i, 102.0 + i, 99.0 + i, 101.0 + i, 10.0, is_closed=True)
+        for i in range(4)
+    ]
+    now_140410 = t0 + 250
+    recon_1m = agg.reconcile_recovery(
+        contract_id=CID_MES,
+        live_mode=False,
+        timeframe="1m",
+        historical_bars=hist_1m,
+        buffered_ticks=(),
+        now_utc=now_140410,
+        mark_open_incomplete=False,
+    )
+    assert recon_1m.open_bar is None
+
+    agg.reconcile_from_1m_bars(
+        contract_id=CID_MES,
+        live_mode=False,
+        timeframe="5m",
+        closed_1m_bars=[e.bar for e in recon_1m.closed_bars],
+        open_1m_bar=None,
+        now_utc=now_140410,
+        covered_start_utc=t0,
+    )
+
+    res = agg.process_tick(
+        NormalizedTick(CID_MES, False, t0 + 270, 106.0, 5.0),
+        now_utc=t0 + 270,
+    )
+    assert res.accepted is True
+
+    flushed = agg.flush_closed_bars(now_utc=t0 + 300, contract_id=CID_MES, live_mode=False)
+    assert agg.pop_discarded_incomplete_bars(contract_id=CID_MES, live_mode=False) == []
+    flushed_by_tf = {evt.timeframe: evt.bar for evt in flushed}
+    assert "1m" in flushed_by_tf
+    assert flushed_by_tf["1m"] == OHLCVBar(
+        t0 + 240, 106.0, 106.0, 106.0, 106.0, 5.0, is_closed=True
+    )
+    assert "5m" in flushed_by_tf
+    assert flushed_by_tf["5m"] == OHLCVBar(
+        t0, 100.0, 106.0, 99.0, 106.0, 45.0, is_closed=True
+    )
+
+
+@pytest.mark.asyncio
+async def test_f03_mismatched_live_mode_malformed_tick_preserves_live_state_and_coverage(
+    tmp_path: Path,
+) -> None:
+    """Contract: P2-F02-002 isolates mismatched live_mode malformed ticks from active mode.
+
+    Defect caught: _handle_malformed_signalr_tick overwriting event.live_mode with c_state mode,
+    corrupting an active LIVE contract's state, open bar, and SQLite coverage on stale Sim events.
+    """
+    settings = Settings(data_dir=tmp_path / "data", signalr_enabled=True)
+    sqlite = SqliteStore(tmp_path / "meta.db")
+    sqlite.initialize()
+    parquet = ParquetStore(settings.data_dir, sqlite_store=sqlite)
+
+    t0 = BASE_T
+    clock_ref = [t0 + 10]
+
+    class _OkRest:
+        async def retrieve_bars_paginated(self, **kw: Any) -> Any:
+            s_ts = int(kw["start_ts"])
+            e_ts = int(kw["end_ts"])
+            cutoff = clock_ref[0] - (clock_ref[0] % 60)
+            bars = [
+                {"t": ts, "o": 5950.0, "h": 5951.0, "l": 5949.0, "c": 5950.0, "v": 2.0}
+                for ts in range(s_ts - (s_ts % 60), min(e_ts, cutoff), 60)
+            ]
+            return type("R", (), {"raw_bars": bars, "truncated": False, "provider_gap": False})()
+
+    def _auth_handler(_req: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"success": True, "errorCode": 0, "token": "jwt-mode-malf"})
+
+    key_live_1m = StorageDatasetKey("topstepx", True, CID_MES, "1m")
+    try:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(_auth_handler)) as client:
+            auth = TopstepAuthService(settings, client)
+            await auth.login("alice", "api-key")
+            agg = BarAggregator(timeframes=("1m",))
+            svc = LiveFeedService(
+                settings,
+                auth,
+                _OkRest(),
+                parquet,
+                sqlite,
+                aggregator=agg,
+                recovery_timeframes=("1m",),
+                initial_backfill_bars=1,
+                clock=lambda: clock_ref[0],
+            )
+            try:
+                await svc.set_active_contracts([CID_MES], live_mode=True)
+                svc._last_connected_utc = t0 - 30
+                await svc.trigger_recovery(now_utc=clock_ref[0])
+                assert svc.feed_state == "LIVE"
+                assert await sqlite.is_interval_complete(key_live_1m, t0 - 60, t0) is True
+
+                # Open an active LIVE bar at t0.
+                svc.handle_hub_event(
+                    SignalRTickEvent(CID_MES, True, t0 + 10, 5950.0, 2.0, "GatewayTrade", 1.0)
+                )
+                assert agg.get_open_bar(CID_MES, True, "1m") is not None
+
+                # Stale Sim (live_mode=False) malformed tick arrives for the same contract_id.
+                svc.handle_hub_event(
+                    SignalRMalformedTickEvent(
+                        contract_id=CID_MES,
+                        live_mode=False,
+                        reason="stale sim invalid price",
+                        issue_code="invalid_price",
+                        raw_summary="{'price': -1}",
+                        bar_time=t0 + 20,
+                        received_monotonic=2.0,
+                    )
+                )
+                await svc.flush_pending_tasks()
+
+                c_state = svc._contracts[CID_MES]
+                assert svc.feed_state == "LIVE"
+                assert c_state.state == "LIVE"
+                assert c_state.unresolved_gaps == 0
+                assert await sqlite.is_interval_complete(key_live_1m, t0 - 60, t0) is True
+                live_cov = await sqlite.get_coverage_intervals(key_live_1m)
+                assert not any(c.status == "CORRUPTED" for c in live_cov)
+
+                # Active LIVE open bar at t0 stays valid; crossing t0+60 closes it cleanly.
+                clock_ref[0] = t0 + 65
+                svc.handle_hub_event(
+                    SignalRTickEvent(CID_MES, True, t0 + 65, 5952.0, 1.0, "GatewayTrade", 3.0)
+                )
+                await svc.flush_pending_tasks()
+                persisted = await parquet.read_bars(key_live_1m, start_ts=t0, end_ts=t0)
+                assert len(persisted) == 1
+                assert persisted[0].volume == 2.0
+            finally:
                 await svc.stop()
     finally:
         sqlite.close()

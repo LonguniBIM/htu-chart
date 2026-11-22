@@ -724,6 +724,16 @@ class BarAggregator:
             for t in sorted(merged_closed)
         )
 
+        # Prune pending incomplete markers already confirmed closed by REST history.
+        pending_set = self._incomplete_open_buckets.get(stream_key)
+        if pending_set is not None and latest_hist_closed is not None:
+            confirmed = {b for b in pending_set if b <= latest_hist_closed}
+            if confirmed:
+                pending_set.difference_update(confirmed)
+            if not pending_set:
+                self._incomplete_open_buckets.pop(stream_key, None)
+                pending_set = None
+
         rebuilt_open = temp_agg.get_open_bar(cid, eff_live, tf)
         open_event: AggregatedBarEvent | None = None
         if rebuilt_open is not None:
@@ -735,13 +745,7 @@ class BarAggregator:
                     float(rebuilt_open.time),
                     float(rebuilt_open.time),
                 )
-            # Only prune pending incomplete markers already confirmed closed by REST history.
-            pending_set = self._incomplete_open_buckets.get(stream_key)
             if pending_set is not None:
-                if latest_hist_closed is not None:
-                    confirmed = {b for b in pending_set if b <= latest_hist_closed}
-                    if confirmed:
-                        pending_set.difference_update(confirmed)
                 pending_set.discard(rebuilt_open.time)
                 if not pending_set:
                     self._incomplete_open_buckets.pop(stream_key, None)

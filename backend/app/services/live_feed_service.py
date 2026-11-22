@@ -804,10 +804,14 @@ class LiveFeedService:
         )
 
     def _handle_malformed_signalr_tick(self, event: SignalRMalformedTickEvent) -> None:
-        self._last_event_monotonic = event.received_monotonic
-        cid = event.contract_id or next(iter(self._contracts), None)
-        redacted_reason = self._redact(event.reason)
-        self._last_error = redacted_reason
+        raw_cid = (
+            event.contract_id.strip().upper()
+            if isinstance(event.contract_id, str) and event.contract_id.strip()
+            else None
+        )
+        cid = raw_cid or next(iter(self._contracts), None)
+        c_state = self._contracts.get(cid) if cid else None
+
         clock_now = self._clock()
         raw_bt = event.bar_time
         if (
@@ -823,8 +827,29 @@ class LiveFeedService:
         gap_tfs = self._gap_target_timeframes()
         primary_tf = gap_tfs[0]
         primary_open = bucket_open_utc(eff_ts, primary_tf)
+        redacted_reason = self._redact(event.reason)
 
-        c_state = self._contracts.get(cid) if cid else None
+        if c_state is not None and cid is not None and event.live_mode != c_state.live_mode:
+            item = (
+                StorageDatasetKey("topstepx", bool(event.live_mode), cid, primary_tf),
+                safe_bar_time,
+                primary_open,
+                event.issue_code,
+                redacted_reason,
+                self._redact(event.raw_summary),
+                self._generation,
+                0,
+            )
+            try:
+                self._quarantine_queue.put_nowait(item)
+            except asyncio.QueueFull:
+                self._queue_overflow_count += 1
+                self._global_unresolved_gaps += 1
+            self._ensure_quarantine_worker()
+            return
+
+        self._last_event_monotonic = event.received_monotonic
+        self._last_error = redacted_reason
         live_mode = c_state.live_mode if c_state is not None else event.live_mode
         if c_state is not None:
             c_state.unresolved_gaps += 1
@@ -837,10 +862,16 @@ class LiveFeedService:
             self._global_unresolved_gaps += 1
 
         if cid:
-            self._aggregator.mark_open_bucket_incomplete(cid, live_mode, eff_ts)
+            if c_state is not None:
+                self._aggregator.mark_open_bucket_incomplete(cid, live_mode, eff_ts)
+            try:
+                key = StorageDatasetKey("topstepx", live_mode, cid, primary_tf)
+            except ValueError:
+                fallback_cid = next(iter(self._contracts), "UNKNOWN")
+                key = StorageDatasetKey("topstepx", live_mode, fallback_cid, primary_tf)
             queued_heal_seq = c_state.coverage_heal_seq if c_state is not None else 0
             item = (
-                StorageDatasetKey("topstepx", live_mode, cid, primary_tf),
+                key,
                 safe_bar_time,
                 primary_open,
                 event.issue_code,
