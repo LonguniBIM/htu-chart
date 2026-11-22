@@ -36,6 +36,7 @@ from app.topstep.signalr_hub import (
     SignalRMalformedTickEvent,
     SignalRMarketHub,
     SignalRTickEvent,
+    parse_market_invocation_events,
 )
 
 BASE_T = int(datetime(2026, 11, 10, 14, 0, 0, tzinfo=UTC).timestamp())
@@ -8112,4 +8113,134 @@ async def test_f03_signalr_queue_overflow_eviction_marks_task_done_for_join(
 
     assert event_queue.empty() is True
     await asyncio.wait_for(event_queue.join(), timeout=0.2)
+
+
+def test_f03_signalr_parse_rejects_symbol_id_fallback_without_contract_id() -> None:
+    """Contract: P2-F02-001 requires explicit contractId or callback contract, never symbolId.
+
+    Defect caught: parse_market_invocation_events falling back to root symbolId ('F.US.MES')
+    when contractId and arguments[0] contract ID are absent, risking cross-expiry dataset mixing.
+    """
+    frame = {
+        "type": 1,
+        "target": "GatewayTrade",
+        "arguments": [
+            {
+                "symbolId": "F.US.MES",
+                "price": 5950.0,
+                "volume": 2.0,
+                "timestamp": BASE_T + 10,
+            }
+        ],
+    }
+    events = parse_market_invocation_events(frame, live_mode=False, received_monotonic=1.0)
+    assert len(events) == 1
+    evt = events[0]
+    assert isinstance(evt, SignalRMalformedTickEvent)
+    assert evt.issue_code == "invalid_contract"
+    assert not any(isinstance(e, SignalRTickEvent) and e.contract_id == "F.US.MES" for e in events)
+
+
+@pytest.mark.asyncio
+async def test_f03_live_feed_quarantines_untracked_contract_and_mismatched_live_mode_ticks(
+    tmp_path: Path,
+) -> None:
+    """Contract: P2-F02-001 rejects/quarantines untracked contract_ids and live_mode mismatches.
+
+    Defect caught: handle_hub_event ingesting ticks for unregistered contracts (F.US.MES) or
+    mismatched live_mode into BarAggregator and ParquetStore under arbitrary dataset keys.
+    """
+    settings = Settings(data_dir=tmp_path / "data", signalr_enabled=True)
+    sqlite = SqliteStore(tmp_path / "meta.db")
+    sqlite.initialize()
+    parquet = ParquetStore(settings.data_dir, sqlite_store=sqlite)
+
+    clock_ref = [BASE_T + 10]
+
+    class _OkRest:
+        async def retrieve_bars_paginated(self, **kw: Any) -> Any:
+            s_ts = int(kw["start_ts"])
+            e_ts = int(kw["end_ts"])
+            cutoff = clock_ref[0] - (clock_ref[0] % 60)
+            bars = [
+                {"t": ts, "o": 5950.0, "h": 5951.0, "l": 5949.0, "c": 5950.0, "v": 2.0}
+                for ts in range(s_ts - (s_ts % 60), min(e_ts, cutoff), 60)
+            ]
+            return type("R", (), {"raw_bars": bars, "truncated": False, "provider_gap": False})()
+
+    def _auth_handler(_req: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"success": True, "errorCode": 0, "token": "jwt-f02"})
+
+    try:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(_auth_handler)) as client:
+            auth = TopstepAuthService(settings, client)
+            await auth.login("alice", "api-key")
+            agg = BarAggregator(timeframes=("1m",))
+            svc = LiveFeedService(
+                settings,
+                auth,
+                _OkRest(),
+                parquet,
+                sqlite,
+                aggregator=agg,
+                recovery_timeframes=("1m",),
+                initial_backfill_bars=1,
+                clock=lambda: clock_ref[0],
+            )
+            try:
+                await svc.set_active_contracts([CID_MES], live_mode=False)
+                svc._last_connected_utc = BASE_T - 30
+                await svc.trigger_recovery(now_utc=clock_ref[0])
+                assert svc.feed_state == "LIVE"
+
+                # Feed untracked root symbol tick + mismatched live_mode tick, then cross minute.
+                svc.handle_hub_event(
+                    SignalRTickEvent(
+                        "F.US.MES", False, BASE_T + 10, 5950.0, 2.0, "GatewayTrade", 1.0
+                    )
+                )
+                svc.handle_hub_event(
+                    SignalRTickEvent(
+                        CID_MES, True, BASE_T + 15, 5951.0, 3.0, "GatewayTrade", 1.1
+                    )
+                )
+                clock_ref[0] = BASE_T + 70
+                svc.handle_hub_event(
+                    SignalRTickEvent(
+                        "F.US.MES", False, BASE_T + 65, 5952.0, 1.0, "GatewayTrade", 1.2
+                    )
+                )
+                svc.handle_hub_event(
+                    SignalRTickEvent(
+                        CID_MES, True, BASE_T + 66, 5953.0, 1.0, "GatewayTrade", 1.3
+                    )
+                )
+                await svc.flush_pending_tasks()
+
+                bad_root_key = StorageDatasetKey("topstepx", False, "F.US.MES", "1m")
+                bad_mode_key = StorageDatasetKey("topstepx", True, CID_MES, "1m")
+                assert (
+                    await parquet.read_bars(
+                        bad_root_key, start_ts=BASE_T - 60, end_ts=BASE_T + 120
+                    )
+                    == []
+                )
+                assert (
+                    await parquet.read_bars(
+                        bad_mode_key, start_ts=BASE_T - 60, end_ts=BASE_T + 120
+                    )
+                    == []
+                )
+                assert agg.get_open_bar("F.US.MES", False, "1m") is None
+                assert agg.get_open_bar(CID_MES, True, "1m") is None
+
+                root_issues = await sqlite.list_quality_issues(bad_root_key)
+                assert len(root_issues) >= 1
+                mode_issues = await sqlite.list_quality_issues(bad_mode_key)
+                assert len(mode_issues) >= 1
+            finally:
+                await svc.stop()
+    finally:
+        sqlite.close()
+
 

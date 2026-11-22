@@ -588,18 +588,15 @@ class LiveFeedService:
 
         if isinstance(event, SignalRTickEvent):
             self._last_event_monotonic = event.received_monotonic
-            c_state = self._contracts.get(event.contract_id)
-            if c_state is not None:
-                c_state.last_event_monotonic = event.received_monotonic
+            c_state = self._validate_tracked_tick_identity(event)
+            if c_state is None:
+                return
+            c_state.last_event_monotonic = event.received_monotonic
 
             if (
                 self._feed_state == "RECOVERING"
-                or (c_state is not None and c_state.state == "RECOVERING")
-                or (
-                    self._hub.is_connected
-                    and c_state is not None
-                    and c_state.state == "DISCONNECTED"
-                )
+                or c_state.state == "RECOVERING"
+                or (self._hub.is_connected and c_state.state == "DISCONNECTED")
             ):
                 total_buffered = (
                     self._recovery_queue.qsize() + self._pending_recovery_ticks_count
@@ -613,8 +610,7 @@ class LiveFeedService:
                     self._record_recovery_overflow(c_state, tick=event)
                 return
 
-            c_active = c_state is not None and c_state.state in {"LIVE", "DEGRADED"}
-            if c_active or (c_state is None and self._feed_state in {"LIVE", "DEGRADED"}):
+            if c_state.state in {"LIVE", "DEGRADED"}:
                 self._ingest_live_tick_sync(event)
 
     def _gap_target_timeframes(self) -> tuple[str, ...]:
@@ -707,6 +703,81 @@ class LiveFeedService:
             ts_hint=tick.timestamp_utc_sec if tick is not None else None,
             eff_now=eff_now,
         )
+
+    def _validate_tracked_tick_identity(
+        self,
+        event: SignalRTickEvent,
+    ) -> ContractFeedRuntime | None:
+        cid = event.contract_id.strip().upper() if isinstance(event.contract_id, str) else ""
+        c_state = self._contracts.get(cid) if cid else None
+        if c_state is not None and event.live_mode == c_state.live_mode:
+            return c_state
+        self._quarantine_untracked_or_mismatched_tick(event, cid=cid, c_state=c_state)
+        return None
+
+    def _quarantine_untracked_or_mismatched_tick(
+        self,
+        event: SignalRTickEvent,
+        *,
+        cid: str,
+        c_state: ContractFeedRuntime | None,
+    ) -> None:
+        clock_now = self._clock()
+        raw_ts = event.timestamp_utc_sec
+        if (
+            not isinstance(raw_ts, bool)
+            and isinstance(raw_ts, (int, float))
+            and math.isfinite(float(raw_ts))
+        ):
+            ts_floor = math.floor(float(raw_ts))
+            if DEFAULT_MIN_BAR_TIMESTAMP <= ts_floor <= clock_now + DEFAULT_MAX_FUTURE_SKEW_SEC:
+                eff_ts = ts_floor
+                safe_bar_time: int | None = eff_ts
+            else:
+                eff_ts = clock_now
+                safe_bar_time = None
+        else:
+            eff_ts = clock_now
+            safe_bar_time = None
+
+        primary_tf = self._gap_target_timeframes()[0]
+        primary_open = bucket_open_utc(eff_ts, primary_tf)
+        issue_code = "mismatched_live_mode" if c_state is not None else "untracked_contract"
+        if c_state is not None:
+            reason = (
+                f"Mismatched live_mode {event.live_mode!r} for active contract {cid} "
+                f"(expected {c_state.live_mode!r})"
+            )
+        else:
+            reason = f"Untracked SignalR contract_id {cid or event.contract_id!r}"
+
+        try:
+            key = StorageDatasetKey("topstepx", bool(event.live_mode), cid, primary_tf)
+        except ValueError:
+            fallback_cid = next(iter(self._contracts), "UNKNOWN")
+            key = StorageDatasetKey("topstepx", bool(event.live_mode), fallback_cid, primary_tf)
+
+        raw_summary = (
+            f"{{'contract_id': {event.contract_id!r}, 'live_mode': {event.live_mode!r}, "
+            f"'target': {event.source_target!r}, 'ts': {event.timestamp_utc_sec!r}, "
+            f"'price': {event.price!r}, 'volume': {event.volume!r}}}"
+        )
+        item = (
+            key,
+            safe_bar_time,
+            primary_open,
+            issue_code,
+            self._redact(reason),
+            self._redact(raw_summary),
+            self._generation,
+            0,
+        )
+        try:
+            self._quarantine_queue.put_nowait(item)
+        except asyncio.QueueFull:
+            self._queue_overflow_count += 1
+            self._global_unresolved_gaps += 1
+        self._ensure_quarantine_worker()
 
     def _handle_rejected_live_tick(
         self,
@@ -840,7 +911,16 @@ class LiveFeedService:
     ) -> None:
         try:
             c_state = self._contracts.get(key.contract_id)
-            root_sym = c_state.root_symbol if c_state is not None else None
+            matched_state = (
+                c_state
+                if c_state is not None and c_state.live_mode == key.live_mode
+                else None
+            )
+            root_sym = (
+                matched_state.root_symbol
+                if matched_state is not None
+                else infer_root_symbol(key.contract_id)
+            )
             _, bar_end = bucket_bounds(bar_open_1m, key.timeframe, root_symbol=root_sym)
             await self._sqlite.record_quality_issues(
                 key,
@@ -857,29 +937,34 @@ class LiveFeedService:
             )
             async with self._coverage_write_lock:
                 c_state = self._contracts.get(key.contract_id)
+                matched_state = (
+                    c_state
+                    if c_state is not None and c_state.live_mode == key.live_mode
+                    else None
+                )
                 is_stale_gen = queued_gen != self._generation
                 healed_since_queue = (
                     is_stale_gen
-                    or c_state is None
-                    or c_state.coverage_heal_seq != queued_heal_seq
+                    or matched_state is None
+                    or matched_state.coverage_heal_seq != queued_heal_seq
                 )
-                skip_corrupted_coverage = False
-                if healed_since_queue:
+                skip_corrupted_coverage = matched_state is None
+                if not skip_corrupted_coverage and healed_since_queue:
                     tf_buckets = (
-                        c_state.unhealed_gap_buckets.get(key.timeframe, set())
-                        if c_state is not None
+                        matched_state.unhealed_gap_buckets.get(key.timeframe, set())
+                        if matched_state is not None
                         else set()
                     )
                     gap_tf = (
-                        c_state.unhealed_gap_starts.get(key.timeframe)
-                        if c_state is not None
+                        matched_state.unhealed_gap_starts.get(key.timeframe)
+                        if matched_state is not None
                         else None
                     )
-                    still_unhealed = c_state is not None and (
+                    still_unhealed = matched_state is not None and (
                         bar_open_1m in tf_buckets or (gap_tf is not None and gap_tf <= bar_open_1m)
                     )
-                    contract_healed = c_state is not None and (
-                        c_state.state == "LIVE" or not still_unhealed
+                    contract_healed = matched_state is not None and (
+                        matched_state.state == "LIVE" or not still_unhealed
                     )
                     if contract_healed or await self._sqlite.is_interval_complete(
                         key, bar_open_1m, bar_end
@@ -969,13 +1054,16 @@ class LiveFeedService:
                 evt = self._recovery_queue.get_nowait()
             except asyncio.QueueEmpty:
                 break
+            c_state = self._validate_tracked_tick_identity(evt)
+            if c_state is None:
+                continue
             if (
                 self._pending_recovery_ticks_count
                 >= self._settings.signalr_recovery_queue_maxsize
             ):
-                self._record_recovery_overflow(self._contracts.get(evt.contract_id))
+                self._record_recovery_overflow(c_state, tick=evt)
                 continue
-            pending_by_contract.setdefault(evt.contract_id.upper(), []).append(evt)
+            pending_by_contract.setdefault(c_state.contract_id, []).append(evt)
             self._pending_recovery_ticks_count += 1
 
     def _effective_last_activity_monotonic(self) -> float | None:
@@ -1990,15 +2078,13 @@ class LiveFeedService:
         *,
         now_utc: int | None = None,
     ) -> list[AggregatedBarEvent]:
-        c_state = self._contracts.get(event.contract_id)
-        root_sym = (
-            c_state.root_symbol
-            if c_state is not None
-            else infer_root_symbol(event.contract_id)
-        )
+        c_state = self._validate_tracked_tick_identity(event)
+        if c_state is None:
+            return []
+        root_sym = c_state.root_symbol or infer_root_symbol(c_state.contract_id)
         tick = NormalizedTick(
-            contract_id=event.contract_id,
-            live_mode=event.live_mode,
+            contract_id=c_state.contract_id,
+            live_mode=c_state.live_mode,
             timestamp_utc_sec=event.timestamp_utc_sec,
             price=event.price,
             volume=event.volume,
@@ -2074,15 +2160,13 @@ class LiveFeedService:
         skip_timeframes: Collection[str] = (),
     ) -> None:
         self._ensure_generation(expected_gen)
-        c_state = self._contracts.get(event.contract_id)
-        root_sym = (
-            c_state.root_symbol
-            if c_state is not None
-            else infer_root_symbol(event.contract_id)
-        )
+        c_state = self._validate_tracked_tick_identity(event)
+        if c_state is None:
+            return
+        root_sym = c_state.root_symbol or infer_root_symbol(c_state.contract_id)
         tick = NormalizedTick(
-            contract_id=event.contract_id,
-            live_mode=event.live_mode,
+            contract_id=c_state.contract_id,
+            live_mode=c_state.live_mode,
             timestamp_utc_sec=event.timestamp_utc_sec,
             price=event.price,
             volume=event.volume,

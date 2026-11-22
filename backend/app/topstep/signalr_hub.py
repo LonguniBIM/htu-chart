@@ -262,8 +262,8 @@ def parse_market_invocation_events(
                 )
             )
             continue
-        # Preserve explicit callback contractId over symbolId (ProjectX payloads set symbolId).
-        raw_cid = item.get("contractId") or default_contract or item.get("symbolId")
+        # Require explicit contractId or callback contract; never fall back to root symbolId.
+        raw_cid = item.get("contractId") or default_contract
         if not isinstance(raw_cid, str) or not raw_cid.strip():
             events.append(
                 SignalRMalformedTickEvent(
