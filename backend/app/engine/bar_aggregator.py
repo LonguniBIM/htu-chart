@@ -214,6 +214,17 @@ class BarAggregator:
         tf = normalize_timeframe(timeframe)
         return self._last_closed_times.get((cid, bool(live_mode), tf))
 
+    def get_rest_authoritative_closed_time(
+        self,
+        contract_id: str,
+        live_mode: bool,
+        timeframe: str,
+    ) -> int | None:
+        """Return latest REST-confirmed closed bar-open UTC timestamp for a stream, if known."""
+        cid = _normalize_contract_id(contract_id)
+        tf = normalize_timeframe(timeframe)
+        return self._rest_authoritative_closed_times.get((cid, bool(live_mode), tf))
+
     def get_open_bar(
         self,
         contract_id: str,
@@ -256,11 +267,20 @@ class BarAggregator:
         contract_id: str,
         live_mode: bool,
         ts_sec: int,
+        *,
+        timeframes: Sequence[str] | None = None,
     ) -> None:
-        """Mark the open bucket containing ts_sec as incomplete across configured timeframes."""
+        """Mark the open bucket containing ts_sec as incomplete across target timeframes."""
         cid = _normalize_contract_id(contract_id)
         eff_live = bool(live_mode)
-        for tf in self._timeframes:
+        target_tfs = (
+            tuple(normalize_timeframe(tf) for tf in timeframes)
+            if timeframes is not None
+            else self._timeframes
+        )
+        for tf in target_tfs:
+            if tf not in self._timeframes:
+                continue
             stream_key = (cid, eff_live, tf)
             bucket_ts = bucket_open_utc(ts_sec, tf)
             existing = self._open_bars.get(stream_key)

@@ -601,6 +601,7 @@ class SignalRMarketHub:
             with contextlib.suppress(asyncio.QueueFull):
                 self._event_queue.put_nowait(dropped_event)
             return
+        self._event_queue.task_done()
 
         if isinstance(dropped_event, (SignalRDisconnectedEvent, SignalRConnectedEvent)):
             # Lifecycle transitions supersede stale queued ticks/errors so consumers resync.

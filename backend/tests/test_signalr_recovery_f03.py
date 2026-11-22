@@ -7838,3 +7838,278 @@ async def test_f03_buffered_late_tick_in_recovering_after_local_watermark_stays_
                 await svc2.stop()
     finally:
         sqlite.close()
+
+
+@pytest.mark.asyncio
+async def test_f03_tail_drain_supersession_preserves_unprocessed_ticks_and_count(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Contract: PASS2-TAIL-001 preserves unprocessed tail ticks and count across supersession.
+
+    Defect caught: Clearing pending_by_contract and _replayed_tick_tfs before iterating
+    remaining_indexed silently drops tail ticks (e.g. T+70) when recovery is superseded
+    during bar-close persistence of an earlier tail tick (T+65).
+    """
+    settings = Settings(data_dir=tmp_path / "data", signalr_enabled=True)
+    sqlite = SqliteStore(tmp_path / "meta.db")
+    sqlite.initialize()
+    parquet = ParquetStore(settings.data_dir, sqlite_store=sqlite)
+
+    b_prev = BASE_T - 60
+    t0 = BASE_T
+    mnq = "CON.F.US.MNQ.Z26"
+    now_ref = [t0 + 20]
+    tail_upsert_entered = asyncio.Event()
+    release_tail_upsert = asyncio.Event()
+
+    class _DynamicRest:
+        async def retrieve_bars_paginated(self, **kw: Any) -> Any:
+            s_ts = int(kw["start_ts"])
+            e_ts = int(kw["end_ts"])
+            cutoff = now_ref[0] - (now_ref[0] % 60)
+            bars = [
+                {"t": ts, "o": 100.0, "h": 101.0, "l": 99.0, "c": 100.0, "v": 2.0}
+                for ts in range(s_ts - (s_ts % 60), min(e_ts, cutoff), 60)
+            ]
+            return type("R", (), {"raw_bars": bars, "truncated": False, "provider_gap": False})()
+
+    orig_upsert = parquet.upsert_bars
+    svc_ref: list[LiveFeedService] = []
+    injected_tail = False
+
+    async def _gated_upsert(key: StorageDatasetKey, bars: Any, **kwargs: Any) -> Any:
+        nonlocal injected_tail
+        if (
+            not injected_tail
+            and key.contract_id == CID_MES
+            and any(getattr(b, "time", None) == b_prev for b in bars)
+        ):
+            injected_tail = True
+            now_ref[0] = t0 + 75
+            svc = svc_ref[0]
+            svc.handle_hub_event(
+                SignalRTickEvent(CID_MES, False, t0 + 5, 100.0, 2.0, "GatewayTrade", 1.0)
+            )
+            svc.handle_hub_event(
+                SignalRTickEvent(CID_MES, False, t0 + 65, 102.0, 3.0, "GatewayTrade", 1.1)
+            )
+            svc.handle_hub_event(
+                SignalRTickEvent(CID_MES, False, t0 + 70, 105.0, 4.0, "GatewayTrade", 1.2)
+            )
+        if (
+            key.contract_id == CID_MES
+            and any(getattr(b, "time", None) == t0 for b in bars)
+            and not tail_upsert_entered.is_set()
+        ):
+            tail_upsert_entered.set()
+            await asyncio.wait_for(release_tail_upsert.wait(), timeout=2.0)
+        return await orig_upsert(key, bars, **kwargs)
+
+    monkeypatch.setattr(parquet, "upsert_bars", _gated_upsert)
+
+    def _auth_handler(_req: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"success": True, "errorCode": 0, "token": "jwt-tail-sup"})
+
+    try:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(_auth_handler)) as client:
+            auth = TopstepAuthService(settings, client)
+            await auth.login("alice", "api-key")
+            svc = LiveFeedService(
+                settings,
+                auth,
+                _DynamicRest(),
+                parquet,
+                sqlite,
+                aggregator=BarAggregator(timeframes=("1m",)),
+                recovery_timeframes=("1m",),
+                initial_backfill_bars=1,
+                clock=lambda: now_ref[0],
+            )
+            svc_ref.append(svc)
+            try:
+                await svc.set_active_contracts([CID_MES], live_mode=False)
+                svc._last_connected_utc = b_prev - 30
+                svc._transition_all_contracts("RECOVERING")
+                t1 = svc._start_recovery_task(now_utc=t0 + 20)
+
+                await asyncio.wait_for(tail_upsert_entered.wait(), timeout=2.0)
+                assert injected_tail is True
+                # Unprocessed tail tick T+70 MUST still be accounted for while awaiting persistence.
+                assert svc._pending_recovery_ticks_count >= 1
+
+                # Supersede recovery (e.g. subscribing another contract + bumping generation).
+                svc.register_contract(mnq, live_mode=False)
+                svc._bump_generation_and_cancel_live_tasks()
+                svc._transition_all_contracts("RECOVERING")
+                t2 = svc._start_recovery_task(now_utc=now_ref[0])
+
+                release_tail_upsert.set()
+                await asyncio.gather(t1, return_exceptions=True)
+                await asyncio.wait_for(t2, timeout=2.0)
+
+                assert svc.feed_state == "LIVE"
+                open_bar = svc._aggregator.get_open_bar(CID_MES, False, "1m")
+                assert open_bar is not None
+                assert open_bar.time == t0 + 60
+                assert open_bar.open == 102.0
+                assert open_bar.high == 105.0
+                assert open_bar.close == 105.0
+                assert open_bar.volume == 7.0
+            finally:
+                release_tail_upsert.set()
+                await svc.stop()
+    finally:
+        sqlite.close()
+
+
+@pytest.mark.asyncio
+async def test_f03_rest_failure_tail_drain_skips_unconfirmed_historical_bar_close(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Contract: P1-001 blocks tail drain from closing/broadcasting unconfirmed historical bars.
+
+    Defect caught: After REST backfill failure on a fresh aggregator at T+65, buffered ticks at
+    T+59.9 and T+65 finalize and persist/broadcast closed bar T without REST confirmation.
+    """
+    settings = Settings(data_dir=tmp_path / "data", signalr_enabled=True)
+    sqlite = SqliteStore(tmp_path / "meta.db")
+    sqlite.initialize()
+    parquet = ParquetStore(settings.data_dir, sqlite_store=sqlite)
+
+    t0 = BASE_T
+    now_ref = [t0 + 65]
+    fail_rest = [True]
+
+    class _FlakyRest:
+        async def retrieve_bars_paginated(self, **kw: Any) -> Any:
+            if fail_rest[0]:
+                raise ConnectionError("REST history unreachable")
+            s_ts = int(kw["start_ts"])
+            e_ts = int(kw["end_ts"])
+            cutoff = now_ref[0] - (now_ref[0] % 60)
+            bars = []
+            for ts in range(s_ts - (s_ts % 60), min(e_ts, cutoff), 60):
+                if ts == t0:
+                    bars.append(
+                        {"t": ts, "o": 100.0, "h": 102.0, "l": 99.0, "c": 101.0, "v": 5.0}
+                    )
+                else:
+                    bars.append(
+                        {"t": ts, "o": 100.0, "h": 101.0, "l": 99.0, "c": 100.0, "v": 2.0}
+                    )
+            return type("R", (), {"raw_bars": bars, "truncated": False, "provider_gap": False})()
+
+    upserted_closed: list[tuple[str, int, float]] = []
+    orig_upsert = parquet.upsert_bars
+
+    async def _spy_upsert(key: StorageDatasetKey, bars: Any, **kwargs: Any) -> Any:
+        for b in bars:
+            if b.is_closed:
+                upserted_closed.append((key.timeframe, b.time, b.volume))
+        return await orig_upsert(key, bars, **kwargs)
+
+    monkeypatch.setattr(parquet, "upsert_bars", _spy_upsert)
+
+    broadcasted_closed: list[tuple[str, int, float]] = []
+    broadcaster = WsBroadcaster()
+    orig_publish_bar = broadcaster.publish_bar
+
+    def _spy_publish_bar(evt: Any) -> None:
+        if evt.bar.is_closed:
+            broadcasted_closed.append((evt.timeframe, evt.bar.time, evt.bar.volume))
+        orig_publish_bar(evt)
+
+    monkeypatch.setattr(broadcaster, "publish_bar", _spy_publish_bar)
+
+    def _auth_handler(_req: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"success": True, "errorCode": 0, "token": "jwt-p1-001"})
+
+    key_1m = StorageDatasetKey("topstepx", False, CID_MES, "1m")
+    try:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(_auth_handler)) as client:
+            auth = TopstepAuthService(settings, client)
+            await auth.login("alice", "api-key")
+            svc = LiveFeedService(
+                settings,
+                auth,
+                _FlakyRest(),
+                parquet,
+                sqlite,
+                aggregator=BarAggregator(timeframes=("1m",)),
+                broadcaster=broadcaster,
+                recovery_timeframes=("1m",),
+                initial_backfill_bars=2,
+                clock=lambda: now_ref[0],
+            )
+            try:
+                await svc.set_active_contracts([CID_MES], live_mode=False)
+                svc._last_connected_utc = t0 - 30
+                svc._transition_all_contracts("RECOVERING")
+
+                svc.handle_hub_event(
+                    SignalRTickEvent(CID_MES, False, t0 + 59.9, 101.0, 2.0, "GatewayTrade", 1.0)
+                )
+                svc.handle_hub_event(
+                    SignalRTickEvent(CID_MES, False, t0 + 65.0, 103.0, 3.0, "GatewayTrade", 1.1)
+                )
+                await svc._run_recovery(now_utc=now_ref[0])
+
+                assert svc.feed_state == "DEGRADED"
+                assert svc.live_alerts_enabled is False
+                assert not any(bt == t0 for _, bt, _ in upserted_closed)
+                assert not any(bt == t0 for _, bt, _ in broadcasted_closed)
+                assert await parquet.read_bars(key_1m, start_ts=t0, end_ts=t0) == []
+                assert await sqlite.get_watermark(key_1m) is None
+
+                # Subsequent successful REST recovery MUST heal bucket t0 cleanly -> LIVE.
+                fail_rest[0] = False
+                now_ref[0] = t0 + 66
+                await svc.trigger_recovery(now_utc=now_ref[0])
+
+                assert svc.feed_state == "LIVE"
+                assert svc.live_alerts_enabled is True
+                persisted = await parquet.read_bars(key_1m, start_ts=t0, end_ts=t0)
+                assert len(persisted) == 1
+                assert persisted[0].volume == 5.0
+                assert persisted[0].high == 102.0
+                assert await sqlite.is_interval_complete(key_1m, t0, t0 + 60) is True
+                open_cur = svc._aggregator.get_open_bar(CID_MES, False, "1m")
+                assert open_cur is not None and open_cur.time == t0 + 60 and open_cur.volume == 3.0
+            finally:
+                await svc.stop()
+    finally:
+        sqlite.close()
+
+
+@pytest.mark.asyncio
+async def test_f03_signalr_queue_overflow_eviction_marks_task_done_for_join(
+    tmp_path: Path,
+) -> None:
+    """Contract: P1-002 calls task_done() when evicting oldest event on bounded queue overflow.
+
+    Defect caught: _surface_queue_overflow calling get_nowait() without task_done() leaks an
+    unfinished task on every overflow eviction, causing queue.join() to hang forever.
+    """
+    settings = Settings(data_dir=tmp_path / "data", signalr_enabled=True)
+    event_queue: asyncio.Queue[Any] = asyncio.Queue(maxsize=1)
+    hub = SignalRMarketHub(
+        settings,
+        token_provider=lambda: asyncio.sleep(0, result="test-jwt"),
+        event_queue=event_queue,
+        contracts=[CID_MES],
+    )
+    tick1 = SignalRTickEvent(CID_MES, False, BASE_T + 1, 5950.0, 1.0, "GatewayTrade", 1.0)
+    tick2 = SignalRTickEvent(CID_MES, False, BASE_T + 2, 5951.0, 2.0, "GatewayTrade", 2.0)
+
+    await hub._emit(tick1)
+    await hub._emit(tick2)
+
+    replacement = event_queue.get_nowait()
+    assert isinstance(replacement, SignalRErrorEvent)
+    event_queue.task_done()
+
+    assert event_queue.empty() is True
+    await asyncio.wait_for(event_queue.join(), timeout=0.2)
+

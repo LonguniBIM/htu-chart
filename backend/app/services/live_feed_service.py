@@ -1758,22 +1758,29 @@ class LiveFeedService:
                     c_state.last_error = None
                 c_state.recovery_duration_ms = int((time.monotonic() - started_mono) * 1000)
 
-            # Atomically drain all remaining/late ticks before leaving RECOVERING.
+            # Drain remaining/late ticks before leaving RECOVERING without discarding
+            # unprocessed ticks or _replayed_tick_tfs if this recovery is superseded.
             while True:
                 self._ensure_generation(recovery_gen)
                 self._drain_into_contract_buckets(pending_by_contract)
-                remaining: list[SignalRTickEvent] = []
-                for tick_list in pending_by_contract.values():
-                    remaining.extend(tick_list)
-                applied_by_tick = {
-                    id(t): set(self._replayed_tick_tfs.get(id(t), ()))
-                    for t in remaining
-                }
-                pending_by_contract.clear()
-                self._replayed_tick_tfs.clear()
-                self._recalc_pending_recovery_count()
+                remaining_tagged: list[tuple[float, int, str, SignalRTickEvent]] = []
+                seq = 0
+                for cid_key, tick_list in pending_by_contract.items():
+                    for tick_evt in tick_list:
+                        raw_ts = tick_evt.timestamp_utc_sec
+                        sort_ts = (
+                            float(raw_ts)
+                            if (
+                                not isinstance(raw_ts, bool)
+                                and isinstance(raw_ts, (int, float))
+                                and math.isfinite(float(raw_ts))
+                            )
+                            else float("inf")
+                        )
+                        remaining_tagged.append((sort_ts, seq, cid_key, tick_evt))
+                        seq += 1
 
-                if not remaining:
+                if not remaining_tagged:
                     self._recovery_duration_ms = int((time.monotonic() - started_mono) * 1000)
                     for cid, c_state in self._contracts.items():
                         if self._hub.has_pending_subscription(cid):
@@ -1801,16 +1808,34 @@ class LiveFeedService:
                             self._last_error = None
                     break
 
-                remaining_indexed = sorted(
-                    enumerate(remaining),
-                    key=lambda item: (float(item[1].timestamp_utc_sec), item[0]),
-                )
-                for _idx, tick_evt in remaining_indexed:
+                remaining_tagged.sort(key=lambda item: (item[0], item[1]))
+                for _ts, _seq, cid_key, tick_evt in remaining_tagged:
+                    self._ensure_generation(recovery_gen)
+                    bucket = pending_by_contract.get(cid_key)
+                    if not bucket:
+                        continue
+                    removed_idx = next(
+                        (i for i, item in enumerate(bucket) if item is tick_evt),
+                        None,
+                    )
+                    if removed_idx is None:
+                        continue
+                    del bucket[removed_idx]
+                    if not bucket:
+                        pending_by_contract.pop(cid_key, None)
+                    skip_tfs = set(self._replayed_tick_tfs.pop(id(tick_evt), ()))
+                    self._recalc_pending_recovery_count()
+                    self._guard_unconfirmed_historical_tick(
+                        tick_evt,
+                        eff_now=eff_now,
+                        skip_timeframes=skip_tfs,
+                        contract_degraded=contract_degraded,
+                    )
                     await self._process_live_tick(
                         tick_evt,
                         now_utc=eff_now,
                         expected_gen=recovery_gen,
-                        skip_timeframes=applied_by_tick.get(id(tick_evt), ()),
+                        skip_timeframes=skip_tfs,
                     )
 
             self._ensure_generation(recovery_gen)
@@ -1892,6 +1917,73 @@ class LiveFeedService:
         ):
             self._start_recovery_task()
 
+    def _guard_unconfirmed_historical_tick(
+        self,
+        event: SignalRTickEvent,
+        *,
+        eff_now: int,
+        skip_timeframes: Collection[str] = (),
+        contract_degraded: dict[str, bool] | None = None,
+        require_empty_open: bool = False,
+    ) -> None:
+        """Mark unconfirmed historical buckets incomplete so buffered ticks cannot close them."""
+        raw_ts = event.timestamp_utc_sec
+        if isinstance(raw_ts, bool) or not isinstance(raw_ts, (int, float)):
+            return
+        try:
+            ts_float = float(raw_ts)
+        except (ValueError, TypeError, OverflowError):
+            return
+        if not math.isfinite(ts_float):
+            return
+        ts_sec = math.floor(ts_float)
+        if ts_sec < DEFAULT_MIN_BAR_TIMESTAMP or ts_sec > eff_now + DEFAULT_MAX_FUTURE_SKEW_SEC:
+            return
+
+        cid = event.contract_id.strip().upper()
+        if not cid:
+            return
+        live_mode = bool(event.live_mode)
+        c_state = self._contracts.get(cid)
+        m1_in_agg = "1m" in self._aggregator.timeframes
+        m1_rest_closed = (
+            self._aggregator.get_rest_authoritative_closed_time(cid, live_mode, "1m")
+            if m1_in_agg
+            else None
+        )
+        m1_tick_bucket = bucket_open_utc(ts_sec, "1m")
+        m1_now_bucket = bucket_open_utc(eff_now, "1m")
+        m1_unconfirmed_hist = (
+            m1_in_agg
+            and m1_tick_bucket < m1_now_bucket
+            and (m1_rest_closed is None or m1_tick_bucket > m1_rest_closed)
+        )
+
+        for tf in self._aggregator.timeframes:
+            if tf in skip_timeframes:
+                continue
+            tick_bucket = bucket_open_utc(ts_sec, tf)
+            if require_empty_open and self._aggregator.get_open_bar(cid, live_mode, tf) is not None:
+                continue
+            now_bucket = bucket_open_utc(eff_now, tf)
+            rest_closed = self._aggregator.get_rest_authoritative_closed_time(cid, live_mode, tf)
+            is_unconfirmed_hist = tick_bucket < now_bucket and (
+                rest_closed is None or tick_bucket > rest_closed
+            )
+            if is_unconfirmed_hist or (tf != "1m" and m1_unconfirmed_hist):
+                self._aggregator.mark_open_bucket_incomplete(
+                    cid,
+                    live_mode,
+                    ts_sec,
+                    timeframes=(tf,),
+                )
+                if is_unconfirmed_hist and c_state is not None:
+                    self._record_gap_bucket(c_state, tf, tick_bucket)
+                    if c_state.unresolved_gaps == 0:
+                        c_state.unresolved_gaps += 1
+                    if contract_degraded is not None:
+                        contract_degraded[cid] = True
+
     def _ingest_live_tick_sync(
         self,
         event: SignalRTickEvent,
@@ -1912,6 +2004,12 @@ class LiveFeedService:
             volume=event.volume,
         )
         eff_now = now_utc if now_utc is not None else self._clock()
+        if c_state is not None and c_state.state == "DEGRADED":
+            self._guard_unconfirmed_historical_tick(
+                event,
+                eff_now=eff_now,
+                require_empty_open=True,
+            )
         gen = self._generation
         res = self._aggregator.process_tick(tick, now_utc=eff_now, root_symbol=root_sym)
         self._handle_discarded_incomplete_bars(
@@ -2017,6 +2115,7 @@ class LiveFeedService:
             now_utc=eff_now,
             broadcast=True,
             expected_gen=expected_gen,
+            reraise_abort=True,
         )
 
     async def _safe_persist_and_signal_events(
@@ -2026,6 +2125,7 @@ class LiveFeedService:
         now_utc: int,
         broadcast: bool = True,
         expected_gen: int | None = None,
+        reraise_abort: bool = False,
     ) -> None:
         try:
             await self._persist_and_signal_events(
@@ -2035,6 +2135,8 @@ class LiveFeedService:
                 expected_gen=expected_gen,
             )
         except (asyncio.CancelledError, _StaleGenerationAbort):
+            if reraise_abort:
+                raise
             return
         except Exception as exc:
             if expected_gen is not None and self._generation != expected_gen:
