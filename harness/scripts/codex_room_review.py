@@ -11,12 +11,15 @@ dismissal (any blocking finding from either pass keeps status OPEN).
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import json
 import os
 import re
 import shutil
 import subprocess
 import sys
+import threading
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -345,6 +348,35 @@ def render_consolidated_markdown(report: dict[str, Any]) -> str:
     return "\n".join(lines).rstrip() + "\n"
 
 
+def _terminate_process_tree(proc: subprocess.Popen[str]) -> None:
+    """Best-effort cross-platform termination of a timed-out Codex process tree."""
+    if proc.poll() is not None:
+        return
+    try:
+        if os.name == "nt":
+            subprocess.run(
+                ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                capture_output=True,
+                check=False,
+                timeout=10,
+            )
+        else:
+            proc.terminate()
+            try:
+                proc.wait(timeout=3.0)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+    except OSError:
+        try:
+            proc.kill()
+        except OSError:
+            pass
+    try:
+        proc.wait(timeout=3.0)
+    except subprocess.TimeoutExpired:
+        pass
+
+
 def _run_codex_pass(
     codex_prefix: list[str],
     role: str,
@@ -355,7 +387,8 @@ def _run_codex_pass(
     out_dir: Path,
     pass_name: str,
     model: str | None,
-    timeout_sec: int,
+    timeout_sec: float,
+    idle_timeout_sec: float = 180.0,
 ) -> dict[str, Any] | None:
     pass_json = out_dir / f"{pass_name}.json"
     raw_jsonl = out_dir / f"{pass_name}.raw.jsonl"
@@ -382,21 +415,99 @@ def _run_codex_pass(
     env = dict(os.environ)
     env["CODEX_HOME"] = str(runtime_dir)
 
-    proc = subprocess.run(
+    proc = subprocess.Popen(
         cmd,
-        input=prompt_text,
-        capture_output=True,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
         text=True,
         encoding="utf-8",
         errors="replace",
+        bufsize=1,
         env=env,
-        timeout=timeout_sec,
-        check=False,
     )
-    raw_jsonl.write_text(proc.stdout or "", encoding="utf-8")
-    stderr_log.write_text(proc.stderr or "", encoding="utf-8")
 
-    if proc.returncode != 0 or not pass_json.is_file():
+    stdout_lines: list[str] = []
+    stderr_lines: list[str] = []
+    activity_lock = threading.Lock()
+    started_at = time.monotonic()
+    last_activity = started_at
+
+    def _touch_activity() -> None:
+        nonlocal last_activity
+        with activity_lock:
+            last_activity = time.monotonic()
+
+    def _write_stdin() -> None:
+        if proc.stdin is None:
+            return
+        try:
+            proc.stdin.write(prompt_text)
+            proc.stdin.flush()
+        except OSError:
+            pass
+        finally:
+            try:
+                proc.stdin.close()
+            except OSError:
+                pass
+
+    def _pump_stream(stream: Any, bucket: list[str]) -> None:
+        if stream is None:
+            return
+        try:
+            for line in iter(stream.readline, ""):
+                bucket.append(line)
+                _touch_activity()
+        except OSError:
+            pass
+        finally:
+            try:
+                stream.close()
+            except OSError:
+                pass
+
+    writer_thread = threading.Thread(target=_write_stdin, daemon=True)
+    stdout_thread = threading.Thread(target=_pump_stream, args=(proc.stdout, stdout_lines), daemon=True)
+    stderr_thread = threading.Thread(target=_pump_stream, args=(proc.stderr, stderr_lines), daemon=True)
+    writer_thread.start()
+    stdout_thread.start()
+    stderr_thread.start()
+
+    termination_reason: str | None = None
+    while proc.poll() is None:
+        now = time.monotonic()
+        with activity_lock:
+            idle_elapsed = now - last_activity
+        total_elapsed = now - started_at
+
+        if idle_timeout_sec > 0 and idle_elapsed >= idle_timeout_sec:
+            termination_reason = (
+                f"[codex_room_review] pass={pass_name} terminated: "
+                f"idle_timeout={idle_timeout_sec:.1f}s (total={total_elapsed:.1f}s)\n"
+            )
+            _terminate_process_tree(proc)
+            break
+        if timeout_sec > 0 and total_elapsed >= timeout_sec:
+            termination_reason = (
+                f"[codex_room_review] pass={pass_name} terminated: "
+                f"total_timeout={timeout_sec:.1f}s (idle={idle_elapsed:.1f}s)\n"
+            )
+            _terminate_process_tree(proc)
+            break
+        time.sleep(0.05)
+
+    writer_thread.join(timeout=2.0)
+    stdout_thread.join(timeout=2.0)
+    stderr_thread.join(timeout=2.0)
+
+    if termination_reason:
+        stderr_lines.append(termination_reason)
+
+    raw_jsonl.write_text("".join(stdout_lines), encoding="utf-8")
+    stderr_log.write_text("".join(stderr_lines), encoding="utf-8")
+
+    if termination_reason is not None or proc.returncode != 0 or not pass_json.is_file():
         return None
     try:
         return json.loads(pass_json.read_text(encoding="utf-8"))
@@ -414,7 +525,23 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--out-dir", type=Path, default=None)
     parser.add_argument("--runtime-root", type=Path, default=Path.home() / ".codex-runtime")
     parser.add_argument("--model", type=str, default=None)
-    parser.add_argument("--timeout", type=int, default=300)
+    parser.add_argument(
+        "--timeout",
+        type=float,
+        default=1200.0,
+        help="Hard wall-clock safety ceiling per pass in seconds (0 disables). Default: 1200.",
+    )
+    parser.add_argument(
+        "--idle-timeout",
+        type=float,
+        default=180.0,
+        help="Inactivity watchdog timeout per pass in seconds; resets on stdout/stderr activity (0 disables). Default: 180.",
+    )
+    parser.add_argument(
+        "--sequential",
+        action="store_true",
+        help="Run pass1 and pass2 sequentially instead of in parallel.",
+    )
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument(
         "--consolidate-only",
@@ -493,30 +620,42 @@ def main(argv: list[str] | None = None) -> int:
     (out_dir / "pass1.prompt.md").write_text(prompt1, encoding="utf-8")
     (out_dir / "pass2.prompt.md").write_text(prompt2, encoding="utf-8")
 
-    p1_data = _run_codex_pass(
-        codex_prefix,
-        "pass1",
-        args.runtime_root / "topstep-review-pass1",
-        repo_root,
-        SCHEMA_PATH,
-        prompt1,
-        out_dir,
-        "pass1",
-        args.model,
-        args.timeout,
+    pass1_kwargs = dict(
+        codex_prefix=codex_prefix,
+        role="pass1",
+        runtime_dir=args.runtime_root / "topstep-review-pass1",
+        repo_root=repo_root,
+        schema_path=SCHEMA_PATH,
+        prompt_text=prompt1,
+        out_dir=out_dir,
+        pass_name="pass1",
+        model=args.model,
+        timeout_sec=args.timeout,
+        idle_timeout_sec=args.idle_timeout,
     )
-    p2_data = _run_codex_pass(
-        codex_prefix,
-        "pass2",
-        args.runtime_root / "topstep-review-pass2",
-        repo_root,
-        SCHEMA_PATH,
-        prompt2,
-        out_dir,
-        "pass2",
-        args.model,
-        args.timeout,
+    pass2_kwargs = dict(
+        codex_prefix=codex_prefix,
+        role="pass2",
+        runtime_dir=args.runtime_root / "topstep-review-pass2",
+        repo_root=repo_root,
+        schema_path=SCHEMA_PATH,
+        prompt_text=prompt2,
+        out_dir=out_dir,
+        pass_name="pass2",
+        model=args.model,
+        timeout_sec=args.timeout,
+        idle_timeout_sec=args.idle_timeout,
     )
+
+    if args.sequential:
+        p1_data = _run_codex_pass(**pass1_kwargs)
+        p2_data = _run_codex_pass(**pass2_kwargs)
+    else:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+            fut1 = pool.submit(_run_codex_pass, **pass1_kwargs)
+            fut2 = pool.submit(_run_codex_pass, **pass2_kwargs)
+            p1_data = fut1.result()
+            p2_data = fut2.result()
 
     report = consolidate_reviews(p1_data, p2_data, expected_sha=candidate_sha)
     report["worktree_dirty_at_review"] = info["worktree_dirty"]

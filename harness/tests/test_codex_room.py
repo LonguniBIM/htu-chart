@@ -4,10 +4,13 @@ from __future__ import annotations
 
 import hashlib
 import json
+import sys
 import tomllib
 from pathlib import Path
 
 from harness.scripts.codex_room_review import (
+    _build_parser,
+    _run_codex_pass,
     consolidate_reviews,
     validate_strict_json_schema,
 )
@@ -176,3 +179,127 @@ def test_consolidate_passes_only_when_both_passes_clear_blocking_findings() -> N
     assert res["review_gate_status"] == "PASSED"
     assert res["blocking_open_count"] == 0
     assert res["advisory_count"] == 1
+
+
+def _write_fake_codex_script(script_path: Path, body: str) -> list[str]:
+    script_path.write_text(body, encoding="utf-8")
+    return [sys.executable, "-u", str(script_path)]
+
+
+def test_run_codex_pass_resets_idle_timeout_on_streaming_activity(tmp_path: Path) -> None:
+    """When stdout streams events faster than idle_timeout_sec, total runtime > idle_timeout_sec succeeds."""
+    out_dir = tmp_path / "run"
+    out_dir.mkdir()
+    runtime_dir = tmp_path / "rt"
+    runtime_dir.mkdir()
+    script = tmp_path / "fake_codex_active.py"
+    prefix = _write_fake_codex_script(
+        script,
+        (
+            "import json, sys, time\n"
+            "args = sys.argv[1:]\n"
+            "out_path = args[args.index('-o') + 1]\n"
+            "_ = sys.stdin.read()\n"
+            "for i in range(6):\n"
+            "    print(json.dumps({'event': 'tick', 'i': i}), flush=True)\n"
+            "    time.sleep(0.12)\n"
+            "with open(out_path, 'w', encoding='utf-8') as fh:\n"
+            "    json.dump({'revision_sha': 'a'*40, 'lens': 'correctness_and_tests', 'verdict': 'APPROVE', "
+            "'summary': 'ok', 'findings': [], 'test_quality_issues': [], 'unverified_areas': []}, fh)\n"
+        ),
+    )
+
+    result = _run_codex_pass(
+        codex_prefix=prefix,
+        role="pass1",
+        runtime_dir=runtime_dir,
+        repo_root=REPO_ROOT,
+        schema_path=SCHEMA_PATH,
+        prompt_text="review prompt",
+        out_dir=out_dir,
+        pass_name="pass1",
+        model=None,
+        timeout_sec=10.0,
+        idle_timeout_sec=0.45,
+    )
+    assert result is not None
+    assert result["verdict"] == "APPROVE"
+    raw_lines = (out_dir / "pass1.raw.jsonl").read_text(encoding="utf-8").splitlines()
+    assert len(raw_lines) == 6
+
+
+def test_run_codex_pass_terminates_on_idle_timeout_and_preserves_logs(tmp_path: Path) -> None:
+    """When process stops emitting output past idle_timeout_sec, it is terminated cleanly with diagnostics."""
+    out_dir = tmp_path / "run"
+    out_dir.mkdir()
+    runtime_dir = tmp_path / "rt"
+    runtime_dir.mkdir()
+    script = tmp_path / "fake_codex_hang.py"
+    prefix = _write_fake_codex_script(
+        script,
+        (
+            "import sys, time\n"
+            "_ = sys.stdin.read()\n"
+            "print('{\"event\":\"started\"}', flush=True)\n"
+            "time.sleep(30)\n"
+        ),
+    )
+
+    result = _run_codex_pass(
+        codex_prefix=prefix,
+        role="pass1",
+        runtime_dir=runtime_dir,
+        repo_root=REPO_ROOT,
+        schema_path=SCHEMA_PATH,
+        prompt_text="review prompt",
+        out_dir=out_dir,
+        pass_name="pass1",
+        model=None,
+        timeout_sec=10.0,
+        idle_timeout_sec=0.35,
+    )
+    assert result is None
+    assert "started" in (out_dir / "pass1.raw.jsonl").read_text(encoding="utf-8")
+    assert "idle_timeout=" in (out_dir / "pass1.stderr.log").read_text(encoding="utf-8")
+
+
+def test_run_codex_pass_enforces_hard_total_timeout_cap(tmp_path: Path) -> None:
+    """Even with continuous stdout activity, hard timeout_sec terminates the pass cleanly."""
+    out_dir = tmp_path / "run"
+    out_dir.mkdir()
+    runtime_dir = tmp_path / "rt"
+    runtime_dir.mkdir()
+    script = tmp_path / "fake_codex_spin.py"
+    prefix = _write_fake_codex_script(
+        script,
+        (
+            "import sys, time\n"
+            "_ = sys.stdin.read()\n"
+            "for i in range(200):\n"
+            "    print(f'{{\"i\":{i}}}', flush=True)\n"
+            "    time.sleep(0.05)\n"
+        ),
+    )
+
+    result = _run_codex_pass(
+        codex_prefix=prefix,
+        role="pass2",
+        runtime_dir=runtime_dir,
+        repo_root=REPO_ROOT,
+        schema_path=SCHEMA_PATH,
+        prompt_text="review prompt",
+        out_dir=out_dir,
+        pass_name="pass2",
+        model=None,
+        timeout_sec=0.45,
+        idle_timeout_sec=5.0,
+    )
+    assert result is None
+    assert "total_timeout=" in (out_dir / "pass2.stderr.log").read_text(encoding="utf-8")
+
+
+def test_codex_room_review_parser_defaults_enable_parallel_and_idle_watchdog() -> None:
+    args = _build_parser().parse_args([])
+    assert args.timeout == 1200.0
+    assert args.idle_timeout == 180.0
+    assert args.sequential is False
