@@ -7,6 +7,7 @@ import contextlib
 import inspect
 import json
 import logging
+import math
 import time
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, field
@@ -496,6 +497,18 @@ class LiveFeedService:
                 self._queue_overflow_count += event.pre_connect_overflow_count
                 self._recovery_overflowed = True
                 self._global_unresolved_gaps += event.pre_connect_overflow_count
+                overflow_targets = list(event.pre_connect_overflow_buckets)
+                if not overflow_targets:
+                    fallback_ts = self._clock()
+                    overflow_targets = [(cid, fallback_ts) for cid in event.contracts]
+                for ovf_cid, ovf_ts in overflow_targets:
+                    self._mark_overflow_bucket_gap(
+                        self._contracts.get(ovf_cid),
+                        contract_id=ovf_cid,
+                        live_mode=event.live_mode,
+                        ts_hint=ovf_ts,
+                        eff_now=self._clock(),
+                    )
             self._transition_all_contracts("RECOVERING")
             self._start_recovery_task()
             return
@@ -537,24 +550,72 @@ class LiveFeedService:
                     self._recovery_queue.qsize() + self._pending_recovery_ticks_count
                 )
                 if total_buffered >= self._settings.signalr_recovery_queue_maxsize:
-                    self._record_recovery_overflow(c_state)
+                    self._record_recovery_overflow(c_state, tick=event)
                     return
                 try:
                     self._recovery_queue.put_nowait(event)
                 except asyncio.QueueFull:
-                    self._record_recovery_overflow(c_state)
+                    self._record_recovery_overflow(c_state, tick=event)
                 return
 
-            if self._feed_state in {"LIVE", "DEGRADED"}:
+            c_active = c_state is not None and c_state.state in {"LIVE", "DEGRADED"}
+            if c_active or (c_state is None and self._feed_state in {"LIVE", "DEGRADED"}):
                 self._ingest_live_tick_sync(event)
 
-    def _record_recovery_overflow(self, c_state: ContractFeedRuntime | None) -> None:
+    def _mark_overflow_bucket_gap(
+        self,
+        c_state: ContractFeedRuntime | None,
+        *,
+        contract_id: str | None = None,
+        live_mode: bool | None = None,
+        ts_hint: float | int | None = None,
+        eff_now: int | None = None,
+    ) -> None:
+        ref_now = eff_now if eff_now is not None else self._clock()
+        eff_ts = ref_now
+        if ts_hint is not None:
+            raw_ts = float(ts_hint)
+            if math.isfinite(raw_ts):
+                floor_ts = math.floor(raw_ts)
+                if DEFAULT_MIN_BAR_TIMESTAMP <= floor_ts <= ref_now + DEFAULT_MAX_FUTURE_SKEW_SEC:
+                    eff_ts = floor_ts
+        gap_open_1m = bucket_open_utc(eff_ts, "1m")
+        if c_state is not None:
+            prev_gap = c_state.unhealed_gap_starts.get("1m")
+            c_state.unhealed_gap_starts["1m"] = (
+                gap_open_1m if prev_gap is None else min(prev_gap, gap_open_1m)
+            )
+            c_state.last_error = "SignalR recovery queue overflowed"
+            self._aggregator.mark_open_bucket_incomplete(
+                c_state.contract_id, c_state.live_mode, eff_ts
+            )
+        elif contract_id:
+            self._aggregator.mark_open_bucket_incomplete(
+                contract_id,
+                self._auth.live if live_mode is None else bool(live_mode),
+                eff_ts,
+            )
+
+    def _record_recovery_overflow(
+        self,
+        c_state: ContractFeedRuntime | None,
+        *,
+        tick: SignalRTickEvent | None = None,
+        eff_now: int | None = None,
+    ) -> None:
         self._queue_overflow_count += 1
         self._recovery_overflowed = True
         if c_state is not None:
             c_state.unresolved_gaps += 1
         else:
             self._global_unresolved_gaps += 1
+        self._mark_overflow_bucket_gap(
+            c_state,
+            contract_id=tick.contract_id if tick is not None else None,
+            live_mode=tick.live_mode if tick is not None else None,
+            ts_hint=tick.timestamp_utc_sec if tick is not None else None,
+            eff_now=eff_now,
+        )
 
     def _handle_rejected_live_tick(
         self,
@@ -895,98 +956,125 @@ class LiveFeedService:
             backfill_start = min(backfill_start, unhealed_start)
 
         backfill_end = max(eff_now, backfill_start + TIMEFRAME_SECONDS[tf])
-        # Track start defensively so any exception during REST/persistence retains gap start.
-        # Keep unhealed open-bucket gaps intact until the bucket closes and REST confirms it.
-        if not open_bucket_unhealed:
-            c_state.unhealed_gap_starts[tf] = min(
-                c_state.unhealed_gap_starts.get(tf, backfill_start),
-                backfill_start,
-            )
-
-        page_res = await asyncio.wait_for(
-            self._rest.retrieve_bars_paginated(
-                contract_id=cid,
-                live=c_state.live_mode,
-                timeframe=tf,
-                start_ts=backfill_start,
-                end_ts=backfill_end,
-                include_partial_bar=False,
-                root_symbol=c_state.root_symbol,
-            ),
-            timeout=self._settings.signalr_recovery_timeout_sec,
-        )
-        self._ensure_generation(expected_gen)
-
-        valid_bars, issues = self._validate_rest_bars(
-            page_res.raw_bars,
-            key=key,
-            tf=tf,
-            eff_now=eff_now,
-            eff_root=c_state.root_symbol,
-            interval_start=backfill_start,
-            interval_end=backfill_end,
-        )
-        had_gap = False
-        if issues:
-            await self._sqlite.record_quality_issues(key, issues)
-            await self._sqlite.record_coverage(
-                key,
-                backfill_start,
-                backfill_end,
-                status="CORRUPTED",
-                quarantined_count=len(issues),
-                truncated=page_res.truncated,
-                provider_gap=page_res.provider_gap,
-            )
-            had_gap = True
-            c_state.unresolved_gaps += 1
-            c_state.unhealed_gap_starts[tf] = min(
-                c_state.unhealed_gap_starts.get(tf, backfill_start),
-                backfill_start,
-            )
-        elif page_res.truncated or page_res.provider_gap:
-            had_gap = True
-            c_state.unresolved_gaps += 1
-            c_state.unhealed_gap_starts[tf] = min(
-                c_state.unhealed_gap_starts.get(tf, backfill_start),
-                backfill_start,
-            )
-
-        self._drain_into_contract_buckets(pending_by_contract)
-        contract_ticks = pending_by_contract.pop(cid, [])
-        self._pending_recovery_ticks_count = max(
-            0, self._pending_recovery_ticks_count - len(contract_ticks)
-        )
-        normalized_ticks = [
-            NormalizedTick(
-                contract_id=t.contract_id,
-                live_mode=t.live_mode,
-                timestamp_utc_sec=t.timestamp_utc_sec,
-                price=t.price,
-                volume=t.volume,
-            )
-            for t in contract_ticks
-        ]
-
         open_bucket_utc_ts = bucket_open_utc(eff_now, tf)
-        has_open_unhealed_gap = open_bucket_unhealed or any(
-            gap_ts >= open_bucket_utc_ts for gap_ts in c_state.unhealed_gap_starts.values()
-        )
-        mark_open_inc = (
-            self._last_connected_utc is None
-            or self._last_connected_utc >= open_bucket_utc_ts
-            or has_open_unhealed_gap
-        )
-        recon = self._aggregator.reconcile_recovery(
-            contract_id=cid,
-            live_mode=c_state.live_mode,
-            timeframe=tf,
-            historical_bars=valid_bars,
-            buffered_ticks=normalized_ticks,
-            now_utc=eff_now,
-            root_symbol=c_state.root_symbol,
-            mark_open_incomplete=mark_open_inc,
-        )
+        # Preserve any open-bucket gap start without pre-polluting unhealed_gap_starts before REST.
+        try:
+            page_res = await asyncio.wait_for(
+                self._rest.retrieve_bars_paginated(
+                    contract_id=cid,
+                    live=c_state.live_mode,
+                    timeframe=tf,
+                    start_ts=backfill_start,
+                    end_ts=backfill_end,
+                    include_partial_bar=False,
+                    root_symbol=c_state.root_symbol,
+                ),
+                timeout=self._settings.signalr_recovery_timeout_sec,
+            )
+            self._ensure_generation(expected_gen)
+
+            valid_bars, issues = self._validate_rest_bars(
+                page_res.raw_bars,
+                key=key,
+                tf=tf,
+                eff_now=eff_now,
+                eff_root=c_state.root_symbol,
+                interval_start=backfill_start,
+                interval_end=backfill_end,
+            )
+            had_gap = False
+            gap_from_rest_issues = False
+            if issues:
+                await self._sqlite.record_quality_issues(key, issues)
+                await self._sqlite.record_coverage(
+                    key,
+                    backfill_start,
+                    backfill_end,
+                    status="CORRUPTED",
+                    quarantined_count=len(issues),
+                    truncated=page_res.truncated,
+                    provider_gap=page_res.provider_gap,
+                )
+                had_gap = True
+                gap_from_rest_issues = True
+                c_state.unresolved_gaps += 1
+            elif page_res.truncated or page_res.provider_gap:
+                had_gap = True
+                gap_from_rest_issues = True
+                c_state.unresolved_gaps += 1
+
+            self._drain_into_contract_buckets(pending_by_contract)
+            contract_ticks = pending_by_contract.pop(cid, [])
+            self._pending_recovery_ticks_count = max(
+                0, self._pending_recovery_ticks_count - len(contract_ticks)
+            )
+            normalized_ticks = [
+                NormalizedTick(
+                    contract_id=t.contract_id,
+                    live_mode=t.live_mode,
+                    timestamp_utc_sec=t.timestamp_utc_sec,
+                    price=t.price,
+                    volume=t.volume,
+                )
+                for t in contract_ticks
+            ]
+
+            has_open_unhealed_gap = open_bucket_unhealed or any(
+                gap_ts >= open_bucket_utc_ts for gap_ts in c_state.unhealed_gap_starts.values()
+            )
+            if gap_from_rest_issues:
+                c_state.unhealed_gap_starts[tf] = min(
+                    c_state.unhealed_gap_starts.get(tf, backfill_start),
+                    backfill_start,
+                )
+            mark_open_inc = (
+                self._last_connected_utc is None
+                or self._last_connected_utc >= open_bucket_utc_ts
+                or has_open_unhealed_gap
+            )
+            recon = self._aggregator.reconcile_recovery(
+                contract_id=cid,
+                live_mode=c_state.live_mode,
+                timeframe=tf,
+                historical_bars=valid_bars,
+                buffered_ticks=normalized_ticks,
+                now_utc=eff_now,
+                root_symbol=c_state.root_symbol,
+                mark_open_incomplete=mark_open_inc,
+            )
+        except (asyncio.CancelledError, _StaleGenerationAbort):
+            raise
+        except Exception:
+            if not open_bucket_unhealed:
+                c_state.unhealed_gap_starts[tf] = min(
+                    c_state.unhealed_gap_starts.get(tf, backfill_start),
+                    backfill_start,
+                )
+            raise
+        for rej_tick, rej_reason in recon.rejected_ticks:
+            had_gap = True
+            matched_target = next(
+                (
+                    t.source_target
+                    for t in contract_ticks
+                    if t.timestamp_utc_sec == rej_tick.timestamp_utc_sec
+                    and t.price == rej_tick.price
+                    and t.volume == rej_tick.volume
+                ),
+                "GatewayTrade",
+            )
+            self._handle_rejected_live_tick(
+                SignalRTickEvent(
+                    contract_id=rej_tick.contract_id,
+                    live_mode=rej_tick.live_mode,
+                    timestamp_utc_sec=rej_tick.timestamp_utc_sec,
+                    price=rej_tick.price,
+                    volume=rej_tick.volume,
+                    source_target=matched_target,
+                    received_monotonic=time.monotonic(),
+                ),
+                reason=rej_reason,
+            )
         # Preserve any unconfirmed tick-closed buckets at or after closed_end (P1-NEW-002).
         discarded_in_recon = self._aggregator.pop_discarded_incomplete_bars(
             contract_id=cid, live_mode=c_state.live_mode
@@ -1006,8 +1094,22 @@ class LiveFeedService:
             )
             self._ensure_generation(expected_gen)
 
-        # Only authoritative closed REST/cached bars satisfy gap closure (COR-001).
-        present_closed_times = {b.time for b in cached_closed if b.is_closed} | {
+        coverage_rows = await self._sqlite.get_coverage_intervals(key)
+        self._ensure_generation(expected_gen)
+        non_complete_ranges = [
+            (cov.start_ts, cov.end_ts)
+            for cov in coverage_rows
+            if cov.status != "COMPLETE"
+        ]
+
+        # Only non-corrupted cached closed bars or fresh valid REST bars heal gaps (PASS2-001).
+        valid_cached_times = {
+            b.time
+            for b in cached_closed
+            if b.is_closed
+            and not any(c_start <= b.time < c_end for c_start, c_end in non_complete_ranges)
+        }
+        present_closed_times = valid_cached_times | {
             b.time for b in valid_bars if b.is_closed
         }
         missing_buckets = self._find_missing_open_buckets(
@@ -1659,13 +1761,22 @@ class LiveFeedService:
             await self._hub.trigger_reconnect()
             return
 
+        hub_token_stale = (
+            self._feed_state in {"LIVE", "DEGRADED"}
+            and self._hub.is_connected
+            and self._auth.is_connected
+            and self._hub.connected_token_digest is not None
+            and self._auth.current_token_digest is not None
+            and self._hub.connected_token_digest != self._auth.current_token_digest
+        )
         if (
             self._feed_state == "LIVE"
             and self._auth.is_connected
             and self._auth.needs_refresh()
-        ):
+        ) or hub_token_stale:
             try:
-                await self._auth.ensure_token()
+                if self._auth.needs_refresh():
+                    await self._auth.ensure_token()
                 self._bump_generation_and_cancel_live_tasks()
                 self._transition_all_contracts("RECOVERING")
                 await self._hub.trigger_reconnect()

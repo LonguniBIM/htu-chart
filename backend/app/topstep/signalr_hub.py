@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
 import inspect
 import json
 import logging
@@ -57,6 +58,7 @@ class SignalRConnectedEvent:
     live_mode: bool
     connected_monotonic: float
     pre_connect_overflow_count: int = 0
+    pre_connect_overflow_buckets: tuple[tuple[str, int], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -442,6 +444,7 @@ class SignalRMarketHub:
 
         self._ws: SignalRWebSocketTransport | None = None
         self._connected = False
+        self._connected_token_digest: str | None = None
         self._stopping = False
         self._invocation_seq = 0
         self._last_event_monotonic: float | None = None
@@ -474,6 +477,11 @@ class SignalRMarketHub:
     def is_connected(self) -> bool:
         """Return True iff SignalR handshake succeeded and socket is active."""
         return self._connected
+
+    @property
+    def connected_token_digest(self) -> str | None:
+        """One-way SHA-256 hex digest of the JWT used for the active SignalR session."""
+        return self._connected_token_digest
 
     @property
     def has_pending_subscriptions(self) -> bool:
@@ -787,6 +795,9 @@ class SignalRMarketHub:
             token = await asyncio.wait_for(self._get_token(), timeout=self._connect_timeout)
             if token:
                 self._recent_tokens.append(token)
+                self._connected_token_digest = hashlib.sha256(token.encode("utf-8")).hexdigest()
+            else:
+                self._connected_token_digest = None
             if self._auth_service is not None:
                 self._live_mode = self._auth_service.live
             auth_url = _build_authenticated_ws_url(self._base_url, token)
@@ -818,6 +829,7 @@ class SignalRMarketHub:
             pre_connect_cap = max(1, self._settings.signalr_recovery_queue_maxsize)
             pre_connect_events: deque[SignalREvent] = deque(maxlen=pre_connect_cap)
             pre_connect_overflow = 0
+            overflow_buckets: set[tuple[str, int]] = set()
             while self._pending_subscriptions or set(self._contracts) != self._subscribed_contracts:
                 if set(self._contracts) != self._subscribed_contracts:
                     await self._sync_session_subscriptions(ws)
@@ -851,6 +863,20 @@ class SignalRMarketHub:
                     for pre_evt in frame_events:
                         if len(pre_connect_events) >= pre_connect_cap:
                             pre_connect_overflow += 1
+                            if isinstance(pre_evt, SignalRTickEvent):
+                                overflow_buckets.add(
+                                    (pre_evt.contract_id, int(pre_evt.timestamp_utc_sec))
+                                )
+                            elif (
+                                isinstance(pre_evt, SignalRMalformedTickEvent)
+                                and pre_evt.contract_id
+                            ):
+                                ts_val = (
+                                    pre_evt.bar_time
+                                    if pre_evt.bar_time is not None
+                                    else int(time.time())
+                                )
+                                overflow_buckets.add((pre_evt.contract_id, ts_val))
                             continue
                         pre_connect_events.append(pre_evt)
 
@@ -861,6 +887,7 @@ class SignalRMarketHub:
                     live_mode=self._live_mode,
                     connected_monotonic=time.monotonic(),
                     pre_connect_overflow_count=pre_connect_overflow,
+                    pre_connect_overflow_buckets=tuple(sorted(overflow_buckets)),
                 )
             )
             for pre_evt in pre_connect_events:
@@ -956,6 +983,7 @@ class SignalRMarketHub:
                     await heartbeat_task
             was_connected = self._connected
             self._connected = False
+            self._connected_token_digest = None
             self._ws = None
             self._clear_pending_subscriptions(ConnectionError(disconnect_reason))
             self._subscribed_contracts.clear()

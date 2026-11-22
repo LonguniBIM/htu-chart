@@ -67,6 +67,7 @@ class ReconciliationResult:
     closed_bars: tuple[AggregatedBarEvent, ...]
     open_bar: AggregatedBarEvent | None
     last_closed_bar_time: int | None
+    rejected_ticks: tuple[tuple[NormalizedTick, str], ...] = ()
 
 
 def _utc_now_sec() -> int:
@@ -549,9 +550,13 @@ class BarAggregator:
         # Replay only valid buffered ticks belonging to buckets strictly newer than closed history.
         # Preserve exact float timestamps for sub-second ordering, tie-breaking by arrival index.
         eligible_ticks: list[tuple[float, int, NormalizedTick]] = []
+        rejected_ticks: list[tuple[NormalizedTick, str]] = []
         for idx, tick in enumerate(buffered_ticks):
             t_cid, t_live, ts_sec, _, _, err = _validate_tick(tick, now_utc=eff_now)
-            if err is not None or t_cid != cid or t_live != eff_live or ts_sec is None:
+            if err is not None:
+                rejected_ticks.append((tick, err))
+                continue
+            if t_cid != cid or t_live != eff_live or ts_sec is None:
                 continue
             bucket_ts = bucket_open_utc(ts_sec, tf)
             if auth_cutoff is not None and bucket_ts <= auth_cutoff:
@@ -647,6 +652,7 @@ class BarAggregator:
             closed_bars=closed_events,
             open_bar=open_event,
             last_closed_bar_time=final_last_closed,
+            rejected_ticks=tuple(rejected_ticks),
         )
 
     def reconcile_from_1m_bars(

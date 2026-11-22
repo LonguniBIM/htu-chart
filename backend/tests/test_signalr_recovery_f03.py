@@ -3654,3 +3654,537 @@ async def test_f03_aggregator_rejected_out_of_range_timestamp_quarantined_and_de
                 await live_feed.stop()
     finally:
         sqlite_store.close()
+
+
+async def test_f03_live_contract_ticks_preserved_while_new_contract_awaits_ack(
+    tmp_path: Path,
+) -> None:
+    """Contract: Existing LIVE contract ticks continue aggregating while new contract awaits ACK.
+
+    Defect caught: Dropping live ticks on an already-LIVE contract because aggregate feed_state
+    became DISCONNECTED while a newly subscribed contract awaited upstream type=3 ACK.
+    """
+    from app.topstep.signalr_hub import SignalRTickEvent
+
+    cid_nq = "CON.F.US.NQ.Z26"
+    clock_ref = [BASE_T + 15]
+    nq_ack_gate = asyncio.Event()
+    nq_ack_sent = asyncio.Event()
+    pending_nq_inv_ids: list[str] = []
+
+    class _DualContractAckTransport(_MockSignalRTransport):
+        async def send(self, data: str) -> None:
+            for chunk in data.split(SIGNALR_RECORD_SEPARATOR):
+                if not chunk.strip():
+                    continue
+                frame = json.loads(chunk)
+                self.sent_frames.append(frame)
+                if frame.get("protocol") == "json":
+                    await self.incoming.put("{}" + SIGNALR_RECORD_SEPARATOR)
+                    self.handshake_done.set()
+                elif (
+                    frame.get("target") in {"SubscribeContractQuotes", "SubscribeContractTrades"}
+                    and frame.get("invocationId") is not None
+                ):
+                    args = frame.get("arguments") or []
+                    if args and args[0] == cid_nq:
+                        pending_nq_inv_ids.append(str(frame["invocationId"]))
+                        if len(pending_nq_inv_ids) >= 2:
+                            nq_ack_sent.set()
+                        continue
+                    comp = {"type": 3, "invocationId": frame["invocationId"]}
+                    await self.incoming.put(json.dumps(comp) + SIGNALR_RECORD_SEPARATOR)
+
+        async def release_nq_acks(self) -> None:
+            await nq_ack_gate.wait()
+            for inv_id in pending_nq_inv_ids:
+                await self.incoming.put(
+                    json.dumps({"type": 3, "invocationId": inv_id}) + SIGNALR_RECORD_SEPARATOR
+                )
+
+    transports: list[_DualContractAckTransport] = []
+
+    async def ws_factory(_url: str, _headers: dict[str, str]) -> _DualContractAckTransport:
+        t = _DualContractAckTransport()
+        transports.append(t)
+        return t
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/Auth/loginKey":
+            return httpx.Response(200, json={"success": True, "token": "jwt-dual"})
+        if request.url.path == "/api/History/retrieveBars":
+            payload = json.loads(request.content.decode("utf-8"))
+            return httpx.Response(
+                200,
+                json={"success": True, "bars": _bars_for_history_payload(payload)},
+            )
+        return httpx.Response(404)
+
+    settings = Settings(data_dir=tmp_path / "data")
+    sqlite_store = SqliteStore(tmp_path / "meta.db")
+    sqlite_store.initialize()
+    try:
+        parquet_store = ParquetStore(settings.data_dir, sqlite_store=sqlite_store)
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            auth = TopstepAuthService(settings, client)
+            await auth.login("alice", "key-dual")
+            rest = TopstepRestClient(settings, auth, client)
+            hub = SignalRMarketHub(
+                settings,
+                auth_service=auth,
+                ws_factory=ws_factory,
+                contracts=[CID_MES],
+                connect_timeout_sec=2.0,
+                heartbeat_timeout_sec=2.0,
+            )
+            agg = BarAggregator(timeframes=("1m",))
+            live_feed = LiveFeedService(
+                settings,
+                auth,
+                rest,
+                parquet_store,
+                sqlite_store,
+                aggregator=agg,
+                signalr_hub=hub,
+                recovery_timeframes=("1m",),
+                clock=lambda: clock_ref[0],
+            )
+            try:
+                await live_feed.set_active_contracts([CID_MES], live_mode=False)
+                await live_feed.start()
+                for _ in range(100):
+                    if live_feed.feed_state == "LIVE":
+                        break
+                    await asyncio.sleep(0.01)
+                assert live_feed.feed_state == "LIVE"
+
+                sub_task = asyncio.create_task(live_feed.subscribe_ws_contract(cid_nq))
+                await asyncio.wait_for(nq_ack_sent.wait(), timeout=2.0)
+
+                # While NQ awaits ACK, MES stays LIVE and MUST NOT drop incoming ticks.
+                assert live_feed.feed_state != "LIVE"
+                live_feed.handle_hub_event(
+                    SignalRTickEvent(
+                        CID_MES, False, BASE_T + 20, 5950.0, 2.0, "GatewayTrade", time.monotonic()
+                    )
+                )
+                live_feed.handle_hub_event(
+                    SignalRTickEvent(
+                        CID_MES, False, BASE_T + 25, 5955.0, 3.0, "GatewayTrade", time.monotonic()
+                    )
+                )
+                live_feed.handle_hub_event(
+                    SignalRTickEvent(
+                        cid_nq, False, BASE_T + 22, 20100.0, 1.0, "GatewayTrade", time.monotonic()
+                    )
+                )
+                mes_open = agg.get_open_bar(CID_MES, False, "1m")
+                assert mes_open is not None
+                assert mes_open.open == 5950.0
+                assert mes_open.high == 5955.0
+                assert mes_open.volume == 5.0
+
+                nq_ack_gate.set()
+                await transports[0].release_nq_acks()
+                await asyncio.wait_for(sub_task, timeout=2.0)
+                await live_feed.flush_pending_tasks()
+                assert live_feed.feed_state == "LIVE"
+                mes_after = agg.get_open_bar(CID_MES, False, "1m")
+                assert mes_after is not None and mes_after.volume == 5.0
+            finally:
+                nq_ack_gate.set()
+                await live_feed.stop()
+    finally:
+        sqlite_store.close()
+
+
+async def test_f03_overflow_bucket_stays_incomplete_and_degraded_across_same_bucket_retry(
+    tmp_path: Path,
+) -> None:
+    """Contract: Overflowed open bucket stays incomplete and DEGRADED across same-bucket retry.
+
+    Defect caught: Clearing _recovery_overflowed on a watchdog retry in the same bucket without
+    recording unhealed_gap_starts or marking the open bar incomplete.
+    """
+    from app.topstep.signalr_hub import SignalRTickEvent
+
+    clock_ref = [BASE_T + 15]
+    transports: list[_MockSignalRTransport] = []
+    rest_gate = asyncio.Event()
+    rest_entered = asyncio.Event()
+    gate_enabled = [False]
+
+    async def ws_factory(_url: str, _headers: dict[str, str]) -> _MockSignalRTransport:
+        t = _MockSignalRTransport()
+        transports.append(t)
+        return t
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/Auth/loginKey":
+            return httpx.Response(200, json={"success": True, "token": "jwt-ovf-retry"})
+        if request.url.path == "/api/History/retrieveBars":
+            if gate_enabled[0]:
+                rest_entered.set()
+                await rest_gate.wait()
+            payload = json.loads(request.content.decode("utf-8"))
+            return httpx.Response(
+                200,
+                json={"success": True, "bars": _bars_for_history_payload(payload)},
+            )
+        return httpx.Response(404)
+
+    settings = Settings(data_dir=tmp_path / "data", signalr_recovery_queue_maxsize=1)
+    sqlite_store = SqliteStore(tmp_path / "meta.db")
+    sqlite_store.initialize()
+    try:
+        parquet_store = ParquetStore(settings.data_dir, sqlite_store=sqlite_store)
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            auth = TopstepAuthService(settings, client)
+            await auth.login("alice", "key-ovf-retry")
+            rest = TopstepRestClient(settings, auth, client)
+            hub = SignalRMarketHub(
+                settings,
+                auth_service=auth,
+                ws_factory=ws_factory,
+                contracts=[CID_MES],
+            )
+            live_feed = LiveFeedService(
+                settings,
+                auth,
+                rest,
+                parquet_store,
+                sqlite_store,
+                signalr_hub=hub,
+                recovery_timeframes=("1m",),
+                clock=lambda: clock_ref[0],
+            )
+            try:
+                await live_feed.set_active_contracts([CID_MES], live_mode=False)
+                await live_feed.start()
+                for _ in range(100):
+                    if live_feed.feed_state == "LIVE":
+                        break
+                    await asyncio.sleep(0.01)
+                assert live_feed.feed_state == "LIVE"
+
+                # Advance into next bucket BASE_T + 60 so _last_connected_utc < BASE_T + 60.
+                clock_ref[0] = BASE_T + 70
+                gate_enabled[0] = True
+                rec_task = asyncio.create_task(live_feed.trigger_recovery())
+                await asyncio.wait_for(rest_entered.wait(), timeout=2.0)
+
+                live_feed.handle_hub_event(
+                    SignalRTickEvent(
+                        CID_MES, False, BASE_T + 65, 5950.0, 2.0, "GatewayTrade", time.monotonic()
+                    )
+                )
+                live_feed.handle_hub_event(
+                    SignalRTickEvent(
+                        CID_MES, False, BASE_T + 70, 5990.0, 9.0, "GatewayTrade", time.monotonic()
+                    )
+                )
+                assert live_feed.queue_overflow_count >= 1
+
+                gate_enabled[0] = False
+                rest_gate.set()
+                await asyncio.wait_for(rec_task, timeout=2.0)
+                assert live_feed.feed_state == "DEGRADED"
+
+                # Same-bucket retry (BASE_T + 80) must STILL remain DEGRADED (not clear gap!).
+                clock_ref[0] = BASE_T + 80
+                await live_feed.trigger_recovery()
+                await live_feed.flush_pending_tasks()
+                assert live_feed.feed_state == "DEGRADED"
+                assert live_feed.live_alerts_enabled is False
+
+                # Even if BASE_T + 125 tick rolls over before REST confirms BASE_T+60, never close.
+                clock_ref[0] = BASE_T + 125
+                await transports[0].push_frame(_quote_frame(CID_MES, BASE_T + 125, 5960.0, 1.0))
+                await asyncio.sleep(0.03)
+                await live_feed.flush_pending_tasks()
+                key = StorageDatasetKey("topstepx", False, CID_MES, "1m")
+                assert await parquet_store.read_bars(
+                    key, start_ts=BASE_T + 60, end_ts=BASE_T + 60
+                ) == []
+            finally:
+                rest_gate.set()
+                await live_feed.stop()
+    finally:
+        sqlite_store.close()
+
+
+async def test_f03_corrupted_cached_parquet_bar_not_counted_as_gap_healed(
+    tmp_path: Path,
+) -> None:
+    """Contract: Cached Parquet bar inside CORRUPTED coverage never heals a missing REST bar.
+
+    Defect caught: Merging Parquet bars in CORRUPTED coverage intervals into present_closed_times,
+    falsely clearing unhealed_gap_starts and recording COMPLETE when REST omits that bucket.
+    """
+    clock_ref = [BASE_T + 65]
+
+    async def ws_factory(_url: str, _headers: dict[str, str]) -> _MockSignalRTransport:
+        return _MockSignalRTransport()
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/Auth/loginKey":
+            return httpx.Response(200, json={"success": True, "token": "jwt-corrupt-cache"})
+        if request.url.path == "/api/History/retrieveBars":
+            payload = json.loads(request.content.decode("utf-8"))
+            bars = [
+                b
+                for b in _bars_for_history_payload(payload)
+                if int(b["t"]) != (BASE_T - 60)
+            ]
+            return httpx.Response(200, json={"success": True, "bars": bars})
+        return httpx.Response(404)
+
+    settings = Settings(data_dir=tmp_path / "data")
+    sqlite_store = SqliteStore(tmp_path / "meta.db")
+    sqlite_store.initialize()
+    try:
+        parquet_store = ParquetStore(settings.data_dir, sqlite_store=sqlite_store)
+        key = StorageDatasetKey("topstepx", False, CID_MES, "1m")
+        await parquet_store.upsert_bars(
+            key,
+            [
+                OHLCVBar(BASE_T - 120, 100.0, 101.0, 99.0, 100.5, 5.0, True),
+                OHLCVBar(BASE_T - 60, 100.5, 102.0, 100.0, 101.0, 6.0, True),
+                OHLCVBar(BASE_T, 101.0, 102.0, 100.5, 101.5, 7.0, True),
+            ],
+            now_utc=BASE_T + 65,
+        )
+        await sqlite_store.record_coverage(key, BASE_T - 120, BASE_T - 60, status="COMPLETE")
+        await sqlite_store.record_coverage(
+            key, BASE_T - 60, BASE_T, status="CORRUPTED", quarantined_count=1
+        )
+        await sqlite_store.record_coverage(key, BASE_T, BASE_T + 60, status="COMPLETE")
+        await sqlite_store.upsert_watermark(key, BASE_T)
+
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            auth = TopstepAuthService(settings, client)
+            await auth.login("alice", "key-corrupt-cache")
+            rest = TopstepRestClient(settings, auth, client)
+            hub = SignalRMarketHub(
+                settings,
+                auth_service=auth,
+                ws_factory=ws_factory,
+                contracts=[CID_MES],
+            )
+            live_feed = LiveFeedService(
+                settings,
+                auth,
+                rest,
+                parquet_store,
+                sqlite_store,
+                signalr_hub=hub,
+                recovery_timeframes=("1m",),
+                clock=lambda: clock_ref[0],
+            )
+            try:
+                await live_feed.set_active_contracts([CID_MES], live_mode=False)
+                await live_feed.start()
+                for _ in range(100):
+                    if live_feed.get_status_snapshot()["unresolved_gaps"] >= 1:
+                        break
+                    await asyncio.sleep(0.01)
+                await live_feed.flush_pending_tasks()
+                assert live_feed.feed_state == "DEGRADED"
+                assert live_feed.live_alerts_enabled is False
+                assert live_feed._contracts[CID_MES].unhealed_gap_starts["1m"] == BASE_T - 60
+                assert (
+                    await sqlite_store.is_interval_complete(key, BASE_T - 120, BASE_T + 60)
+                    is False
+                )
+            finally:
+                await live_feed.stop()
+    finally:
+        sqlite_store.close()
+
+
+async def test_f03_recovery_buffered_out_of_range_tick_quarantined_and_degrades(
+    tmp_path: Path,
+) -> None:
+    """Contract: Out-of-range buffered ticks seen during RECOVERING are quarantined and DEGRADED.
+
+    Defect caught: Silently skipping invalid buffered ticks in BarAggregator.reconcile_recovery()
+    so recovery could exit to LIVE without recording SQLite quality issues.
+    """
+    clock_ref = [BASE_T + 15]
+    transports: list[_MockSignalRTransport] = []
+    rest_gate = asyncio.Event()
+    rest_entered = asyncio.Event()
+
+    async def ws_factory(_url: str, _headers: dict[str, str]) -> _MockSignalRTransport:
+        t = _MockSignalRTransport()
+        transports.append(t)
+        return t
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/Auth/loginKey":
+            return httpx.Response(200, json={"success": True, "token": "jwt-rec-range"})
+        if request.url.path == "/api/History/retrieveBars":
+            rest_entered.set()
+            await rest_gate.wait()
+            payload = json.loads(request.content.decode("utf-8"))
+            return httpx.Response(
+                200,
+                json={"success": True, "bars": _bars_for_history_payload(payload)},
+            )
+        return httpx.Response(404)
+
+    settings = Settings(data_dir=tmp_path / "data")
+    sqlite_store = SqliteStore(tmp_path / "meta.db")
+    sqlite_store.initialize()
+    try:
+        parquet_store = ParquetStore(settings.data_dir, sqlite_store=sqlite_store)
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            auth = TopstepAuthService(settings, client)
+            await auth.login("alice", "key-rec-range")
+            rest = TopstepRestClient(settings, auth, client)
+            hub = SignalRMarketHub(
+                settings,
+                auth_service=auth,
+                ws_factory=ws_factory,
+                contracts=[CID_MES],
+            )
+            live_feed = LiveFeedService(
+                settings,
+                auth,
+                rest,
+                parquet_store,
+                sqlite_store,
+                signalr_hub=hub,
+                recovery_timeframes=("1m",),
+                clock=lambda: clock_ref[0],
+            )
+            try:
+                await live_feed.set_active_contracts([CID_MES], live_mode=False)
+                await live_feed.start()
+                await asyncio.wait_for(rest_entered.wait(), timeout=2.0)
+                assert live_feed.feed_state == "RECOVERING"
+
+                # Push out-of-range future timestamp tick while recovery backfill is in-flight.
+                await transports[0].push_frame(_quote_frame(CID_MES, BASE_T + 3600, 5960.0, 2.0))
+                await asyncio.sleep(0.02)
+                rest_gate.set()
+
+                for _ in range(100):
+                    if live_feed.feed_state == "DEGRADED":
+                        break
+                    await asyncio.sleep(0.01)
+                await live_feed.flush_pending_tasks()
+
+                assert live_feed.feed_state == "DEGRADED"
+                assert live_feed.live_alerts_enabled is False
+                key = StorageDatasetKey("topstepx", False, CID_MES, "1m")
+                issues = await sqlite_store.list_quality_issues(key)
+                assert len(issues) == 1
+                assert issues[0]["issue_code"] == "invalid_timestamp"
+            finally:
+                rest_gate.set()
+                await live_feed.stop()
+    finally:
+        sqlite_store.close()
+
+
+async def test_f03_rest_triggered_jwt_refresh_reconnects_hub_via_watchdog(
+    tmp_path: Path,
+) -> None:
+    """Contract: Watchdog detects REST-triggered JWT refresh and reconnects Hub with new token.
+
+    Defect caught: Checking only auth.needs_refresh() in run_watchdog_tick(), leaving Hub on an
+    older JWT after a REST call refreshed the token and reset needs_refresh() to False.
+    """
+    from datetime import timedelta
+
+    clock_ref = [BASE_T + 15]
+    transports: list[_MockSignalRTransport] = []
+    ws_urls: list[str] = []
+    tokens_issued = ["jwt-refresh-v1", "jwt-refresh-v2"]
+    login_idx = [0]
+
+    async def ws_factory(url: str, _headers: dict[str, str]) -> _MockSignalRTransport:
+        ws_urls.append(url)
+        t = _MockSignalRTransport()
+        transports.append(t)
+        return t
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/Auth/loginKey":
+            tok = tokens_issued[min(login_idx[0], len(tokens_issued) - 1)]
+            login_idx[0] += 1
+            return httpx.Response(200, json={"success": True, "token": tok})
+        if request.url.path == "/api/History/retrieveBars":
+            payload = json.loads(request.content.decode("utf-8"))
+            return httpx.Response(
+                200,
+                json={"success": True, "bars": _bars_for_history_payload(payload)},
+            )
+        return httpx.Response(404)
+
+    settings = Settings(data_dir=tmp_path / "data", jwt_refresh_hours=1)
+    sqlite_store = SqliteStore(tmp_path / "meta.db")
+    sqlite_store.initialize()
+    try:
+        parquet_store = ParquetStore(settings.data_dir, sqlite_store=sqlite_store)
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            auth = TopstepAuthService(settings, client)
+            await auth.login("alice", "key-jwt-sync")
+            rest = TopstepRestClient(settings, auth, client)
+            hub = SignalRMarketHub(
+                settings,
+                auth_service=auth,
+                ws_factory=ws_factory,
+                contracts=[CID_MES],
+                reconnect_initial_delay_sec=0.01,
+                reconnect_max_delay_sec=0.02,
+            )
+            live_feed = LiveFeedService(
+                settings,
+                auth,
+                rest,
+                parquet_store,
+                sqlite_store,
+                signalr_hub=hub,
+                recovery_timeframes=("1m",),
+                clock=lambda: clock_ref[0],
+            )
+            try:
+                await live_feed.set_active_contracts([CID_MES], live_mode=False)
+                await live_feed.start()
+                for _ in range(100):
+                    if live_feed.feed_state == "LIVE":
+                        break
+                    await asyncio.sleep(0.01)
+                assert live_feed.feed_state == "LIVE"
+                assert "jwt-refresh-v1" in ws_urls[0]
+
+                # Simulate token aging followed by REST call triggering JWT refresh before watchdog.
+                assert auth._token_acquired_at is not None
+                auth._token_acquired_at = auth._token_acquired_at - timedelta(hours=2)
+                await rest.retrieve_bars_paginated(
+                    contract_id=CID_MES,
+                    live=False,
+                    timeframe="1m",
+                    start_ts=BASE_T - 120,
+                    end_ts=BASE_T,
+                    include_partial_bar=False,
+                )
+                assert auth.needs_refresh() is False
+                assert auth.token_generation >= 2
+
+                # Watchdog must detect hub's stale token digest and force LIVE -> RECOVERING.
+                await live_feed.run_watchdog_tick()
+                for _ in range(100):
+                    if len(transports) >= 2 and live_feed.feed_state == "LIVE":
+                        break
+                    await asyncio.sleep(0.02)
+                assert len(transports) >= 2
+                assert "jwt-refresh-v2" in ws_urls[-1]
+                assert live_feed.feed_state == "LIVE"
+                assert hub.connected_token_digest == auth.current_token_digest
+            finally:
+                await live_feed.stop()
+    finally:
+        sqlite_store.close()

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 from collections import deque
 from collections.abc import Iterable, Iterator
@@ -93,6 +94,7 @@ class TopstepAuthService:
         self._live: bool = settings.topstepx_live
         self._connected_at: datetime | None = None
         self._token_acquired_at: datetime | None = None
+        self._token_generation: int = 0
         self._connection_state: ConnectionState = "DISCONNECTED"
         self._last_error: str | None = None
 
@@ -100,6 +102,18 @@ class TopstepAuthService:
     def is_connected(self) -> bool:
         """Return whether an active TopstepX JWT is held in memory."""
         return self._token is not None
+
+    @property
+    def token_generation(self) -> int:
+        """Monotonic counter incremented each time a TopstepX JWT is acquired or refreshed."""
+        return self._token_generation
+
+    @property
+    def current_token_digest(self) -> str | None:
+        """One-way SHA-256 hex digest of the active in-memory JWT (never raw secret)."""
+        if self._token is None:
+            return None
+        return hashlib.sha256(self._token.encode("utf-8")).hexdigest()
 
     @property
     def connection_state(self) -> ConnectionState:
@@ -265,6 +279,7 @@ class TopstepAuthService:
 
         acquired = now or datetime.now(UTC)
         self._token = token
+        self._token_generation += 1
         if token not in self._session_tokens:
             self._session_tokens.append(token)
         self._notify_active_scopes(token, cleaned_key)
