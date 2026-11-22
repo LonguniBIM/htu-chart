@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import threading
 import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -8242,5 +8243,234 @@ async def test_f03_live_feed_quarantines_untracked_contract_and_mismatched_live_
                 await svc.stop()
     finally:
         sqlite.close()
+
+
+@pytest.mark.asyncio
+async def test_f03_late_tick_auto_recovery_fences_generation_and_other_contracts(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Contract: P1-002 fences generation & transitions all contracts to RECOVERING on late tick.
+
+    Defect caught: _handle_stale_local_buckets calling _start_recovery_task() without bumping
+    _generation or transitioning other LIVE contracts to RECOVERING, leaving live ticks on
+    contract B to spawn uncancelled persistence tasks that overwrite REST HTF bars.
+    """
+    settings = Settings(data_dir=tmp_path / "data", signalr_enabled=True)
+    sqlite = SqliteStore(tmp_path / "meta.db")
+    sqlite.initialize()
+    parquet = ParquetStore(settings.data_dir, sqlite_store=sqlite)
+
+    t0 = first_bucket_open_at_or_after(BASE_T, "5m")
+    mnq = "CON.F.US.MNQ.Z26"
+    clock_ref = [t0 + 10]
+    block_mes_rest = [False]
+    mes_rest_entered = asyncio.Event()
+    release_mes_rest = asyncio.Event()
+
+    class _FenceRest:
+        async def retrieve_bars_paginated(self, **kw: Any) -> Any:
+            cid = str(kw["contract_id"])
+            if cid == CID_MES and block_mes_rest[0]:
+                mes_rest_entered.set()
+                await asyncio.wait_for(release_mes_rest.wait(), timeout=2.0)
+            s_ts = int(kw["start_ts"])
+            e_ts = int(kw["end_ts"])
+            cutoff = clock_ref[0] - (clock_ref[0] % 60)
+            bars = []
+            for ts in range(s_ts - (s_ts % 60), min(e_ts, cutoff), 60):
+                vol = 10.0 if (cid == mnq and t0 <= ts < t0 + 300) else 2.0
+                bars.append({"t": ts, "o": 100.0, "h": 105.0, "l": 99.0, "c": 102.0, "v": vol})
+            return type("R", (), {"raw_bars": bars, "truncated": False, "provider_gap": False})()
+
+    def _auth_handler(_req: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"success": True, "errorCode": 0, "token": "jwt-fence"})
+
+    try:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(_auth_handler)) as client:
+            auth = TopstepAuthService(settings, client)
+            await auth.login("alice", "api-key")
+            agg = BarAggregator(timeframes=("1m", "5m"))
+            svc = LiveFeedService(
+                settings,
+                auth,
+                _FenceRest(),
+                parquet,
+                sqlite,
+                aggregator=agg,
+                recovery_timeframes=("1m", "5m"),
+                initial_backfill_bars=1,
+                clock=lambda: clock_ref[0],
+            )
+            try:
+                await svc.set_active_contracts([CID_MES, mnq], live_mode=False)
+                svc._last_connected_utc = t0 - 30
+                await svc.trigger_recovery(now_utc=clock_ref[0])
+                assert svc.feed_state == "LIVE"
+
+                # Feed live ticks on CID_MES and MNQ, then watchdog-flush locally at t0 + 61.
+                now_mono = time.monotonic()
+                svc.handle_hub_event(
+                    SignalRTickEvent(
+                        CID_MES, False, t0 + 10, 100.0, 1.0, "GatewayTrade", now_mono
+                    )
+                )
+                svc.handle_hub_event(
+                    SignalRTickEvent(
+                        mnq, False, t0 + 10, 20000.0, 1.0, "GatewayTrade", now_mono
+                    )
+                )
+                await svc.flush_pending_tasks()
+                clock_ref[0] = t0 + 61
+                await svc.run_watchdog_tick()
+                assert svc.feed_state == "LIVE"
+
+                # Enable service/hub flags and block CID_MES REST before late tick triggers.
+                svc._running = True
+                monkeypatch.setattr(svc._hub, "_connected", True)
+                block_mes_rest[0] = True
+                gen_before = svc._generation
+                clock_ref[0] = t0 + 301
+
+                svc.handle_hub_event(
+                    SignalRTickEvent(
+                        CID_MES, False, t0 + 59.9, 105.0, 3.0, "GatewayTrade", now_mono + 1.0
+                    )
+                )
+
+                assert svc.feed_state == "RECOVERING"
+                assert svc._contracts[CID_MES].state == "RECOVERING"
+                assert svc._contracts[mnq].state == "RECOVERING"
+                assert svc._generation > gen_before
+
+                await asyncio.wait_for(mes_rest_entered.wait(), timeout=2.0)
+
+                # MNQ tick at t0+305 during MES recovery must buffer, not spawn live tasks.
+                svc.handle_hub_event(
+                    SignalRTickEvent(
+                        mnq, False, t0 + 305, 20010.0, 1.0, "GatewayTrade", now_mono + 2.0
+                    )
+                )
+                assert len(svc._live_tick_tasks) == 0
+
+                release_mes_rest.set()
+                await svc.flush_pending_tasks()
+                assert svc.feed_state == "LIVE"
+
+                # MNQ's authoritative 5m bar at t0 (5 x 1m @ vol 10 = 50.0) must remain intact.
+                key_mnq_5m = StorageDatasetKey("topstepx", False, mnq, "5m")
+                bars_5m = await parquet.read_bars(key_mnq_5m, start_ts=t0, end_ts=t0)
+                assert len(bars_5m) == 1
+                assert bars_5m[0].volume == 50.0
+            finally:
+                release_mes_rest.set()
+                svc._running = False
+                await svc.stop()
+    finally:
+        sqlite.close()
+
+
+@pytest.mark.asyncio
+async def test_f03_cancelled_recovery_shields_coverage_write_lock_until_thread_finishes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Contract: P1-001 shields record_coverage inside _coverage_write_lock across cancellation.
+
+    Defect caught: CancelledError releasing _coverage_write_lock while an older to_thread
+    _record_coverage_sync worker is still queued/running, letting stale CORRUPTED overwrite
+    newer COMPLETE coverage after supersession.
+    """
+    settings = Settings(data_dir=tmp_path / "data", signalr_enabled=True)
+    sqlite = SqliteStore(tmp_path / "meta.db")
+    sqlite.initialize()
+    parquet = ParquetStore(settings.data_dir, sqlite_store=sqlite)
+
+    t0 = BASE_T
+    now_t = t0 + 65
+    corrupt_rest = [True]
+    thread_entered = threading.Event()
+    release_thread = threading.Event()
+
+    orig_record_sync = sqlite._record_coverage_sync
+
+    def _gated_record_coverage_sync(*args: Any, **kwargs: Any) -> Any:
+        status = kwargs.get("status")
+        if status is None and len(args) >= 4:
+            status = args[3]
+        if status == "CORRUPTED" and not thread_entered.is_set():
+            thread_entered.set()
+            release_thread.wait(timeout=3.0)
+        return orig_record_sync(*args, **kwargs)
+
+    monkeypatch.setattr(sqlite, "_record_coverage_sync", _gated_record_coverage_sync)
+
+    class _CorruptThenCleanRest:
+        async def retrieve_bars_paginated(self, **kw: Any) -> Any:
+            s_ts = int(kw["start_ts"])
+            e_ts = int(kw["end_ts"])
+            cutoff = now_t - (now_t % 60)
+            if corrupt_rest[0]:
+                # Trigger CORRUPTED coverage via invalid negative price in REST payload.
+                bars = [{"t": t0, "o": -1.0, "h": 100.0, "l": 99.0, "c": 100.0, "v": 1.0}]
+            else:
+                bars = [
+                    {"t": ts, "o": 100.0, "h": 101.0, "l": 99.0, "c": 100.0, "v": 2.0}
+                    for ts in range(s_ts - (s_ts % 60), min(e_ts, cutoff), 60)
+                ]
+            return type("R", (), {"raw_bars": bars, "truncated": False, "provider_gap": False})()
+
+    def _auth_handler(_req: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"success": True, "errorCode": 0, "token": "jwt-cov"})
+
+    key_1m = StorageDatasetKey("topstepx", False, CID_MES, "1m")
+    try:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(_auth_handler)) as client:
+            auth = TopstepAuthService(settings, client)
+            await auth.login("alice", "api-key")
+            svc = LiveFeedService(
+                settings,
+                auth,
+                _CorruptThenCleanRest(),
+                parquet,
+                sqlite,
+                recovery_timeframes=("1m",),
+                initial_backfill_bars=1,
+                clock=lambda: now_t,
+            )
+            try:
+                await svc.set_active_contracts([CID_MES], live_mode=False)
+                svc._last_connected_utc = t0 - 30
+                svc._transition_all_contracts("RECOVERING")
+                t1 = svc._start_recovery_task(now_utc=now_t)
+
+                for _ in range(200):
+                    if thread_entered.is_set():
+                        break
+                    await asyncio.sleep(0.01)
+                assert thread_entered.is_set() is True
+
+                # Supersede recovery while t1's CORRUPTED worker thread is paused.
+                corrupt_rest[0] = False
+                svc._bump_generation_and_cancel_live_tasks()
+                t2 = svc._start_recovery_task(now_utc=now_t)
+
+                # Wait briefly; t1 MUST hold _coverage_write_lock until its thread finishes.
+                await asyncio.sleep(0.05)
+                assert not t1.done()
+                assert await sqlite.is_interval_complete(key_1m, t0, t0 + 60) is False
+
+                release_thread.set()
+                await asyncio.gather(t1, return_exceptions=True)
+                await asyncio.wait_for(t2, timeout=2.0)
+
+                assert svc.feed_state == "LIVE"
+                assert await sqlite.is_interval_complete(key_1m, t0, t0 + 60) is True
+            finally:
+                release_thread.set()
+                await svc.stop()
+    finally:
+        sqlite.close()
+
 
 
