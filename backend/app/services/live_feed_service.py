@@ -68,6 +68,7 @@ class ContractFeedRuntime:
     last_event_monotonic: float | None = None
     last_error: str | None = None
     watermarks: dict[str, int] = field(default_factory=dict)
+    unhealed_gap_starts: dict[str, int] = field(default_factory=dict)
 
 
 class LiveFeedService:
@@ -355,17 +356,46 @@ class LiveFeedService:
             self._hub.start()
 
     async def on_auth_connected(self) -> None:
-        """Called when TopstepX auth acquires a JWT; starts SignalR if contracts are active."""
+        """Sync live_mode and start/reconnect SignalR when TopstepX auth acquires a JWT."""
         if not self._running:
             await self.start()
             return
-        if (
-            self._settings.signalr_enabled
-            and self._auth.is_connected
-            and self._contracts
-            and not self._hub.is_connected
-        ):
+
+        new_live = self._auth.live
+        mode_changed = any(c.live_mode != new_live for c in self._contracts.values()) or (
+            self._hub.live_mode != new_live
+        )
+
+        if mode_changed:
+            if self._recovery_task is not None and not self._recovery_task.done():
+                self._recovery_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await self._recovery_task
+            self._recovery_task = None
+            for cid, c_state in list(self._contracts.items()):
+                self._aggregator.reset_contract(cid)
+                self._contracts[cid] = ContractFeedRuntime(
+                    contract_id=cid,
+                    live_mode=new_live,
+                    root_symbol=c_state.root_symbol,
+                    state="DISCONNECTED",
+                )
+
+        if not self._settings.signalr_enabled or not self._auth.is_connected or not self._contracts:
+            if mode_changed:
+                await self._hub.update_contracts(list(self._contracts.keys()), live_mode=new_live)
+                self._broadcast_status()
+            return
+
+        if not self._hub.is_connected:
+            await self._hub.update_contracts(list(self._contracts.keys()), live_mode=new_live)
             self._hub.start()
+        else:
+            self._transition_all_contracts("RECOVERING")
+            if mode_changed:
+                await self._hub.update_contracts(list(self._contracts.keys()), live_mode=new_live)
+            else:
+                await self._hub.trigger_reconnect()
 
     async def on_auth_disconnected(self) -> None:
         """Stop active SignalR and recovery tasks when TopstepX auth disconnects."""
@@ -553,6 +583,7 @@ class LiveFeedService:
         tf: str,
         eff_now: int,
         pending_by_contract: dict[str, list[SignalRTickEvent]],
+        align_for_higher_tfs: Sequence[str] = (),
     ) -> tuple[bool, int, Any]:
         key = StorageDatasetKey("topstepx", c_state.live_mode, cid, tf)
         wm = await self._sqlite.get_watermark(key)
@@ -570,7 +601,29 @@ class LiveFeedService:
                 DEFAULT_MIN_BAR_TIMESTAMP,
                 eff_now - (self._initial_backfill_bars * TIMEFRAME_SECONDS[tf]),
             )
+
+        if tf == "1m" and align_for_higher_tfs:
+            aligned_htf_start = max(
+                DEFAULT_MIN_BAR_TIMESTAMP,
+                min(bucket_open_utc(backfill_start, htf) for htf in align_for_higher_tfs),
+            )
+            if aligned_htf_start < backfill_start:
+                missing_ranges = await self._sqlite.compute_missing_ranges(
+                    key, aligned_htf_start, backfill_start
+                )
+                if missing_ranges:
+                    backfill_start = min(backfill_start, missing_ranges[0][0])
+
+        unhealed_start = c_state.unhealed_gap_starts.get(tf)
+        if unhealed_start is not None:
+            backfill_start = min(backfill_start, unhealed_start)
+
         backfill_end = max(eff_now, backfill_start + TIMEFRAME_SECONDS[tf])
+        # Track start defensively so any exception during REST/persistence retains gap start.
+        c_state.unhealed_gap_starts[tf] = min(
+            c_state.unhealed_gap_starts.get(tf, backfill_start),
+            backfill_start,
+        )
 
         page_res = await asyncio.wait_for(
             self._rest.retrieve_bars_paginated(
@@ -644,9 +697,13 @@ class LiveFeedService:
                 now_utc=eff_now,
             )
 
-        if recon.last_closed_bar_time is not None:
-            updated_wm = await self._sqlite.upsert_watermark(key, recon.last_closed_bar_time)
-            c_state.watermarks[tf] = updated_wm.last_closed_bar_time
+        if not had_gap:
+            c_state.unhealed_gap_starts.pop(tf, None)
+            if recon.last_closed_bar_time is not None:
+                updated_wm = await self._sqlite.upsert_watermark(
+                    key, recon.last_closed_bar_time
+                )
+                c_state.watermarks[tf] = updated_wm.last_closed_bar_time
 
         closed_end = latest_closed_bucket_end_utc(eff_now, tf, root_symbol=c_state.root_symbol)
         if not had_gap and closed_end > backfill_start:
@@ -678,6 +735,7 @@ class LiveFeedService:
         backfill_start_1m: int,
         recon_1m: Any,
         eff_now: int,
+        had_1m_gap: bool,
     ) -> None:
         key_1m = StorageDatasetKey("topstepx", c_state.live_mode, cid, "1m")
         min_htf_start = min(bucket_open_utc(backfill_start_1m, htf) for htf in higher_tfs)
@@ -692,6 +750,20 @@ class LiveFeedService:
             merged_1m[evt.bar.time] = evt.bar
         all_closed_1m = [merged_1m[t] for t in sorted(merged_1m)]
         open_1m_bar = recon_1m.open_bar.bar if recon_1m.open_bar is not None else None
+
+        closed_1m_end = latest_closed_bucket_end_utc(
+            eff_now, "1m", root_symbol=c_state.root_symbol
+        )
+        if had_1m_gap:
+            covered_start_utc = eff_now + 1
+        elif await self._sqlite.is_interval_complete(
+            key_1m,
+            min_htf_start,
+            max(min_htf_start, closed_1m_end),
+        ):
+            covered_start_utc = min_htf_start
+        else:
+            covered_start_utc = backfill_start_1m
 
         for htf in higher_tfs:
             key_htf = StorageDatasetKey("topstepx", c_state.live_mode, cid, htf)
@@ -710,6 +782,7 @@ class LiveFeedService:
                 open_1m_bar=open_1m_bar,
                 now_utc=eff_now,
                 root_symbol=c_state.root_symbol,
+                covered_start_utc=covered_start_utc,
             )
             closed_htf = [evt.bar for evt in recon_htf.closed_bars]
             if closed_htf:
@@ -719,7 +792,11 @@ class LiveFeedService:
                     root_symbol=c_state.root_symbol,
                     now_utc=eff_now,
                 )
-            if recon_htf.last_closed_bar_time is not None:
+            if (
+                not had_1m_gap
+                and not c_state.unhealed_gap_starts
+                and recon_htf.last_closed_bar_time is not None
+            ):
                 updated_wm = await self._sqlite.upsert_watermark(
                     key_htf, recon_htf.last_closed_bar_time
                 )
@@ -746,6 +823,7 @@ class LiveFeedService:
                 contract_had_gap = False
                 try:
                     if "1m" in self._recovery_timeframes:
+                        higher_tfs = [tf for tf in self._recovery_timeframes if tf != "1m"]
                         had_gap, backfill_start_1m, recon_1m = (
                             await self._recover_single_timeframe_rest(
                                 cid=cid,
@@ -753,11 +831,11 @@ class LiveFeedService:
                                 tf="1m",
                                 eff_now=eff_now,
                                 pending_by_contract=pending_by_contract,
+                                align_for_higher_tfs=higher_tfs,
                             )
                         )
                         if had_gap:
                             contract_had_gap = True
-                        higher_tfs = [tf for tf in self._recovery_timeframes if tf != "1m"]
                         if higher_tfs:
                             await self._recover_higher_timeframes_from_1m(
                                 cid=cid,
@@ -766,6 +844,7 @@ class LiveFeedService:
                                 backfill_start_1m=backfill_start_1m,
                                 recon_1m=recon_1m,
                                 eff_now=eff_now,
+                                had_1m_gap=had_gap,
                             )
                     else:
                         for tf in self._recovery_timeframes:
@@ -791,7 +870,7 @@ class LiveFeedService:
                         c_state.last_error,
                     )
 
-                if self._recovery_overflowed:
+                if self._recovery_overflowed or c_state.unhealed_gap_starts:
                     contract_had_gap = True
 
                 contract_degraded[cid] = contract_had_gap
@@ -813,7 +892,11 @@ class LiveFeedService:
                 if not remaining:
                     self._recovery_duration_ms = int((time.monotonic() - started_mono) * 1000)
                     for cid, c_state in self._contracts.items():
-                        if self._recovery_overflowed or contract_degraded.get(cid, False):
+                        if (
+                            self._recovery_overflowed
+                            or contract_degraded.get(cid, False)
+                            or c_state.unhealed_gap_starts
+                        ):
                             c_state.state = "DEGRADED"
                             self._last_degraded_at_mono = time.monotonic()
                         else:
@@ -840,6 +923,13 @@ class LiveFeedService:
             self._recovery_duration_ms = int((time.monotonic() - started_mono) * 1000)
             self._transition_all_contracts("DEGRADED")
             logger.warning("Recovery coordinator error: %s", self._last_error)
+
+    def _on_live_task_done(self, task: asyncio.Task[None]) -> None:
+        self._live_tick_tasks.discard(task)
+        if not task.cancelled():
+            exc = task.exception()
+            if exc is not None:
+                logger.warning("Unexpected live task error: %s", self._redact(str(exc)))
 
     def _ingest_live_tick_sync(
         self,
@@ -874,10 +964,12 @@ class LiveFeedService:
         ]
         if closed_or_signal:
             task = asyncio.create_task(
-                self._persist_and_signal_events(res.events, now_utc=eff_now, broadcast=False)
+                self._safe_persist_and_signal_events(
+                    res.events, now_utc=eff_now, broadcast=False
+                )
             )
             self._live_tick_tasks.add(task)
-            task.add_done_callback(self._live_tick_tasks.discard)
+            task.add_done_callback(self._on_live_task_done)
         return list(res.events)
 
     async def flush_pending_tasks(self) -> None:
@@ -910,7 +1002,43 @@ class LiveFeedService:
         res = self._aggregator.process_tick(tick, now_utc=eff_now, root_symbol=root_sym)
         if not res.accepted:
             return
-        await self._persist_and_signal_events(res.events, now_utc=eff_now, broadcast=True)
+        await self._safe_persist_and_signal_events(res.events, now_utc=eff_now, broadcast=True)
+
+    async def _safe_persist_and_signal_events(
+        self,
+        events: Sequence[AggregatedBarEvent],
+        *,
+        now_utc: int,
+        broadcast: bool = True,
+    ) -> None:
+        try:
+            await self._persist_and_signal_events(events, now_utc=now_utc, broadcast=broadcast)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            redacted_err = self._redact(str(exc) or type(exc).__name__)
+            self._last_error = redacted_err
+            marked_any = False
+            for bar_evt in events:
+                c_state = self._contracts.get(bar_evt.contract_id)
+                if c_state is not None:
+                    marked_any = True
+                    c_state.unresolved_gaps += 1
+                    c_state.last_error = redacted_err
+                    c_state.state = "DEGRADED"
+                    if bar_evt.bar.is_closed:
+                        prev_gap = c_state.unhealed_gap_starts.get(bar_evt.timeframe)
+                        c_state.unhealed_gap_starts[bar_evt.timeframe] = (
+                            bar_evt.bar.time
+                            if prev_gap is None
+                            else min(prev_gap, bar_evt.bar.time)
+                        )
+            if not marked_any:
+                self._global_unresolved_gaps += 1
+            self._last_degraded_at_mono = time.monotonic()
+            self._recompute_aggregate_state()
+            self._broadcast_status()
+            logger.warning("Live persistence/signal failure: %s", redacted_err)
 
     async def _persist_and_signal_events(
         self,
@@ -971,9 +1099,19 @@ class LiveFeedService:
                 self._transition_all_contracts("DISCONNECTED")
             return
 
-        flushed = self._aggregator.flush_closed_bars(now_utc=now_ts)
-        if flushed:
-            await self._persist_and_signal_events(flushed, now_utc=now_ts, broadcast=True)
+        # Only flush elapsed open bars for LIVE contracts; RECOVERING uses REST + buffered ticks.
+        for cid, c_state in list(self._contracts.items()):
+            if c_state.state != "LIVE":
+                continue
+            flushed = self._aggregator.flush_closed_bars(
+                now_utc=now_ts,
+                contract_id=cid,
+                live_mode=c_state.live_mode,
+            )
+            if flushed:
+                await self._safe_persist_and_signal_events(
+                    flushed, now_utc=now_ts, broadcast=True
+                )
 
         effective_last = self._effective_last_activity_monotonic()
         if (
@@ -1015,7 +1153,20 @@ class LiveFeedService:
     async def _watchdog_loop(self) -> None:
         while self._running:
             await asyncio.sleep(0.5)
-            await self.run_watchdog_tick()
+            try:
+                await self.run_watchdog_tick()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                self._global_unresolved_gaps += 1
+                self._last_error = self._redact(str(exc) or type(exc).__name__)
+                for c_state in self._contracts.values():
+                    if c_state.state != "DISCONNECTED":
+                        c_state.state = "DEGRADED"
+                self._last_degraded_at_mono = time.monotonic()
+                self._recompute_aggregate_state()
+                self._broadcast_status()
+                logger.warning("Watchdog tick failed: %s", self._last_error)
 
     def get_status_snapshot(self) -> dict[str, Any]:
         """Return strictly redacted live-feed telemetry snapshot for /api/status and WS."""

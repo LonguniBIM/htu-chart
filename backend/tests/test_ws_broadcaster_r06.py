@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import json
 import time
 from datetime import UTC, datetime
@@ -398,7 +399,7 @@ class _MockSignalRTransport:
             "arguments": [
                 contract_id,
                 {
-                    "contractId": contract_id,
+                    "symbolId": "F.US.MES",
                     "price": price,
                     "volume": volume,
                     "timestamp": ts,
@@ -406,6 +407,33 @@ class _MockSignalRTransport:
             ],
         }
         await self.incoming.put(json.dumps(frame) + SIGNALR_RECORD_SEPARATOR)
+
+    async def push_quote(
+        self,
+        contract_id: str,
+        ts: int,
+        last_price: float,
+        cumulative_volume: float,
+    ) -> None:
+        frame = {
+            "type": 1,
+            "target": "GatewayQuote",
+            "arguments": [
+                contract_id,
+                {
+                    "symbolId": "F.US.MES",
+                    "lastPrice": last_price,
+                    "volume": cumulative_volume,
+                    "timestamp": ts,
+                },
+            ],
+        }
+        await self.incoming.put(json.dumps(frame) + SIGNALR_RECORD_SEPARATOR)
+
+
+def _receive_json_with_timeout(ws: Any, timeout_sec: float) -> dict[str, Any]:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+        return pool.submit(ws.receive_json).result(timeout=timeout_sec)
 
 
 def test_r06_ws_subscribe_triggers_upstream_signalr_and_streams_live_bars(
@@ -499,20 +527,24 @@ def test_r06_ws_subscribe_triggers_upstream_signalr_and_streams_live_bars(
                 assert len(transports) == 1
                 assert "CON.F.US.MES.Z26" in transports[0].subscribed_contracts
 
-                # Push live tick through SignalR transport and verify client receives bar_update.
+                # Push GatewayQuote (cumulative vol=12000) + GatewayTrade (vol=4.0) through SignalR
+                # and verify client receives bar_update for CON.F.US.MES.Z26 with volume=4.0!
                 portal = client.portal
                 assert portal is not None
+                portal.call(transports[0].push_quote, "CON.F.US.MES.Z26", now_ts, 5955.0, 12000.0)
                 portal.call(transports[0].push_trade, "CON.F.US.MES.Z26", now_ts, 5955.25, 4.0)
 
                 deadline = time.monotonic() + 2.0
                 received_bar = None
                 while time.monotonic() < deadline:
-                    msg = ws.receive_json()
+                    remaining = max(0.05, deadline - time.monotonic())
+                    msg = _receive_json_with_timeout(ws, remaining)
                     if msg.get("type") == "bar_update" and msg["bar"]["close"] == 5955.25:
                         received_bar = msg
                         break
                 assert received_bar is not None
                 assert received_bar["contract_id"] == "CON.F.US.MES.Z26"
+                assert received_bar["bar"]["volume"] == 4.0
     finally:
         asyncio.run(upstream.aclose())
 

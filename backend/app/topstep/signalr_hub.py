@@ -205,7 +205,8 @@ def extract_ticks_from_invocation(
 
     ticks: list[SignalRTickEvent] = []
     for item in payload_items:
-        raw_cid = item.get("contractId") or item.get("symbolId") or default_contract
+        # Preserve explicit callback contractId over symbolId (ProjectX payloads set symbolId).
+        raw_cid = item.get("contractId") or default_contract or item.get("symbolId")
         if not isinstance(raw_cid, str) or not raw_cid.strip():
             continue
         cid = raw_cid.strip().upper()
@@ -221,14 +222,19 @@ def extract_ticks_from_invocation(
         if price is None or price <= 0.0:
             continue
 
-        raw_vol: Any = 0.0
-        for vol_key in ("volume", "size", "qty", "v"):
-            if vol_key in item and item[vol_key] is not None:
-                raw_vol = item[vol_key]
-                break
-        volume = _parse_finite_number(raw_vol)
-        if volume is None or volume < 0.0:
-            continue
+        # GatewayQuote carries cumulative session volume; only GatewayTrade volume is incremental.
+        if target_lower == "gatewayquote":
+            volume = 0.0
+        else:
+            raw_vol: Any = 0.0
+            for vol_key in ("volume", "size", "qty", "v"):
+                if vol_key in item and item[vol_key] is not None:
+                    raw_vol = item[vol_key]
+                    break
+            parsed_vol = _parse_finite_number(raw_vol)
+            if parsed_vol is None or parsed_vol < 0.0:
+                continue
+            volume = parsed_vol
 
         raw_ts: Any = None
         for ts_key in ("timestamp", "lastUpdated", "t", "ts"):

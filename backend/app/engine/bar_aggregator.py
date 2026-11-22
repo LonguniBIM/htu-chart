@@ -15,6 +15,7 @@ from app.engine.ohlcv import (
     validate_ohlcv_bar,
 )
 from app.engine.session_calendar import (
+    bucket_bounds,
     bucket_open_utc,
     is_bar_closed,
     normalize_timeframe,
@@ -530,6 +531,7 @@ class BarAggregator:
         open_1m_bar: OHLCVBar | None = None,
         now_utc: int | None = None,
         root_symbol: str | None = None,
+        covered_start_utc: int | None = None,
     ) -> ReconciliationResult:
         """Deterministically rebuild a higher timeframe from recovered 1m closed + open bars."""
         cid = _normalize_contract_id(contract_id)
@@ -583,19 +585,31 @@ class BarAggregator:
         for bar_time in sorted(dedup_1m):
             bar = dedup_1m[bar_time]
             htf_open = bucket_open_utc(bar.time, tf)
-            if prev_closed is not None and htf_open <= prev_closed:
-                continue
             grouped.setdefault(htf_open, []).append(bar)
 
+        current_htf_open = bucket_open_utc(eff_now, tf)
         closed_events: list[AggregatedBarEvent] = []
         latest_open_bar: OHLCVBar | None = None
 
         for htf_open in sorted(grouped):
             members = grouped[htf_open]
+            _, htf_end = bucket_bounds(htf_open, tf, root_symbol=eff_root)
+            expected_1m_count = max(1, (htf_end - htf_open) // 60)
             all_inputs_closed = all(b.is_closed for b in members)
-            bar_closed = all_inputs_closed and is_bar_closed(
-                htf_open, tf, eff_now, root_symbol=eff_root
+            bucket_elapsed = is_bar_closed(htf_open, tf, eff_now, root_symbol=eff_root)
+            covered_ok = covered_start_utc is None or covered_start_utc <= htf_open
+            full_1m_coverage = (
+                covered_ok
+                and len(members) == expected_1m_count
+                and members[0].time == htf_open
+                and members[-1].time == htf_end - 60
             )
+            bar_closed = all_inputs_closed and bucket_elapsed and full_1m_coverage
+
+            # Never finalize or publish an elapsed bucket with incomplete 1m source bars.
+            if bucket_elapsed and not bar_closed:
+                continue
+
             candidate = {
                 "time": htf_open,
                 "open": members[0].open,
@@ -623,7 +637,7 @@ class BarAggregator:
                         root_symbol=eff_root,
                     )
                 )
-            else:
+            elif htf_open >= current_htf_open:
                 latest_open_bar = val.bar
 
         open_event: AggregatedBarEvent | None = None

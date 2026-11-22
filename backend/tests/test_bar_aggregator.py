@@ -256,3 +256,86 @@ def test_reconcile_recovery_preserves_pre_disconnect_open_bar_ohlcv() -> None:
         volume=17.0,
         is_closed=False,
     )
+
+
+def test_cme_globex_1h_4h_session_close_and_dst_transition() -> None:
+    """Contract: 1h and 4h buckets honor CME 17:00 ET close and US DST 18:00 ET shifts.
+
+    Defect caught: 1h/4h bars anchored to 00:00 UTC or failing to close at 17:00 ET / DST shifts.
+    """
+    agg = BarAggregator(timeframes=("1h", "4h"))
+    cid = "CON.F.US.MES.Z26"
+
+    # Before US Spring Forward (EST, UTC-5): 2026-03-06 16:30 ET = 21:30 UTC
+    # 1h bucket: 16:00 ET (21:00 UTC); 4h bucket: 14:00 ET (19:00 UTC), both close at 17:00 ET!
+    est_tick = _et_ts(2026, 3, 6, 16, 30, 0)
+    agg.process_tick(NormalizedTick(cid, False, est_tick, 5900.0, 5.0), now_utc=est_tick)
+    assert agg.get_open_bar(cid, False, "1h").time == _et_ts(2026, 3, 6, 16, 0, 0)
+    assert agg.get_open_bar(cid, False, "4h").time == _et_ts(2026, 3, 6, 14, 0, 0)
+
+    # Flush at 17:00:00 ET -> closes BOTH 1h (16:00 ET) and 4h (14:00 ET) at session halt!
+    flushed_est = agg.flush_closed_bars(now_utc=_et_ts(2026, 3, 6, 17, 0, 0))
+    assert {e.timeframe: e.bar.time for e in flushed_est} == {
+        "1h": _et_ts(2026, 3, 6, 16, 0, 0),
+        "4h": _et_ts(2026, 3, 6, 14, 0, 0),
+    }
+
+    # After US Spring Forward (2026-03-08 18:00 EDT = 22:00 UTC, 1h shift from EST 23:00 UTC):
+    edt_open_utc = int(datetime(2026, 3, 8, 22, 0, 0, tzinfo=UTC).timestamp())
+    edt_tick = edt_open_utc + 600
+    agg.process_tick(NormalizedTick(cid, False, edt_tick, 5910.0, 3.0), now_utc=edt_tick)
+    assert agg.get_open_bar(cid, False, "1h").time == edt_open_utc
+    assert agg.get_open_bar(cid, False, "4h").time == edt_open_utc
+
+
+def test_reconcile_from_1m_bars_blocks_incomplete_cold_start_and_corrects_watermark() -> None:
+    """Contract: Incomplete 1m buckets never finalize HTF bars; complete history can correct them.
+
+    Defect caught: Partial 15m/1h bucket marked closed on cold start (SECINV-001) and skipping
+    historical correction for buckets <= watermark (P1-006).
+    """
+    agg = BarAggregator(timeframes=("1m", "15m", "1h"))
+    cid = "CON.F.US.MES.Z26"
+    h0 = int(datetime(2026, 11, 10, 14, 0, 0, tzinfo=UTC).timestamp())
+
+    # 1) Cold-start partial 15m bucket (14:05..14:14 only, missing 14:00..14:04) at 14:16 UTC.
+    partial_1m = [
+        OHLCVBar(h0 + (m * 60), 100.0, 102.0, 99.0, 101.0, 1.0, is_closed=True)
+        for m in range(5, 15)
+    ]
+    res_partial = agg.reconcile_from_1m_bars(
+        contract_id=cid,
+        live_mode=False,
+        timeframe="15m",
+        closed_1m_bars=partial_1m,
+        now_utc=h0 + (16 * 60),
+    )
+    assert res_partial.closed_bars == ()
+    assert agg.get_last_closed_time(cid, False, "15m") is None
+
+    # 2) Seed 1h watermark at h0, then reconcile all 60 1m bars with corrected high=250.0.
+    agg.set_last_closed_time(cid, False, "1h", h0)
+    full_hour_1m = [
+        OHLCVBar(
+            h0 + (m * 60),
+            100.0,
+            250.0 if m == 10 else 105.0,
+            95.0,
+            102.0,
+            2.0,
+            is_closed=True,
+        )
+        for m in range(60)
+    ]
+    res_corrected = agg.reconcile_from_1m_bars(
+        contract_id=cid,
+        live_mode=False,
+        timeframe="1h",
+        closed_1m_bars=full_hour_1m,
+        now_utc=h0 + 3600,
+    )
+    assert len(res_corrected.closed_bars) == 1
+    assert res_corrected.closed_bars[0].bar.time == h0
+    assert res_corrected.closed_bars[0].bar.high == 250.0
+    assert res_corrected.closed_bars[0].bar.volume == 120.0
+    assert res_corrected.closed_bars[0].is_recovered_historical is True
