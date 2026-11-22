@@ -31,6 +31,8 @@ from app.topstep.rest_client import TopstepRestClient
 from app.topstep.signalr_hub import (
     SIGNALR_RECORD_SEPARATOR,
     SignalRConnectedEvent,
+    SignalRDisconnectedEvent,
+    SignalRErrorEvent,
     SignalRMalformedTickEvent,
     SignalRMarketHub,
     SignalRTickEvent,
@@ -213,7 +215,7 @@ async def test_signalr_hub_backoff_redacts_secrets_and_stops_cleanly_on_cancel(
         attempt += 1
         assert f"access_token={secret_jwt}" in url
         assert headers["Authorization"] == f"Bearer {secret_jwt}"
-        if attempt <= 3:
+        if attempt <= 4:
             raise ConnectionError(f"Dial failed for {url} with Bearer {secret_jwt}")
         return _MockSignalRTransport()
 
@@ -251,9 +253,9 @@ async def test_signalr_hub_backoff_redacts_secrets_and_stops_cleanly_on_cancel(
         await asyncio.sleep(0.01)
 
     assert hub.is_connected is True
-    assert sleep_delays[:3] == [2.0, 4.0, 8.0]
+    assert sleep_delays[:4] == [2.0, 4.0, 8.0, 8.0]
     err_msgs = [e.message for e in events if hasattr(e, "message")]
-    assert len(err_msgs) == 3
+    assert len(err_msgs) == 4
     assert all(secret_jwt not in msg and "***REDACTED***" in msg for msg in err_msgs)
 
     await hub.stop()
@@ -7406,6 +7408,7 @@ async def test_f03_late_tick_after_local_watchdog_flush_triggers_gap_and_rest_re
 
     t0 = first_bucket_open_at_or_after(BASE_T, "5m")
     now_t = [t0 + 10]
+    omit_t0 = [False]
 
     class _RestAuthoritative:
         async def retrieve_bars_paginated(self, **kw: Any) -> Any:
@@ -7416,6 +7419,8 @@ async def test_f03_late_tick_after_local_watchdog_flush_triggers_gap_and_rest_re
             for ts in range(s_ts - (s_ts % 60), e_ts, 60):
                 if ts < cutoff:
                     if ts == t0:
+                        if omit_t0[0]:
+                            continue
                         bars.append(
                             {"t": ts, "o": 100.0, "h": 105.0, "l": 100.0, "c": 105.0, "v": 4.0}
                         )
@@ -7472,11 +7477,22 @@ async def test_f03_late_tick_after_local_watchdog_flush_triggers_gap_and_rest_re
             assert t0 in c_state.unhealed_gap_buckets.get("1m", set())
             assert svc.live_alerts_enabled is False
 
-            # REST reconciliation heals t0 with authoritative volume=4.0, high=105.0 -> LIVE.
+            key_1m = StorageDatasetKey("topstepx", False, CID_MES, "1m")
+
+            # First REST recovery omits t0: cached stale bar MUST NOT self-heal the gap!
+            omit_t0[0] = True
+            now_t[0] = t0 + 62
+            await svc.trigger_recovery(now_utc=now_t[0])
+            assert c_state.state == "DEGRADED"
+            assert svc.live_alerts_enabled is False
+            assert t0 in c_state.unhealed_gap_buckets.get("1m", set())
+            assert await sqlite.is_interval_complete(key_1m, t0, t0 + 60) is False
+
+            # REST reconciliation returns repaired t0 (vol=4.0, high=105.0) -> heals to LIVE.
+            omit_t0[0] = False
             now_t[0] = t0 + 65
             await svc.trigger_recovery(now_utc=now_t[0])
             assert svc.feed_state == "LIVE"
-            key_1m = StorageDatasetKey("topstepx", False, CID_MES, "1m")
             persisted = await parquet.read_bars(key_1m, start_ts=t0, end_ts=t0 + 60)
             assert any(b.time == t0 and b.volume == 4.0 and b.high == 105.0 for b in persisted)
 
@@ -7491,3 +7507,88 @@ async def test_f03_late_tick_after_local_watchdog_flush_triggers_gap_and_rest_re
         finally:
             await svc.stop()
             sqlite.close()
+
+
+@pytest.mark.asyncio
+async def test_f03_signalr_bounded_event_queue_overflow_surfaces_error_and_disconnect(
+    tmp_path: Path,
+) -> None:
+    """Contract: Bounded event_queue overflow records telemetry and surfaces error/disconnect.
+    Defect caught: silent asyncio.QueueFull suppression losing ticks and disconnects.
+    """
+    settings = Settings(data_dir=tmp_path / "data", signalr_enabled=True)
+    event_queue: asyncio.Queue[Any] = asyncio.Queue(maxsize=1)
+    overflow_records: list[tuple[str, int]] = []
+    transports: list[_MockSignalRTransport] = []
+
+    async def fake_ws_factory(_url: str, _headers: dict[str, str]) -> _MockSignalRTransport:
+        tr = _MockSignalRTransport()
+        transports.append(tr)
+        return tr
+
+    def record_overflow(evt: Any, count: int) -> None:
+        overflow_records.append((type(evt).__name__, count))
+
+    hub = SignalRMarketHub(
+        settings,
+        token_provider=lambda: asyncio.sleep(0, result="test-jwt"),
+        ws_factory=fake_ws_factory,
+        event_queue=event_queue,
+        on_queue_overflow=record_overflow,
+        contracts=[CID_MES],
+        reconnect_initial_delay_sec=0.5,
+        reconnect_max_delay_sec=1.0,
+    )
+    task = hub.start()
+    try:
+        for _ in range(50):
+            if transports and hub.is_connected:
+                break
+            await asyncio.sleep(0.01)
+        assert hub.is_connected is True
+        first = await asyncio.wait_for(event_queue.get(), timeout=1.0)
+        assert isinstance(first, SignalRConnectedEvent)
+
+        # Fill bounded queue (maxsize=1) with tick0, then push tick1 to trigger QueueFull.
+        tr0 = transports[0]
+        await tr0.push_frame(_quote_frame(CID_MES, BASE_T + 1, 5950.0, 1.0))
+        for _ in range(50):
+            if event_queue.full():
+                break
+            await asyncio.sleep(0.01)
+        assert event_queue.full() is True
+
+        await tr0.push_frame(_quote_frame(CID_MES, BASE_T + 2, 5951.0, 2.0))
+        for _ in range(50):
+            if hub.queue_overflow_count >= 1:
+                break
+            await asyncio.sleep(0.01)
+        assert hub.queue_overflow_count >= 1
+        assert overflow_records[0] == ("SignalRTickEvent", 1)
+
+        # Consumer draining queue receives an explicit SignalRErrorEvent instead of silent loss.
+        surfaced_err = await asyncio.wait_for(event_queue.get(), timeout=1.0)
+        assert isinstance(surfaced_err, SignalRErrorEvent)
+        assert "overflowed" in surfaced_err.message
+
+        # Refill queue with tick2, then drop socket while queue is full -> disconnect MUST surface!
+        await tr0.push_frame(_quote_frame(CID_MES, BASE_T + 3, 5952.0, 1.0))
+        for _ in range(50):
+            if event_queue.full():
+                break
+            await asyncio.sleep(0.01)
+        assert event_queue.full() is True
+
+        prev_overflows = hub.queue_overflow_count
+        await tr0.drop()
+        for _ in range(50):
+            if hub.queue_overflow_count > prev_overflows:
+                break
+            await asyncio.sleep(0.01)
+        assert hub.queue_overflow_count > prev_overflows
+
+        drained = await asyncio.wait_for(event_queue.get(), timeout=1.0)
+        assert isinstance(drained, SignalRDisconnectedEvent)
+    finally:
+        await hub.stop()
+        assert task.done()

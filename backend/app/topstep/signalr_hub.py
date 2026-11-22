@@ -119,6 +119,7 @@ SignalREvent = (
     | SignalRErrorEvent
 )
 EventCallback = Callable[[SignalREvent], Awaitable[None] | None]
+QueueOverflowCallback = Callable[[SignalREvent, int], Awaitable[None] | None]
 
 
 def _validate_market_hub_url(url: str) -> str:
@@ -417,6 +418,7 @@ class SignalRMarketHub:
         ws_factory: WsConnectFactory | None = None,
         on_event: EventCallback | None = None,
         event_queue: asyncio.Queue[SignalREvent] | None = None,
+        on_queue_overflow: QueueOverflowCallback | None = None,
         contracts: Sequence[str] = (),
         live_mode: bool | None = None,
         reconnect_initial_delay_sec: float | None = None,
@@ -433,6 +435,8 @@ class SignalRMarketHub:
         self._ws_factory = ws_factory or self._default_ws_connect
         self._on_event = on_event
         self._event_queue = event_queue
+        self._on_queue_overflow = on_queue_overflow
+        self._queue_overflow_count = 0
 
         self._contracts: list[str] = self._normalize_contracts(contracts)
         if live_mode is not None:
@@ -513,6 +517,11 @@ class SignalRMarketHub:
         return self._connected
 
     @property
+    def queue_overflow_count(self) -> int:
+        """Return total number of SignalR hub events that hit a full event_queue."""
+        return self._queue_overflow_count
+
+    @property
     def connected_token_digest(self) -> str | None:
         """One-way SHA-256 hex digest of the JWT used for the active SignalR session."""
         return self._connected_token_digest
@@ -583,10 +592,54 @@ class SignalRMarketHub:
             return await self._auth_service.ensure_token()
         raise RuntimeError("SignalRMarketHub requires token_provider or auth_service")
 
+    def _surface_queue_overflow(self, dropped_event: SignalREvent) -> None:
+        if self._event_queue is None:
+            return
+        try:
+            oldest = self._event_queue.get_nowait()
+        except asyncio.QueueEmpty:
+            with contextlib.suppress(asyncio.QueueFull):
+                self._event_queue.put_nowait(dropped_event)
+            return
+
+        if isinstance(dropped_event, (SignalRDisconnectedEvent, SignalRConnectedEvent)):
+            # Lifecycle transitions supersede stale queued ticks/errors so consumers resync.
+            replacement: SignalREvent = dropped_event
+        elif isinstance(
+            oldest,
+            (SignalRDisconnectedEvent, SignalRConnectedEvent, SignalRErrorEvent),
+        ):
+            # Keep an already-queued lifecycle or overflow/error marker intact.
+            replacement = oldest
+        elif isinstance(dropped_event, SignalRErrorEvent):
+            replacement = dropped_event
+        else:
+            replacement = SignalRErrorEvent(
+                message=(
+                    "SignalR event_queue overflowed "
+                    f"(count={self._queue_overflow_count}); resync required"
+                ),
+                occurred_monotonic=time.monotonic(),
+            )
+        with contextlib.suppress(asyncio.QueueFull):
+            self._event_queue.put_nowait(replacement)
+
     async def _emit(self, event: SignalREvent) -> None:
         if self._event_queue is not None:
-            with contextlib.suppress(asyncio.QueueFull):
+            try:
                 self._event_queue.put_nowait(event)
+            except asyncio.QueueFull:
+                self._queue_overflow_count += 1
+                logger.warning(
+                    "SignalR event_queue overflow (count=%d, dropped=%s)",
+                    self._queue_overflow_count,
+                    type(event).__name__,
+                )
+                self._surface_queue_overflow(event)
+                if self._on_queue_overflow is not None:
+                    cb_res = self._on_queue_overflow(event, self._queue_overflow_count)
+                    if inspect.isawaitable(cb_res):
+                        await cb_res
         if self._on_event is not None:
             res = self._on_event(event)
             if inspect.isawaitable(res):

@@ -1329,10 +1329,19 @@ class LiveFeedService:
         ]
 
         # Only non-corrupted cached closed bars or fresh valid REST bars heal gaps (PASS2-001).
+        unhealed_tf_buckets = c_state.unhealed_gap_buckets.get(tf, set())
+        unhealed_1m_buckets = (
+            c_state.unhealed_gap_buckets.get("1m", set()) if tf != "1m" else set()
+        )
         valid_cached_times = {
             b.time
             for b in cached_closed
             if b.is_closed
+            and b.time not in unhealed_tf_buckets
+            and not any(
+                b.time <= g1m < bucket_bounds(b.time, tf, root_symbol=c_state.root_symbol)[1]
+                for g1m in unhealed_1m_buckets
+            )
             and not any(c_start <= b.time < c_end for c_start, c_end in non_complete_ranges)
         }
         present_closed_times = valid_cached_times | {
