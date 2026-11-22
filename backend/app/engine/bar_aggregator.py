@@ -55,6 +55,7 @@ class TickProcessResult:
     accepted: bool
     reason: str | None
     events: tuple[AggregatedBarEvent, ...]
+    stale_local_buckets: tuple[tuple[str, int], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -172,6 +173,7 @@ class BarAggregator:
         self._incomplete_open_buckets: dict[tuple[str, bool, str], set[int]] = {}
         self._discarded_incomplete_bars: list[tuple[str, bool, str, int]] = []
         self._last_closed_times: dict[tuple[str, bool, str], int] = {}
+        self._rest_authoritative_closed_times: dict[tuple[str, bool, str], int] = {}
         self._root_symbols: dict[tuple[str, bool], str | None] = {}
 
     @property
@@ -186,13 +188,17 @@ class BarAggregator:
         timeframe: str,
         bar_time: int,
     ) -> None:
-        """Seed or advance the closed-bar watermark for a stream."""
+        """Seed or advance the REST-authoritative closed-bar watermark for a stream."""
         cid = _normalize_contract_id(contract_id)
         tf = normalize_timeframe(timeframe)
         key = (cid, bool(live_mode), tf)
+        val = int(bar_time)
         prev = self._last_closed_times.get(key)
-        if prev is None or bar_time > prev:
-            self._last_closed_times[key] = int(bar_time)
+        if prev is None or val > prev:
+            self._last_closed_times[key] = val
+        prev_rest = self._rest_authoritative_closed_times.get(key)
+        if prev_rest is None or val > prev_rest:
+            self._rest_authoritative_closed_times[key] = val
 
     def get_last_closed_time(
         self,
@@ -235,6 +241,9 @@ class BarAggregator:
         for key in list(self._last_closed_times):
             if key[0] == cid and (live_mode is None or key[1] == bool(live_mode)):
                 self._last_closed_times.pop(key, None)
+        for key in list(self._rest_authoritative_closed_times):
+            if key[0] == cid and (live_mode is None or key[1] == bool(live_mode)):
+                self._rest_authoritative_closed_times.pop(key, None)
         for rkey in list(self._root_symbols):
             if rkey[0] == cid and (live_mode is None or rkey[1] == bool(live_mode)):
                 self._root_symbols.pop(rkey, None)
@@ -344,10 +353,20 @@ class BarAggregator:
         eff_root = self._resolve_root(cid, live_mode, root_symbol)
         raw_ts = float(tick.timestamp_utc_sec)
         if "1m" in self._timeframes:
-            m1_last_closed = self._last_closed_times.get((cid, live_mode, "1m"))
-            if m1_last_closed is not None and bucket_open_utc(ts_sec, "1m") <= m1_last_closed:
+            m1_key = (cid, live_mode, "1m")
+            m1_bucket = bucket_open_utc(ts_sec, "1m")
+            m1_rest_closed = self._rest_authoritative_closed_times.get(m1_key)
+            if m1_rest_closed is not None and m1_bucket <= m1_rest_closed:
                 # Never double-count ticks belonging to REST-confirmed 1m minutes into HTF bars.
                 return TickProcessResult(accepted=True, reason=None, events=())
+            m1_last_closed = self._last_closed_times.get(m1_key)
+            if m1_last_closed is not None and m1_bucket <= m1_last_closed:
+                return TickProcessResult(
+                    accepted=True,
+                    reason=None,
+                    events=(),
+                    stale_local_buckets=(("1m", m1_bucket),),
+                )
         for tf in self._timeframes:
             if tf in skip_timeframes:
                 continue
@@ -366,19 +385,25 @@ class BarAggregator:
                         events=(),
                     )
         emitted: list[AggregatedBarEvent] = []
+        stale_local: list[tuple[str, int]] = []
 
         for tf in self._timeframes:
             if tf in skip_timeframes:
                 continue
             stream_key = (cid, live_mode, tf)
             bucket_ts = bucket_open_utc(ts_sec, tf)
+            rest_closed = self._rest_authoritative_closed_times.get(stream_key)
+            if rest_closed is not None and bucket_ts <= rest_closed:
+                continue
             last_closed = self._last_closed_times.get(stream_key)
             if last_closed is not None and bucket_ts <= last_closed:
+                stale_local.append((tf, bucket_ts))
                 continue
 
             existing = self._open_bars.get(stream_key)
             if existing is not None:
                 if bucket_ts < existing.time:
+                    stale_local.append((tf, bucket_ts))
                     continue
                 if bucket_ts > existing.time:
                     is_incomplete_existing = stream_key in self._incomplete_open_bars
@@ -513,7 +538,12 @@ class BarAggregator:
                         )
                     )
 
-        return TickProcessResult(accepted=True, reason=None, events=tuple(emitted))
+        return TickProcessResult(
+            accepted=True,
+            reason=None,
+            events=tuple(emitted),
+            stale_local_buckets=tuple(stale_local),
+        )
 
     def flush_closed_bars(
         self,
@@ -723,6 +753,13 @@ class BarAggregator:
         )
         if final_last_closed is not None:
             self._last_closed_times[stream_key] = final_last_closed
+        prev_rest = self._rest_authoritative_closed_times.get(stream_key)
+        rest_last_closed = max(
+            (t for t in (*merged_closed.keys(), prev_rest) if t is not None),
+            default=None,
+        )
+        if rest_last_closed is not None:
+            self._rest_authoritative_closed_times[stream_key] = rest_last_closed
 
         return ReconciliationResult(
             contract_id=cid,
@@ -945,6 +982,13 @@ class BarAggregator:
         )
         if final_last_closed is not None:
             self._last_closed_times[stream_key] = final_last_closed
+        prev_rest = self._rest_authoritative_closed_times.get(stream_key)
+        rest_last_closed = max(
+            (t for t in (*contiguous_closed, prev_rest) if t is not None),
+            default=None,
+        )
+        if rest_last_closed is not None:
+            self._rest_authoritative_closed_times[stream_key] = rest_last_closed
 
         return ReconciliationResult(
             contract_id=cid,

@@ -7335,3 +7335,159 @@ async def test_f03_tail_drain_sorts_out_of_order_ticks_by_market_timestamp(
             )
     finally:
         sqlite_store.close()
+
+
+@pytest.mark.asyncio
+async def test_f03_default_ws_connect_disables_http_redirects_against_hub_downgrade(
+    tmp_path: Path,
+) -> None:
+    """Contract: PASS2-002 disables HTTP 3xx redirects in _default_ws_connect.
+    Defect caught: /hubs/market 302 redirect hijacking authenticated WebSocket connections.
+    """
+    import websockets
+
+    settings = Settings(data_dir=tmp_path / "data")
+    hub = SignalRMarketHub(
+        settings,
+        token_provider=lambda: asyncio.sleep(0, result="jwt-redirect-test"),
+        contracts=[CID_MES],
+    )
+
+    requested_paths: list[str] = []
+
+    async def _handle_client(
+        reader: asyncio.StreamReader,
+        writer: asyncio.StreamWriter,
+    ) -> None:
+        try:
+            req_line = await asyncio.wait_for(reader.readline(), timeout=1.0)
+            parts = req_line.decode("ascii", errors="replace").split()
+            if len(parts) >= 2:
+                requested_paths.append(parts[1])
+            while True:
+                line = await asyncio.wait_for(reader.readline(), timeout=1.0)
+                if line in {b"\r\n", b"\n", b""}:
+                    break
+            writer.write(
+                b"HTTP/1.1 302 Found\r\n"
+                b"Location: /hubs/other\r\n"
+                b"Content-Length: 0\r\n"
+                b"Connection: close\r\n\r\n"
+            )
+            await writer.drain()
+        finally:
+            writer.close()
+
+    server = await asyncio.start_server(_handle_client, "127.0.0.1", 0)
+    port = int(server.sockets[0].getsockname()[1])
+    try:
+        with pytest.raises(websockets.exceptions.InvalidStatus):
+            await hub._default_ws_connect(
+                f"ws://127.0.0.1:{port}/hubs/market?access_token=jwt-redirect-test",
+                {"Authorization": "Bearer jwt-redirect-test"},
+            )
+        assert requested_paths == ["/hubs/market?access_token=jwt-redirect-test"]
+    finally:
+        server.close()
+        await server.wait_closed()
+
+
+@pytest.mark.asyncio
+async def test_f03_late_tick_after_local_watchdog_flush_triggers_gap_and_rest_reconcile(
+    tmp_path: Path,
+) -> None:
+    """Contract: PASS2-001 surfaces late ticks for locally-closed (unconfirmed) bars as gaps.
+    Defect caught: watchdog flush advancing _last_closed_times and silently dropping T+59.9 trade.
+    """
+    settings = Settings(data_dir=tmp_path / "data", signalr_enabled=True)
+    sqlite = SqliteStore(tmp_path / "meta.db")
+    sqlite.initialize()
+    parquet = ParquetStore(settings.data_dir, sqlite_store=sqlite)
+
+    t0 = first_bucket_open_at_or_after(BASE_T, "5m")
+    now_t = [t0 + 10]
+
+    class _RestAuthoritative:
+        async def retrieve_bars_paginated(self, **kw: Any) -> Any:
+            s_ts = int(kw["start_ts"])
+            e_ts = int(kw["end_ts"])
+            cutoff = now_t[0] - (now_t[0] % 60)
+            bars = []
+            for ts in range(s_ts - (s_ts % 60), e_ts, 60):
+                if ts < cutoff:
+                    if ts == t0:
+                        bars.append(
+                            {"t": ts, "o": 100.0, "h": 105.0, "l": 100.0, "c": 105.0, "v": 4.0}
+                        )
+                    else:
+                        bars.append(
+                            {"t": ts, "o": 100.0, "h": 101.0, "l": 99.0, "c": 100.0, "v": 1.0}
+                        )
+            return type("R", (), {"raw_bars": bars, "truncated": False, "provider_gap": False})()
+
+    def _auth_handler(_req: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"success": True, "errorCode": 0, "token": "test-jwt"})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(_auth_handler)) as client:
+        auth = TopstepAuthService(settings, client)
+        await auth.login("alice", "api-key")
+        agg = BarAggregator(timeframes=("1m", "5m"))
+        svc = LiveFeedService(
+            settings,
+            auth,
+            _RestAuthoritative(),
+            parquet,
+            sqlite,
+            aggregator=agg,
+            recovery_timeframes=("1m", "5m"),
+            initial_backfill_bars=1,
+            clock=lambda: now_t[0],
+        )
+        try:
+            await svc.set_active_contracts([CID_MES])
+            svc._last_connected_utc = t0 - 30
+            await svc.trigger_recovery(now_utc=now_t[0])
+            assert svc.feed_state == "LIVE"
+
+            now_mono = time.monotonic()
+            svc.handle_hub_event(
+                SignalRTickEvent(CID_MES, False, t0 + 10, 100.0, 1.0, "GatewayTrade", now_mono)
+            )
+            await svc.flush_pending_tasks()
+
+            # Watchdog flushes locally-closed t0 (vol=1.0), NOT yet REST-confirmed.
+            now_t[0] = t0 + 61
+            await svc.run_watchdog_tick()
+            assert svc.feed_state == "LIVE"
+
+            # Late trade for t0 + 59.9 arrives at t0 + 61 -> MUST flag gap & DEGRADED!
+            svc.handle_hub_event(
+                SignalRTickEvent(
+                    CID_MES, False, t0 + 59.9, 105.0, 3.0, "GatewayTrade", now_mono + 1.0
+                )
+            )
+            await svc.flush_pending_tasks()
+            c_state = svc._contracts[CID_MES]
+            assert c_state.state == "DEGRADED"
+            assert t0 in c_state.unhealed_gap_buckets.get("1m", set())
+            assert svc.live_alerts_enabled is False
+
+            # REST reconciliation heals t0 with authoritative volume=4.0, high=105.0 -> LIVE.
+            now_t[0] = t0 + 65
+            await svc.trigger_recovery(now_utc=now_t[0])
+            assert svc.feed_state == "LIVE"
+            key_1m = StorageDatasetKey("topstepx", False, CID_MES, "1m")
+            persisted = await parquet.read_bars(key_1m, start_ts=t0, end_ts=t0 + 60)
+            assert any(b.time == t0 and b.volume == 4.0 and b.high == 105.0 for b in persisted)
+
+            # Once REST-confirmed, an even later duplicate tick for t0 skips cleanly while LIVE.
+            svc.handle_hub_event(
+                SignalRTickEvent(
+                    CID_MES, False, t0 + 59.8, 105.0, 3.0, "GatewayTrade", now_mono + 2.0
+                )
+            )
+            await svc.flush_pending_tasks()
+            assert c_state.state == "LIVE"
+        finally:
+            await svc.stop()
+            sqlite.close()

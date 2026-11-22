@@ -1773,6 +1773,37 @@ class LiveFeedService:
         self._broadcast_status()
         return True
 
+    def _handle_stale_local_buckets(
+        self,
+        contract_id: str,
+        stale_buckets: Sequence[tuple[str, int]],
+        *,
+        trigger_reconcile: bool,
+    ) -> None:
+        c_state = self._contracts.get(contract_id)
+        if c_state is None:
+            return
+        for gap_tf, gap_ts in stale_buckets:
+            if gap_tf in self._recovery_timeframes:
+                self._record_gap_bucket(c_state, gap_tf, gap_ts)
+        c_state.unresolved_gaps += 1
+        c_state.last_error = "Late trade arrived after local bar close; reconciliation required"
+        self._last_error = c_state.last_error
+        if c_state.state != "RECOVERING":
+            c_state.state = "DEGRADED"
+        self._last_degraded_at_mono = time.monotonic()
+        self._recompute_aggregate_state()
+        self._broadcast_status()
+        if (
+            trigger_reconcile
+            and self._running
+            and self._settings.signalr_enabled
+            and self._auth.is_connected
+            and self._hub.is_connected
+            and (self._recovery_task is None or self._recovery_task.done())
+        ):
+            self._start_recovery_task()
+
     def _ingest_live_tick_sync(
         self,
         event: SignalRTickEvent,
@@ -1805,6 +1836,12 @@ class LiveFeedService:
                 reason=res.reason or "Rejected live tick",
             )
             return []
+        if res.stale_local_buckets:
+            self._handle_stale_local_buckets(
+                event.contract_id,
+                res.stale_local_buckets,
+                trigger_reconcile=True,
+            )
         if not res.events:
             return []
         for bar_evt in res.events:
@@ -1881,6 +1918,12 @@ class LiveFeedService:
                 reason=res.reason or "Rejected live tick",
             )
             return
+        if res.stale_local_buckets:
+            self._handle_stale_local_buckets(
+                event.contract_id,
+                res.stale_local_buckets,
+                trigger_reconcile=False,
+            )
         await self._safe_persist_and_signal_events(
             res.events,
             now_utc=eff_now,

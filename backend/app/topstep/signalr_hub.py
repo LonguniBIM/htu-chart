@@ -32,6 +32,13 @@ SIGNALR_HANDSHAKE_FRAME = json.dumps({"protocol": "json", "version": 1}, separat
 SIGNALR_PING_FRAME = json.dumps({"type": 6}, separators=(",", ":")) + SIGNALR_RECORD_SEPARATOR
 
 
+class _NoRedirectWsConnect(websockets.connect):
+    """Reject all HTTP 3xx redirects so Market Hub connections never leave /hubs/market."""
+
+    def process_redirect(self, exc: Exception) -> Exception | str:
+        return exc
+
+
 class SignalRWebSocketTransport(Protocol):
     """Minimal async WebSocket transport interface for injectable SignalR testing."""
 
@@ -561,7 +568,7 @@ class SignalRMarketHub:
         url: str,
         headers: dict[str, str],
     ) -> SignalRWebSocketTransport:
-        return await websockets.connect(
+        return await _NoRedirectWsConnect(
             url,
             additional_headers=headers,
             open_timeout=self._connect_timeout,
