@@ -387,6 +387,9 @@ class _MockSignalRTransport:
                 }:
                     for arg in frame.get("arguments", []):
                         self.subscribed_contracts.add(str(arg))
+                    if frame.get("invocationId") is not None:
+                        ack = {"type": 3, "invocationId": frame["invocationId"]}
+                        await self.incoming.put(json.dumps(ack) + SIGNALR_RECORD_SEPARATOR)
                     self.subscribed_event.set()
 
     async def recv(self) -> str:
@@ -556,6 +559,7 @@ def test_r06_ws_subscribe_triggers_upstream_signalr_and_streams_live_bars(
                         break
                     time.sleep(0.02)
 
+                assert app.state.live_feed_service.feed_state == "LIVE"
                 assert len(transports) == 1
                 assert "CON.F.US.MES.Z26" in transports[0].subscribed_contracts
 

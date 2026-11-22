@@ -333,6 +333,7 @@ class SignalRMarketHub:
         self._reconnect_now_event = asyncio.Event()
         self._send_lock = asyncio.Lock()
         self._recent_tokens: deque[str] = deque(maxlen=4)
+        self._pending_subscriptions: dict[str, tuple[str, str]] = {}
 
     @staticmethod
     def _normalize_contracts(contracts: Sequence[str]) -> list[str]:
@@ -424,27 +425,44 @@ class SignalRMarketHub:
         return str(self._invocation_seq)
 
     async def _send_raw(self, ws: SignalRWebSocketTransport, frame: str) -> None:
-        async with self._send_lock:
-            await ws.send(frame)
+        send_deadline = min(self._connect_timeout, self._heartbeat_timeout)
+        try:
+            async with asyncio.timeout(send_deadline):
+                async with self._send_lock:
+                    await ws.send(frame)
+        except TimeoutError as exc:
+            raise TimeoutError(
+                f"SignalR frame send exceeded {send_deadline}s deadline"
+            ) from exc
 
     async def _send_invocation(
         self,
         ws: SignalRWebSocketTransport,
         target: str,
         arguments: list[Any],
-    ) -> None:
+        *,
+        invocation_id: str | None = None,
+    ) -> str:
+        inv_id = invocation_id or self._next_invocation_id()
         payload = {
             "type": 1,
-            "invocationId": self._next_invocation_id(),
+            "invocationId": inv_id,
             "target": target,
             "arguments": arguments,
         }
         frame = json.dumps(payload, separators=(",", ":")) + SIGNALR_RECORD_SEPARATOR
         await self._send_raw(ws, frame)
+        return inv_id
 
     async def _subscribe_contract(self, ws: SignalRWebSocketTransport, contract_id: str) -> None:
-        await self._send_invocation(ws, "SubscribeContractQuotes", [contract_id])
-        await self._send_invocation(ws, "SubscribeContractTrades", [contract_id])
+        for target in ("SubscribeContractQuotes", "SubscribeContractTrades"):
+            inv_id = self._next_invocation_id()
+            self._pending_subscriptions[inv_id] = (target, contract_id)
+            try:
+                await self._send_invocation(ws, target, [contract_id], invocation_id=inv_id)
+            except Exception:
+                self._pending_subscriptions.pop(inv_id, None)
+                raise
 
     async def _unsubscribe_contract(self, ws: SignalRWebSocketTransport, contract_id: str) -> None:
         await self._send_invocation(ws, "UnsubscribeContractQuotes", [contract_id])
@@ -473,8 +491,17 @@ class SignalRMarketHub:
                 with contextlib.suppress(Exception):
                     await self._unsubscribe_contract(ws, removed)
             for added in sorted(new_set - old_set):
-                with contextlib.suppress(Exception):
+                try:
                     await self._subscribe_contract(ws, added)
+                except Exception as exc:
+                    safe_err = self._redact(str(exc) or type(exc).__name__)
+                    logger.warning(
+                        "SignalR dynamic subscribe failed for %s: %s",
+                        added,
+                        safe_err,
+                    )
+                    await self.trigger_reconnect()
+                    return
 
     async def trigger_reconnect(self) -> None:
         """Force an immediate reconnect cycle (e.g. on JWT refresh)."""
@@ -554,13 +581,14 @@ class SignalRMarketHub:
             if handshake_frames[0].get("error"):
                 raise ConnectionError(f"SignalR handshake error: {handshake_frames[0]['error']}")
 
+            self._pending_subscriptions.clear()
             now_mono = time.monotonic()
             self._last_event_monotonic = now_mono
-            self._connected = True
 
             for cid in tuple(self._contracts):
                 await self._subscribe_contract(ws, cid)
 
+            self._connected = True
             await self._emit(
                 SignalRConnectedEvent(
                     contracts=tuple(self._contracts),
@@ -602,6 +630,25 @@ class SignalRMarketHub:
                     msg_type = frame.get("type")
                     if msg_type == 6:
                         continue
+                    if msg_type == 3:
+                        inv_id = frame.get("invocationId")
+                        sub_info = (
+                            self._pending_subscriptions.pop(str(inv_id), None)
+                            if inv_id is not None
+                            else None
+                        )
+                        err_msg = frame.get("error")
+                        if err_msg:
+                            safe_err = self._redact(str(err_msg), token)
+                            target_desc = (
+                                f"{sub_info[0]}({sub_info[1]})"
+                                if sub_info is not None
+                                else f"invocation={inv_id}"
+                            )
+                            raise ConnectionError(
+                                f"SignalR invocation rejected ({target_desc}): {safe_err}"
+                            )
+                        continue
                     if msg_type == 7:
                         err_detail = frame.get("error") or "Server sent SignalR close frame"
                         disconnect_reason = self._redact(str(err_detail), token)
@@ -632,6 +679,7 @@ class SignalRMarketHub:
             was_connected = self._connected
             self._connected = False
             self._ws = None
+            self._pending_subscriptions.clear()
             await self._close_ws(ws)
             if was_connected:
                 await self._emit(

@@ -419,3 +419,40 @@ def test_incomplete_provisional_htf_bar_does_not_finalize_on_next_bucket_or_watc
     assert flushed == []
     assert agg_wd.get_last_closed_time(cid, False, "1h") is None
     assert agg_wd.get_open_bar(cid, False, "1h") is None
+
+
+def test_process_tick_subsecond_out_of_order_open_close_matches_reconcile() -> None:
+    """Contract: Out-of-order sub-second ticks in LIVE process_tick match reconcile_recovery OHLCV.
+
+    Defect caught: process_tick() using arrival order instead of event timestamp for open and
+    close within the same bar bucket (COR-004).
+    """
+    cid = "CON.F.US.MES.Z26"
+    b0 = int(datetime(2026, 11, 10, 14, 0, 0, tzinfo=UTC).timestamp())
+    ticks = [
+        NormalizedTick(cid, False, b0 + 5.9, 110.0, 2.0),
+        NormalizedTick(cid, False, b0 + 5.1, 100.0, 3.0),
+        NormalizedTick(cid, False, b0 + 5.5, 105.0, 1.0),
+    ]
+
+    agg_live = BarAggregator(timeframes=("1m",))
+    for t in ticks:
+        agg_live.process_tick(t, now_utc=b0 + 10)
+    live_open = agg_live.get_open_bar(cid, False, "1m")
+    flushed = agg_live.flush_closed_bars(now_utc=b0 + 65)
+    assert len(flushed) == 1
+
+    agg_rec = BarAggregator(timeframes=("1m",))
+    recon = agg_rec.reconcile_recovery(
+        contract_id=cid,
+        live_mode=False,
+        timeframe="1m",
+        historical_bars=[],
+        buffered_ticks=ticks,
+        now_utc=b0 + 10,
+    )
+    assert recon.open_bar is not None
+    expected_open = OHLCVBar(b0, 100.0, 110.0, 100.0, 110.0, 6.0, is_closed=False)
+    assert live_open == expected_open
+    assert recon.open_bar.bar == expected_open
+    assert flushed[0].bar == OHLCVBar(b0, 100.0, 110.0, 100.0, 110.0, 6.0, is_closed=True)

@@ -149,6 +149,7 @@ class LiveFeedService:
         self._watchdog_task: asyncio.Task[None] | None = None
         self._running = False
         self._generation = 0
+        self._last_connected_utc: int | None = None
         self._last_degraded_at_mono: float | None = None
 
     @property
@@ -395,6 +396,7 @@ class LiveFeedService:
                     root_symbol=c_state.root_symbol,
                     state="DISCONNECTED",
                 )
+            self._last_connected_utc = None
 
         if not self._settings.signalr_enabled or not self._auth.is_connected or not self._contracts:
             if mode_changed:
@@ -442,12 +444,14 @@ class LiveFeedService:
         self._live_tick_tasks.clear()
 
         await self._hub.stop()
+        self._last_connected_utc = None
         self._transition_all_contracts("DISCONNECTED")
 
     def handle_hub_event(self, event: SignalREvent) -> None:
         """Handle lifecycle and tick events from SignalRMarketHub without blocking recv."""
         if isinstance(event, SignalRConnectedEvent):
             self._last_event_monotonic = event.connected_monotonic
+            self._last_connected_utc = self._clock()
             self._last_error = None
             for cid in event.contracts:
                 self.register_contract(cid, live_mode=event.live_mode)
@@ -459,6 +463,7 @@ class LiveFeedService:
 
         if isinstance(event, SignalRDisconnectedEvent):
             self._last_event_monotonic = event.disconnected_monotonic
+            self._last_connected_utc = None
             self._last_error = self._redact(event.reason)
             self._bump_generation_and_cancel_live_tasks()
             if self._recovery_task is not None and not self._recovery_task.done():
@@ -663,6 +668,17 @@ class LiveFeedService:
             )
 
         if tf == "1m" and align_for_higher_tfs:
+            for htf in align_for_higher_tfs:
+                htf_key = StorageDatasetKey("topstepx", c_state.live_mode, cid, htf)
+                wm_htf = await self._sqlite.get_watermark(htf_key)
+                self._ensure_generation(expected_gen)
+                if wm_htf is not None:
+                    htf_overlap = max(
+                        DEFAULT_MIN_BAR_TIMESTAMP,
+                        wm_htf.last_closed_bar_time - (2 * TIMEFRAME_SECONDS[htf]),
+                    )
+                    backfill_start = min(backfill_start, htf_overlap)
+
             htf_candidates = [bucket_open_utc(backfill_start, htf) for htf in align_for_higher_tfs]
             htf_candidates.extend(
                 bucket_open_utc(c_state.unhealed_gap_starts[htf], htf)
@@ -743,6 +759,10 @@ class LiveFeedService:
             for t in contract_ticks
         ]
 
+        mark_open_inc = (
+            self._last_connected_utc is None
+            or self._last_connected_utc >= bucket_open_utc(eff_now, tf)
+        )
         recon = self._aggregator.reconcile_recovery(
             contract_id=cid,
             live_mode=c_state.live_mode,
@@ -751,6 +771,12 @@ class LiveFeedService:
             buffered_ticks=normalized_ticks,
             now_utc=eff_now,
             root_symbol=c_state.root_symbol,
+            mark_open_incomplete=mark_open_inc,
+        )
+        # Clear any unconfirmed tick-closed markers emitted strictly inside this recovery merge;
+        # completeness check below detects missing REST bars directly.
+        self._aggregator.pop_discarded_incomplete_bars(
+            contract_id=cid, live_mode=c_state.live_mode
         )
 
         closed_end = latest_closed_bucket_end_utc(eff_now, tf, root_symbol=c_state.root_symbol)
@@ -764,8 +790,9 @@ class LiveFeedService:
             )
             self._ensure_generation(expected_gen)
 
+        # Only authoritative closed REST/cached bars satisfy gap closure (COR-001).
         present_closed_times = {b.time for b in cached_closed if b.is_closed} | {
-            e.bar.time for e in recon.closed_bars
+            b.time for b in valid_bars if b.is_closed
         }
         missing_buckets = self._find_missing_open_buckets(
             timeframe=tf,
@@ -939,6 +966,8 @@ class LiveFeedService:
     async def _run_recovery(self, *, now_utc: int | None = None) -> None:
         started_mono = time.monotonic()
         eff_now = now_utc if now_utc is not None else self._clock()
+        if self._last_connected_utc is None:
+            self._last_connected_utc = eff_now
         recovery_gen = self._generation
         prior_tasks = [t for t in self._live_tick_tasks if not t.done()]
         for t in prior_tasks:
@@ -1093,6 +1122,33 @@ class LiveFeedService:
             if exc is not None:
                 logger.warning("Unexpected live task error: %s", self._redact(str(exc)))
 
+    def _handle_discarded_incomplete_bars(
+        self,
+        *,
+        contract_id: str | None = None,
+        live_mode: bool | None = None,
+    ) -> bool:
+        discarded = self._aggregator.pop_discarded_incomplete_bars(
+            contract_id=contract_id,
+            live_mode=live_mode,
+        )
+        if not discarded:
+            return False
+        for cid, _lmode, tf, bar_time in discarded:
+            c_state = self._contracts.get(cid)
+            if c_state is not None:
+                c_state.unresolved_gaps += 1
+                prev_gap = c_state.unhealed_gap_starts.get(tf)
+                c_state.unhealed_gap_starts[tf] = (
+                    bar_time if prev_gap is None else min(prev_gap, bar_time)
+                )
+                c_state.last_error = f"Unconfirmed interrupted {tf} bar at {bar_time}"
+                c_state.state = "DEGRADED"
+        self._last_degraded_at_mono = time.monotonic()
+        self._recompute_aggregate_state()
+        self._broadcast_status()
+        return True
+
     def _ingest_live_tick_sync(
         self,
         event: SignalRTickEvent,
@@ -1115,6 +1171,10 @@ class LiveFeedService:
         eff_now = now_utc if now_utc is not None else self._clock()
         gen = self._generation
         res = self._aggregator.process_tick(tick, now_utc=eff_now, root_symbol=root_sym)
+        self._handle_discarded_incomplete_bars(
+            contract_id=event.contract_id,
+            live_mode=event.live_mode,
+        )
         if not res.accepted or not res.events:
             return []
         for bar_evt in res.events:
@@ -1168,6 +1228,10 @@ class LiveFeedService:
         )
         eff_now = now_utc if now_utc is not None else self._clock()
         res = self._aggregator.process_tick(tick, now_utc=eff_now, root_symbol=root_sym)
+        self._handle_discarded_incomplete_bars(
+            contract_id=event.contract_id,
+            live_mode=event.live_mode,
+        )
         if not res.accepted:
             return
         await self._safe_persist_and_signal_events(
@@ -1245,11 +1309,29 @@ class LiveFeedService:
                     now_utc=now_utc,
                 )
                 self._ensure_generation(expected_gen)
-                wm = await self._sqlite.upsert_watermark(key, bar_evt.bar.time)
-                self._ensure_generation(expected_gen)
                 c_state = self._contracts.get(bar_evt.contract_id)
+                blocked_by_gap = False
                 if c_state is not None:
-                    c_state.watermarks[bar_evt.timeframe] = wm.last_closed_bar_time
+                    gap_floor = c_state.unhealed_gap_starts.get(bar_evt.timeframe)
+                    gap_1m = c_state.unhealed_gap_starts.get("1m")
+                    if gap_floor is not None and bar_evt.bar.time >= gap_floor:
+                        blocked_by_gap = True
+                    elif (
+                        gap_1m is not None
+                        and bar_evt.timeframe != "1m"
+                        and bucket_bounds(
+                            bar_evt.bar.time,
+                            bar_evt.timeframe,
+                            root_symbol=bar_evt.root_symbol,
+                        )[1]
+                        > gap_1m
+                    ):
+                        blocked_by_gap = True
+                if not blocked_by_gap:
+                    wm = await self._sqlite.upsert_watermark(key, bar_evt.bar.time)
+                    self._ensure_generation(expected_gen)
+                    if c_state is not None:
+                        c_state.watermarks[bar_evt.timeframe] = wm.last_closed_bar_time
                 tag = (
                     None
                     if self.is_contract_live_alerts_enabled(bar_evt.contract_id)
@@ -1293,6 +1375,10 @@ class LiveFeedService:
             live_gen = self._generation
             flushed = self._aggregator.flush_closed_bars(
                 now_utc=now_ts,
+                contract_id=cid,
+                live_mode=c_state.live_mode,
+            )
+            self._handle_discarded_incomplete_bars(
                 contract_id=cid,
                 live_mode=c_state.live_mode,
             )
