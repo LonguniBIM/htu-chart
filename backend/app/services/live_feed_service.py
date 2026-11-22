@@ -273,6 +273,7 @@ class LiveFeedService:
                 self._aggregator.reset_contract(old_cid)
 
             added_or_mode_changed = False
+            added_cids: list[str] = []
             sub_utc = (
                 self._clock()
                 if (self._hub.is_connected or self._last_connected_utc is not None)
@@ -291,6 +292,7 @@ class LiveFeedService:
                         subscribed_at_utc=sub_utc,
                     )
                     added_or_mode_changed = True
+                    added_cids.append(cid)
                 elif root is not None:
                     existing.root_symbol = root
 
@@ -302,6 +304,11 @@ class LiveFeedService:
                 self._broadcast_status()
 
             await self._hub.update_contracts(list(self._contracts.keys()), live_mode=eff_live)
+            if added_cids and (self._hub.is_connected or self._last_connected_utc is not None):
+                ack_ts = self._clock()
+                for cid in added_cids:
+                    if cid in self._contracts:
+                        self._contracts[cid].subscribed_at_utc = ack_ts
 
             if (
                 self._running
@@ -331,11 +338,13 @@ class LiveFeedService:
             self._ws_contracts.add(cid)
             existing = self._contracts.get(cid)
             newly_added = existing is None or existing.live_mode != eff_live
-            self.register_contract(cid, live_mode=eff_live)
+            c_state = self.register_contract(cid, live_mode=eff_live)
             if newly_added:
                 self._recompute_aggregate_state()
                 self._broadcast_status()
             await self._hub.update_contracts(list(self._contracts.keys()), live_mode=eff_live)
+            if newly_added and (self._hub.is_connected or self._last_connected_utc is not None):
+                c_state.subscribed_at_utc = self._clock()
 
             if self._running and self._settings.signalr_enabled and self._auth.is_connected:
                 if not self._hub.is_connected:
@@ -606,6 +615,11 @@ class LiveFeedService:
             if c_active or (c_state is None and self._feed_state in {"LIVE", "DEGRADED"}):
                 self._ingest_live_tick_sync(event)
 
+    def _gap_target_timeframes(self) -> tuple[str, ...]:
+        if "1m" in self._recovery_timeframes:
+            return ("1m",)
+        return self._recovery_timeframes
+
     def _mark_overflow_bucket_gap(
         self,
         c_state: ContractFeedRuntime | None,
@@ -623,9 +637,9 @@ class LiveFeedService:
                 floor_ts = math.floor(raw_ts)
                 if DEFAULT_MIN_BAR_TIMESTAMP <= floor_ts <= ref_now + DEFAULT_MAX_FUTURE_SKEW_SEC:
                     eff_ts = floor_ts
-        gap_open_1m = bucket_open_utc(eff_ts, "1m")
         if c_state is not None:
-            self._record_gap_bucket(c_state, "1m", gap_open_1m)
+            for gap_tf in self._gap_target_timeframes():
+                self._record_gap_bucket(c_state, gap_tf, bucket_open_utc(eff_ts, gap_tf))
             c_state.last_error = "SignalR recovery queue overflowed"
             self._aggregator.mark_open_bucket_incomplete(
                 c_state.contract_id, c_state.live_mode, eff_ts
@@ -733,14 +747,17 @@ class LiveFeedService:
         else:
             eff_ts = clock_now
             safe_bar_time = None
-        bar_open_1m = bucket_open_utc(eff_ts, "1m")
+        gap_tfs = self._gap_target_timeframes()
+        primary_tf = gap_tfs[0]
+        primary_open = bucket_open_utc(eff_ts, primary_tf)
 
         c_state = self._contracts.get(cid) if cid else None
         live_mode = c_state.live_mode if c_state is not None else event.live_mode
         if c_state is not None:
             c_state.unresolved_gaps += 1
             c_state.last_error = redacted_reason
-            self._record_gap_bucket(c_state, "1m", bar_open_1m)
+            for gap_tf in gap_tfs:
+                self._record_gap_bucket(c_state, gap_tf, bucket_open_utc(eff_ts, gap_tf))
             if c_state.state != "RECOVERING":
                 c_state.state = "DEGRADED"
         else:
@@ -749,9 +766,9 @@ class LiveFeedService:
         if cid:
             self._aggregator.mark_open_bucket_incomplete(cid, live_mode, eff_ts)
             item = (
-                StorageDatasetKey("topstepx", live_mode, cid, "1m"),
+                StorageDatasetKey("topstepx", live_mode, cid, primary_tf),
                 safe_bar_time,
-                bar_open_1m,
+                primary_open,
                 event.issue_code,
                 redacted_reason,
                 self._redact(event.raw_summary),
@@ -807,13 +824,16 @@ class LiveFeedService:
         queued_gen: int,
     ) -> None:
         try:
+            c_state = self._contracts.get(key.contract_id)
+            root_sym = c_state.root_symbol if c_state is not None else None
+            _, bar_end = bucket_bounds(bar_open_1m, key.timeframe, root_symbol=root_sym)
             await self._sqlite.record_quality_issues(
                 key,
                 [
                     QualityIssueInput(
                         bar_time=bar_time,
                         interval_start=bar_open_1m,
-                        interval_end=bar_open_1m + 60,
+                        interval_end=bar_end,
                         issue_code=issue_code,
                         detail=detail,
                         raw_payload=raw_summary[:2048],
@@ -822,28 +842,31 @@ class LiveFeedService:
             )
             skip_corrupted_coverage = False
             if queued_gen != self._generation:
-                c_state = self._contracts.get(key.contract_id)
-                m1_buckets = (
-                    c_state.unhealed_gap_buckets.get("1m", set())
+                tf_buckets = (
+                    c_state.unhealed_gap_buckets.get(key.timeframe, set())
                     if c_state is not None
                     else set()
                 )
-                gap_1m = c_state.unhealed_gap_starts.get("1m") if c_state is not None else None
+                gap_tf = (
+                    c_state.unhealed_gap_starts.get(key.timeframe)
+                    if c_state is not None
+                    else None
+                )
                 still_unhealed = c_state is not None and (
-                    bar_open_1m in m1_buckets or (gap_1m is not None and gap_1m <= bar_open_1m)
+                    bar_open_1m in tf_buckets or (gap_tf is not None and gap_tf <= bar_open_1m)
                 )
                 contract_healed = c_state is not None and (
                     c_state.state == "LIVE" or not still_unhealed
                 )
                 if contract_healed or await self._sqlite.is_interval_complete(
-                    key, bar_open_1m, bar_open_1m + 60
+                    key, bar_open_1m, bar_end
                 ):
                     skip_corrupted_coverage = True
             if not skip_corrupted_coverage:
                 await self._sqlite.record_coverage(
                     key,
                     bar_open_1m,
-                    bar_open_1m + 60,
+                    bar_end,
                     status="CORRUPTED",
                     quarantined_count=1,
                 )

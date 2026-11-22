@@ -6589,3 +6589,219 @@ async def test_f03_cancelled_recovery_maintains_pending_tick_count_within_maxsiz
             release_mes.set()
             await svc.stop()
             sqlite.close()
+
+
+@pytest.mark.asyncio
+async def test_f03_delayed_subscribe_ack_across_minute_boundary_marks_new_minute_incomplete(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Contract: P1-F03-001 updates subscribed_at_utc AFTER subscribe ACK completes.
+    Defect caught: subscribe at 14:00:59 finishing ACK at 14:01:01 closing partial 14:01 bar.
+    """
+    settings = Settings(
+        data_dir=tmp_path / "data",
+        signalr_enabled=True,
+        signalr_ack_timeout_sec=1.0,
+    )
+    sqlite = SqliteStore(tmp_path / "meta.db")
+    sqlite.initialize()
+    parquet = ParquetStore(settings.data_dir, sqlite_store=sqlite)
+
+    now_val = [BASE_T + 15]
+    mnq = "CON.F.US.MNQ.Z26"
+
+    class _RestStub:
+        async def retrieve_bars_paginated(self, **kw: Any) -> Any:
+            s_ts = int(kw.get("start_ts", BASE_T))
+            e_ts = int(kw.get("end_ts", BASE_T))
+            cutoff = now_val[0] - (now_val[0] % 60)
+            bars = [
+                {"t": ts, "o": 100.0, "h": 101.0, "l": 99.0, "c": 100.5, "v": 2.0}
+                for ts in range(s_ts - (s_ts % 60), e_ts, 60)
+                if ts < cutoff
+            ]
+            return type("R", (), {"raw_bars": bars, "truncated": False, "provider_gap": False})()
+
+    tr = _MockSignalRTransport()
+    sub_entered = asyncio.Event()
+    sub_release = asyncio.Event()
+    orig_send = tr.send
+
+    async def _gated_send(data: str) -> None:
+        if mnq in data and not sub_entered.is_set():
+            sub_entered.set()
+            await asyncio.wait_for(sub_release.wait(), timeout=2.0)
+        await orig_send(data)
+
+    monkeypatch.setattr(tr, "send", _gated_send)
+
+    async def _ws_factory(_u: str, _h: dict[str, str]) -> _MockSignalRTransport:
+        return tr
+
+    def _auth_handler(_req: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"success": True, "errorCode": 0, "token": "test-jwt"})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(_auth_handler)) as client:
+        auth = TopstepAuthService(settings, client)
+        await auth.login("alice", "api-key")
+        hub = SignalRMarketHub(
+            settings,
+            token_provider=lambda: asyncio.sleep(0, result="test-jwt"),
+            contracts=[CID_MES],
+            ws_factory=_ws_factory,
+        )
+        svc = LiveFeedService(
+            settings,
+            auth,
+            _RestStub(),
+            parquet,
+            sqlite,
+            signalr_hub=hub,
+            recovery_timeframes=("1m",),
+            initial_backfill_bars=1,
+            clock=lambda: now_val[0],
+        )
+        try:
+            await svc.set_active_contracts([CID_MES])
+            await svc.start()
+            for _ in range(50):
+                if hub.is_connected and svc._contracts[CID_MES].state == "LIVE":
+                    break
+                await asyncio.sleep(0.01)
+            assert svc._contracts[CID_MES].state == "LIVE"
+
+            now_val[0] = BASE_T + 59
+            sub_task = asyncio.create_task(svc.subscribe_ws_contract(mnq))
+            await asyncio.wait_for(sub_entered.wait(), timeout=2.0)
+
+            now_val[0] = BASE_T + 61
+            sub_release.set()
+            await asyncio.wait_for(sub_task, timeout=2.0)
+            now_val[0] = BASE_T + 62
+            if svc._recovery_task is not None:
+                await asyncio.wait_for(svc._recovery_task, timeout=2.0)
+            assert svc._contracts[mnq].state == "LIVE"
+
+            now_val[0] = BASE_T + 70
+            svc.handle_hub_event(
+                SignalRTickEvent(mnq, False, BASE_T + 70, 200.0, 1.0, "GatewayTrade", 1.0)
+            )
+            now_val[0] = BASE_T + 125
+            svc.handle_hub_event(
+                SignalRTickEvent(mnq, False, BASE_T + 125, 201.0, 1.0, "GatewayTrade", 1.1)
+            )
+            if svc._live_tick_tasks:
+                await asyncio.gather(*list(svc._live_tick_tasks))
+
+            key_mnq = StorageDatasetKey("topstepx", False, mnq, "1m")
+            mnq_bars = await parquet.read_bars(
+                key_mnq, start_ts=BASE_T, end_ts=BASE_T + 180, include_provisional=False
+            )
+            assert all(b.time != BASE_T + 60 for b in mnq_bars)
+            wm = await sqlite.get_watermark(key_mnq)
+            assert wm is not None and wm.last_closed_bar_time < BASE_T + 60
+            assert svc._contracts[mnq].state == "DEGRADED"
+        finally:
+            sub_release.set()
+            await svc.stop()
+            sqlite.close()
+
+
+@pytest.mark.asyncio
+async def test_f03_non_1m_recovery_heals_malformed_tick_and_overflow_back_to_live(
+    tmp_path: Path,
+) -> None:
+    """Contract: P1-F03-002 records malformed/overflow gaps on configured TFs when 1m disabled.
+    Defect caught: hardcoding '1m' gap key leaving ('5m','15m') stuck DEGRADED forever.
+    """
+    settings = Settings(data_dir=tmp_path / "data", signalr_enabled=True)
+    sqlite = SqliteStore(tmp_path / "meta.db")
+    sqlite.initialize()
+    parquet = ParquetStore(settings.data_dir, sqlite_store=sqlite)
+
+    t0 = first_bucket_open_at_or_after(BASE_T, "15m")
+    now_val = [t0 + 60]
+
+    class _CompleteRest:
+        async def retrieve_bars_paginated(self, **kw: Any) -> Any:
+            tf = str(kw.get("timeframe"))
+            step = 300 if tf == "5m" else 900
+            s_ts = int(kw["start_ts"])
+            e_ts = int(kw["end_ts"])
+            aligned = first_bucket_open_at_or_after(s_ts, tf)
+            cutoff = now_val[0] - (now_val[0] % step)
+            bars = [
+                {"t": ts, "o": 100.0, "h": 101.0, "l": 99.0, "c": 100.5, "v": 5.0}
+                for ts in range(aligned, e_ts, step)
+                if ts < cutoff
+            ]
+            return type("R", (), {"raw_bars": bars, "truncated": False, "provider_gap": False})()
+
+    def _auth_handler(_req: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"success": True, "errorCode": 0, "token": "test-jwt"})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(_auth_handler)) as client:
+        auth = TopstepAuthService(settings, client)
+        await auth.login("alice", "api-key")
+        agg = BarAggregator(timeframes=("5m", "15m"))
+        svc = LiveFeedService(
+            settings,
+            auth,
+            _CompleteRest(),
+            parquet,
+            sqlite,
+            aggregator=agg,
+            recovery_timeframes=("5m", "15m"),
+            initial_backfill_bars=1,
+            clock=lambda: now_val[0],
+        )
+        try:
+            await svc.set_active_contracts([CID_MES])
+            svc._last_connected_utc = t0 - 30
+            await svc.trigger_recovery(now_utc=now_val[0])
+            assert svc.feed_state == "LIVE"
+
+            svc.handle_hub_event(
+                SignalRMalformedTickEvent(
+                    contract_id=CID_MES,
+                    live_mode=False,
+                    reason="bad trade price",
+                    issue_code="invalid_tick",
+                    raw_summary="{}",
+                    bar_time=t0 + 30,
+                    received_monotonic=1.0,
+                )
+            )
+            c_state = svc._contracts[CID_MES]
+            assert c_state.state == "DEGRADED"
+            assert "1m" not in c_state.unhealed_gap_buckets
+            assert t0 in c_state.unhealed_gap_buckets.get("5m", set())
+            assert t0 in c_state.unhealed_gap_buckets.get("15m", set())
+            assert svc.live_alerts_enabled is False
+
+            now_val[0] = t0 + 905
+            await svc.trigger_recovery(now_utc=now_val[0])
+            assert c_state.state == "LIVE"
+            assert c_state.unhealed_gap_buckets == {}
+            assert c_state.unhealed_gap_starts == {}
+            assert c_state.unresolved_gaps == 0
+            assert svc.feed_state == "LIVE"
+            assert svc.live_alerts_enabled is True
+
+            svc._record_recovery_overflow(
+                c_state,
+                tick=SignalRTickEvent(CID_MES, False, now_val[0], 101.0, 1.0, "GatewayTrade", 2.0),
+                eff_now=now_val[0],
+            )
+            assert "1m" not in c_state.unhealed_gap_buckets
+            assert (t0 + 900) in c_state.unhealed_gap_buckets.get("5m", set())
+            assert (t0 + 900) in c_state.unhealed_gap_buckets.get("15m", set())
+            now_val[0] = t0 + 1805
+            await svc.trigger_recovery(now_utc=now_val[0])
+            assert c_state.state == "LIVE"
+            assert c_state.unhealed_gap_buckets == {}
+            assert svc.live_alerts_enabled is True
+        finally:
+            await svc.stop()
+            sqlite.close()
