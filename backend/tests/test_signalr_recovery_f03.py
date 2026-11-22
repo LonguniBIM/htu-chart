@@ -33,6 +33,7 @@ from app.topstep.signalr_hub import (
     SignalRConnectedEvent,
     SignalRMalformedTickEvent,
     SignalRMarketHub,
+    SignalRTickEvent,
 )
 
 BASE_T = int(datetime(2026, 11, 10, 14, 0, 0, tzinfo=UTC).timestamp())
@@ -5450,6 +5451,353 @@ def test_f03_websockets_debug_frame_and_handshake_logs_redact_jwt(tmp_path: Path
         assert len(captured) == 2
         for line in captured:
             assert secret_jwt not in line
+            assert "***REDACTED***" in line
+    finally:
+        hub._ws_logger.removeHandler(handler)
+        hub._ws_logger.setLevel(prev_level)
+
+
+@pytest.mark.asyncio
+async def test_f03_last_subscriber_disconnect_racing_with_new_subscribe_keeps_hub_active(
+    tmp_path: Path,
+) -> None:
+    """Contract: P1-001 serializes sync_ws_contracts(empty) and concurrent subscribe_ws_contract.
+    Defect caught: hub.stop() cancelling/clearing a concurrent new subscriber's hub task.
+    """
+    settings = Settings(
+        data_dir=tmp_path / "data",
+        signalr_enabled=True,
+        signalr_ack_timeout_sec=0.5,
+    )
+    sqlite = SqliteStore(tmp_path / "meta.db")
+    sqlite.initialize()
+    parquet = ParquetStore(settings.data_dir, sqlite_store=sqlite)
+
+    close_entered = asyncio.Event()
+    close_release = asyncio.Event()
+    transports: list[_MockSignalRTransport] = []
+
+    class _SlowCloseTransport(_MockSignalRTransport):
+        async def close(self) -> None:
+            if not close_entered.is_set():
+                close_entered.set()
+                await asyncio.wait_for(close_release.wait(), timeout=2.0)
+            await super().close()
+
+    async def _ws_factory(_url: str, _headers: dict[str, str]) -> _SlowCloseTransport:
+        tr = _SlowCloseTransport()
+        transports.append(tr)
+        return tr
+
+    class _EmptyRest:
+        async def retrieve_bars_paginated(self, **_kw: Any) -> Any:
+            return type("R", (), {"raw_bars": [], "truncated": False, "provider_gap": False})()
+
+    def _auth_handler(_req: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"success": True, "errorCode": 0, "token": "test-jwt"})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(_auth_handler)) as client:
+        auth = TopstepAuthService(settings, client)
+        await auth.login("alice", "api-key")
+        hub = SignalRMarketHub(
+            settings,
+            token_provider=lambda: asyncio.sleep(0, result="test-jwt"),
+            contracts=[],
+            ws_factory=_ws_factory,
+        )
+        svc = LiveFeedService(
+            settings,
+            auth,
+            _EmptyRest(),
+            parquet,
+            sqlite,
+            signalr_hub=hub,
+            recovery_timeframes=("1m",),
+            clock=lambda: BASE_T + 15,
+        )
+        try:
+            await svc.start()
+            await svc.subscribe_ws_contract(CID_MES)
+            for _ in range(50):
+                if hub.is_connected and transports:
+                    break
+                await asyncio.sleep(0.01)
+            assert hub.is_connected
+
+            t_disc = asyncio.create_task(svc.sync_ws_contracts(set()))
+            await asyncio.wait_for(close_entered.wait(), timeout=2.0)
+            t_sub = asyncio.create_task(svc.subscribe_ws_contract(CID_MES))
+            await asyncio.sleep(0.02)
+            assert not t_sub.done()
+
+            close_release.set()
+            await asyncio.wait_for(asyncio.gather(t_disc, t_sub), timeout=2.0)
+            for _ in range(50):
+                if hub.is_connected and len(transports) >= 2:
+                    break
+                await asyncio.sleep(0.01)
+
+            assert len(transports) >= 2
+            assert hub.is_connected
+            assert CID_MES in svc.get_status_snapshot()["contracts"]
+        finally:
+            close_release.set()
+            await svc.stop()
+            sqlite.close()
+
+
+@pytest.mark.asyncio
+async def test_f03_dynamic_mid_candle_contract_add_keeps_first_partial_minute_incomplete(
+    tmp_path: Path,
+) -> None:
+    """Contract: P2-DYNAMIC-001 marks a newly added contract's initial open minute incomplete.
+    Defect caught: mid-candle dynamic add using older hub connect_utc and closing partial bar.
+    """
+    settings = Settings(data_dir=tmp_path / "data", signalr_enabled=True)
+    sqlite = SqliteStore(tmp_path / "meta.db")
+    sqlite.initialize()
+    parquet = ParquetStore(settings.data_dir, sqlite_store=sqlite)
+
+    now_val = [BASE_T + 15]
+
+    class _RestStub:
+        async def retrieve_bars_paginated(self, **kw: Any) -> Any:
+            start_ts = int(kw.get("start_ts", BASE_T))
+            end_ts = int(kw.get("end_ts", BASE_T))
+            closed_cutoff = now_val[0] - (now_val[0] % 60)
+            bars = [
+                {
+                    "t": ts,
+                    "o": 100.0,
+                    "h": 101.0,
+                    "l": 99.0,
+                    "c": 100.5,
+                    "v": 5.0,
+                }
+                for ts in range(start_ts - (start_ts % 60), end_ts, 60)
+                if ts < closed_cutoff
+            ]
+            return type("R", (), {"raw_bars": bars, "truncated": False, "provider_gap": False})()
+
+    def _auth_handler(_req: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"success": True, "errorCode": 0, "token": "test-jwt"})
+
+    tr = _MockSignalRTransport()
+
+    async def _ws_factory(_url: str, _headers: dict[str, str]) -> _MockSignalRTransport:
+        return tr
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(_auth_handler)) as client:
+        auth = TopstepAuthService(settings, client)
+        await auth.login("alice", "api-key")
+        hub = SignalRMarketHub(
+            settings,
+            token_provider=lambda: asyncio.sleep(0, result="test-jwt"),
+            contracts=[CID_MES],
+            ws_factory=_ws_factory,
+        )
+        svc = LiveFeedService(
+            settings,
+            auth,
+            _RestStub(),
+            parquet,
+            sqlite,
+            signalr_hub=hub,
+            recovery_timeframes=("1m",),
+            initial_backfill_bars=1,
+            clock=lambda: now_val[0],
+        )
+        mnq = "CON.F.US.MNQ.Z26"
+        try:
+            await svc.set_active_contracts([CID_MES])
+            await svc.start()
+            for _ in range(50):
+                if hub.is_connected and svc._contracts[CID_MES].state == "LIVE":
+                    break
+                await asyncio.sleep(0.01)
+            assert svc._contracts[CID_MES].state == "LIVE"
+
+            now_val[0] = BASE_T + 150
+            await svc.subscribe_ws_contract(mnq)
+            for _ in range(50):
+                if (
+                    mnq in svc._contracts
+                    and svc._contracts[mnq].state == "LIVE"
+                    and (svc._recovery_task is None or svc._recovery_task.done())
+                ):
+                    break
+                await asyncio.sleep(0.01)
+
+            now_val[0] = BASE_T + 160
+            svc.handle_hub_event(
+                SignalRTickEvent(mnq, False, BASE_T + 160, 200.0, 1.0, "GatewayTrade", 1.0)
+            )
+            now_val[0] = BASE_T + 190
+            svc.handle_hub_event(
+                SignalRTickEvent(mnq, False, BASE_T + 190, 201.0, 1.0, "GatewayTrade", 1.1)
+            )
+            if svc._live_tick_tasks:
+                await asyncio.gather(*list(svc._live_tick_tasks))
+
+            mnq_bars = await parquet.read_bars(
+                StorageDatasetKey("topstepx", False, mnq, "1m"),
+                start_ts=BASE_T,
+                end_ts=BASE_T + 300,
+                include_provisional=False,
+            )
+            assert all(b.time != BASE_T + 120 for b in mnq_bars)
+            assert svc._contracts[mnq].state == "DEGRADED"
+        finally:
+            await svc.stop()
+            sqlite.close()
+
+
+@pytest.mark.asyncio
+async def test_f03_htf_volume_overflow_from_1m_bars_quarantined_and_degrades(
+    tmp_path: Path,
+) -> None:
+    """Contract: P1-003/P2-OHLCV-003 quarantines invalid aggregated HTF bars & degrades feed.
+    Defect caught: silent HTF drop allowing LIVE/watermark advance over overflowed 5m bucket.
+    """
+    settings = Settings(data_dir=tmp_path / "data", signalr_enabled=True)
+    sqlite = SqliteStore(tmp_path / "meta.db")
+    sqlite.initialize()
+    parquet = ParquetStore(settings.data_dir, sqlite_store=sqlite)
+
+    t0 = first_bucket_open_at_or_after(BASE_T, "5m")
+
+    class _Overflow1mRest:
+        async def retrieve_bars_paginated(self, **_kw: Any) -> Any:
+            bars = [
+                {
+                    "t": t0 + i * 60,
+                    "o": 100.0,
+                    "h": 102.0,
+                    "l": 99.0,
+                    "c": 101.0,
+                    "v": 1e308,
+                }
+                for i in range(5)
+            ]
+            return type("R", (), {"raw_bars": bars, "truncated": False, "provider_gap": False})()
+
+    def _auth_handler(_req: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"success": True, "errorCode": 0, "token": "test-jwt"})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(_auth_handler)) as client:
+        auth = TopstepAuthService(settings, client)
+        await auth.login("alice", "api-key")
+        svc = LiveFeedService(
+            settings,
+            auth,
+            _Overflow1mRest(),
+            parquet,
+            sqlite,
+            recovery_timeframes=("1m", "5m"),
+            initial_backfill_bars=5,
+            clock=lambda: t0 + 310,
+        )
+        try:
+            await svc.set_active_contracts([CID_MES])
+            await svc._run_recovery(now_utc=t0 + 310)
+            snap = svc.get_status_snapshot()
+            assert snap["contracts"][CID_MES]["state"] == "DEGRADED"
+            assert snap["live_alerts_enabled"] is False
+
+            key_5m = StorageDatasetKey("topstepx", False, CID_MES, "5m")
+            wm_5m = await sqlite.get_watermark(key_5m)
+            assert wm_5m is None
+            issues = await sqlite.list_quality_issues(key_5m)
+            assert any(
+                i["interval_start"] == t0 and "volume" in str(i["issue_code"]) for i in issues
+            )
+            bars_5m = await parquet.read_bars(
+                key_5m, start_ts=t0, end_ts=t0 + 300, include_provisional=True
+            )
+            assert bars_5m == []
+        finally:
+            await svc.stop()
+            sqlite.close()
+
+
+def test_f03_htf_open_bar_preserves_earliest_tick_ts_after_rebuild() -> None:
+    """Contract: P1-002 preserves open_1m first_ts in HTF _open_bar_ts_bounds on rebuild.
+    Defect caught: sub-second out-of-order tick failing to update rebuilt HTF open price.
+    """
+    from app.engine.bar_aggregator import NormalizedTick
+
+    t0 = first_bucket_open_at_or_after(BASE_T, "5m")
+    agg = BarAggregator(timeframes=("1m", "5m"))
+    recon_1m = agg.reconcile_recovery(
+        contract_id=CID_MES,
+        live_mode=False,
+        timeframe="1m",
+        historical_bars=[],
+        buffered_ticks=[NormalizedTick(CID_MES, False, t0 + 5.9, 110.0, 1.0)],
+        now_utc=t0 + 10,
+    )
+    assert recon_1m.open_bar is not None
+    agg.reconcile_from_1m_bars(
+        contract_id=CID_MES,
+        live_mode=False,
+        timeframe="5m",
+        closed_1m_bars=[],
+        open_1m_bar=recon_1m.open_bar.bar,
+        now_utc=t0 + 10,
+    )
+    res = agg.process_tick(
+        NormalizedTick(CID_MES, False, t0 + 5.1, 100.0, 1.0),
+        now_utc=t0 + 10,
+    )
+    bars_by_tf = {evt.timeframe: evt.bar for evt in res.events}
+    assert bars_by_tf["1m"].open == 100.0
+    assert bars_by_tf["5m"].open == 100.0
+
+
+def test_f03_websockets_debug_frame_long_jwt_exceeding_max_log_size_redacts_fragments(
+    tmp_path: Path,
+) -> None:
+    """Contract: P2-REDACTION-002 redacts Frame payloads before Frame.__str__ truncates them.
+    Defect caught: >300-byte JWT inside Frame.__str__ leaking prefix/suffix fragments in logs.
+    """
+    from websockets.frames import Frame, Opcode
+
+    hdr = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9"
+    pay = "eyJzdWIiOiJ1c2VyMTIzIiwicm9sZSI6InRyYWRlciIsImV4cCI6MTk5OTk5OTk5OSwibm9uY2UiOiJhYmMxIn0"
+    sig = "A" * 280 + "TailSecretSignature12345"
+    long_jwt = f"{hdr}.{pay}.{sig}"
+    assert len(long_jwt) > 350
+
+    settings = Settings(data_dir=tmp_path / "data")
+    hub = SignalRMarketHub(
+        settings,
+        token_provider=lambda: asyncio.sleep(0, result=long_jwt),
+        contracts=[CID_MES],
+    )
+    hub._recent_tokens.append(long_jwt)
+
+    captured: list[str] = []
+
+    class _ListHandler(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            captured.append(self.format(record))
+
+    handler = _ListHandler()
+    prev_level = hub._ws_logger.level
+    hub._ws_logger.setLevel(logging.DEBUG)
+    hub._ws_logger.addHandler(handler)
+    try:
+        frame = Frame(
+            Opcode.TEXT,
+            f'{{"type":7,"error":"unauthorized {long_jwt}"}}'.encode(),
+        )
+        hub._ws_logger.debug("< %s", frame)
+        hub._ws_logger.debug("< %s", str(frame))
+        assert len(captured) == 2
+        for line in captured:
+            assert long_jwt not in line
+            assert hdr not in line
+            assert "TailSecretSignature12345" not in line
             assert "***REDACTED***" in line
     finally:
         hub._ws_logger.removeHandler(handler)

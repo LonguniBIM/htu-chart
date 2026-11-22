@@ -85,6 +85,7 @@ class ContractFeedRuntime:
     watermarks: dict[str, int] = field(default_factory=dict)
     unhealed_gap_starts: dict[str, int] = field(default_factory=dict)
     unhealed_gap_buckets: dict[str, set[int]] = field(default_factory=dict)
+    subscribed_at_utc: int | None = None
 
 
 class LiveFeedService:
@@ -168,6 +169,7 @@ class LiveFeedService:
         self._auth_retry_pending = False
         self._last_auth_retry_mono: float | None = None
         self._auth_retry_delay_sec = max(0.01, settings.signalr_reconnect_initial_delay_sec)
+        self._hub_lifecycle_lock = asyncio.Lock()
 
     @property
     def hub(self) -> SignalRMarketHub:
@@ -248,61 +250,68 @@ class LiveFeedService:
         live_mode: bool | None = None,
     ) -> None:
         """Register active contracts, reset removed contracts on rollover, and sync SignalR."""
-        eff_live = self._auth.live if live_mode is None else bool(live_mode)
-        normalized: dict[str, str | None] = {}
-        for item in contracts:
-            if isinstance(item, tuple):
-                cid = item[0].strip().upper()
-                root = item[1].strip().upper() if item[1] else infer_root_symbol(cid)
-            else:
-                cid = str(item).strip().upper()
-                root = infer_root_symbol(cid)
-            if cid:
-                normalized[cid] = root
+        async with self._hub_lifecycle_lock:
+            eff_live = self._auth.live if live_mode is None else bool(live_mode)
+            normalized: dict[str, str | None] = {}
+            for item in contracts:
+                if isinstance(item, tuple):
+                    cid = item[0].strip().upper()
+                    root = item[1].strip().upper() if item[1] else infer_root_symbol(cid)
+                else:
+                    cid = str(item).strip().upper()
+                    root = infer_root_symbol(cid)
+                if cid:
+                    normalized[cid] = root
 
-        removed = (set(self._contracts) - set(normalized)) - self._ws_contracts
-        self._explicit_contracts = set(normalized)
-        for old_cid in removed:
-            self._contracts.pop(old_cid, None)
-            self._aggregator.reset_contract(old_cid)
+            removed = (set(self._contracts) - set(normalized)) - self._ws_contracts
+            self._explicit_contracts = set(normalized)
+            for old_cid in removed:
+                self._contracts.pop(old_cid, None)
+                self._aggregator.reset_contract(old_cid)
 
-        added_or_mode_changed = False
-        for cid, root in normalized.items():
-            existing = self._contracts.get(cid)
-            if existing is None or existing.live_mode != eff_live:
-                if existing is not None:
-                    self._aggregator.reset_contract(cid)
-                self._contracts[cid] = ContractFeedRuntime(
-                    contract_id=cid,
-                    live_mode=eff_live,
-                    root_symbol=root,
-                    state="DISCONNECTED",
-                )
-                added_or_mode_changed = True
-            elif root is not None:
-                existing.root_symbol = root
+            added_or_mode_changed = False
+            sub_utc = (
+                self._clock()
+                if (self._hub.is_connected or self._last_connected_utc is not None)
+                else None
+            )
+            for cid, root in normalized.items():
+                existing = self._contracts.get(cid)
+                if existing is None or existing.live_mode != eff_live:
+                    if existing is not None:
+                        self._aggregator.reset_contract(cid)
+                    self._contracts[cid] = ContractFeedRuntime(
+                        contract_id=cid,
+                        live_mode=eff_live,
+                        root_symbol=root,
+                        state="DISCONNECTED",
+                        subscribed_at_utc=sub_utc,
+                    )
+                    added_or_mode_changed = True
+                elif root is not None:
+                    existing.root_symbol = root
 
-        if added_or_mode_changed or removed:
-            if not self._contracts:
-                self._feed_state = "DISCONNECTED"
-            else:
-                self._recompute_aggregate_state()
+            if added_or_mode_changed or removed:
+                if not self._contracts:
+                    self._feed_state = "DISCONNECTED"
+                else:
+                    self._recompute_aggregate_state()
+                self._broadcast_status()
+
+            await self._hub.update_contracts(list(self._contracts.keys()), live_mode=eff_live)
+
+            if (
+                self._running
+                and self._settings.signalr_enabled
+                and self._auth.is_connected
+                and self._contracts
+            ):
+                if not self._hub.is_connected:
+                    self._hub.start()
+                elif (added_or_mode_changed or removed) and not self._hub.has_pending_subscriptions:
+                    await self.trigger_recovery()
+            self._recompute_aggregate_state()
             self._broadcast_status()
-
-        await self._hub.update_contracts(list(self._contracts.keys()), live_mode=eff_live)
-
-        if (
-            self._running
-            and self._settings.signalr_enabled
-            and self._auth.is_connected
-            and self._contracts
-        ):
-            if not self._hub.is_connected:
-                self._hub.start()
-            elif (added_or_mode_changed or removed) and not self._hub.has_pending_subscriptions:
-                await self.trigger_recovery()
-        self._recompute_aggregate_state()
-        self._broadcast_status()
 
     async def subscribe_ws_contract(
         self,
@@ -314,49 +323,55 @@ class LiveFeedService:
         cid = contract_id.strip().upper()
         if not cid:
             raise ValueError("contract_id cannot be empty")
-        eff_live = self._auth.live if live_mode is None else bool(live_mode)
-        self._ws_contracts.add(cid)
-        existing = self._contracts.get(cid)
-        newly_added = existing is None or existing.live_mode != eff_live
-        self.register_contract(cid, live_mode=eff_live)
-        if newly_added:
+        async with self._hub_lifecycle_lock:
+            eff_live = self._auth.live if live_mode is None else bool(live_mode)
+            self._ws_contracts.add(cid)
+            existing = self._contracts.get(cid)
+            newly_added = existing is None or existing.live_mode != eff_live
+            self.register_contract(cid, live_mode=eff_live)
+            if newly_added:
+                self._recompute_aggregate_state()
+                self._broadcast_status()
+            await self._hub.update_contracts(list(self._contracts.keys()), live_mode=eff_live)
+
+            if self._running and self._settings.signalr_enabled and self._auth.is_connected:
+                if not self._hub.is_connected:
+                    self._hub.start()
+                elif newly_added and not self._hub.has_pending_subscription(cid):
+                    self._bump_generation_and_cancel_live_tasks()
+                    self._transition_all_contracts("RECOVERING")
+                    self._start_recovery_task()
             self._recompute_aggregate_state()
             self._broadcast_status()
-        await self._hub.update_contracts(list(self._contracts.keys()), live_mode=eff_live)
-
-        if self._running and self._settings.signalr_enabled and self._auth.is_connected:
-            if not self._hub.is_connected:
-                self._hub.start()
-            elif newly_added and not self._hub.has_pending_subscription(cid):
-                self._bump_generation_and_cancel_live_tasks()
-                self._transition_all_contracts("RECOVERING")
-                self._start_recovery_task()
-        self._recompute_aggregate_state()
-        self._broadcast_status()
 
     async def sync_ws_contracts(self, active_ws_contracts: set[str]) -> None:
         """Prune WS-only contracts when all WebSocket subscribers leave."""
-        norm_ws = {cid.strip().upper() for cid in active_ws_contracts if cid.strip()}
-        self._ws_contracts = norm_ws
-        keep = self._explicit_contracts | self._ws_contracts
-        removed = [cid for cid in list(self._contracts) if cid not in keep]
-        if not removed:
-            return
-        for old_cid in removed:
-            self._contracts.pop(old_cid, None)
-            self._aggregator.reset_contract(old_cid)
-        if not self._contracts:
-            self._feed_state = "DISCONNECTED"
-        else:
-            self._recompute_aggregate_state()
-        self._broadcast_status()
-        await self._hub.update_contracts(list(self._contracts.keys()), live_mode=self._auth.live)
-        if not self._contracts and self._hub.is_connected:
-            await self._hub.stop()
-            self._feed_state = "DISCONNECTED"
-        else:
-            self._recompute_aggregate_state()
-        self._broadcast_status()
+        async with self._hub_lifecycle_lock:
+            norm_ws = {cid.strip().upper() for cid in active_ws_contracts if cid.strip()}
+            self._ws_contracts = norm_ws
+            keep = self._explicit_contracts | self._ws_contracts
+            removed = [cid for cid in list(self._contracts) if cid not in keep]
+            if not removed and self._contracts:
+                return
+            for old_cid in removed:
+                self._contracts.pop(old_cid, None)
+                self._aggregator.reset_contract(old_cid)
+            if not self._contracts:
+                self._feed_state = "DISCONNECTED"
+            else:
+                self._recompute_aggregate_state()
+            self._broadcast_status()
+            await self._hub.update_contracts(
+                list(self._contracts.keys()), live_mode=self._auth.live
+            )
+            hub_task = getattr(self._hub, "_task", None)
+            hub_active = self._hub.is_connected or (hub_task is not None and not hub_task.done())
+            if not self._contracts and hub_active:
+                await self._hub.stop()
+                self._feed_state = "DISCONNECTED"
+            else:
+                self._recompute_aggregate_state()
+            self._broadcast_status()
 
     def register_contract(
         self,
@@ -375,11 +390,17 @@ class LiveFeedService:
             if existing is not None:
                 self._aggregator.reset_contract(cid)
             eff_root = root_symbol.strip().upper() if root_symbol else infer_root_symbol(cid)
+            sub_utc = (
+                self._clock()
+                if (self._hub.is_connected or self._last_connected_utc is not None)
+                else None
+            )
             existing = ContractFeedRuntime(
                 contract_id=cid,
                 live_mode=eff_live,
                 root_symbol=eff_root,
                 state="DISCONNECTED",
+                subscribed_at_utc=sub_utc,
             )
             self._contracts[cid] = existing
         return existing
@@ -490,15 +511,20 @@ class LiveFeedService:
                 self._quarantine_queue.get_nowait()
                 self._quarantine_queue.task_done()
 
-        await self._hub.stop()
-        self._last_connected_utc = None
-        self._transition_all_contracts("DISCONNECTED")
+        async with self._hub_lifecycle_lock:
+            await self._hub.stop()
+            self._last_connected_utc = None
+            for c_state in self._contracts.values():
+                c_state.subscribed_at_utc = None
+            self._transition_all_contracts("DISCONNECTED")
 
     def handle_hub_event(self, event: SignalREvent) -> None:
         """Handle lifecycle and tick events from SignalRMarketHub without blocking recv."""
         if isinstance(event, SignalRConnectedEvent):
             self._last_event_monotonic = event.connected_monotonic
             self._last_connected_utc = self._clock()
+            for c_state in self._contracts.values():
+                c_state.subscribed_at_utc = None
             self._last_error = None
             for cid in event.contracts:
                 self.register_contract(cid, live_mode=event.live_mode)
@@ -527,6 +553,8 @@ class LiveFeedService:
         if isinstance(event, SignalRDisconnectedEvent):
             self._last_event_monotonic = event.disconnected_monotonic
             self._last_connected_utc = None
+            for c_state in self._contracts.values():
+                c_state.subscribed_at_utc = None
             self._last_error = self._redact(event.reason)
             self._bump_generation_and_cancel_live_tasks()
             if self._recovery_task is not None and not self._recovery_task.done():
@@ -1123,9 +1151,13 @@ class LiveFeedService:
             )
             if gap_from_rest_issues:
                 self._record_gap_bucket(c_state, tf, backfill_start)
+            eff_connected_utc = max(
+                (t for t in (self._last_connected_utc, c_state.subscribed_at_utc) if t is not None),
+                default=None,
+            )
             mark_open_inc = (
-                self._last_connected_utc is None
-                or self._last_connected_utc >= open_bucket_utc_ts
+                eff_connected_utc is None
+                or eff_connected_utc >= open_bucket_utc_ts
                 or has_open_unhealed_gap
             )
             recon = self._aggregator.reconcile_recovery(
@@ -1344,6 +1376,37 @@ class LiveFeedService:
                 root_symbol=c_state.root_symbol,
                 covered_start_utc=covered_start_utc,
             )
+            if recon_htf.rejected_bars:
+                htf_issues: list[QualityIssueInput] = []
+                for rej_time, rej_code, rej_detail in recon_htf.rejected_bars:
+                    _, rej_end = bucket_bounds(rej_time, htf, root_symbol=c_state.root_symbol)
+                    safe_detail = self._redact(rej_detail)
+                    htf_issues.append(
+                        QualityIssueInput(
+                            bar_time=rej_time,
+                            interval_start=rej_time,
+                            interval_end=rej_end,
+                            issue_code=rej_code,
+                            detail=safe_detail,
+                            raw_payload=safe_detail[:2048],
+                        )
+                    )
+                    self._ensure_generation(expected_gen)
+                    await self._sqlite.record_coverage(
+                        key_htf,
+                        rej_time,
+                        rej_end,
+                        status="CORRUPTED",
+                        quarantined_count=1,
+                    )
+                    self._record_gap_bucket(c_state, htf, rej_time)
+                    c_state.unresolved_gaps += 1
+                    c_state.last_error = safe_detail
+                    self._last_error = safe_detail
+                self._ensure_generation(expected_gen)
+                await self._sqlite.record_quality_issues(key_htf, htf_issues)
+                self._ensure_generation(expected_gen)
+
             closed_htf = [evt.bar for evt in recon_htf.closed_bars]
             if closed_htf:
                 recovered_any_closed = True
@@ -1359,6 +1422,7 @@ class LiveFeedService:
             htf_gap_start = c_state.unhealed_gap_starts.get(htf)
             htf_clean = (
                 not had_1m_gap
+                and not recon_htf.rejected_bars
                 and "1m" not in c_state.unhealed_gap_starts
                 and (
                     htf_gap_start is None

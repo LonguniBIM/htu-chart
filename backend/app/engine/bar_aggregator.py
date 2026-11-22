@@ -68,6 +68,7 @@ class ReconciliationResult:
     open_bar: AggregatedBarEvent | None
     last_closed_bar_time: int | None
     rejected_ticks: tuple[tuple[NormalizedTick, str], ...] = ()
+    rejected_bars: tuple[tuple[int, str, str], ...] = ()
 
 
 def _utc_now_sec() -> int:
@@ -793,6 +794,7 @@ class BarAggregator:
         current_htf_open = bucket_open_utc(eff_now, tf)
         closed_1m_end = latest_closed_bucket_end_utc(eff_now, "1m", root_symbol=eff_root)
         closed_events: list[AggregatedBarEvent] = []
+        rejected_bars: list[tuple[int, str, str]] = []
         latest_open_bar: OHLCVBar | None = None
         latest_open_incomplete = False
 
@@ -830,6 +832,15 @@ class BarAggregator:
                 now_utc=max(eff_now, htf_open),
             )
             if not val.is_valid or val.bar is None:
+                rejected_bars.append(
+                    (
+                        htf_open,
+                        val.issue_code or "invalid_ohlcv",
+                        val.issue_detail or f"Invalid aggregated {tf} bar",
+                    )
+                )
+                if htf_open >= current_htf_open:
+                    self._incomplete_open_buckets.setdefault(stream_key, set()).add(htf_open)
                 continue
             if bar_closed:
                 closed_events.append(
@@ -877,20 +888,19 @@ class BarAggregator:
             self._open_bars[stream_key] = latest_open_bar
             open_1m_bounds = self._open_bar_ts_bounds.get((cid, eff_live, "1m"))
             open_members = grouped.get(latest_open_bar.time, ())
+            closed_member_times = [b.time for b in open_members if b.is_closed]
+            earliest_ts = float(latest_open_bar.time)
             max_closed_1m_end = max(
                 (float(b.time + 59) for b in open_members if b.is_closed),
                 default=float(latest_open_bar.time),
             )
             if open_1m_bounds is not None and open_1m_bar is not None:
-                self._open_bar_ts_bounds[stream_key] = (
-                    float(latest_open_bar.time),
-                    max(max_closed_1m_end, open_1m_bounds[1]),
-                )
+                if not closed_member_times or open_1m_bar.time <= min(closed_member_times):
+                    earliest_ts = open_1m_bounds[0]
+                last_ts = max(max_closed_1m_end, open_1m_bounds[1])
             else:
-                self._open_bar_ts_bounds[stream_key] = (
-                    float(latest_open_bar.time),
-                    max_closed_1m_end,
-                )
+                last_ts = max_closed_1m_end
+            self._open_bar_ts_bounds[stream_key] = (earliest_ts, last_ts)
             if latest_open_incomplete:
                 self._incomplete_open_bars.add(stream_key)
             else:
@@ -914,8 +924,14 @@ class BarAggregator:
             if any(current_htf_start <= p < current_htf_end for p in m1_pending):
                 self._incomplete_open_buckets.setdefault(stream_key, set()).add(current_htf_open)
 
+        earliest_rejected = min((r[0] for r in rejected_bars), default=None)
+        contiguous_closed = [
+            e.bar.time
+            for e in closed_events
+            if earliest_rejected is None or e.bar.time < earliest_rejected
+        ]
         final_last_closed = max(
-            (t for t in (*(e.bar.time for e in closed_events), prev_closed) if t is not None),
+            (t for t in (*contiguous_closed, prev_closed) if t is not None),
             default=None,
         )
         if final_last_closed is not None:
@@ -928,4 +944,5 @@ class BarAggregator:
             closed_bars=tuple(closed_events),
             open_bar=open_event,
             last_closed_bar_time=final_last_closed,
+            rejected_bars=tuple(rejected_bars),
         )

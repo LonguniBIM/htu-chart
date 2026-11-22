@@ -714,6 +714,7 @@ class SignalRMarketHub:
         self._task = None
         self._ws = None
         self._connected = False
+        self._stopping = False
 
     async def _close_ws(self, ws: SignalRWebSocketTransport | None) -> None:
         if ws is not None:

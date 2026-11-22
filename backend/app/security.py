@@ -12,7 +12,7 @@ import threading
 import time
 from collections import defaultdict, deque
 from collections.abc import Callable, Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, is_dataclass, replace
 from datetime import UTC, datetime, timedelta
 from typing import Annotated, Any
 from urllib.parse import urlparse
@@ -37,6 +37,7 @@ _REDACTED_FIELD_PATTERN = (
 _AUTH_SCHEMES = r"Bearer|Basic|Token|Digest|ApiKey|OAuth|Negotiate|NTLM|AWS4-HMAC-SHA256"
 _QUOTED_VALUE_ALT = r'(?:"(?:\\.|[^"\\])*"?(?:\\$)?|\'(?:\\.|[^\'\\])*\'?(?:\\$)?)'
 _BEARER_RE = re.compile(r"(?i)\bBearer\s+[A-Za-z0-9._~+/=-]+")
+_JWT_RE = re.compile(r"\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}(?:\.[A-Za-z0-9_-]*)?")
 _AUTH_HEADER_RE = re.compile(
     rf"""(?i)\bAuthorization\s*([:=])\s*(?!['"])(?:(?:{_AUTH_SCHEMES})\s+)?[^\s,;'"]+"""
 )
@@ -82,8 +83,19 @@ def _redact_arg(
 ) -> Any:
     if isinstance(value, (int, float, bool)) or value is None:
         return value
-    if isinstance(value, bytes):
-        return redact_secrets(value.decode("utf-8", errors="replace"), extra_secrets)
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        return redact_secrets(bytes(value).decode("utf-8", errors="replace"), extra_secrets)
+    if (
+        hasattr(value, "opcode")
+        and hasattr(value, "data")
+        and isinstance(getattr(value, "data", None), (bytes, bytearray, memoryview))
+    ):
+        raw_text = bytes(value.data).decode("utf-8", errors="replace")
+        redacted_bytes = redact_secrets(raw_text, extra_secrets).encode("utf-8", errors="replace")
+        if is_dataclass(value) and not isinstance(value, type):
+            with contextlib.suppress(TypeError):
+                return replace(value, data=redacted_bytes)
+        return redact_secrets(f"{value.opcode!r} {raw_text!r}", extra_secrets)
     if isinstance(value, str):
         return redact_secrets(value, extra_secrets)
     if isinstance(value, tuple):
@@ -176,9 +188,57 @@ def _redact_log_message_template(msg: str, extra_secrets: tuple[str, ...]) -> st
     redacted = _safe_sub(_AUTH_HEADER_RE, r"Authorization\1 ***REDACTED***", redacted)
     redacted = _safe_sub(_BEARER_RE, "Bearer ***REDACTED***", redacted)
     redacted = _safe_sub(_KV_SECRET_RE, r"\1\2***REDACTED***", redacted)
+    redacted = _safe_sub(_JWT_RE, "***REDACTED***", redacted)
     for secret in extra_secrets:
-        if secret and len(secret) >= 6:
-            redacted = redacted.replace(secret, "***REDACTED***")
+        redacted = _redact_extra_secret(redacted, secret)
+    return redacted
+
+
+def _redact_extra_secret(text: str, secret: str) -> str:
+    """Redact full secret and any truncated head/tail fragments (>=16 chars)."""
+    if not secret or len(secret) < 6:
+        return text
+    redacted = text.replace(secret, "***REDACTED***")
+    frag_len = 16
+    if len(secret) >= 32:
+        head = secret[:frag_len]
+        if head in redacted:
+            out: list[str] = []
+            idx = 0
+            while idx < len(redacted):
+                pos = redacted.find(head, idx)
+                if pos == -1:
+                    out.append(redacted[idx:])
+                    break
+                out.append(redacted[idx:pos])
+                match_len = frag_len
+                while (
+                    pos + match_len < len(redacted)
+                    and match_len < len(secret)
+                    and redacted[pos + match_len] == secret[match_len]
+                ):
+                    match_len += 1
+                out.append("***REDACTED***")
+                idx = pos + match_len
+            redacted = "".join(out)
+        tail = secret[-frag_len:]
+        if tail in redacted:
+            out_tail: list[str] = []
+            idx = 0
+            while idx < len(redacted):
+                pos = redacted.find(tail, idx)
+                if pos == -1:
+                    out_tail.append(redacted[idx:])
+                    break
+                start = pos
+                s_idx = len(secret) - frag_len
+                while start > idx and s_idx > 0 and redacted[start - 1] == secret[s_idx - 1]:
+                    start -= 1
+                    s_idx -= 1
+                out_tail.append(redacted[idx:start])
+                out_tail.append("***REDACTED***")
+                idx = pos + frag_len
+            redacted = "".join(out_tail)
     return redacted
 
 
@@ -191,9 +251,9 @@ def redact_secrets(text: str, extra_secrets: Iterable[str] = ()) -> str:
     redacted = _AUTH_HEADER_RE.sub(r"Authorization\1 ***REDACTED***", redacted)
     redacted = _BEARER_RE.sub("Bearer ***REDACTED***", redacted)
     redacted = _KV_SECRET_RE.sub(r"\1\2***REDACTED***", redacted)
+    redacted = _JWT_RE.sub("***REDACTED***", redacted)
     for secret in extra_secrets:
-        if secret and len(secret) >= 6:
-            redacted = redacted.replace(secret, "***REDACTED***")
+        redacted = _redact_extra_secret(redacted, secret)
     return redacted
 
 
