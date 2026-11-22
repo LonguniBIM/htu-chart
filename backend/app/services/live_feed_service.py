@@ -48,6 +48,7 @@ from app.topstep.signalr_hub import (
     SignalRDisconnectedEvent,
     SignalRErrorEvent,
     SignalREvent,
+    SignalRMalformedTickEvent,
     SignalRMarketHub,
     SignalRTickEvent,
 )
@@ -144,6 +145,7 @@ class LiveFeedService:
             maxsize=settings.signalr_recovery_queue_maxsize
         )
         self._recovery_overflowed = False
+        self._pending_recovery_ticks_count = 0
         self._recovery_task: asyncio.Task[None] | None = None
         self._live_tick_tasks: set[asyncio.Task[None]] = set()
         self._watchdog_task: asyncio.Task[None] | None = None
@@ -475,6 +477,10 @@ class LiveFeedService:
             self._last_error = self._redact(event.message)
             return
 
+        if isinstance(event, SignalRMalformedTickEvent):
+            self._handle_malformed_signalr_tick(event)
+            return
+
         if isinstance(event, SignalRTickEvent):
             self._last_event_monotonic = event.received_monotonic
             c_state = self._contracts.get(event.contract_id)
@@ -484,19 +490,104 @@ class LiveFeedService:
             if self._feed_state == "RECOVERING" or (
                 c_state is not None and c_state.state == "RECOVERING"
             ):
+                total_buffered = (
+                    self._recovery_queue.qsize() + self._pending_recovery_ticks_count
+                )
+                if total_buffered >= self._settings.signalr_recovery_queue_maxsize:
+                    self._record_recovery_overflow(c_state)
+                    return
                 try:
                     self._recovery_queue.put_nowait(event)
                 except asyncio.QueueFull:
-                    self._queue_overflow_count += 1
-                    self._recovery_overflowed = True
-                    if c_state is not None:
-                        c_state.unresolved_gaps += 1
-                    else:
-                        self._global_unresolved_gaps += 1
+                    self._record_recovery_overflow(c_state)
                 return
 
             if self._feed_state in {"LIVE", "DEGRADED"}:
                 self._ingest_live_tick_sync(event)
+
+    def _record_recovery_overflow(self, c_state: ContractFeedRuntime | None) -> None:
+        self._queue_overflow_count += 1
+        self._recovery_overflowed = True
+        if c_state is not None:
+            c_state.unresolved_gaps += 1
+        else:
+            self._global_unresolved_gaps += 1
+
+    def _handle_malformed_signalr_tick(self, event: SignalRMalformedTickEvent) -> None:
+        self._last_event_monotonic = event.received_monotonic
+        cid = event.contract_id or next(iter(self._contracts), None)
+        redacted_reason = self._redact(event.reason)
+        self._last_error = redacted_reason
+        eff_ts = event.bar_time if event.bar_time is not None else self._clock()
+        bar_open_1m = bucket_open_utc(eff_ts, "1m")
+
+        c_state = self._contracts.get(cid) if cid else None
+        live_mode = c_state.live_mode if c_state is not None else event.live_mode
+        if c_state is not None:
+            c_state.unresolved_gaps += 1
+            c_state.last_error = redacted_reason
+            prev_gap = c_state.unhealed_gap_starts.get("1m")
+            c_state.unhealed_gap_starts["1m"] = (
+                bar_open_1m if prev_gap is None else min(prev_gap, bar_open_1m)
+            )
+            c_state.state = "DEGRADED"
+        else:
+            self._global_unresolved_gaps += 1
+
+        if cid:
+            self._aggregator.mark_open_bucket_incomplete(cid, live_mode, eff_ts)
+            task = asyncio.create_task(
+                self._quarantine_malformed_tick(
+                    key=StorageDatasetKey("topstepx", live_mode, cid, "1m"),
+                    bar_time=event.bar_time,
+                    bar_open_1m=bar_open_1m,
+                    issue_code=event.issue_code,
+                    detail=redacted_reason,
+                    raw_summary=self._redact(event.raw_summary),
+                )
+            )
+            self._live_tick_tasks.add(task)
+            task.add_done_callback(self._on_live_task_done)
+
+        self._last_degraded_at_mono = time.monotonic()
+        self._recompute_aggregate_state()
+        self._broadcast_status()
+
+    async def _quarantine_malformed_tick(
+        self,
+        *,
+        key: StorageDatasetKey,
+        bar_time: int | None,
+        bar_open_1m: int,
+        issue_code: str,
+        detail: str,
+        raw_summary: str,
+    ) -> None:
+        try:
+            await self._sqlite.record_quality_issues(
+                key,
+                [
+                    QualityIssueInput(
+                        bar_time=bar_time,
+                        interval_start=bar_open_1m,
+                        interval_end=bar_open_1m + 60,
+                        issue_code=issue_code,
+                        detail=detail,
+                        raw_payload=raw_summary[:2048],
+                    )
+                ],
+            )
+            await self._sqlite.record_coverage(
+                key,
+                bar_open_1m,
+                bar_open_1m + 60,
+                status="CORRUPTED",
+                quarantined_count=1,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning("Failed to persist SignalR tick quarantine: %s", self._redact(str(exc)))
 
     def _bump_generation_and_cancel_live_tasks(self) -> int:
         self._generation += 1
@@ -510,6 +601,7 @@ class LiveFeedService:
             maxsize=self._settings.signalr_recovery_queue_maxsize
         )
         self._recovery_overflowed = False
+        self._pending_recovery_ticks_count = 0
 
     def _start_recovery_task(self, *, now_utc: int | None = None) -> asyncio.Task[None]:
         if self._recovery_task is not None and not self._recovery_task.done():
@@ -536,7 +628,14 @@ class LiveFeedService:
                 evt = self._recovery_queue.get_nowait()
             except asyncio.QueueEmpty:
                 break
+            if (
+                self._pending_recovery_ticks_count
+                >= self._settings.signalr_recovery_queue_maxsize
+            ):
+                self._record_recovery_overflow(self._contracts.get(evt.contract_id))
+                continue
             pending_by_contract.setdefault(evt.contract_id.upper(), []).append(evt)
+            self._pending_recovery_ticks_count += 1
 
     def _effective_last_activity_monotonic(self) -> float | None:
         candidates = [
@@ -748,6 +847,9 @@ class LiveFeedService:
 
         self._drain_into_contract_buckets(pending_by_contract)
         contract_ticks = pending_by_contract.pop(cid, [])
+        self._pending_recovery_ticks_count = max(
+            0, self._pending_recovery_ticks_count - len(contract_ticks)
+        )
         normalized_ticks = [
             NormalizedTick(
                 contract_id=t.contract_id,
@@ -773,13 +875,16 @@ class LiveFeedService:
             root_symbol=c_state.root_symbol,
             mark_open_incomplete=mark_open_inc,
         )
-        # Clear any unconfirmed tick-closed markers emitted strictly inside this recovery merge;
-        # completeness check below detects missing REST bars directly.
-        self._aggregator.pop_discarded_incomplete_bars(
+        closed_end = latest_closed_bucket_end_utc(eff_now, tf, root_symbol=c_state.root_symbol)
+        # Preserve any unconfirmed tick-closed buckets at or after closed_end (P1-NEW-002).
+        discarded_in_recon = self._aggregator.pop_discarded_incomplete_bars(
             contract_id=cid, live_mode=c_state.live_mode
         )
-
-        closed_end = latest_closed_bucket_end_utc(eff_now, tf, root_symbol=c_state.root_symbol)
+        post_window_discarded = [
+            d_time
+            for _d_cid, _d_live, d_tf, d_time in discarded_in_recon
+            if d_tf == tf and d_time >= closed_end
+        ]
         cached_closed: Sequence[OHLCVBar] = ()
         if closed_end > backfill_start:
             cached_closed = await self._parquet.read_bars(
@@ -815,6 +920,22 @@ class LiveFeedService:
                     provider_gap=True,
                 )
 
+        if post_window_discarded:
+            earliest_post = min(post_window_discarded)
+            if not had_gap:
+                had_gap = True
+                c_state.unresolved_gaps += 1
+                c_state.unhealed_gap_starts[tf] = (
+                    earliest_post
+                    if unhealed_start is None
+                    else min(unhealed_start, earliest_post)
+                )
+            else:
+                prev_gap = c_state.unhealed_gap_starts.get(tf)
+                c_state.unhealed_gap_starts[tf] = (
+                    earliest_post if prev_gap is None else min(prev_gap, earliest_post)
+                )
+
         self._ensure_generation(expected_gen)
         closed_bars = [evt.bar for evt in recon.closed_bars]
         if closed_bars:
@@ -826,6 +947,10 @@ class LiveFeedService:
             )
             self._ensure_generation(expected_gen)
 
+        recorded_gap = c_state.unhealed_gap_starts.get(tf)
+        if not had_gap and recorded_gap is not None and recorded_gap >= closed_end:
+            # Never clear a newer unhealed gap occurring outside this recovery window (P1-NEW-002).
+            had_gap = True
         if not had_gap:
             c_state.unhealed_gap_starts.pop(tf, None)
             if recon.last_closed_bar_time is not None:
@@ -1070,6 +1195,7 @@ class LiveFeedService:
                 for tick_list in pending_by_contract.values():
                     remaining.extend(tick_list)
                 pending_by_contract.clear()
+                self._pending_recovery_ticks_count = 0
 
                 if not remaining:
                     self._recovery_duration_ms = int((time.monotonic() - started_mono) * 1000)
@@ -1114,6 +1240,8 @@ class LiveFeedService:
             self._recovery_duration_ms = int((time.monotonic() - started_mono) * 1000)
             self._transition_all_contracts("DEGRADED")
             logger.warning("Recovery coordinator error: %s", self._last_error)
+        finally:
+            self._pending_recovery_ticks_count = 0
 
     def _on_live_task_done(self, task: asyncio.Task[None]) -> None:
         self._live_tick_tasks.discard(task)

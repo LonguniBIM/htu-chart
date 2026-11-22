@@ -81,6 +81,19 @@ class SignalRTickEvent:
 
 
 @dataclass(frozen=True)
+class SignalRMalformedTickEvent:
+    """Malformed market tick/quote payload rejected during SignalR parsing (R04)."""
+
+    contract_id: str | None
+    live_mode: bool
+    reason: str
+    issue_code: str
+    raw_summary: str
+    bar_time: int | None
+    received_monotonic: float
+
+
+@dataclass(frozen=True)
 class SignalRErrorEvent:
     """Redacted transport or protocol error observed by SignalRMarketHub."""
 
@@ -89,7 +102,11 @@ class SignalRErrorEvent:
 
 
 SignalREvent = (
-    SignalRConnectedEvent | SignalRDisconnectedEvent | SignalRTickEvent | SignalRErrorEvent
+    SignalRConnectedEvent
+    | SignalRDisconnectedEvent
+    | SignalRTickEvent
+    | SignalRMalformedTickEvent
+    | SignalRErrorEvent
 )
 EventCallback = Callable[[SignalREvent], Awaitable[None] | None]
 
@@ -172,13 +189,23 @@ def parse_market_hub_frames(raw_message: str | bytes) -> list[dict[str, Any]]:
     return frames
 
 
-def extract_ticks_from_invocation(
+def _extract_item_timestamp(item: Mapping[str, Any]) -> int | None:
+    raw_ts: Any = None
+    for ts_key in ("timestamp", "lastUpdated", "t", "ts"):
+        if ts_key in item and item[ts_key] is not None:
+            raw_ts = item[ts_key]
+            break
+    ts_val = _parse_signalr_timestamp(raw_ts)
+    return int(math.floor(ts_val)) if ts_val is not None else None
+
+
+def parse_market_invocation_events(
     frame: Mapping[str, Any],
     *,
     live_mode: bool,
     received_monotonic: float,
-) -> list[SignalRTickEvent]:
-    """Extract normalized market ticks from a SignalR GatewayQuote/GatewayTrade frame."""
+) -> list[SignalRTickEvent | SignalRMalformedTickEvent]:
+    """Extract ticks and malformed-tick quarantine events from a SignalR invocation."""
     if frame.get("type") != 1:
         return []
     target = str(frame.get("target") or "")
@@ -204,13 +231,26 @@ def extract_ticks_from_invocation(
     elif isinstance(args[0], list):
         payload_items.extend(item for item in args[0] if isinstance(item, Mapping))
 
-    ticks: list[SignalRTickEvent] = []
+    events: list[SignalRTickEvent | SignalRMalformedTickEvent] = []
     for item in payload_items:
+        raw_summary = json.dumps(item, default=str)[:512]
         # Preserve explicit callback contractId over symbolId (ProjectX payloads set symbolId).
         raw_cid = item.get("contractId") or default_contract or item.get("symbolId")
         if not isinstance(raw_cid, str) or not raw_cid.strip():
+            events.append(
+                SignalRMalformedTickEvent(
+                    contract_id=default_contract,
+                    live_mode=live_mode,
+                    reason="Missing or empty SignalR contractId",
+                    issue_code="invalid_contract",
+                    raw_summary=raw_summary,
+                    bar_time=_extract_item_timestamp(item),
+                    received_monotonic=received_monotonic,
+                )
+            )
             continue
         cid = raw_cid.strip().upper()
+        best_bar_time = _extract_item_timestamp(item)
 
         raw_price: Any = None
         for price_key in ("lastPrice", "price", "tradePrice", "p", "c"):
@@ -218,9 +258,31 @@ def extract_ticks_from_invocation(
                 raw_price = item[price_key]
                 break
         if raw_price is None:
+            events.append(
+                SignalRMalformedTickEvent(
+                    contract_id=cid,
+                    live_mode=live_mode,
+                    reason=f"Missing price in {target} tick",
+                    issue_code="missing_price",
+                    raw_summary=raw_summary,
+                    bar_time=best_bar_time,
+                    received_monotonic=received_monotonic,
+                )
+            )
             continue
         price = _parse_finite_number(raw_price)
         if price is None or price <= 0.0:
+            events.append(
+                SignalRMalformedTickEvent(
+                    contract_id=cid,
+                    live_mode=live_mode,
+                    reason=f"Invalid price {raw_price!r} in {target} tick",
+                    issue_code="invalid_price",
+                    raw_summary=raw_summary,
+                    bar_time=best_bar_time,
+                    received_monotonic=received_monotonic,
+                )
+            )
             continue
 
         # GatewayQuote carries cumulative session volume; only GatewayTrade volume is incremental.
@@ -234,6 +296,19 @@ def extract_ticks_from_invocation(
                     break
             parsed_vol = _parse_finite_number(raw_vol)
             if parsed_vol is None or parsed_vol < 0.0:
+                events.append(
+                    SignalRMalformedTickEvent(
+                        contract_id=cid,
+                        live_mode=live_mode,
+                        reason=f"Invalid trade volume {raw_vol!r} in {target} tick",
+                        issue_code="negative_volume"
+                        if parsed_vol is not None and parsed_vol < 0.0
+                        else "invalid_volume",
+                        raw_summary=raw_summary,
+                        bar_time=best_bar_time,
+                        received_monotonic=received_monotonic,
+                    )
+                )
                 continue
             volume = parsed_vol
 
@@ -244,9 +319,20 @@ def extract_ticks_from_invocation(
                 break
         ts_sec = _parse_signalr_timestamp(raw_ts)
         if ts_sec is None:
+            events.append(
+                SignalRMalformedTickEvent(
+                    contract_id=cid,
+                    live_mode=live_mode,
+                    reason=f"Invalid timestamp {raw_ts!r} in {target} tick",
+                    issue_code="invalid_timestamp",
+                    raw_summary=raw_summary,
+                    bar_time=None,
+                    received_monotonic=received_monotonic,
+                )
+            )
             continue
 
-        ticks.append(
+        events.append(
             SignalRTickEvent(
                 contract_id=cid,
                 live_mode=live_mode,
@@ -257,7 +343,25 @@ def extract_ticks_from_invocation(
                 received_monotonic=received_monotonic,
             )
         )
-    return ticks
+    return events
+
+
+def extract_ticks_from_invocation(
+    frame: Mapping[str, Any],
+    *,
+    live_mode: bool,
+    received_monotonic: float,
+) -> list[SignalRTickEvent]:
+    """Extract normalized market ticks from a SignalR GatewayQuote/GatewayTrade frame."""
+    return [
+        evt
+        for evt in parse_market_invocation_events(
+            frame,
+            live_mode=live_mode,
+            received_monotonic=received_monotonic,
+        )
+        if isinstance(evt, SignalRTickEvent)
+    ]
 
 
 class SignalRMarketHub:
@@ -334,6 +438,8 @@ class SignalRMarketHub:
         self._send_lock = asyncio.Lock()
         self._recent_tokens: deque[str] = deque(maxlen=4)
         self._pending_subscriptions: dict[str, tuple[str, str]] = {}
+        self._subscribed_contracts: set[str] = set()
+        self._sub_sync_lock = asyncio.Lock()
 
     @staticmethod
     def _normalize_contracts(contracts: Sequence[str]) -> list[str]:
@@ -468,6 +574,26 @@ class SignalRMarketHub:
         await self._send_invocation(ws, "UnsubscribeContractQuotes", [contract_id])
         await self._send_invocation(ws, "UnsubscribeContractTrades", [contract_id])
 
+    async def _sync_session_subscriptions(self, ws: SignalRWebSocketTransport) -> None:
+        async with self._sub_sync_lock:
+            while self._ws is ws:
+                desired = set(self._contracts)
+                to_unsub = sorted(self._subscribed_contracts - desired)
+                to_sub = sorted(desired - self._subscribed_contracts)
+                if not to_unsub and not to_sub:
+                    return
+                for removed in to_unsub:
+                    self._subscribed_contracts.discard(removed)
+                    with contextlib.suppress(Exception):
+                        await self._unsubscribe_contract(ws, removed)
+                for added in to_sub:
+                    self._subscribed_contracts.add(added)
+                    try:
+                        await self._subscribe_contract(ws, added)
+                    except Exception:
+                        self._subscribed_contracts.discard(added)
+                        raise
+
     async def update_contracts(
         self,
         contracts: Sequence[str],
@@ -476,8 +602,6 @@ class SignalRMarketHub:
     ) -> None:
         """Update active contract subscriptions (unsubscribe removed, subscribe added)."""
         new_contracts = self._normalize_contracts(contracts)
-        old_set = set(self._contracts)
-        new_set = set(new_contracts)
         self._contracts = new_contracts
 
         if live_mode is not None and bool(live_mode) != self._live_mode:
@@ -487,21 +611,12 @@ class SignalRMarketHub:
 
         ws = self._ws
         if ws is not None and self._connected:
-            for removed in sorted(old_set - new_set):
-                with contextlib.suppress(Exception):
-                    await self._unsubscribe_contract(ws, removed)
-            for added in sorted(new_set - old_set):
-                try:
-                    await self._subscribe_contract(ws, added)
-                except Exception as exc:
-                    safe_err = self._redact(str(exc) or type(exc).__name__)
-                    logger.warning(
-                        "SignalR dynamic subscribe failed for %s: %s",
-                        added,
-                        safe_err,
-                    )
-                    await self.trigger_reconnect()
-                    return
+            try:
+                await self._sync_session_subscriptions(ws)
+            except Exception as exc:
+                safe_err = self._redact(str(exc) or type(exc).__name__)
+                logger.warning("SignalR dynamic contract sync failed: %s", safe_err)
+                await self.trigger_reconnect()
 
     async def trigger_reconnect(self) -> None:
         """Force an immediate reconnect cycle (e.g. on JWT refresh)."""
@@ -552,6 +667,47 @@ class SignalRMarketHub:
                 )
             await self._send_raw(ws, SIGNALR_PING_FRAME)
 
+    def _handle_completion_frame(self, frame: Mapping[str, Any], token: str | None) -> None:
+        inv_id = frame.get("invocationId")
+        sub_info = (
+            self._pending_subscriptions.pop(str(inv_id), None)
+            if inv_id is not None
+            else None
+        )
+        err_msg = frame.get("error")
+        if err_msg:
+            safe_err = self._redact(str(err_msg), token)
+            target_desc = (
+                f"{sub_info[0]}({sub_info[1]})"
+                if sub_info is not None
+                else f"invocation={inv_id}"
+            )
+            raise ConnectionError(f"SignalR invocation rejected ({target_desc}): {safe_err}")
+
+    async def _emit_frame_events(
+        self,
+        frame: Mapping[str, Any],
+        *,
+        recv_mono: float,
+        token: str | None,
+    ) -> None:
+        for evt in parse_market_invocation_events(
+            frame,
+            live_mode=self._live_mode,
+            received_monotonic=recv_mono,
+        ):
+            if isinstance(evt, SignalRMalformedTickEvent):
+                evt = SignalRMalformedTickEvent(
+                    contract_id=evt.contract_id,
+                    live_mode=evt.live_mode,
+                    reason=self._redact(evt.reason, token),
+                    issue_code=evt.issue_code,
+                    raw_summary=self._redact(evt.raw_summary, token),
+                    bar_time=evt.bar_time,
+                    received_monotonic=evt.received_monotonic,
+                )
+            await self._emit(evt)
+
     async def _run_single_session(self) -> None:
         token: str | None = None
         ws: SignalRWebSocketTransport | None = None
@@ -582,18 +738,49 @@ class SignalRMarketHub:
                 raise ConnectionError(f"SignalR handshake error: {handshake_frames[0]['error']}")
 
             self._pending_subscriptions.clear()
+            self._subscribed_contracts.clear()
             now_mono = time.monotonic()
             self._last_event_monotonic = now_mono
 
-            for cid in tuple(self._contracts):
-                await self._subscribe_contract(ws, cid)
+            await self._sync_session_subscriptions(ws)
+
+            ack_timeout = min(self._connect_timeout, self._heartbeat_timeout)
+            deadline_mono = time.monotonic() + ack_timeout
+            while self._pending_subscriptions or set(self._contracts) != self._subscribed_contracts:
+                if set(self._contracts) != self._subscribed_contracts:
+                    await self._sync_session_subscriptions(ws)
+                    continue
+                remaining = deadline_mono - time.monotonic()
+                if remaining <= 0:
+                    pending_desc = ", ".join(
+                        f"{tgt}({cid})" for tgt, cid in self._pending_subscriptions.values()
+                    )
+                    raise TimeoutError(
+                        f"SignalR subscribe completion timed out after {ack_timeout}s "
+                        f"waiting for: {pending_desc}"
+                    )
+                raw_msg = await asyncio.wait_for(ws.recv(), timeout=remaining)
+                recv_mono = time.monotonic()
+                self._last_event_monotonic = recv_mono
+                for frame in parse_market_hub_frames(raw_msg):
+                    msg_type = frame.get("type")
+                    if msg_type == 6:
+                        continue
+                    if msg_type == 3:
+                        self._handle_completion_frame(frame, token)
+                        continue
+                    if msg_type == 7:
+                        err_detail = frame.get("error") or "Server sent SignalR close frame"
+                        disconnect_reason = self._redact(str(err_detail), token)
+                        return
+                    await self._emit_frame_events(frame, recv_mono=recv_mono, token=token)
 
             self._connected = True
             await self._emit(
                 SignalRConnectedEvent(
                     contracts=tuple(self._contracts),
                     live_mode=self._live_mode,
-                    connected_monotonic=now_mono,
+                    connected_monotonic=time.monotonic(),
                 )
             )
 
@@ -631,34 +818,13 @@ class SignalRMarketHub:
                     if msg_type == 6:
                         continue
                     if msg_type == 3:
-                        inv_id = frame.get("invocationId")
-                        sub_info = (
-                            self._pending_subscriptions.pop(str(inv_id), None)
-                            if inv_id is not None
-                            else None
-                        )
-                        err_msg = frame.get("error")
-                        if err_msg:
-                            safe_err = self._redact(str(err_msg), token)
-                            target_desc = (
-                                f"{sub_info[0]}({sub_info[1]})"
-                                if sub_info is not None
-                                else f"invocation={inv_id}"
-                            )
-                            raise ConnectionError(
-                                f"SignalR invocation rejected ({target_desc}): {safe_err}"
-                            )
+                        self._handle_completion_frame(frame, token)
                         continue
                     if msg_type == 7:
                         err_detail = frame.get("error") or "Server sent SignalR close frame"
                         disconnect_reason = self._redact(str(err_detail), token)
                         return
-                    for tick in extract_ticks_from_invocation(
-                        frame,
-                        live_mode=self._live_mode,
-                        received_monotonic=recv_mono,
-                    ):
-                        await self._emit(tick)
+                    await self._emit_frame_events(frame, recv_mono=recv_mono, token=token)
 
         except asyncio.CancelledError:
             raise
@@ -680,6 +846,7 @@ class SignalRMarketHub:
             self._connected = False
             self._ws = None
             self._pending_subscriptions.clear()
+            self._subscribed_contracts.clear()
             await self._close_ws(ws)
             if was_connected:
                 await self._emit(

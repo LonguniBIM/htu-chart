@@ -163,6 +163,7 @@ class BarAggregator:
         self._open_bars: dict[tuple[str, bool, str], OHLCVBar] = {}
         self._open_bar_ts_bounds: dict[tuple[str, bool, str], tuple[float, float]] = {}
         self._incomplete_open_bars: set[tuple[str, bool, str]] = set()
+        self._incomplete_open_buckets: dict[tuple[str, bool, str], int] = {}
         self._discarded_incomplete_bars: list[tuple[str, bool, str, int]] = []
         self._last_closed_times: dict[tuple[str, bool, str], int] = {}
         self._root_symbols: dict[tuple[str, bool], str | None] = {}
@@ -217,6 +218,9 @@ class BarAggregator:
                 self._open_bars.pop(key, None)
                 self._open_bar_ts_bounds.pop(key, None)
                 self._incomplete_open_bars.discard(key)
+        for key in list(self._incomplete_open_buckets):
+            if key[0] == cid and (live_mode is None or key[1] == bool(live_mode)):
+                self._incomplete_open_buckets.pop(key, None)
         self._discarded_incomplete_bars = [
             item
             for item in self._discarded_incomplete_bars
@@ -228,6 +232,24 @@ class BarAggregator:
         for rkey in list(self._root_symbols):
             if rkey[0] == cid and (live_mode is None or rkey[1] == bool(live_mode)):
                 self._root_symbols.pop(rkey, None)
+
+    def mark_open_bucket_incomplete(
+        self,
+        contract_id: str,
+        live_mode: bool,
+        ts_sec: int,
+    ) -> None:
+        """Mark the open bucket containing ts_sec as incomplete across configured timeframes."""
+        cid = _normalize_contract_id(contract_id)
+        eff_live = bool(live_mode)
+        for tf in self._timeframes:
+            stream_key = (cid, eff_live, tf)
+            bucket_ts = bucket_open_utc(ts_sec, tf)
+            existing = self._open_bars.get(stream_key)
+            if existing is not None and existing.time == bucket_ts:
+                self._incomplete_open_bars.add(stream_key)
+            else:
+                self._incomplete_open_buckets[stream_key] = bucket_ts
 
     def pop_discarded_incomplete_bars(
         self,
@@ -409,6 +431,12 @@ class BarAggregator:
                 if new_res.is_valid and new_res.bar is not None:
                     self._open_bars[stream_key] = new_res.bar
                     self._open_bar_ts_bounds[stream_key] = (raw_ts, raw_ts)
+                    pending_inc = self._incomplete_open_buckets.get(stream_key)
+                    if pending_inc is not None:
+                        if bucket_ts == pending_inc:
+                            self._incomplete_open_bars.add(stream_key)
+                        if bucket_ts >= pending_inc:
+                            self._incomplete_open_buckets.pop(stream_key, None)
                     emitted.append(
                         AggregatedBarEvent(
                             contract_id=cid,
@@ -575,6 +603,7 @@ class BarAggregator:
                     float(rebuilt_open.time),
                 )
             # An open bar carried/rebuilt across recovery has not been REST-confirmed closed.
+            self._incomplete_open_buckets.pop(stream_key, None)
             if mark_open_incomplete:
                 self._incomplete_open_bars.add(stream_key)
             else:
@@ -591,6 +620,10 @@ class BarAggregator:
             self._open_bars.pop(stream_key, None)
             self._open_bar_ts_bounds.pop(stream_key, None)
             self._incomplete_open_bars.discard(stream_key)
+            if mark_open_incomplete:
+                self._incomplete_open_buckets[stream_key] = bucket_open_utc(eff_now, tf)
+            else:
+                self._incomplete_open_buckets.pop(stream_key, None)
 
         final_last_closed = max(
             (t for t in (*merged_closed.keys(), prev_closed) if t is not None),

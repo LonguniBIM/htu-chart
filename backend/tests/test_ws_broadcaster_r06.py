@@ -480,8 +480,8 @@ def test_r06_ws_subscribe_triggers_upstream_signalr_and_streams_live_bars(
 
     Defect caught: WS subscribe updating broadcaster only without starting SignalR (P1-001/P2-002).
     """
-    now_ts = int(datetime.now(UTC).timestamp())
-    bar_open_ts = now_ts - (now_ts % 60)
+    clock_now = BASE_T + 15  # Deterministic open CME session timestamp (no wall-clock drift)
+    bar_open_ts = BASE_T
     transports: list[_MockSignalRTransport] = []
 
     async def ws_factory(_url: str, _headers: dict[str, str]) -> _MockSignalRTransport:
@@ -515,7 +515,12 @@ def test_r06_ws_subscribe_triggers_upstream_signalr_and_streams_live_bars(
         data_dir=tmp_path / "data",
     )
     upstream = httpx.AsyncClient(transport=httpx.MockTransport(handler))
-    app = create_app(settings=settings, http_client=upstream, signalr_ws_factory=ws_factory)
+    app = create_app(
+        settings=settings,
+        http_client=upstream,
+        signalr_ws_factory=ws_factory,
+        clock=lambda: clock_now,
+    )
 
     try:
         with TestClient(
@@ -567,8 +572,10 @@ def test_r06_ws_subscribe_triggers_upstream_signalr_and_streams_live_bars(
                 # and verify client receives bar_update for CON.F.US.MES.Z26 with volume=4.0!
                 portal = client.portal
                 assert portal is not None
-                portal.call(transports[0].push_quote, "CON.F.US.MES.Z26", now_ts, 5955.0, 12000.0)
-                portal.call(transports[0].push_trade, "CON.F.US.MES.Z26", now_ts, 5955.25, 4.0)
+                portal.call(
+                    transports[0].push_quote, "CON.F.US.MES.Z26", clock_now, 5955.0, 12000.0
+                )
+                portal.call(transports[0].push_trade, "CON.F.US.MES.Z26", clock_now, 5955.25, 4.0)
 
                 deadline = time.monotonic() + 2.0
                 received_bar = None

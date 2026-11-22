@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from typing import Any
 
@@ -72,6 +72,7 @@ def create_app(
     settings: Settings | None = None,
     http_client: httpx.AsyncClient | None = None,
     signalr_ws_factory: WsConnectFactory | None = None,
+    clock: Callable[[], int] | None = None,
 ) -> FastAPI:
     """Create and configure the FastAPI application instance."""
     resolved_settings = settings or load_settings()
@@ -133,6 +134,7 @@ def create_app(
             aggregator=bar_aggregator,
             broadcaster=ws_broadcaster,
             signalr_hub=signalr_hub,
+            clock=clock,
         )
 
         app_instance.state.settings = resolved_settings
