@@ -187,8 +187,10 @@ class BarAggregator:
         live_mode: bool,
         timeframe: str,
         bar_time: int,
+        *,
+        authoritative: bool = True,
     ) -> None:
-        """Seed or advance the REST-authoritative closed-bar watermark for a stream."""
+        """Seed or advance the closed-bar watermark (and optionally REST authority)."""
         cid = _normalize_contract_id(contract_id)
         tf = normalize_timeframe(timeframe)
         key = (cid, bool(live_mode), tf)
@@ -196,9 +198,10 @@ class BarAggregator:
         prev = self._last_closed_times.get(key)
         if prev is None or val > prev:
             self._last_closed_times[key] = val
-        prev_rest = self._rest_authoritative_closed_times.get(key)
-        if prev_rest is None or val > prev_rest:
-            self._rest_authoritative_closed_times[key] = val
+        if authoritative:
+            prev_rest = self._rest_authoritative_closed_times.get(key)
+            if prev_rest is None or val > prev_rest:
+                self._rest_authoritative_closed_times[key] = val
 
     def get_last_closed_time(
         self,
@@ -628,17 +631,18 @@ class BarAggregator:
 
         latest_hist_closed = max(closed_by_time.keys(), default=None)
         prev_closed = self._last_closed_times.get(stream_key)
+        prev_rest = self._rest_authoritative_closed_times.get(stream_key)
         auth_cutoff = max(
-            (t for t in (latest_hist_closed, prev_closed) if t is not None),
+            (t for t in (latest_hist_closed, prev_rest) if t is not None),
             default=None,
         )
-        m1_last_closed = (
-            self._last_closed_times.get((cid, eff_live, "1m"))
+        m1_rest_closed = (
+            self._rest_authoritative_closed_times.get((cid, eff_live, "1m"))
             if tf != "1m" and "1m" in self._timeframes
             else None
         )
 
-        # Replay only valid buffered ticks belonging to buckets strictly newer than closed history.
+        # Replay buffered ticks in buckets strictly newer than REST-confirmed history.
         # Preserve exact float timestamps for sub-second ordering, tie-breaking by arrival index.
         eligible_ticks: list[tuple[float, int, NormalizedTick]] = []
         rejected_ticks: list[tuple[NormalizedTick, str]] = []
@@ -652,7 +656,7 @@ class BarAggregator:
             bucket_ts = bucket_open_utc(ts_sec, tf)
             if auth_cutoff is not None and bucket_ts <= auth_cutoff:
                 continue
-            if m1_last_closed is not None and bucket_open_utc(ts_sec, "1m") <= m1_last_closed:
+            if m1_rest_closed is not None and bucket_open_utc(ts_sec, "1m") <= m1_rest_closed:
                 continue
             eligible_ticks.append((float(tick.timestamp_utc_sec), idx, tick))
 

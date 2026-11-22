@@ -5682,9 +5682,13 @@ async def test_f03_htf_volume_overflow_from_1m_bars_quarantined_and_degrades(
     parquet = ParquetStore(settings.data_dir, sqlite_store=sqlite)
 
     t0 = first_bucket_open_at_or_after(BASE_T, "5m")
+    overflow_active = [True]
 
     class _Overflow1mRest:
-        async def retrieve_bars_paginated(self, **_kw: Any) -> Any:
+        async def retrieve_bars_paginated(self, **kw: Any) -> Any:
+            s_ts = int(kw["start_ts"])
+            e_ts = int(kw["end_ts"])
+            vol = 1e308 if overflow_active[0] else 10.0
             bars = [
                 {
                     "t": t0 + i * 60,
@@ -5692,9 +5696,10 @@ async def test_f03_htf_volume_overflow_from_1m_bars_quarantined_and_degrades(
                     "h": 102.0,
                     "l": 99.0,
                     "c": 101.0,
-                    "v": 1e308,
+                    "v": vol,
                 }
                 for i in range(5)
+                if s_ts <= t0 + i * 60 < e_ts
             ]
             return type("R", (), {"raw_bars": bars, "truncated": False, "provider_gap": False})()
 
@@ -5724,6 +5729,7 @@ async def test_f03_htf_volume_overflow_from_1m_bars_quarantined_and_degrades(
             key_5m = StorageDatasetKey("topstepx", False, CID_MES, "5m")
             wm_5m = await sqlite.get_watermark(key_5m)
             assert wm_5m is None
+            assert await sqlite.is_interval_complete(key_5m, t0, t0 + 300) is False
             issues = await sqlite.list_quality_issues(key_5m)
             assert any(
                 i["interval_start"] == t0 and "volume" in str(i["issue_code"]) for i in issues
@@ -5732,6 +5738,21 @@ async def test_f03_htf_volume_overflow_from_1m_bars_quarantined_and_degrades(
                 key_5m, start_ts=t0, end_ts=t0 + 300, include_provisional=True
             )
             assert bars_5m == []
+
+            # Repaired 1m data heals HTF bar and SQLite CORRUPTED coverage to COMPLETE (P1-002).
+            overflow_active[0] = False
+            await svc._run_recovery(now_utc=t0 + 310)
+            healed_snap = svc.get_status_snapshot()
+            assert healed_snap["contracts"][CID_MES]["state"] == "LIVE"
+            assert healed_snap["live_alerts_enabled"] is True
+            assert await sqlite.is_interval_complete(key_5m, t0, t0 + 300) is True
+            cov_5m = await sqlite.get_coverage_intervals(key_5m)
+            assert cov_5m and all(row.status == "COMPLETE" for row in cov_5m)
+            healed_wm = await sqlite.get_watermark(key_5m)
+            assert healed_wm is not None and healed_wm.last_closed_bar_time == t0
+            healed_bars = await parquet.read_bars(key_5m, start_ts=t0, end_ts=t0 + 300)
+            assert len(healed_bars) == 1
+            assert healed_bars[0].time == t0 and healed_bars[0].volume == 50.0
         finally:
             await svc.stop()
             sqlite.close()
@@ -7592,3 +7613,228 @@ async def test_f03_signalr_bounded_event_queue_overflow_surfaces_error_and_disco
     finally:
         await hub.stop()
         assert task.done()
+
+
+@pytest.mark.asyncio
+async def test_f03_same_generation_quarantine_delayed_until_after_rest_heal_keeps_complete(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Contract: P1-001 ensures delayed same-gen quarantine cannot overwrite REST-healed COMPLETE.
+    Defect caught: coverage_write_lock only guarding queued_gen != _generation.
+    """
+    settings = Settings(data_dir=tmp_path / "data", signalr_enabled=True)
+    sqlite_store = SqliteStore(tmp_path / "meta.db")
+    sqlite_store.initialize()
+    parquet_store = ParquetStore(settings.data_dir, sqlite_store=sqlite_store)
+
+    rest_entered = asyncio.Event()
+    release_rest = asyncio.Event()
+    issues_entered = asyncio.Event()
+    release_issues = asyncio.Event()
+    hold_rest = [False]
+    hold_issues = [False]
+
+    class _GatedRest:
+        async def retrieve_bars_paginated(self, **kw: Any) -> Any:
+            if hold_rest[0]:
+                rest_entered.set()
+                await asyncio.wait_for(release_rest.wait(), timeout=2.0)
+            s_ts = int(kw["start_ts"])
+            e_ts = int(kw["end_ts"])
+            bars = [
+                {"t": ts, "o": 100.0, "h": 101.0, "l": 99.0, "c": 100.0, "v": 2.0}
+                for ts in range(s_ts - (s_ts % 60), e_ts, 60)
+            ]
+            return type("R", (), {"raw_bars": bars, "truncated": False, "provider_gap": False})()
+
+    orig_record_issues = sqlite_store.record_quality_issues
+
+    async def gated_record_issues(key: StorageDatasetKey, issues: list[Any]) -> int:
+        res = await orig_record_issues(key, issues)
+        if hold_issues[0]:
+            issues_entered.set()
+            await asyncio.wait_for(release_issues.wait(), timeout=2.0)
+        return res
+
+    monkeypatch.setattr(sqlite_store, "record_quality_issues", gated_record_issues)
+
+    def _auth_handler(_req: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"success": True, "errorCode": 0, "token": "jwt-samegen"})
+
+    try:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(_auth_handler)) as client:
+            auth = TopstepAuthService(settings, client)
+            await auth.login("alice", "key-samegen")
+            now_ref = [BASE_T + 65]
+            svc = LiveFeedService(
+                settings,
+                auth,
+                _GatedRest(),
+                parquet_store,
+                sqlite_store,
+                recovery_timeframes=("1m",),
+                initial_backfill_bars=2,
+                clock=lambda: now_ref[0],
+            )
+            try:
+                await svc.set_active_contracts([CID_MES], live_mode=False)
+                hold_rest[0] = True
+                hold_issues[0] = True
+                svc._contracts[CID_MES].state = "RECOVERING"
+                svc._last_connected_utc = BASE_T + 5
+                rec_task = asyncio.create_task(svc._run_recovery(now_utc=BASE_T + 65))
+                await asyncio.wait_for(rest_entered.wait(), timeout=2.0)
+
+                # Bad tick for closed minute BASE_T arrives during RECOVERING in same generation.
+                svc._handle_malformed_signalr_tick(
+                    SignalRMalformedTickEvent(
+                        contract_id=CID_MES,
+                        live_mode=False,
+                        reason="bad volume",
+                        issue_code="invalid_tick",
+                        raw_summary="{'v': -3}",
+                        bar_time=BASE_T + 20,
+                        received_monotonic=time.monotonic(),
+                    )
+                )
+                await asyncio.wait_for(issues_entered.wait(), timeout=2.0)
+
+                # Same-generation REST finishes healing [..., BASE_T + 60) -> LIVE!
+                release_rest.set()
+                await asyncio.wait_for(rec_task, timeout=2.0)
+                assert svc._contracts[CID_MES].state == "LIVE"
+                assert svc._contracts[CID_MES].unresolved_gaps == 0
+
+                # Delayed same-generation quarantine releases after heal -> COMPLETE stays intact!
+                release_issues.set()
+                await svc.flush_pending_tasks()
+                key_1m = StorageDatasetKey("topstepx", False, CID_MES, "1m")
+                assert await sqlite_store.is_interval_complete(key_1m, BASE_T, BASE_T + 60) is True
+                assert svc._contracts[CID_MES].unresolved_gaps == 0
+                assert svc.feed_state == "LIVE"
+            finally:
+                release_rest.set()
+                release_issues.set()
+                await svc.stop()
+    finally:
+        sqlite_store.close()
+
+
+@pytest.mark.asyncio
+async def test_f03_buffered_late_tick_in_recovering_after_local_watermark_stays_degraded(
+    tmp_path: Path,
+) -> None:
+    """Contract: PASS2-001 never treats a local-only watermark as REST-authoritative in recovery.
+    Defect caught: local watermark suppressing buffered late tick in RECOVERING & healing stale T.
+    """
+    settings = Settings(data_dir=tmp_path / "data", signalr_enabled=True)
+    sqlite = SqliteStore(tmp_path / "meta.db")
+    sqlite.initialize()
+    parquet = ParquetStore(settings.data_dir, sqlite_store=sqlite)
+
+    t0 = first_bucket_open_at_or_after(BASE_T, "5m")
+    now_t = [t0 + 10]
+    omit_t0 = [True]
+
+    class _RestReconnect:
+        async def retrieve_bars_paginated(self, **kw: Any) -> Any:
+            s_ts = int(kw["start_ts"])
+            e_ts = int(kw["end_ts"])
+            cutoff = now_t[0] - (now_t[0] % 60)
+            bars = []
+            for ts in range(s_ts - (s_ts % 60), min(e_ts, cutoff), 60):
+                if ts == t0:
+                    if omit_t0[0]:
+                        continue
+                    bars.append(
+                        {"t": ts, "o": 100.0, "h": 105.0, "l": 100.0, "c": 105.0, "v": 4.0}
+                    )
+                else:
+                    bars.append(
+                        {"t": ts, "o": 100.0, "h": 101.0, "l": 99.0, "c": 100.0, "v": 1.0}
+                    )
+            return type("R", (), {"raw_bars": bars, "truncated": False, "provider_gap": False})()
+
+    def _auth_handler(_req: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"success": True, "errorCode": 0, "token": "jwt-p2-wm"})
+
+    key_1m = StorageDatasetKey("topstepx", False, CID_MES, "1m")
+    try:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(_auth_handler)) as client:
+            auth = TopstepAuthService(settings, client)
+            await auth.login("alice", "api-key")
+
+            # Phase 1: Confirm < t0 via REST, ingest tick in t0, flush locally at t0+61 (vol=1).
+            svc1 = LiveFeedService(
+                settings,
+                auth,
+                _RestReconnect(),
+                parquet,
+                sqlite,
+                aggregator=BarAggregator(timeframes=("1m",)),
+                recovery_timeframes=("1m",),
+                initial_backfill_bars=2,
+                clock=lambda: now_t[0],
+            )
+            try:
+                await svc1.set_active_contracts([CID_MES])
+                svc1._last_connected_utc = t0 - 30
+                await svc1.trigger_recovery(now_utc=now_t[0])
+                assert svc1.feed_state == "LIVE"
+
+                svc1.handle_hub_event(
+                    SignalRTickEvent(
+                        CID_MES, False, t0 + 10, 100.0, 1.0, "GatewayTrade", time.monotonic()
+                    )
+                )
+                await svc1.flush_pending_tasks()
+                now_t[0] = t0 + 61
+                await svc1.run_watchdog_tick()
+                wm = await sqlite.get_watermark(key_1m)
+                assert wm is not None and wm.last_closed_bar_time == t0
+                assert await sqlite.is_interval_complete(key_1m, t0, t0 + 60) is False
+            finally:
+                await svc1.stop()
+
+            # Phase 2: Fresh service reads local watermark t0 during recovery; late tick for t0
+            # is buffered in RECOVERING while REST returns < t0 (omitting t0) -> MUST stay DEGRADED!
+            now_t[0] = t0 + 65
+            svc2 = LiveFeedService(
+                settings,
+                auth,
+                _RestReconnect(),
+                parquet,
+                sqlite,
+                aggregator=BarAggregator(timeframes=("1m",)),
+                recovery_timeframes=("1m",),
+                initial_backfill_bars=2,
+                clock=lambda: now_t[0],
+            )
+            try:
+                await svc2.set_active_contracts([CID_MES])
+                svc2._contracts[CID_MES].state = "RECOVERING"
+                svc2._last_connected_utc = t0 + 64
+                svc2.handle_hub_event(
+                    SignalRTickEvent(
+                        CID_MES, False, t0 + 59.9, 105.0, 3.0, "GatewayTrade", time.monotonic()
+                    )
+                )
+                await svc2._run_recovery(now_utc=now_t[0])
+                assert svc2.feed_state == "DEGRADED"
+                assert svc2.live_alerts_enabled is False
+                assert await sqlite.is_interval_complete(key_1m, t0, t0 + 60) is False
+
+                # Once REST returns repaired t0 (vol=4.0, high=105.0), recovery heals -> LIVE!
+                omit_t0[0] = False
+                now_t[0] = t0 + 66
+                await svc2._run_recovery(now_utc=now_t[0])
+                assert svc2.feed_state == "LIVE"
+                assert svc2.live_alerts_enabled is True
+                assert await sqlite.is_interval_complete(key_1m, t0, t0 + 60) is True
+                persisted = await parquet.read_bars(key_1m, start_ts=t0, end_ts=t0 + 60)
+                assert any(b.time == t0 and b.volume == 4.0 and b.high == 105.0 for b in persisted)
+            finally:
+                await svc2.stop()
+    finally:
+        sqlite.close()

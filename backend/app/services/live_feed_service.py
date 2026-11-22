@@ -86,6 +86,7 @@ class ContractFeedRuntime:
     unhealed_gap_starts: dict[str, int] = field(default_factory=dict)
     unhealed_gap_buckets: dict[str, set[int]] = field(default_factory=dict)
     subscribed_at_utc: int | None = None
+    coverage_heal_seq: int = 0
 
 
 class LiveFeedService:
@@ -154,7 +155,7 @@ class LiveFeedService:
             maxsize=settings.signalr_recovery_queue_maxsize
         )
         self._quarantine_queue: asyncio.Queue[
-            tuple[StorageDatasetKey, int | None, int, str, str, str, int]
+            tuple[StorageDatasetKey, int | None, int, str, str, str, int, int]
         ] = asyncio.Queue(maxsize=settings.signalr_recovery_queue_maxsize)
         self._quarantine_worker_task: asyncio.Task[None] | None = None
         self._recovery_overflowed = False
@@ -766,6 +767,7 @@ class LiveFeedService:
 
         if cid:
             self._aggregator.mark_open_bucket_incomplete(cid, live_mode, eff_ts)
+            queued_heal_seq = c_state.coverage_heal_seq if c_state is not None else 0
             item = (
                 StorageDatasetKey("topstepx", live_mode, cid, primary_tf),
                 safe_bar_time,
@@ -774,6 +776,7 @@ class LiveFeedService:
                 redacted_reason,
                 self._redact(event.raw_summary),
                 self._generation,
+                queued_heal_seq,
             )
             try:
                 self._quarantine_queue.put_nowait(item)
@@ -800,7 +803,16 @@ class LiveFeedService:
         while True:
             item = await self._quarantine_queue.get()
             try:
-                key, bar_time, bar_open_1m, issue_code, detail, raw_summary, queued_gen = item
+                (
+                    key,
+                    bar_time,
+                    bar_open_1m,
+                    issue_code,
+                    detail,
+                    raw_summary,
+                    queued_gen,
+                    queued_heal_seq,
+                ) = item
                 await self._quarantine_malformed_tick(
                     key=key,
                     bar_time=bar_time,
@@ -809,6 +821,7 @@ class LiveFeedService:
                     detail=detail,
                     raw_summary=raw_summary,
                     queued_gen=queued_gen,
+                    queued_heal_seq=queued_heal_seq,
                 )
             finally:
                 self._quarantine_queue.task_done()
@@ -823,6 +836,7 @@ class LiveFeedService:
         detail: str,
         raw_summary: str,
         queued_gen: int,
+        queued_heal_seq: int,
     ) -> None:
         try:
             c_state = self._contracts.get(key.contract_id)
@@ -842,10 +856,15 @@ class LiveFeedService:
                 ],
             )
             async with self._coverage_write_lock:
-                skip_corrupted_coverage = False
+                c_state = self._contracts.get(key.contract_id)
                 is_stale_gen = queued_gen != self._generation
-                if is_stale_gen:
-                    c_state = self._contracts.get(key.contract_id)
+                healed_since_queue = (
+                    is_stale_gen
+                    or c_state is None
+                    or c_state.coverage_heal_seq != queued_heal_seq
+                )
+                skip_corrupted_coverage = False
+                if healed_since_queue:
                     tf_buckets = (
                         c_state.unhealed_gap_buckets.get(key.timeframe, set())
                         if c_state is not None
@@ -873,7 +892,7 @@ class LiveFeedService:
                         bar_end,
                         status="CORRUPTED",
                         quarantined_count=1,
-                        skip_if_complete=is_stale_gen,
+                        skip_if_complete=healed_since_queue,
                     )
         except asyncio.CancelledError:
             raise
@@ -1115,8 +1134,19 @@ class LiveFeedService:
         wm = await self._sqlite.get_watermark(key)
         self._ensure_generation(expected_gen)
         if wm is not None:
+            _, wm_end = bucket_bounds(
+                wm.last_closed_bar_time, tf, root_symbol=c_state.root_symbol
+            )
+            wm_authoritative = await self._sqlite.is_interval_complete(
+                key, wm.last_closed_bar_time, wm_end
+            )
+            self._ensure_generation(expected_gen)
             self._aggregator.set_last_closed_time(
-                cid, c_state.live_mode, tf, wm.last_closed_bar_time
+                cid,
+                c_state.live_mode,
+                tf,
+                wm.last_closed_bar_time,
+                authoritative=wm_authoritative,
             )
             c_state.watermarks[tf] = wm.last_closed_bar_time
             backfill_start = max(
@@ -1141,12 +1171,18 @@ class LiveFeedService:
                     )
                     backfill_start = min(backfill_start, htf_overlap)
 
-            htf_candidates = [bucket_open_utc(backfill_start, htf) for htf in align_for_higher_tfs]
-            htf_candidates.extend(
+            unhealed_htf_starts = [
                 bucket_open_utc(c_state.unhealed_gap_starts[htf], htf)
                 for htf in align_for_higher_tfs
                 if htf in c_state.unhealed_gap_starts
-            )
+            ]
+            if unhealed_htf_starts:
+                backfill_start = min(
+                    backfill_start,
+                    max(DEFAULT_MIN_BAR_TIMESTAMP, min(unhealed_htf_starts)),
+                )
+            htf_candidates = [bucket_open_utc(backfill_start, htf) for htf in align_for_higher_tfs]
+            htf_candidates.extend(unhealed_htf_starts)
             aligned_htf_start = max(DEFAULT_MIN_BAR_TIMESTAMP, min(htf_candidates))
             if aligned_htf_start < backfill_start:
                 missing_ranges = await self._sqlite.compute_missing_ranges(
@@ -1301,14 +1337,21 @@ class LiveFeedService:
                 ),
                 reason=rej_reason,
             )
-        # Preserve any unconfirmed tick-closed buckets at or after closed_end (P1-NEW-002).
+        # Preserve any unconfirmed tick-closed buckets at or after closed_end (P1-NEW-002),
+        # and prevent local-only cached bars from self-healing buffered unconfirmed buckets.
         discarded_in_recon = self._aggregator.pop_discarded_incomplete_bars(
             contract_id=cid, live_mode=c_state.live_mode
         )
-        post_window_discarded = [
+        discarded_tf_times = {
             d_time
             for _d_cid, _d_live, d_tf, d_time in discarded_in_recon
-            if d_tf == tf and d_time >= closed_end
+            if d_tf == tf
+        }
+        post_window_discarded = [d_time for d_time in discarded_tf_times if d_time >= closed_end]
+        in_window_discarded = [
+            d_time
+            for d_time in discarded_tf_times
+            if backfill_start <= d_time < closed_end
         ]
         cached_closed: Sequence[OHLCVBar] = ()
         if closed_end > backfill_start:
@@ -1322,13 +1365,18 @@ class LiveFeedService:
 
         coverage_rows = await self._sqlite.get_coverage_intervals(key)
         self._ensure_generation(expected_gen)
+        complete_ranges = [
+            (cov.start_ts, cov.end_ts)
+            for cov in coverage_rows
+            if cov.status == "COMPLETE"
+        ]
         non_complete_ranges = [
             (cov.start_ts, cov.end_ts)
             for cov in coverage_rows
             if cov.status != "COMPLETE"
         ]
 
-        # Only non-corrupted cached closed bars or fresh valid REST bars heal gaps (PASS2-001).
+        # Only REST-confirmed (COMPLETE coverage) cached bars or fresh valid REST bars heal gaps.
         unhealed_tf_buckets = c_state.unhealed_gap_buckets.get(tf, set())
         unhealed_1m_buckets = (
             c_state.unhealed_gap_buckets.get("1m", set()) if tf != "1m" else set()
@@ -1338,10 +1386,12 @@ class LiveFeedService:
             for b in cached_closed
             if b.is_closed
             and b.time not in unhealed_tf_buckets
+            and b.time not in discarded_tf_times
             and not any(
                 b.time <= g1m < bucket_bounds(b.time, tf, root_symbol=c_state.root_symbol)[1]
                 for g1m in unhealed_1m_buckets
             )
+            and any(c_start <= b.time < c_end for c_start, c_end in complete_ranges)
             and not any(c_start <= b.time < c_end for c_start, c_end in non_complete_ranges)
         }
         present_closed_times = valid_cached_times | {
@@ -1369,6 +1419,12 @@ class LiveFeedService:
                         status="PROVIDER_GAP",
                         provider_gap=True,
                     )
+
+        if in_window_discarded and not had_gap:
+            earliest_in_win = min(in_window_discarded)
+            had_gap = True
+            c_state.unresolved_gaps += 1
+            self._record_gap_bucket(c_state, tf, earliest_in_win)
 
         if post_window_discarded:
             earliest_post = min(post_window_discarded)
@@ -1404,6 +1460,7 @@ class LiveFeedService:
                         status="COMPLETE",
                         heal_existing=True,
                     )
+                    c_state.coverage_heal_seq += 1
             if self._clear_healed_gap_buckets(c_state, tf, backfill_start, closed_end):
                 had_gap = True
 
@@ -1473,8 +1530,19 @@ class LiveFeedService:
             wm_htf = await self._sqlite.get_watermark(key_htf)
             self._ensure_generation(expected_gen)
             if wm_htf is not None:
+                _, wm_htf_end = bucket_bounds(
+                    wm_htf.last_closed_bar_time, htf, root_symbol=c_state.root_symbol
+                )
+                wm_htf_auth = await self._sqlite.is_interval_complete(
+                    key_htf, wm_htf.last_closed_bar_time, wm_htf_end
+                )
+                self._ensure_generation(expected_gen)
                 self._aggregator.set_last_closed_time(
-                    cid, c_state.live_mode, htf, wm_htf.last_closed_bar_time
+                    cid,
+                    c_state.live_mode,
+                    htf,
+                    wm_htf.last_closed_bar_time,
+                    authoritative=wm_htf_auth,
                 )
                 c_state.watermarks[htf] = wm_htf.last_closed_bar_time
 
@@ -1546,6 +1614,17 @@ class LiveFeedService:
                 htf_closed_end = latest_closed_bucket_end_utc(
                     eff_now, htf, root_symbol=c_state.root_symbol
                 )
+                if htf_closed_end > covered_start_utc:
+                    async with self._coverage_write_lock:
+                        self._ensure_generation(expected_gen)
+                        await self._sqlite.record_coverage(
+                            key_htf,
+                            covered_start_utc,
+                            htf_closed_end,
+                            status="COMPLETE",
+                            heal_existing=True,
+                        )
+                        c_state.coverage_heal_seq += 1
                 self._clear_healed_gap_buckets(c_state, htf, covered_start_utc, htf_closed_end)
                 if recon_htf.last_closed_bar_time is not None:
                     updated_wm = await self._sqlite.upsert_watermark(
