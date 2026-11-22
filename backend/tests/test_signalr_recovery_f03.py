@@ -7148,3 +7148,190 @@ async def test_f03_signalr_non_dict_element_in_batch_and_scalar_payload_quaranti
         finally:
             await svc.stop()
             sqlite.close()
+
+
+@pytest.mark.asyncio
+async def test_f03_quarantine_delayed_after_quality_issues_cannot_overwrite_complete(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Contract: P1-001 serializes generation check & coverage write so CORRUPTED never overwrites
+    a healed COMPLETE interval after record_quality_issues completes.
+    Defect caught: TOCTOU race between generation check and record_coverage(CORRUPTED).
+    """
+    clock_ref = [BASE_T + 15]
+    transports: list[_MockSignalRTransport] = []
+
+    async def ws_factory(_url: str, _headers: dict[str, str]) -> _MockSignalRTransport:
+        t = _MockSignalRTransport()
+        transports.append(t)
+        return t
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/Auth/loginKey":
+            return httpx.Response(200, json={"success": True, "token": "jwt-cov"})
+        if request.url.path == "/api/History/retrieveBars":
+            payload = json.loads(request.content.decode("utf-8"))
+            return httpx.Response(
+                200,
+                json={"success": True, "bars": _bars_for_history_payload(payload)},
+            )
+        return httpx.Response(404)
+
+    settings = Settings(data_dir=tmp_path / "data")
+    sqlite_store = SqliteStore(tmp_path / "meta.db")
+    sqlite_store.initialize()
+    orig_record_issues = sqlite_store.record_quality_issues
+    post_issues_gate = asyncio.Event()
+    release_post_issues = asyncio.Event()
+
+    async def after_issues_gate(key: StorageDatasetKey, issues: list[Any]) -> int:
+        res = await orig_record_issues(key, issues)
+        post_issues_gate.set()
+        await asyncio.wait_for(release_post_issues.wait(), timeout=2.0)
+        return res
+
+    monkeypatch.setattr(sqlite_store, "record_quality_issues", after_issues_gate)
+    try:
+        parquet_store = ParquetStore(settings.data_dir, sqlite_store=sqlite_store)
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            auth = TopstepAuthService(settings, client)
+            await auth.login("alice", "key-cov")
+            rest = TopstepRestClient(settings, auth, client)
+            hub = SignalRMarketHub(
+                settings,
+                auth_service=auth,
+                ws_factory=ws_factory,
+                contracts=[CID_MES],
+            )
+            svc = LiveFeedService(
+                settings,
+                auth,
+                rest,
+                parquet_store,
+                sqlite_store,
+                signalr_hub=hub,
+                recovery_timeframes=("1m",),
+                clock=lambda: clock_ref[0],
+            )
+            try:
+                await svc.set_active_contracts([CID_MES], live_mode=False)
+                await svc.start()
+                for _ in range(100):
+                    if svc.feed_state == "LIVE":
+                        break
+                    await asyncio.sleep(0.01)
+                assert svc.feed_state == "LIVE"
+
+                await transports[0].push_frame(_quote_frame(CID_MES, BASE_T + 20, 5951.0, -3.0))
+                await asyncio.wait_for(post_issues_gate.wait(), timeout=2.0)
+                assert svc.feed_state == "DEGRADED"
+
+                clock_ref[0] = BASE_T + 65
+                await svc.trigger_recovery()
+                assert svc.feed_state == "LIVE"
+
+                release_post_issues.set()
+                await svc.flush_pending_tasks()
+                key = StorageDatasetKey("topstepx", False, CID_MES, "1m")
+                assert await sqlite_store.is_interval_complete(key, BASE_T, BASE_T + 60) is True
+                await sqlite_store.record_coverage(
+                    key,
+                    BASE_T,
+                    BASE_T + 60,
+                    status="CORRUPTED",
+                    quarantined_count=1,
+                    skip_if_complete=True,
+                )
+                assert await sqlite_store.is_interval_complete(key, BASE_T, BASE_T + 60) is True
+                assert svc.feed_state == "LIVE"
+            finally:
+                release_post_issues.set()
+                await svc.stop()
+    finally:
+        sqlite_store.close()
+
+
+@pytest.mark.asyncio
+async def test_f03_tail_drain_sorts_out_of_order_ticks_by_market_timestamp(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Contract: P1-002 sorts tail-drained buffered ticks by market timestamp before process_tick.
+    Defect caught: B+65 arriving before B+5 dropping B tick silently while declaring LIVE.
+    """
+    b0 = BASE_T
+    b1 = BASE_T + 60
+    b2 = BASE_T + 120
+    b3 = BASE_T + 180
+    clock_ref = [b2 + 20]
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/Auth/loginKey":
+            return httpx.Response(200, json={"success": True, "token": "jwt-ooo-tail"})
+        if request.url.path == "/api/History/retrieveBars":
+            payload = json.loads(request.content.decode("utf-8"))
+            bars = _bars_for_history_payload(
+                payload,
+                overrides={b0: _wire_bar(b0, 100.0, 102.0, 99.0, 101.0, 5.0)},
+            )
+            return httpx.Response(200, json={"success": True, "bars": bars})
+        return httpx.Response(404)
+
+    settings = Settings(data_dir=tmp_path / "data", signalr_recovery_timeout_sec=5.0)
+    sqlite_store = SqliteStore(tmp_path / "meta.db")
+    sqlite_store.initialize()
+    try:
+        parquet_store = ParquetStore(settings.data_dir, sqlite_store=sqlite_store)
+        orig_upsert = parquet_store.upsert_bars
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            auth = TopstepAuthService(settings, client)
+            await auth.login("alice", "key-ooo-tail")
+            rest = TopstepRestClient(settings, auth, client)
+            agg = BarAggregator(timeframes=("1m",))
+            svc = LiveFeedService(
+                settings,
+                auth,
+                rest,
+                parquet_store,
+                sqlite_store,
+                aggregator=agg,
+                recovery_timeframes=("1m",),
+                clock=lambda: clock_ref[0],
+            )
+            await svc.set_active_contracts([CID_MES], live_mode=False)
+            svc._transition_all_contracts("RECOVERING")
+            svc._last_connected_utc = b1 + 30
+
+            injected = False
+
+            async def hook_upsert(*args: Any, **kwargs: Any) -> Any:
+                nonlocal injected
+                bars_arg = args[1] if len(args) > 1 else []
+                if not injected and any(getattr(b, "time", None) == b1 for b in bars_arg):
+                    injected = True
+                    clock_ref[0] = b3 + 20
+                    svc.handle_hub_event(
+                        SignalRTickEvent(CID_MES, False, b3 + 5, 115.0, 3.0, "GatewayTrade", 1.0)
+                    )
+                    svc.handle_hub_event(
+                        SignalRTickEvent(CID_MES, False, b2 + 5, 110.0, 2.0, "GatewayTrade", 2.0)
+                    )
+                return await orig_upsert(*args, **kwargs)
+
+            monkeypatch.setattr(parquet_store, "upsert_bars", hook_upsert)
+
+            await svc.trigger_recovery(now_utc=b2 + 20)
+            assert injected is True
+            assert svc.feed_state == "LIVE"
+            key_1m = StorageDatasetKey("topstepx", False, CID_MES, "1m")
+            persisted = await parquet_store.read_bars(key_1m, start_ts=b0, end_ts=b3)
+            assert [bar.time for bar in persisted] == [b0, b1, b2]
+            assert persisted[2].volume == 2.0
+            wm_1m = await sqlite_store.get_watermark(key_1m)
+            assert wm_1m is not None and wm_1m.last_closed_bar_time == b2
+            assert agg.get_open_bar(CID_MES, False, "1m") == OHLCVBar(
+                b3, 115.0, 115.0, 115.0, 115.0, 3.0, is_closed=False
+            )
+    finally:
+        sqlite_store.close()

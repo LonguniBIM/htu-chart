@@ -371,6 +371,7 @@ class SqliteStore:
         truncated: bool = False,
         provider_gap: bool = False,
         heal_existing: bool = False,
+        skip_if_complete: bool = False,
     ) -> None:
         if start_ts > end_ts:
             raise ValueError(f"start_ts ({start_ts}) must be <= end_ts ({end_ts})")
@@ -440,6 +441,12 @@ class SqliteStore:
                         (*key_params, c_s, c_e, now_ts),
                     )
             else:
+                if skip_if_complete and start_ts < end_ts:
+                    uncovered = [(start_ts, end_ts)]
+                    for c_s, c_e in complete_ranges:
+                        uncovered = _subtract_interval(uncovered, c_s, c_e)
+                        if not uncovered:
+                            return
                 self._trim_non_complete_rows_locked(
                     conn, key_params, non_complete_rows, start_ts, end_ts, now_ts
                 )
@@ -499,6 +506,7 @@ class SqliteStore:
         truncated: bool = False,
         provider_gap: bool = False,
         heal_existing: bool = False,
+        skip_if_complete: bool = False,
     ) -> None:
         """Record a coverage interval while preserving non-COMPLETE integrity boundaries."""
         await asyncio.to_thread(
@@ -511,6 +519,7 @@ class SqliteStore:
             truncated=truncated,
             provider_gap=provider_gap,
             heal_existing=heal_existing,
+            skip_if_complete=skip_if_complete,
         )
 
     def _get_coverage_intervals_sync(self, key: StorageDatasetKey) -> list[CoverageInterval]:

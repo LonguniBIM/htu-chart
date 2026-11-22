@@ -172,6 +172,7 @@ class LiveFeedService:
         self._last_auth_retry_mono: float | None = None
         self._auth_retry_delay_sec = max(0.01, settings.signalr_reconnect_initial_delay_sec)
         self._hub_lifecycle_lock = asyncio.Lock()
+        self._coverage_write_lock = asyncio.Lock()
 
     @property
     def hub(self) -> SignalRMarketHub:
@@ -840,36 +841,40 @@ class LiveFeedService:
                     )
                 ],
             )
-            skip_corrupted_coverage = False
-            if queued_gen != self._generation:
-                tf_buckets = (
-                    c_state.unhealed_gap_buckets.get(key.timeframe, set())
-                    if c_state is not None
-                    else set()
-                )
-                gap_tf = (
-                    c_state.unhealed_gap_starts.get(key.timeframe)
-                    if c_state is not None
-                    else None
-                )
-                still_unhealed = c_state is not None and (
-                    bar_open_1m in tf_buckets or (gap_tf is not None and gap_tf <= bar_open_1m)
-                )
-                contract_healed = c_state is not None and (
-                    c_state.state == "LIVE" or not still_unhealed
-                )
-                if contract_healed or await self._sqlite.is_interval_complete(
-                    key, bar_open_1m, bar_end
-                ):
-                    skip_corrupted_coverage = True
-            if not skip_corrupted_coverage:
-                await self._sqlite.record_coverage(
-                    key,
-                    bar_open_1m,
-                    bar_end,
-                    status="CORRUPTED",
-                    quarantined_count=1,
-                )
+            async with self._coverage_write_lock:
+                skip_corrupted_coverage = False
+                is_stale_gen = queued_gen != self._generation
+                if is_stale_gen:
+                    c_state = self._contracts.get(key.contract_id)
+                    tf_buckets = (
+                        c_state.unhealed_gap_buckets.get(key.timeframe, set())
+                        if c_state is not None
+                        else set()
+                    )
+                    gap_tf = (
+                        c_state.unhealed_gap_starts.get(key.timeframe)
+                        if c_state is not None
+                        else None
+                    )
+                    still_unhealed = c_state is not None and (
+                        bar_open_1m in tf_buckets or (gap_tf is not None and gap_tf <= bar_open_1m)
+                    )
+                    contract_healed = c_state is not None and (
+                        c_state.state == "LIVE" or not still_unhealed
+                    )
+                    if contract_healed or await self._sqlite.is_interval_complete(
+                        key, bar_open_1m, bar_end
+                    ):
+                        skip_corrupted_coverage = True
+                if not skip_corrupted_coverage:
+                    await self._sqlite.record_coverage(
+                        key,
+                        bar_open_1m,
+                        bar_end,
+                        status="CORRUPTED",
+                        quarantined_count=1,
+                        skip_if_complete=is_stale_gen,
+                    )
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -1188,15 +1193,17 @@ class LiveFeedService:
             gap_from_rest_issues = False
             if issues:
                 await self._sqlite.record_quality_issues(key, issues)
-                await self._sqlite.record_coverage(
-                    key,
-                    backfill_start,
-                    backfill_end,
-                    status="CORRUPTED",
-                    quarantined_count=len(issues),
-                    truncated=page_res.truncated,
-                    provider_gap=page_res.provider_gap,
-                )
+                async with self._coverage_write_lock:
+                    self._ensure_generation(expected_gen)
+                    await self._sqlite.record_coverage(
+                        key,
+                        backfill_start,
+                        backfill_end,
+                        status="CORRUPTED",
+                        quarantined_count=len(issues),
+                        truncated=page_res.truncated,
+                        provider_gap=page_res.provider_gap,
+                    )
                 had_gap = True
                 gap_from_rest_issues = True
                 c_state.unresolved_gaps += 1
@@ -1344,13 +1351,15 @@ class LiveFeedService:
                 c_state.unresolved_gaps += 1
             if not issues and not page_res.truncated and not page_res.provider_gap:
                 self._record_gap_bucket(c_state, tf, missing_buckets[0])
-                await self._sqlite.record_coverage(
-                    key,
-                    missing_buckets[0],
-                    closed_end,
-                    status="PROVIDER_GAP",
-                    provider_gap=True,
-                )
+                async with self._coverage_write_lock:
+                    self._ensure_generation(expected_gen)
+                    await self._sqlite.record_coverage(
+                        key,
+                        missing_buckets[0],
+                        closed_end,
+                        status="PROVIDER_GAP",
+                        provider_gap=True,
+                    )
 
         if post_window_discarded:
             earliest_post = min(post_window_discarded)
@@ -1377,13 +1386,15 @@ class LiveFeedService:
                 )
                 c_state.watermarks[tf] = updated_wm.last_closed_bar_time
             if closed_end > backfill_start:
-                await self._sqlite.record_coverage(
-                    key,
-                    backfill_start,
-                    closed_end,
-                    status="COMPLETE",
-                    heal_existing=True,
-                )
+                async with self._coverage_write_lock:
+                    self._ensure_generation(expected_gen)
+                    await self._sqlite.record_coverage(
+                        key,
+                        backfill_start,
+                        closed_end,
+                        status="COMPLETE",
+                        heal_existing=True,
+                    )
             if self._clear_healed_gap_buckets(c_state, tf, backfill_start, closed_end):
                 had_gap = True
 
@@ -1483,14 +1494,15 @@ class LiveFeedService:
                             raw_payload=safe_detail[:2048],
                         )
                     )
-                    self._ensure_generation(expected_gen)
-                    await self._sqlite.record_coverage(
-                        key_htf,
-                        rej_time,
-                        rej_end,
-                        status="CORRUPTED",
-                        quarantined_count=1,
-                    )
+                    async with self._coverage_write_lock:
+                        self._ensure_generation(expected_gen)
+                        await self._sqlite.record_coverage(
+                            key_htf,
+                            rej_time,
+                            rej_end,
+                            status="CORRUPTED",
+                            quarantined_count=1,
+                        )
                     self._record_gap_bucket(c_state, htf, rej_time)
                     c_state.unresolved_gaps += 1
                     c_state.last_error = safe_detail
@@ -1701,8 +1713,11 @@ class LiveFeedService:
                             self._last_error = None
                     break
 
-                remaining.sort(key=lambda t: t.received_monotonic)
-                for tick_evt in remaining:
+                remaining_indexed = sorted(
+                    enumerate(remaining),
+                    key=lambda item: (float(item[1].timestamp_utc_sec), item[0]),
+                )
+                for _idx, tick_evt in remaining_indexed:
                     await self._process_live_tick(
                         tick_evt,
                         now_utc=eff_now,
