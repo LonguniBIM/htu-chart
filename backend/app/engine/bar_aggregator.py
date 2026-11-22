@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import math
-from collections.abc import Sequence
+from collections.abc import Collection, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 
@@ -333,6 +333,7 @@ class BarAggregator:
         *,
         now_utc: int | None = None,
         root_symbol: str | None = None,
+        skip_timeframes: Collection[str] = (),
     ) -> TickProcessResult:
         """Validate and aggregate a single tick into provisional/closed OHLCV bars."""
         eff_now = now_utc if now_utc is not None else _utc_now_sec()
@@ -348,6 +349,8 @@ class BarAggregator:
                 # Never double-count ticks belonging to REST-confirmed 1m minutes into HTF bars.
                 return TickProcessResult(accepted=True, reason=None, events=())
         for tf in self._timeframes:
+            if tf in skip_timeframes:
+                continue
             stream_key = (cid, live_mode, tf)
             bucket_ts = bucket_open_utc(ts_sec, tf)
             last_closed = self._last_closed_times.get(stream_key)
@@ -365,6 +368,8 @@ class BarAggregator:
         emitted: list[AggregatedBarEvent] = []
 
         for tf in self._timeframes:
+            if tf in skip_timeframes:
+                continue
             stream_key = (cid, live_mode, tf)
             bucket_ts = bucket_open_utc(ts_sec, tf)
             last_closed = self._last_closed_times.get(stream_key)

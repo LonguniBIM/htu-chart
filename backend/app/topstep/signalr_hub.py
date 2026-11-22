@@ -222,22 +222,38 @@ def parse_market_invocation_events(
         return []
 
     default_contract: str | None = None
-    payload_items: list[Mapping[str, Any]] = []
+    payload_items: list[Any] = []
     if len(args) >= 2 and isinstance(args[0], str):
         default_contract = args[0].strip().upper() or None
         second = args[1]
-        if isinstance(second, Mapping):
+        if isinstance(second, list):
+            payload_items.extend(second)
+        else:
             payload_items.append(second)
-        elif isinstance(second, list):
-            payload_items.extend(item for item in second if isinstance(item, Mapping))
-    elif isinstance(args[0], Mapping):
-        payload_items.append(args[0])
     elif isinstance(args[0], list):
-        payload_items.extend(item for item in args[0] if isinstance(item, Mapping))
+        payload_items.extend(args[0])
+    else:
+        payload_items.append(args[0])
 
     events: list[SignalRTickEvent | SignalRMalformedTickEvent] = []
     for item in payload_items:
         raw_summary = json.dumps(item, default=str)[:512]
+        if not isinstance(item, Mapping):
+            events.append(
+                SignalRMalformedTickEvent(
+                    contract_id=default_contract,
+                    live_mode=live_mode,
+                    reason=(
+                        f"Malformed {target or 'market'} payload element type: "
+                        f"{type(item).__name__}"
+                    ),
+                    issue_code="malformed_tick_payload",
+                    raw_summary=raw_summary,
+                    bar_time=None,
+                    received_monotonic=received_monotonic,
+                )
+            )
+            continue
         # Preserve explicit callback contractId over symbolId (ProjectX payloads set symbolId).
         raw_cid = item.get("contractId") or default_contract or item.get("symbolId")
         if not isinstance(raw_cid, str) or not raw_cid.strip():

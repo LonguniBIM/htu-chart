@@ -9,7 +9,7 @@ import json
 import logging
 import math
 import time
-from collections.abc import Awaitable, Callable, Sequence
+from collections.abc import Awaitable, Callable, Collection, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any, Literal
@@ -1665,6 +1665,10 @@ class LiveFeedService:
                 remaining: list[SignalRTickEvent] = []
                 for tick_list in pending_by_contract.values():
                     remaining.extend(tick_list)
+                applied_by_tick = {
+                    id(t): set(self._replayed_tick_tfs.get(id(t), ()))
+                    for t in remaining
+                }
                 pending_by_contract.clear()
                 self._replayed_tick_tfs.clear()
                 self._recalc_pending_recovery_count()
@@ -1703,6 +1707,7 @@ class LiveFeedService:
                         tick_evt,
                         now_utc=eff_now,
                         expected_gen=recovery_gen,
+                        skip_timeframes=applied_by_tick.get(id(tick_evt), ()),
                     )
 
             self._ensure_generation(recovery_gen)
@@ -1828,6 +1833,7 @@ class LiveFeedService:
         *,
         now_utc: int | None = None,
         expected_gen: int | None = None,
+        skip_timeframes: Collection[str] = (),
     ) -> None:
         self._ensure_generation(expected_gen)
         c_state = self._contracts.get(event.contract_id)
@@ -1844,7 +1850,12 @@ class LiveFeedService:
             volume=event.volume,
         )
         eff_now = now_utc if now_utc is not None else self._clock()
-        res = self._aggregator.process_tick(tick, now_utc=eff_now, root_symbol=root_sym)
+        res = self._aggregator.process_tick(
+            tick,
+            now_utc=eff_now,
+            root_symbol=root_sym,
+            skip_timeframes=skip_timeframes,
+        )
         self._handle_discarded_incomplete_bars(
             contract_id=event.contract_id,
             live_mode=event.live_mode,
@@ -2001,10 +2012,8 @@ class LiveFeedService:
                         )
                         self._last_error = None
                         if self._contracts and self._settings.signalr_enabled:
-                            self._transition_all_contracts("RECOVERING")
                             self._hub.start()
-                        else:
-                            self._recompute_aggregate_state()
+                        self._recompute_aggregate_state()
                         self._broadcast_status()
                         return
                     except (UpstreamTimeoutError, UpstreamHTTPError) as exc:
@@ -2060,10 +2069,13 @@ class LiveFeedService:
                 live_mode=c_state.live_mode,
             )
             if flushed:
+                if self._broadcaster is not None:
+                    for bar_evt in flushed:
+                        self._broadcaster.publish_bar(bar_evt)
                 await self._safe_persist_and_signal_events(
                     flushed,
                     now_utc=now_ts,
-                    broadcast=True,
+                    broadcast=False,
                     expected_gen=live_gen,
                 )
 

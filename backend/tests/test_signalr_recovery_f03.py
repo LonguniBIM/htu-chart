@@ -6602,7 +6602,7 @@ async def test_f03_delayed_subscribe_ack_across_minute_boundary_marks_new_minute
     settings = Settings(
         data_dir=tmp_path / "data",
         signalr_enabled=True,
-        signalr_ack_timeout_sec=1.0,
+        upstream_connect_timeout_sec=1.0,
     )
     sqlite = SqliteStore(tmp_path / "meta.db")
     sqlite.initialize()
@@ -6624,17 +6624,30 @@ async def test_f03_delayed_subscribe_ack_across_minute_boundary_marks_new_minute
             return type("R", (), {"raw_bars": bars, "truncated": False, "provider_gap": False})()
 
     tr = _MockSignalRTransport()
-    sub_entered = asyncio.Event()
-    sub_release = asyncio.Event()
+    ack_held = asyncio.Event()
+    held_inv_ids: list[str] = []
     orig_send = tr.send
 
-    async def _gated_send(data: str) -> None:
-        if mnq in data and not sub_entered.is_set():
-            sub_entered.set()
-            await asyncio.wait_for(sub_release.wait(), timeout=2.0)
-        await orig_send(data)
+    async def _defer_ack_send(data: str) -> None:
+        held_frames: list[str] = []
+        for chunk in data.split(SIGNALR_RECORD_SEPARATOR):
+            if not chunk.strip():
+                continue
+            frame = json.loads(chunk)
+            if (
+                frame.get("target") in {"SubscribeContractQuotes", "SubscribeContractTrades"}
+                and mnq in frame.get("arguments", ())
+                and frame.get("invocationId") is not None
+            ):
+                tr.sent_frames.append(frame)
+                held_inv_ids.append(str(frame["invocationId"]))
+                ack_held.set()
+            else:
+                held_frames.append(chunk + SIGNALR_RECORD_SEPARATOR)
+        if held_frames:
+            await orig_send("".join(held_frames))
 
-    monkeypatch.setattr(tr, "send", _gated_send)
+    monkeypatch.setattr(tr, "send", _defer_ack_send)
 
     async def _ws_factory(_u: str, _h: dict[str, str]) -> _MockSignalRTransport:
         return tr
@@ -6673,10 +6686,12 @@ async def test_f03_delayed_subscribe_ack_across_minute_boundary_marks_new_minute
 
             now_val[0] = BASE_T + 59
             sub_task = asyncio.create_task(svc.subscribe_ws_contract(mnq))
-            await asyncio.wait_for(sub_entered.wait(), timeout=2.0)
+            await asyncio.wait_for(ack_held.wait(), timeout=2.0)
+            await asyncio.sleep(0.01)
 
             now_val[0] = BASE_T + 61
-            sub_release.set()
+            for inv_id in held_inv_ids:
+                await tr.push_frame({"type": 3, "invocationId": inv_id})
             await asyncio.wait_for(sub_task, timeout=2.0)
             now_val[0] = BASE_T + 62
             if svc._recovery_task is not None:
@@ -6703,7 +6718,6 @@ async def test_f03_delayed_subscribe_ack_across_minute_boundary_marks_new_minute
             assert wm is not None and wm.last_closed_bar_time < BASE_T + 60
             assert svc._contracts[mnq].state == "DEGRADED"
         finally:
-            sub_release.set()
             await svc.stop()
             sqlite.close()
 
@@ -6802,6 +6816,335 @@ async def test_f03_non_1m_recovery_heals_malformed_tick_and_overflow_back_to_liv
             assert c_state.state == "LIVE"
             assert c_state.unhealed_gap_buckets == {}
             assert svc.live_alerts_enabled is True
+        finally:
+            await svc.stop()
+            sqlite.close()
+
+
+@pytest.mark.asyncio
+async def test_f03_watchdog_flush_publishes_closed_bar_before_next_open_bar_during_persist(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Contract: P1-001 publishes watchdog closed bars before awaiting Parquet persistence.
+    Defect caught: next-minute live tick publishing open B+1 ahead of closed B during await.
+    """
+    settings = Settings(data_dir=tmp_path / "data", signalr_enabled=True)
+    sqlite = SqliteStore(tmp_path / "meta.db")
+    sqlite.initialize()
+    parquet = ParquetStore(settings.data_dir, sqlite_store=sqlite)
+
+    now_t = [BASE_T + 10]
+    published: list[tuple[int, bool]] = []
+    upsert_entered = asyncio.Event()
+    release_upsert = asyncio.Event()
+
+    broadcaster = WsBroadcaster(client_queue_maxsize=16, send_timeout_sec=1.0)
+    monkeypatch.setattr(
+        broadcaster,
+        "publish_bar",
+        lambda event: published.append((event.bar.time, event.bar.is_closed)),
+    )
+
+    class _RestEmpty:
+        async def retrieve_bars_paginated(self, **_kw: Any) -> Any:
+            return type("R", (), {"raw_bars": [], "truncated": False, "provider_gap": False})()
+
+    orig_upsert = parquet.upsert_bars
+
+    async def _gated_upsert(*args: Any, **kwargs: Any) -> Any:
+        if not upsert_entered.is_set():
+            upsert_entered.set()
+            await asyncio.wait_for(release_upsert.wait(), timeout=2.0)
+        return await orig_upsert(*args, **kwargs)
+
+    monkeypatch.setattr(parquet, "upsert_bars", _gated_upsert)
+
+    def _auth_handler(_req: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"success": True, "errorCode": 0, "token": "test-jwt"})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(_auth_handler)) as client:
+        auth = TopstepAuthService(settings, client)
+        await auth.login("alice", "api-key")
+        svc = LiveFeedService(
+            settings,
+            auth,
+            _RestEmpty(),
+            parquet,
+            sqlite,
+            aggregator=BarAggregator(timeframes=("1m",)),
+            broadcaster=broadcaster,
+            recovery_timeframes=("1m",),
+            clock=lambda: now_t[0],
+        )
+        try:
+            await svc.set_active_contracts([CID_MES])
+            svc._contracts[CID_MES].state = "LIVE"
+            svc._feed_state = "LIVE"
+            svc._last_connected_utc = BASE_T - 30
+            now_mono = time.monotonic()
+            svc.handle_hub_event(
+                SignalRTickEvent(
+                    CID_MES, False, BASE_T + 5, 100.0, 2.0, "GatewayTrade", now_mono
+                )
+            )
+            await svc.flush_pending_tasks()
+            published.clear()
+
+            now_t[0] = BASE_T + 65
+            wd_task = asyncio.create_task(svc.run_watchdog_tick())
+            await asyncio.wait_for(upsert_entered.wait(), timeout=2.0)
+
+            svc.handle_hub_event(
+                SignalRTickEvent(
+                    CID_MES, False, BASE_T + 66, 101.0, 3.0, "GatewayTrade", now_mono + 1.0
+                )
+            )
+            release_upsert.set()
+            await asyncio.wait_for(wd_task, timeout=2.0)
+            await svc.flush_pending_tasks()
+
+            assert published == [(BASE_T, True), (BASE_T + 60, False)]
+        finally:
+            release_upsert.set()
+            await svc.stop()
+            sqlite.close()
+
+
+@pytest.mark.asyncio
+async def test_f03_cancelled_non_1m_recovery_preserves_replay_guard_when_retry_rest_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Contract: P1-002 preserves per-tick TF replay guard across tail drain after REST failure.
+    Defect caught: retry REST error before replayed_ticks leaving tail drain to double-add 5m vol.
+    """
+    settings = Settings(data_dir=tmp_path / "data", signalr_enabled=True)
+    sqlite = SqliteStore(tmp_path / "meta.db")
+    sqlite.initialize()
+    parquet = ParquetStore(settings.data_dir, sqlite_store=sqlite)
+
+    t0 = first_bucket_open_at_or_after(BASE_T, "15m")
+    upsert_5m_entered = asyncio.Event()
+    release_upsert = asyncio.Event()
+    fail_5m = False
+
+    class _SwitchRest:
+        async def retrieve_bars_paginated(self, **kw: Any) -> Any:
+            tf = kw.get("timeframe")
+            if fail_5m and tf == "5m":
+                raise ConnectionError("5m REST temporarily unreachable")
+            step = 300 if tf == "5m" else 900
+            bars = [{"t": t0 - step, "o": 100.0, "h": 101.0, "l": 99.0, "c": 100.0, "v": 4.0}]
+            return type("R", (), {"raw_bars": bars, "truncated": False, "provider_gap": False})()
+
+    orig_upsert = parquet.upsert_bars
+
+    async def _gated_upsert(*args: Any, **kwargs: Any) -> Any:
+        if args[0].timeframe == "5m" and not upsert_5m_entered.is_set():
+            upsert_5m_entered.set()
+            await asyncio.wait_for(release_upsert.wait(), timeout=2.0)
+        return await orig_upsert(*args, **kwargs)
+
+    monkeypatch.setattr(parquet, "upsert_bars", _gated_upsert)
+
+    def _auth_handler(_req: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"success": True, "errorCode": 0, "token": "test-jwt"})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(_auth_handler)) as client:
+        auth = TopstepAuthService(settings, client)
+        await auth.login("alice", "api-key")
+        agg = BarAggregator(timeframes=("5m", "15m"))
+        svc = LiveFeedService(
+            settings,
+            auth,
+            _SwitchRest(),
+            parquet,
+            sqlite,
+            aggregator=agg,
+            recovery_timeframes=("5m", "15m"),
+            initial_backfill_bars=1,
+            clock=lambda: t0 + 45,
+        )
+        try:
+            await svc.set_active_contracts([CID_MES])
+            svc._last_connected_utc = t0 - 30
+            svc._transition_all_contracts("RECOVERING")
+            svc.handle_hub_event(
+                SignalRTickEvent(CID_MES, False, t0 + 15, 105.5, 9.0, "GatewayTrade", 1.0)
+            )
+            t1 = svc._start_recovery_task(now_utc=t0 + 45)
+            await asyncio.wait_for(upsert_5m_entered.wait(), timeout=2.0)
+
+            fail_5m = True
+            svc._bump_generation_and_cancel_live_tasks()
+            t2 = svc._start_recovery_task(now_utc=t0 + 45)
+            release_upsert.set()
+            await asyncio.gather(t1, return_exceptions=True)
+            await asyncio.wait_for(t2, timeout=2.0)
+
+            assert svc.feed_state == "DEGRADED"
+            open_5m = agg.get_open_bar(CID_MES, False, "5m")
+            open_15m = agg.get_open_bar(CID_MES, False, "15m")
+            assert open_5m is not None and open_5m.volume == 9.0
+            assert open_15m is not None and open_15m.volume == 9.0
+        finally:
+            release_upsert.set()
+            await svc.stop()
+            sqlite.close()
+
+
+@pytest.mark.asyncio
+async def test_f03_watchdog_retry_login_keeps_disconnected_while_signalr_dial_fails(
+    tmp_path: Path,
+) -> None:
+    """Contract: P1-003 keeps feed DISCONNECTED after retry_login until SignalR connected.
+    Defect caught: transition to RECOVERING on retry_login getting stuck if WS dial fails.
+    """
+    settings = Settings(
+        data_dir=tmp_path / "data",
+        signalr_enabled=True,
+        signalr_reconnect_initial_delay_sec=0.02,
+    )
+    sqlite = SqliteStore(tmp_path / "meta.db")
+    sqlite.initialize()
+    parquet = ParquetStore(settings.data_dir, sqlite_store=sqlite)
+
+    dial_succeeds = False
+    dial_attempts = 0
+
+    async def _ws_factory(_u: str, _h: dict[str, str]) -> _MockSignalRTransport:
+        nonlocal dial_attempts
+        dial_attempts += 1
+        if not dial_succeeds:
+            raise ConnectionError("rtc dial refused")
+        return _MockSignalRTransport()
+
+    class _RestStub:
+        async def retrieve_bars_paginated(self, **_kw: Any) -> Any:
+            bars = [{"t": BASE_T - 60, "o": 100.0, "h": 101.0, "l": 99.0, "c": 100.0, "v": 2.0}]
+            return type("R", (), {"raw_bars": bars, "truncated": False, "provider_gap": False})()
+
+    def _auth_handler(_req: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"success": True, "errorCode": 0, "token": "jwt-retried"})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(_auth_handler)) as client:
+        auth = TopstepAuthService(settings, client)
+        auth._username = "alice"
+        auth._api_key = "api-key"
+        hub = SignalRMarketHub(
+            settings,
+            auth_service=auth,
+            contracts=[CID_MES],
+            ws_factory=_ws_factory,
+            reconnect_initial_delay_sec=0.02,
+            reconnect_max_delay_sec=0.02,
+        )
+        svc = LiveFeedService(
+            settings,
+            auth,
+            _RestStub(),
+            parquet,
+            sqlite,
+            signalr_hub=hub,
+            recovery_timeframes=("1m",),
+            initial_backfill_bars=1,
+            clock=lambda: BASE_T + 10,
+        )
+        try:
+            await svc.set_active_contracts([CID_MES])
+            svc._running = True
+            await svc.run_watchdog_tick()
+            await asyncio.sleep(0.05)
+
+            assert auth.is_connected is True
+            assert dial_attempts >= 1
+            assert svc.feed_state == "DISCONNECTED"
+            assert svc._contracts[CID_MES].state == "DISCONNECTED"
+
+            dial_succeeds = True
+            for _ in range(50):
+                if svc.feed_state == "LIVE":
+                    break
+                await asyncio.sleep(0.02)
+            assert svc.feed_state == "LIVE"
+        finally:
+            await svc.stop()
+            sqlite.close()
+
+
+@pytest.mark.asyncio
+async def test_f03_signalr_non_dict_element_in_batch_and_scalar_payload_quarantined(
+    tmp_path: Path,
+) -> None:
+    """Contract: P2-R04-001 quarantines non-dict elements/scalars in GatewayTrade/Quote frames.
+    Defect caught: silent filtering of non-Mapping items skipping quarantine & DEGRADED state.
+    """
+    from app.topstep.signalr_hub import parse_market_invocation_events
+
+    batch_frame = {
+        "type": 1,
+        "target": "GatewayTrade",
+        "arguments": [
+            CID_MES,
+            [
+                {"price": 5000.0, "volume": 1.0, "timestamp": BASE_T + 5},
+                None,
+                {"price": 5001.0, "volume": 2.0, "timestamp": BASE_T + 6},
+            ],
+        ],
+    }
+    parsed = parse_market_invocation_events(batch_frame, live_mode=False, received_monotonic=1.0)
+    assert len(parsed) == 3
+    assert isinstance(parsed[0], SignalRTickEvent)
+    assert isinstance(parsed[1], SignalRMalformedTickEvent)
+    assert parsed[1].issue_code == "malformed_tick_payload"
+    assert isinstance(parsed[2], SignalRTickEvent)
+
+    scalar_frame = {"type": 1, "target": "GatewayQuote", "arguments": [CID_MES, "bad-scalar"]}
+    scalar_parsed = parse_market_invocation_events(
+        scalar_frame, live_mode=False, received_monotonic=2.0
+    )
+    assert len(scalar_parsed) == 1
+    assert isinstance(scalar_parsed[0], SignalRMalformedTickEvent)
+    assert scalar_parsed[0].issue_code == "malformed_tick_payload"
+
+    settings = Settings(data_dir=tmp_path / "data")
+    sqlite = SqliteStore(tmp_path / "meta.db")
+    sqlite.initialize()
+    parquet = ParquetStore(settings.data_dir, sqlite_store=sqlite)
+
+    class _RestEmpty:
+        async def retrieve_bars_paginated(self, **_kw: Any) -> Any:
+            return type("R", (), {"raw_bars": [], "truncated": False, "provider_gap": False})()
+
+    def _auth_handler(_req: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"success": True, "errorCode": 0, "token": "test-jwt"})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(_auth_handler)) as client:
+        auth = TopstepAuthService(settings, client)
+        await auth.login("alice", "api-key")
+        svc = LiveFeedService(
+            settings,
+            auth,
+            _RestEmpty(),
+            parquet,
+            sqlite,
+            recovery_timeframes=("1m",),
+            clock=lambda: BASE_T + 10,
+        )
+        try:
+            await svc.set_active_contracts([CID_MES])
+            svc._contracts[CID_MES].state = "LIVE"
+            svc._feed_state = "LIVE"
+            svc.handle_hub_event(parsed[1])
+            await svc.flush_pending_tasks()
+
+            assert svc._contracts[CID_MES].state == "DEGRADED"
+            issues = await sqlite.list_quality_issues(
+                StorageDatasetKey("topstepx", False, CID_MES, "1m")
+            )
+            assert any(i["issue_code"] == "malformed_tick_payload" for i in issues)
         finally:
             await svc.stop()
             sqlite.close()
