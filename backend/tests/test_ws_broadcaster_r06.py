@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import time
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+import httpx
 import pytest
 from argon2 import PasswordHasher
 from fastapi.testclient import TestClient
@@ -18,6 +20,7 @@ from app.engine.bar_aggregator import AggregatedBarEvent
 from app.engine.ohlcv import OHLCVBar
 from app.main import create_app
 from app.services.ws_broadcaster import WS_CLOSE_SLOW_CONSUMER, WsBroadcaster
+from app.topstep.signalr_hub import SIGNALR_RECORD_SEPARATOR
 
 TEST_PASSWORD = "ws-market-test-password"
 TEST_PASSWORD_HASH = PasswordHasher().hash(TEST_PASSWORD)
@@ -114,7 +117,10 @@ def test_r06_ws_market_enforces_session_and_origin_before_accept(tmp_path: Path)
             }
 
             ws.send_json({"type": "ping"})
-            assert ws.receive_json() == {"type": "pong"}
+            pong = ws.receive_json()
+            while pong.get("type") == "feed_status":
+                pong = ws.receive_json()
+            assert pong == {"type": "pong"}
 
             # Trigger bar broadcast directly via app's broadcaster
             app.state.ws_broadcaster.publish_bar(
@@ -278,11 +284,17 @@ async def test_r06_open_bar_coalescing_preserves_closed_bars_and_disconnects_on_
     )
     assert len(sess.queue) == 3
 
-    # Release gate and verify closed bars and latest open bar are all delivered cleanly.
+    # Release gate and verify closed bars, coalesced latest open payload, and next open bar.
     gate.set()
     await asyncio.sleep(0.03)
     closed_times = [m["bar"]["time"] for m in blocked_ws.sent if m["bar"]["is_closed"]]
     assert closed_times == [BASE_T, BASE_T + 60]
+    coalesced_open = [
+        m for m in blocked_ws.sent if not m["bar"]["is_closed"] and m["bar"]["time"] == BASE_T + 60
+    ]
+    assert len(coalesced_open) == 1
+    assert coalesced_open[0]["bar"]["close"] == 5971.0
+    assert coalesced_open[0]["bar"]["volume"] == 20.0
     assert blocked_ws.sent[-1]["bar"]["time"] == BASE_T + 120
     assert blocked_ws.sent[-1]["bar"]["is_closed"] is False
 
@@ -344,3 +356,214 @@ async def test_r06_open_bar_coalescing_preserves_closed_bars_and_disconnects_on_
 
     gate.set()
     await broadcaster.close_all()
+
+
+class _MockSignalRTransport:
+    """Minimal SignalR WebSocket transport for full-app /ws/market -> SignalR integration test."""
+
+    def __init__(self) -> None:
+        self.sent_frames: list[dict[str, Any]] = []
+        self.incoming: asyncio.Queue[str | Exception] = asyncio.Queue()
+        self.subscribed_contracts: set[str] = set()
+        self.subscribed_event = asyncio.Event()
+
+    async def send(self, data: str) -> None:
+        for chunk in data.split(SIGNALR_RECORD_SEPARATOR):
+            if chunk.strip():
+                frame = json.loads(chunk)
+                self.sent_frames.append(frame)
+                if frame.get("protocol") == "json":
+                    await self.incoming.put("{}" + SIGNALR_RECORD_SEPARATOR)
+                elif frame.get("target") in {
+                    "SubscribeContractQuotes",
+                    "SubscribeContractTrades",
+                }:
+                    for arg in frame.get("arguments", []):
+                        self.subscribed_contracts.add(str(arg))
+                    self.subscribed_event.set()
+
+    async def recv(self) -> str:
+        item = await self.incoming.get()
+        if isinstance(item, Exception):
+            raise item
+        return item
+
+    async def close(self) -> None:
+        await self.incoming.put(ConnectionError("closed"))
+
+    async def push_trade(self, contract_id: str, ts: int, price: float, volume: float) -> None:
+        frame = {
+            "type": 1,
+            "target": "GatewayTrade",
+            "arguments": [
+                contract_id,
+                {
+                    "contractId": contract_id,
+                    "price": price,
+                    "volume": volume,
+                    "timestamp": ts,
+                },
+            ],
+        }
+        await self.incoming.put(json.dumps(frame) + SIGNALR_RECORD_SEPARATOR)
+
+
+def test_r06_ws_subscribe_triggers_upstream_signalr_and_streams_live_bars(
+    tmp_path: Path,
+) -> None:
+    """Contract: /ws/market subscribe activates upstream SignalR and delivers live bar_update.
+
+    Defect caught: WS subscribe updating broadcaster only without starting SignalR (P1-001/P2-002).
+    """
+    now_ts = int(datetime.now(UTC).timestamp())
+    bar_open_ts = now_ts - (now_ts % 60)
+    transports: list[_MockSignalRTransport] = []
+
+    async def ws_factory(_url: str, _headers: dict[str, str]) -> _MockSignalRTransport:
+        t = _MockSignalRTransport()
+        transports.append(t)
+        return t
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/Auth/loginKey":
+            return httpx.Response(200, json={"success": True, "token": "jwt-e2e-ws"})
+        if request.url.path == "/api/History/retrieveBars":
+            return httpx.Response(
+                200,
+                json={
+                    "success": True,
+                    "bars": [
+                        {
+                            "t": bar_open_ts - 60,
+                            "o": 5950.0,
+                            "h": 5952.0,
+                            "l": 5949.0,
+                            "c": 5951.0,
+                            "v": 10.0,
+                        }
+                    ],
+                },
+            )
+        return httpx.Response(404)
+
+    settings = Settings(
+        app_env="development",
+        app_password_hash=TEST_PASSWORD_HASH,
+        data_dir=tmp_path / "data",
+    )
+    upstream = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    app = create_app(settings=settings, http_client=upstream, signalr_ws_factory=ws_factory)
+
+    try:
+        with TestClient(
+            app,
+            client=("127.0.0.1", 50000),
+            base_url="http://127.0.0.1:8000",
+        ) as client:
+            login_resp = client.post("/api/auth/login", json={"password": TEST_PASSWORD})
+            assert login_resp.status_code == 200
+            csrf = login_resp.json()["csrf_token"]
+            session_cookie = login_resp.cookies["topstep_session"]
+
+            conn = client.post(
+                "/api/connect",
+                json={"userName": "alice", "apiKey": "key-e2e"},
+                headers={"X-CSRF-Token": csrf},
+            )
+            assert conn.status_code == 200
+
+            with client.websocket_connect(
+                "/ws/market",
+                headers={
+                    "Host": "127.0.0.1:8000",
+                    "Origin": "http://127.0.0.1:8000",
+                    "Cookie": f"topstep_session={session_cookie}",
+                },
+            ) as ws:
+                initial = ws.receive_json()
+                assert initial["type"] == "feed_status"
+
+                ws.send_json(
+                    {"type": "subscribe", "contract_id": "CON.F.US.MES.Z26", "timeframe": "1m"}
+                )
+                sub_ack = ws.receive_json()
+                assert sub_ack["type"] == "subscribed"
+
+                # Wait briefly for SignalRMarketHub transport creation & recovery to reach LIVE.
+                deadline = time.monotonic() + 2.0
+                while time.monotonic() < deadline:
+                    if transports and app.state.live_feed_service.feed_state == "LIVE":
+                        break
+                    time.sleep(0.02)
+
+                assert len(transports) == 1
+                assert "CON.F.US.MES.Z26" in transports[0].subscribed_contracts
+
+                # Push live tick through SignalR transport and verify client receives bar_update.
+                portal = client.portal
+                assert portal is not None
+                portal.call(transports[0].push_trade, "CON.F.US.MES.Z26", now_ts, 5955.25, 4.0)
+
+                deadline = time.monotonic() + 2.0
+                received_bar = None
+                while time.monotonic() < deadline:
+                    msg = ws.receive_json()
+                    if msg.get("type") == "bar_update" and msg["bar"]["close"] == 5955.25:
+                        received_bar = msg
+                        break
+                assert received_bar is not None
+                assert received_bar["contract_id"] == "CON.F.US.MES.Z26"
+    finally:
+        asyncio.run(upstream.aclose())
+
+
+def test_r06_revoked_session_closes_passive_websocket_before_push(tmp_path: Path) -> None:
+    """Contract: Revoking or expiring caller session stops pushes and closes passive WS (1008).
+
+    Defect caught: Passive receive-only WebSocket continuing to stream after logout (P2-007).
+    """
+    settings = Settings(app_password_hash=TEST_PASSWORD_HASH, data_dir=tmp_path / "data")
+    app = create_app(settings=settings)
+
+    with TestClient(app, base_url="http://127.0.0.1:8000") as client:
+        login_resp = client.post("/api/auth/login", json={"password": TEST_PASSWORD})
+        assert login_resp.status_code == 200
+        csrf = login_resp.json()["csrf_token"]
+        session_cookie = login_resp.cookies["topstep_session"]
+
+        with client.websocket_connect(
+            "/ws/market",
+            headers={
+                "Host": "127.0.0.1:8000",
+                "Origin": "http://127.0.0.1:8000",
+                "Cookie": f"topstep_session={session_cookie}",
+            },
+        ) as ws:
+            assert ws.receive_json()["type"] == "feed_status"
+            ws.send_json(
+                {"type": "subscribe", "contract_id": "CON.F.US.MES.Z26", "timeframe": "1m"}
+            )
+            assert ws.receive_json()["type"] == "subscribed"
+
+            # Revoke session via /api/auth/logout while client stays completely passive on WS.
+            logout_resp = client.post("/api/auth/logout", headers={"X-CSRF-Token": csrf})
+            assert logout_resp.status_code == 200
+
+            # Attempt to push a bar update -> must NOT be delivered; WS closes with 1008!
+            portal = client.portal
+            assert portal is not None
+            portal.call(
+                app.state.ws_broadcaster.publish_bar,
+                AggregatedBarEvent(
+                    contract_id="CON.F.US.MES.Z26",
+                    live_mode=False,
+                    timeframe="1m",
+                    bar=OHLCVBar(BASE_T, 5950.0, 5952.0, 5949.0, 5951.5, 8.0, is_closed=True),
+                ),
+            )
+            with pytest.raises(WebSocketDisconnect) as exc_revoked:
+                msg = ws.receive_json()
+                while msg.get("type") == "feed_status":
+                    msg = ws.receive_json()
+                pytest.fail(f"Expected WebSocketDisconnect(1008), but received {msg!r}")
+            assert exc_revoked.value.code == 1008

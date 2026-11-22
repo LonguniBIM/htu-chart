@@ -460,6 +460,9 @@ class BarAggregator:
         temp_agg = BarAggregator(timeframes=(tf,))
         if auth_cutoff is not None:
             temp_agg.set_last_closed_time(cid, eff_live, tf, auth_cutoff)
+        pre_open = self._open_bars.get(stream_key)
+        if pre_open is not None and (auth_cutoff is None or pre_open.time > auth_cutoff):
+            temp_agg._open_bars[stream_key] = pre_open
 
         tick_closed_bars: dict[int, OHLCVBar] = {}
         for _, _, tick in eligible_ticks:
@@ -513,6 +516,142 @@ class BarAggregator:
             live_mode=eff_live,
             timeframe=tf,
             closed_bars=closed_events,
+            open_bar=open_event,
+            last_closed_bar_time=final_last_closed,
+        )
+
+    def reconcile_from_1m_bars(
+        self,
+        *,
+        contract_id: str,
+        live_mode: bool,
+        timeframe: str,
+        closed_1m_bars: Sequence[OHLCVBar],
+        open_1m_bar: OHLCVBar | None = None,
+        now_utc: int | None = None,
+        root_symbol: str | None = None,
+    ) -> ReconciliationResult:
+        """Deterministically rebuild a higher timeframe from recovered 1m closed + open bars."""
+        cid = _normalize_contract_id(contract_id)
+        tf = normalize_timeframe(timeframe)
+        if tf == "1m":
+            raise ValueError("reconcile_from_1m_bars is for higher timeframes than 1m")
+        eff_live = bool(live_mode)
+        eff_now = now_utc if now_utc is not None else _utc_now_sec()
+        eff_root = self._resolve_root(cid, eff_live, root_symbol)
+        stream_key = (cid, eff_live, tf)
+
+        prev_closed = self._last_closed_times.get(stream_key)
+        pre_open = self._open_bars.get(stream_key)
+
+        dedup_1m: dict[int, OHLCVBar] = {}
+        for bar in closed_1m_bars:
+            if not isinstance(bar, OHLCVBar) or not bar.is_closed:
+                continue
+            dedup_1m[bar.time] = bar
+        if open_1m_bar is not None and open_1m_bar.time not in dedup_1m:
+            dedup_1m[open_1m_bar.time] = open_1m_bar
+
+        if not dedup_1m:
+            if pre_open is not None and (prev_closed is None or pre_open.time > prev_closed):
+                open_event = AggregatedBarEvent(
+                    contract_id=cid,
+                    live_mode=eff_live,
+                    timeframe=tf,
+                    bar=pre_open,
+                    is_recovered_historical=False,
+                    root_symbol=eff_root,
+                )
+                return ReconciliationResult(
+                    contract_id=cid,
+                    live_mode=eff_live,
+                    timeframe=tf,
+                    closed_bars=(),
+                    open_bar=open_event,
+                    last_closed_bar_time=prev_closed,
+                )
+            return ReconciliationResult(
+                contract_id=cid,
+                live_mode=eff_live,
+                timeframe=tf,
+                closed_bars=(),
+                open_bar=None,
+                last_closed_bar_time=prev_closed,
+            )
+
+        grouped: dict[int, list[OHLCVBar]] = {}
+        for bar_time in sorted(dedup_1m):
+            bar = dedup_1m[bar_time]
+            htf_open = bucket_open_utc(bar.time, tf)
+            if prev_closed is not None and htf_open <= prev_closed:
+                continue
+            grouped.setdefault(htf_open, []).append(bar)
+
+        closed_events: list[AggregatedBarEvent] = []
+        latest_open_bar: OHLCVBar | None = None
+
+        for htf_open in sorted(grouped):
+            members = grouped[htf_open]
+            all_inputs_closed = all(b.is_closed for b in members)
+            bar_closed = all_inputs_closed and is_bar_closed(
+                htf_open, tf, eff_now, root_symbol=eff_root
+            )
+            candidate = {
+                "time": htf_open,
+                "open": members[0].open,
+                "high": max(b.high for b in members),
+                "low": min(b.low for b in members),
+                "close": members[-1].close,
+                "volume": sum(b.volume for b in members),
+                "is_closed": bar_closed,
+            }
+            val = validate_ohlcv_bar(
+                candidate,
+                is_closed=bar_closed,
+                now_utc=max(eff_now, htf_open),
+            )
+            if not val.is_valid or val.bar is None:
+                continue
+            if bar_closed:
+                closed_events.append(
+                    AggregatedBarEvent(
+                        contract_id=cid,
+                        live_mode=eff_live,
+                        timeframe=tf,
+                        bar=val.bar,
+                        is_recovered_historical=True,
+                        root_symbol=eff_root,
+                    )
+                )
+            else:
+                latest_open_bar = val.bar
+
+        open_event: AggregatedBarEvent | None = None
+        if latest_open_bar is not None:
+            self._open_bars[stream_key] = latest_open_bar
+            open_event = AggregatedBarEvent(
+                contract_id=cid,
+                live_mode=eff_live,
+                timeframe=tf,
+                bar=latest_open_bar,
+                is_recovered_historical=False,
+                root_symbol=eff_root,
+            )
+        else:
+            self._open_bars.pop(stream_key, None)
+
+        final_last_closed = max(
+            (t for t in (*(e.bar.time for e in closed_events), prev_closed) if t is not None),
+            default=None,
+        )
+        if final_last_closed is not None:
+            self._last_closed_times[stream_key] = final_last_closed
+
+        return ReconciliationResult(
+            contract_id=cid,
+            live_mode=eff_live,
+            timeframe=tf,
+            closed_bars=tuple(closed_events),
             open_bar=open_event,
             last_closed_bar_time=final_last_closed,
         )

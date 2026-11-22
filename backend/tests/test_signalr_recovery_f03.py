@@ -656,3 +656,418 @@ async def test_f03_status_endpoint_exposes_live_feed_telemetry_without_secret_le
         assert raw_api_key not in serialized
         assert raw_jwt not in serialized
         assert pw_hash not in serialized
+
+
+async def test_f03_multi_contract_and_multi_timeframe_recovery_retains_cross_contract_ticks(
+    tmp_path: Path,
+) -> None:
+    """Contract: Multi-contract recovery preserves higher TFs (5m-1d) and cross-contract ticks.
+
+    Defect caught: Losing contract A ticks during contract B REST backfill (P1-003/P2-003) and
+    leaving 5m/15m/1h/4h/1d bars stale after 1m recovery (P1-002/P2-005).
+    """
+    cid_a = CID_MES
+    cid_b = "CON.F.US.MNQ.Z26"
+    b0 = BASE_T  # 14:00:00Z -> aligns on 1m, 5m, 15m, 1h
+    b1 = BASE_T + 60
+    clock_now = b1 + 30
+    mnq_backfill_entered = asyncio.Event()
+    release_mnq_backfill = asyncio.Event()
+
+    async def ws_factory(_url: str, _headers: dict[str, str]) -> _MockSignalRTransport:
+        return _MockSignalRTransport()
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/Auth/loginKey":
+            return httpx.Response(200, json={"success": True, "token": "jwt-multi"})
+        if request.url.path == "/api/History/retrieveBars":
+            payload = json.loads(request.content.decode("utf-8"))
+            if payload["contractId"] == cid_a:
+                return httpx.Response(
+                    200,
+                    json={
+                        "success": True,
+                        "bars": [_wire_bar(b0, 100.0, 200.0, 95.0, 150.0, 10.0)],
+                    },
+                )
+            mnq_backfill_entered.set()
+            await release_mnq_backfill.wait()
+            return httpx.Response(
+                200,
+                json={
+                    "success": True,
+                    "bars": [_wire_bar(b0, 20000.0, 20020.0, 19990.0, 20010.0, 8.0)],
+                },
+            )
+        return httpx.Response(404)
+
+    settings = Settings(data_dir=tmp_path / "data", signalr_recovery_timeout_sec=5.0)
+    sqlite_store = SqliteStore(tmp_path / "meta.db")
+    sqlite_store.initialize()
+    try:
+        parquet_store = ParquetStore(settings.data_dir, sqlite_store=sqlite_store)
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            auth = TopstepAuthService(settings, client)
+            await auth.login("alice", "key-multi")
+            rest = TopstepRestClient(settings, auth, client)
+            agg = BarAggregator()  # default 6 timeframes: 1m, 5m, 15m, 1h, 4h, 1d
+            hub = SignalRMarketHub(
+                settings,
+                auth_service=auth,
+                ws_factory=ws_factory,
+                contracts=[cid_a, cid_b],
+            )
+            live_feed = LiveFeedService(
+                settings,
+                auth,
+                rest,
+                parquet_store,
+                sqlite_store,
+                aggregator=agg,
+                signalr_hub=hub,
+                clock=lambda: clock_now,
+            )
+            await live_feed.set_active_contracts([cid_a, cid_b], live_mode=False)
+
+            # Seed pre-disconnect open bar on MES across all 6 timeframes.
+            agg.process_tick(
+                __import__("app.engine.bar_aggregator", fromlist=["NormalizedTick"]).NormalizedTick(
+                    cid_a, False, b0 + 10, 150.0, 2.0
+                ),
+                now_utc=b0 + 10,
+            )
+
+            rec_task = asyncio.create_task(live_feed.trigger_recovery(now_utc=clock_now))
+            await asyncio.wait_for(mnq_backfill_entered.wait(), timeout=2.0)
+
+            # While MNQ is awaiting REST, stream a late tick for MES (already reconciled!)
+            # plus a tick for MNQ.
+            from app.topstep.signalr_hub import SignalRTickEvent
+
+            live_feed.handle_hub_event(
+                SignalRTickEvent(cid_a, False, b1 + 10, 180.0, 4.0, "GatewayTrade", 1.0)
+            )
+            live_feed.handle_hub_event(
+                SignalRTickEvent(cid_b, False, b1 + 12, 20015.0, 3.0, "GatewayTrade", 1.1)
+            )
+            release_mnq_backfill.set()
+            await rec_task
+
+            assert live_feed.feed_state == "LIVE"
+            assert live_feed._recovery_queue.empty()
+
+            # Verify MES 1m open bar has the late tick, and 5m/15m/1h/4h/1d reflect BOTH
+            # REST 1m bar (high=200.0, vol=10.0) and late buffered tick (close=180.0, vol=4.0).
+            mes_1m = agg.get_open_bar(cid_a, False, "1m")
+            assert mes_1m == OHLCVBar(b1, 180.0, 180.0, 180.0, 180.0, 4.0, is_closed=False)
+            for htf in ("5m", "15m", "1h", "4h", "1d"):
+                htf_bar = agg.get_open_bar(cid_a, False, htf)
+                assert htf_bar is not None
+                assert htf_bar.open == 100.0
+                assert htf_bar.high == 200.0
+                assert htf_bar.low == 95.0
+                assert htf_bar.close == 180.0
+                assert htf_bar.volume == 14.0
+
+            mnq_5m = agg.get_open_bar(cid_b, False, "5m")
+            assert mnq_5m is not None
+            assert mnq_5m.close == 20015.0
+            assert mnq_5m.volume == 11.0
+            await live_feed.stop()
+    finally:
+        sqlite_store.close()
+
+
+async def test_f03_tail_drain_race_absorbs_tick_arriving_during_tail_persistence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Contract: Ticks arriving during tail-drain awaits are processed before LIVE transition.
+
+    Defect caught: Tail ticks stranded in _recovery_queue after LIVE transition (P1-004).
+    """
+    b0 = BASE_T
+    b1 = BASE_T + 60
+    b2 = BASE_T + 120
+    clock_now = b2 + 20
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/Auth/loginKey":
+            return httpx.Response(200, json={"success": True, "token": "jwt-tail"})
+        if request.url.path == "/api/History/retrieveBars":
+            return httpx.Response(
+                200,
+                json={"success": True, "bars": [_wire_bar(b0, 100.0, 102.0, 99.0, 101.0, 5.0)]},
+            )
+        return httpx.Response(404)
+
+    settings = Settings(data_dir=tmp_path / "data", signalr_recovery_timeout_sec=5.0)
+    sqlite_store = SqliteStore(tmp_path / "meta.db")
+    sqlite_store.initialize()
+    try:
+        parquet_store = ParquetStore(settings.data_dir, sqlite_store=sqlite_store)
+        orig_upsert = parquet_store.upsert_bars
+        injected_during_tail = False
+        live_feed_ref: list[LiveFeedService] = []
+
+        async def yielding_upsert(*args: Any, **kwargs: Any) -> Any:
+            nonlocal injected_during_tail
+            res = await orig_upsert(*args, **kwargs)
+            bars_arg = args[1] if len(args) > 1 else []
+            # When tail tick closes b1 (14:01), inject another tick during the await!
+            if (
+                not injected_during_tail
+                and any(getattr(b, "time", None) == b1 for b in bars_arg)
+                and live_feed_ref
+            ):
+                injected_during_tail = True
+                from app.topstep.signalr_hub import SignalRTickEvent
+
+                live_feed_ref[0].handle_hub_event(
+                    SignalRTickEvent(CID_MES, False, b2 + 10, 120.0, 3.0, "GatewayTrade", 2.0)
+                )
+            return res
+
+        monkeypatch.setattr(parquet_store, "upsert_bars", yielding_upsert)
+
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            auth = TopstepAuthService(settings, client)
+            await auth.login("alice", "key-tail")
+            rest = TopstepRestClient(settings, auth, client)
+            agg = BarAggregator(timeframes=("1m",))
+            live_feed = LiveFeedService(
+                settings,
+                auth,
+                rest,
+                parquet_store,
+                sqlite_store,
+                aggregator=agg,
+                recovery_timeframes=("1m",),
+                clock=lambda: clock_now,
+            )
+            live_feed_ref.append(live_feed)
+            await live_feed.set_active_contracts([CID_MES], live_mode=False)
+            live_feed._transition_all_contracts("RECOVERING")
+
+            # Enqueue tail ticks: first in b1, then one in b2 that closes b1 and triggers upsert.
+            from app.topstep.signalr_hub import SignalRTickEvent
+
+            # First run reconciliation for b0, then inject b1/b2 ticks right before tail loop
+            # by queuing them before trigger_recovery starts while REST yields briefly.
+            orig_retrieve = rest.retrieve_bars_paginated
+
+            async def delayed_retrieve(*args: Any, **kwargs: Any) -> Any:
+                res = await orig_retrieve(*args, **kwargs)
+                live_feed.handle_hub_event(
+                    SignalRTickEvent(CID_MES, False, b1 + 5, 110.0, 2.0, "GatewayTrade", 1.0)
+                )
+                return res
+
+            monkeypatch.setattr(rest, "retrieve_bars_paginated", delayed_retrieve)
+
+            # Inject b1 + b2 ticks during recon's 1m upsert (b0) so the tail loop handles b1->b2.
+            async def hook_upsert(*args: Any, **kwargs: Any) -> Any:
+                bars_arg = args[1] if len(args) > 1 else []
+                if any(getattr(b, "time", None) == b0 for b in bars_arg):
+                    live_feed.handle_hub_event(
+                        SignalRTickEvent(CID_MES, False, b1 + 5, 110.0, 2.0, "GatewayTrade", 1.0)
+                    )
+                    live_feed.handle_hub_event(
+                        SignalRTickEvent(CID_MES, False, b2 + 5, 115.0, 2.0, "GatewayTrade", 1.5)
+                    )
+                return await yielding_upsert(*args, **kwargs)
+
+            monkeypatch.setattr(parquet_store, "upsert_bars", hook_upsert)
+
+            await live_feed.trigger_recovery(now_utc=clock_now)
+            assert injected_during_tail is True
+            assert live_feed.feed_state == "LIVE"
+            assert live_feed._recovery_queue.empty()
+            open_b2 = agg.get_open_bar(CID_MES, False, "1m")
+            assert open_b2 == OHLCVBar(b2, 115.0, 120.0, 115.0, 120.0, 5.0, is_closed=False)
+            await live_feed.stop()
+    finally:
+        sqlite_store.close()
+
+
+async def test_f03_quarantined_rest_backfill_and_persistence_error_keep_feed_degraded(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Contract: Quarantined REST OHLCV bars or storage errors transition to DEGRADED, never LIVE.
+
+    Defect caught: Fail-open transition to LIVE with corrupted backfill (P1-005/P2-004) or
+    getting stuck permanently in RECOVERING when persistence throws (P1-007).
+    """
+    b0 = BASE_T
+    b1 = BASE_T + 60
+    clock_now = b1 + 70
+    corrupt_mode = True
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/Auth/loginKey":
+            return httpx.Response(200, json={"success": True, "token": "jwt-corrupt"})
+        if request.url.path == "/api/History/retrieveBars":
+            if corrupt_mode:
+                # high < open violates OHLC bounds while truncated/provider_gap are both False
+                return httpx.Response(
+                    200,
+                    json={
+                        "success": True,
+                        "bars": [
+                            _wire_bar(b0, 100.0, 102.0, 99.0, 101.0, 5.0),
+                            _wire_bar(b1, 105.0, 90.0, 90.0, 100.0, 5.0),
+                        ],
+                    },
+                )
+            return httpx.Response(
+                200,
+                json={"success": True, "bars": [_wire_bar(b0, 100.0, 102.0, 99.0, 101.0, 5.0)]},
+            )
+        return httpx.Response(404)
+
+    settings = Settings(data_dir=tmp_path / "data", signalr_recovery_timeout_sec=5.0)
+    sqlite_store = SqliteStore(tmp_path / "meta.db")
+    sqlite_store.initialize()
+    try:
+        parquet_store = ParquetStore(settings.data_dir, sqlite_store=sqlite_store)
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            auth = TopstepAuthService(settings, client)
+            await auth.login("alice", "key-corrupt")
+            rest = TopstepRestClient(settings, auth, client)
+            live_feed = LiveFeedService(
+                settings,
+                auth,
+                rest,
+                parquet_store,
+                sqlite_store,
+                recovery_timeframes=("1m",),
+                clock=lambda: clock_now,
+            )
+            await live_feed.set_active_contracts([CID_MES], live_mode=False)
+
+            # 1) Quarantined REST bar -> DEGRADED, unresolved_gaps >= 1, live_alerts_enabled=False
+            await live_feed.trigger_recovery(now_utc=clock_now)
+            assert live_feed.feed_state == "DEGRADED"
+            assert live_feed.live_alerts_enabled is False
+            snap = live_feed.get_status_snapshot()
+            assert snap["unresolved_gaps"] >= 1
+            issues = await sqlite_store.list_quality_issues(
+                StorageDatasetKey("topstepx", False, CID_MES, "1m")
+            )
+            assert len(issues) == 1
+
+            # 2) Persistence OSError -> DEGRADED (NOT stuck in RECOVERING), then recover
+            corrupt_mode = False
+            orig_upsert = parquet_store.upsert_bars
+
+            async def failing_upsert(*args: Any, **kwargs: Any) -> Any:
+                raise OSError("simulated disk write failure")
+
+            monkeypatch.setattr(parquet_store, "upsert_bars", failing_upsert)
+            await live_feed.trigger_recovery(now_utc=clock_now)
+            assert live_feed.feed_state == "DEGRADED"
+            assert live_feed.live_alerts_enabled is False
+            assert live_feed.get_status_snapshot()["unresolved_gaps"] >= 2
+            assert live_feed._last_error is not None
+
+            monkeypatch.setattr(parquet_store, "upsert_bars", orig_upsert)
+            await live_feed.trigger_recovery(now_utc=clock_now)
+            assert live_feed.feed_state == "LIVE"
+            assert live_feed.live_alerts_enabled is True
+            await live_feed.stop()
+    finally:
+        sqlite_store.close()
+
+
+async def test_f03_heartbeat_keepalive_and_key_rotation_watchdog_enforcement(
+    tmp_path: Path,
+) -> None:
+    """Contract: Type=6 pings prevent false disconnects (P1-006); key rotation closes hub (P2-001).
+
+    Defect caught: False timeout disconnects on quiet markets with active pings, or keeping hub LIVE
+    after KEY_ROTATION_ENFORCE invalidates TopstepX auth.
+    """
+    clock_now = BASE_T + 180
+    transports: list[_MockSignalRTransport] = []
+
+    async def ws_factory(_url: str, _headers: dict[str, str]) -> _MockSignalRTransport:
+        t = _MockSignalRTransport()
+        transports.append(t)
+        return t
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/Auth/loginKey":
+            return httpx.Response(200, json={"success": True, "token": "jwt-watchdog"})
+        if request.url.path == "/api/History/retrieveBars":
+            return httpx.Response(
+                200,
+                json={"success": True, "bars": [_wire_bar(BASE_T + 120, 100, 101, 99, 100, 5)]},
+            )
+        return httpx.Response(404)
+
+    settings = Settings(
+        data_dir=tmp_path / "data",
+        signalr_heartbeat_timeout_sec=0.12,
+        signalr_ping_interval_sec=0.04,
+        key_rotation_days=30,
+        key_rotation_enforce=False,
+    )
+    sqlite_store = SqliteStore(tmp_path / "meta.db")
+    sqlite_store.initialize()
+    try:
+        parquet_store = ParquetStore(settings.data_dir, sqlite_store=sqlite_store)
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            auth = TopstepAuthService(settings, client)
+            await auth.login("alice", "key-watchdog")
+            rest = TopstepRestClient(settings, auth, client)
+            hub = SignalRMarketHub(
+                settings,
+                auth_service=auth,
+                ws_factory=ws_factory,
+                contracts=[CID_MES],
+                ping_interval_sec=0.04,
+                heartbeat_timeout_sec=0.12,
+            )
+            live_feed = LiveFeedService(
+                settings,
+                auth,
+                rest,
+                parquet_store,
+                sqlite_store,
+                signalr_hub=hub,
+                recovery_timeframes=("1m",),
+                clock=lambda: clock_now,
+            )
+            await live_feed.set_active_contracts([CID_MES], live_mode=False)
+            await live_feed.start()
+
+            for _ in range(100):
+                if live_feed.feed_state == "LIVE":
+                    break
+                await asyncio.sleep(0.01)
+            assert live_feed.feed_state == "LIVE"
+            assert len(transports) == 1
+
+            # Send only SignalR type=6 pings (zero ticks) past heartbeat_timeout_sec (0.12s).
+            for _ in range(5):
+                await transports[0].push_frame({"type": 6})
+                await asyncio.sleep(0.04)
+                await live_feed.run_watchdog_tick()
+
+            assert live_feed.feed_state == "LIVE"
+            assert hub.is_connected is True
+            assert len(transports) == 1
+
+            # Now enforce key rotation when key is expired -> watchdog must disconnect open hub!
+            settings.key_rotation_enforce = True
+            settings.topstepx_key_updated_at = "2020-01-01"
+            await live_feed.run_watchdog_tick()
+
+            assert hub.is_connected is False
+            assert auth.is_connected is False
+            assert live_feed.feed_state == "DISCONNECTED"
+            assert live_feed.live_alerts_enabled is False
+            await live_feed.stop()
+    finally:
+        sqlite_store.close()

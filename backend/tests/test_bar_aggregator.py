@@ -198,3 +198,61 @@ def test_reconcile_recovery_gives_rest_authority_and_rebuilds_open_bar() -> None
         is_closed=False,
     )
     assert agg.get_open_bar(cid, False, "1m") == recon.open_bar.bar
+
+
+def test_reconcile_recovery_preserves_pre_disconnect_open_bar_ohlcv() -> None:
+    """Contract: Reconnect in same open candle merges pre-disconnect OHLCV with buffered ticks.
+
+    Defect caught: Wiping pre-disconnect open price, extrema, and volume on reconnect (P2-006).
+    """
+    agg = BarAggregator(timeframes=("1m", "5m"))
+    cid = "CON.F.US.MES.Z26"
+    b0 = int(datetime(2026, 11, 10, 14, 0, 0, tzinfo=UTC).timestamp())
+    b1 = b0 + 60
+    now_ts = b1 + 35
+
+    # Pre-disconnect ticks inside b1 (14:01) establish open=100, low=98, volume=5.
+    agg.process_tick(NormalizedTick(cid, False, b1 + 5, 100.0, 3.0), now_utc=b1 + 5)
+    agg.process_tick(NormalizedTick(cid, False, b1 + 10, 98.0, 2.0), now_utc=b1 + 10)
+
+    # REST returns earlier closed bar b0; buffered tick arrives at b1 + 25 (price=110, vol=2).
+    hist_closed = [
+        OHLCVBar(time=b0, open=99.0, high=101.0, low=98.5, close=100.0, volume=10.0, is_closed=True)
+    ]
+    recon_1m = agg.reconcile_recovery(
+        contract_id=cid,
+        live_mode=False,
+        timeframe="1m",
+        historical_bars=hist_closed,
+        buffered_ticks=[NormalizedTick(cid, False, b1 + 25, 110.0, 2.0)],
+        now_utc=now_ts,
+    )
+    assert recon_1m.open_bar is not None
+    assert recon_1m.open_bar.bar == OHLCVBar(
+        time=b1,
+        open=100.0,
+        high=110.0,
+        low=98.0,
+        close=110.0,
+        volume=7.0,
+        is_closed=False,
+    )
+
+    recon_5m = agg.reconcile_from_1m_bars(
+        contract_id=cid,
+        live_mode=False,
+        timeframe="5m",
+        closed_1m_bars=[e.bar for e in recon_1m.closed_bars],
+        open_1m_bar=recon_1m.open_bar.bar,
+        now_utc=now_ts,
+    )
+    assert recon_5m.open_bar is not None
+    assert recon_5m.open_bar.bar == OHLCVBar(
+        time=b0,
+        open=99.0,
+        high=110.0,
+        low=98.0,
+        close=110.0,
+        volume=17.0,
+        is_closed=False,
+    )

@@ -279,7 +279,10 @@ async def market_websocket(websocket: WebSocket) -> None:
     await websocket.accept()
     broadcaster: WsBroadcaster = websocket.app.state.ws_broadcaster
     live_feed: LiveFeedService = websocket.app.state.live_feed_service
-    ws_session = broadcaster.register(websocket)
+    ws_session = broadcaster.register(
+        websocket,
+        session_validator=lambda: session_manager.get_session(session.session_id) is not None,
+    )
     broadcaster.send_to_client(
         ws_session.client_id,
         {"type": "feed_status", **live_feed.get_status_snapshot()},
@@ -349,6 +352,7 @@ async def market_websocket(websocket: WebSocket) -> None:
                         ws_session.client_id,
                         {"type": "subscribed", "contract_id": cid, "timeframe": tf},
                     )
+                    await live_feed.subscribe_ws_contract(cid)
                 except ValueError as exc:
                     broadcaster.send_to_client(
                         ws_session.client_id,
@@ -367,6 +371,7 @@ async def market_websocket(websocket: WebSocket) -> None:
                             "timeframe": normalize_timeframe(raw_tf),
                         },
                     )
+                    await live_feed.sync_ws_contracts(broadcaster.active_contract_ids())
                 except ValueError as exc:
                     broadcaster.send_to_client(
                         ws_session.client_id,
@@ -381,3 +386,4 @@ async def market_websocket(websocket: WebSocket) -> None:
         pass
     finally:
         await broadcaster.unregister(ws_session.client_id)
+        await live_feed.sync_ws_contracts(broadcaster.active_contract_ids())

@@ -7,6 +7,7 @@ import contextlib
 import logging
 import uuid
 from collections import deque
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
@@ -119,6 +120,7 @@ class WsClientSession:
     sender_task: asyncio.Task[None] | None = None
     closed_event: asyncio.Event = field(default_factory=asyncio.Event)
     disconnect_reason: str | None = None
+    session_validator: Callable[[], bool] | None = None
 
 
 async def _safe_close_ws(
@@ -165,11 +167,20 @@ class WsBroadcaster:
         """Total clients disconnected due to queue overflow or send timeout."""
         return self._slow_disconnect_count
 
+    def active_contract_ids(self) -> set[str]:
+        """Return set of contract_ids currently subscribed by at least one client."""
+        active: set[str] = set()
+        for session in list(self._clients.values()):
+            for cid, _tf in session.subscriptions:
+                active.add(cid)
+        return active
+
     def register(
         self,
         transport: WsClientTransport,
         *,
         client_id: str | None = None,
+        session_validator: Callable[[], bool] | None = None,
     ) -> WsClientSession:
         """Register a connected WebSocket client and start its independent sender task."""
         cid = client_id or uuid.uuid4().hex
@@ -177,6 +188,7 @@ class WsBroadcaster:
             client_id=cid,
             transport=transport,
             queue=_CoalescingClientQueue(self._queue_maxsize),
+            session_validator=session_validator,
         )
         session.sender_task = asyncio.create_task(
             self._sender_loop(session),
@@ -227,11 +239,19 @@ class WsBroadcaster:
         if close_transport:
             await _safe_close_ws(session.transport, code=code, reason=reason)
 
-    def _schedule_slow_disconnect(self, session: WsClientSession, reason: str) -> None:
+    def _schedule_slow_disconnect(
+        self,
+        session: WsClientSession,
+        reason: str,
+        *,
+        code: int = WS_CLOSE_SLOW_CONSUMER,
+        count_as_slow: bool = True,
+    ) -> None:
         if session.client_id not in self._clients:
             return
         self._clients.pop(session.client_id, None)
-        self._slow_disconnect_count += 1
+        if count_as_slow:
+            self._slow_disconnect_count += 1
         session.disconnect_reason = reason
         session.queue.close()
         session.closed_event.set()
@@ -244,7 +264,7 @@ class WsBroadcaster:
                     await task
             await _safe_close_ws(
                 session.transport,
-                code=WS_CLOSE_SLOW_CONSUMER,
+                code=code,
                 reason=reason,
             )
 
@@ -252,11 +272,30 @@ class WsBroadcaster:
         self._teardown_tasks.add(cleanup_task)
         cleanup_task.add_done_callback(self._teardown_tasks.discard)
 
+    def _is_session_valid(self, session: WsClientSession) -> bool:
+        if session.session_validator is None:
+            return True
+        try:
+            return bool(session.session_validator())
+        except Exception:
+            return False
+
     async def _sender_loop(self, session: WsClientSession) -> None:
         try:
             while True:
                 payload = await session.queue.get()
                 if payload is None:
+                    break
+                if not self._is_session_valid(session):
+                    session.disconnect_reason = "Session expired or revoked"
+                    self._clients.pop(session.client_id, None)
+                    session.queue.close()
+                    session.closed_event.set()
+                    await _safe_close_ws(
+                        session.transport,
+                        code=1008,
+                        reason=session.disconnect_reason,
+                    )
                     break
                 try:
                     await asyncio.wait_for(
@@ -292,6 +331,14 @@ class WsBroadcaster:
         session = self._clients.get(client_id)
         if session is None:
             return False
+        if not self._is_session_valid(session):
+            self._schedule_slow_disconnect(
+                session,
+                "Session expired or revoked",
+                code=1008,
+                count_as_slow=False,
+            )
+            return False
         if not session.queue.enqueue(payload):
             self._schedule_slow_disconnect(session, "resync_required: queue overflow")
             return False
@@ -320,6 +367,14 @@ class WsBroadcaster:
         for session in list(self._clients.values()):
             if sub_key not in session.subscriptions:
                 continue
+            if not self._is_session_valid(session):
+                self._schedule_slow_disconnect(
+                    session,
+                    "Session expired or revoked",
+                    code=1008,
+                    count_as_slow=False,
+                )
+                continue
             if not session.queue.enqueue(payload):
                 self._schedule_slow_disconnect(session, "resync_required: queue overflow")
 
@@ -327,6 +382,14 @@ class WsBroadcaster:
         """Broadcast feed telemetry status non-blockingly to all connected clients."""
         payload = {"type": "feed_status", **status_payload}
         for session in list(self._clients.values()):
+            if not self._is_session_valid(session):
+                self._schedule_slow_disconnect(
+                    session,
+                    "Session expired or revoked",
+                    code=1008,
+                    count_as_slow=False,
+                )
+                continue
             if not session.queue.enqueue(payload):
                 self._schedule_slow_disconnect(session, "resync_required: queue overflow")
 
@@ -343,6 +406,14 @@ class WsBroadcaster:
             "contract_id": contract_id,
         }
         for session in list(self._clients.values()):
+            if not self._is_session_valid(session):
+                self._schedule_slow_disconnect(
+                    session,
+                    "Session expired or revoked",
+                    code=1008,
+                    count_as_slow=False,
+                )
+                continue
             if not session.queue.enqueue(payload):
                 self._schedule_slow_disconnect(session, "resync_required: queue overflow")
 
