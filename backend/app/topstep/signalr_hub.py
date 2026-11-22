@@ -450,6 +450,7 @@ class SignalRMarketHub:
 
         self._ws: SignalRWebSocketTransport | None = None
         self._connected = False
+        self._session_connected_and_subscribed = False
         self._connected_token_digest: str | None = None
         self._stopping = False
         self._invocation_seq = 0
@@ -887,6 +888,7 @@ class SignalRMarketHub:
                         pre_connect_events.append(pre_evt)
 
             self._connected = True
+            self._session_connected_and_subscribed = True
             await self._emit(
                 SignalRConnectedEvent(
                     contracts=tuple(self._contracts),
@@ -1009,10 +1011,9 @@ class SignalRMarketHub:
         try:
             while not self._stopping:
                 self._reconnect_now_event.clear()
-                session_connected = False
+                self._session_connected_and_subscribed = False
                 try:
                     await self._run_single_session()
-                    session_connected = True
                 except asyncio.CancelledError:
                     raise
                 except Exception as exc:
@@ -1022,16 +1023,22 @@ class SignalRMarketHub:
                 if self._stopping:
                     break
 
-                if self._reconnect_now_event.is_set() or session_connected:
+                if self._reconnect_now_event.is_set():
                     delay = self._initial_delay
+                    wait_delay = 0.0
+                elif self._session_connected_and_subscribed:
+                    delay = self._initial_delay
+                    wait_delay = delay
+                    delay = min(self._max_delay, delay * 2.0)
+                else:
+                    wait_delay = delay
+                    delay = min(self._max_delay, delay * 2.0)
 
-                wait_delay = 0.0 if self._reconnect_now_event.is_set() else delay
                 if wait_delay > 0:
                     try:
                         await asyncio.wait_for(self._reconnect_now_event.wait(), timeout=wait_delay)
                     except TimeoutError:
                         pass
-                delay = min(self._max_delay, delay * 2.0)
         except asyncio.CancelledError:
             self._connected = False
             raise

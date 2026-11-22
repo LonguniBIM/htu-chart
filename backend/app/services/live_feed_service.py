@@ -679,7 +679,8 @@ class LiveFeedService:
             c_state.unhealed_gap_starts["1m"] = (
                 bar_open_1m if prev_gap is None else min(prev_gap, bar_open_1m)
             )
-            c_state.state = "DEGRADED"
+            if c_state.state != "RECOVERING":
+                c_state.state = "DEGRADED"
         else:
             self._global_unresolved_gaps += 1
 
@@ -886,7 +887,28 @@ class LiveFeedService:
                 bar_closed = False
             val = validate_ohlcv_bar(parsed, is_closed=bar_closed, now_utc=eff_now)
             if val.is_valid and val.bar is not None:
-                valid_bars.append(val.bar)
+                valid_window_start = bucket_open_utc(interval_start, tf)
+                if val.bar.time < valid_window_start or val.bar.time > interval_end:
+                    safe_bar_time = (
+                        val.bar.time
+                        if -(2**63) <= val.bar.time <= (2**63 - 1)
+                        else None
+                    )
+                    issues.append(
+                        QualityIssueInput(
+                            bar_time=safe_bar_time,
+                            interval_start=interval_start,
+                            interval_end=interval_end,
+                            issue_code="out_of_window_timestamp",
+                            detail=self._redact(
+                                f"Recovery bar timestamp {val.bar.time} outside "
+                                f"[{valid_window_start}, {interval_end}]"
+                            ),
+                            raw_payload=self._redact(json.dumps(raw, default=str))[:2048],
+                        )
+                    )
+                else:
+                    valid_bars.append(val.bar)
             else:
                 issues.append(
                     QualityIssueInput(
@@ -1087,6 +1109,8 @@ class LiveFeedService:
                     c_state.unhealed_gap_starts.get(tf, backfill_start),
                     backfill_start,
                 )
+            self._aggregator.mark_active_open_bars_incomplete(cid, c_state.live_mode)
+            self._aggregator.mark_open_bucket_incomplete(cid, c_state.live_mode, eff_now)
             raise
         for rej_tick, rej_reason in recon.rejected_ticks:
             had_gap = True
@@ -1775,7 +1799,7 @@ class LiveFeedService:
             return
 
         if not self._auth.is_connected:
-            if self._auth_retry_pending and self._auth.can_retry_login:
+            if self._auth.can_retry_login:
                 due_retry = (
                     self._last_auth_retry_mono is None
                     or (now_mono - self._last_auth_retry_mono) >= self._auth_retry_delay_sec
@@ -1784,6 +1808,7 @@ class LiveFeedService:
                     try:
                         await self._auth.retry_login()
                         self._auth_retry_pending = False
+                        self._last_auth_retry_mono = None
                         self._auth_retry_delay_sec = max(
                             0.01, self._settings.signalr_reconnect_initial_delay_sec
                         )

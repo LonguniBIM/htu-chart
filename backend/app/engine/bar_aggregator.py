@@ -257,6 +257,19 @@ class BarAggregator:
                     if obsolete:
                         pending_set.difference_update(obsolete)
 
+    def mark_active_open_bars_incomplete(
+        self,
+        contract_id: str,
+        live_mode: bool,
+    ) -> None:
+        """Mark every currently active open bar for contract_id/live_mode as incomplete."""
+        cid = _normalize_contract_id(contract_id)
+        eff_live = bool(live_mode)
+        for tf in self._timeframes:
+            stream_key = (cid, eff_live, tf)
+            if stream_key in self._open_bars:
+                self._incomplete_open_bars.add(stream_key)
+
     def _apply_pending_incomplete(
         self,
         stream_key: tuple[str, bool, str],
@@ -635,8 +648,16 @@ class BarAggregator:
                     float(rebuilt_open.time),
                     float(rebuilt_open.time),
                 )
-            # An open bar carried/rebuilt across recovery has not been REST-confirmed closed.
-            self._incomplete_open_buckets.pop(stream_key, None)
+            # Only prune pending incomplete markers already confirmed closed by REST history.
+            pending_set = self._incomplete_open_buckets.get(stream_key)
+            if pending_set is not None:
+                if latest_hist_closed is not None:
+                    confirmed = {b for b in pending_set if b <= latest_hist_closed}
+                    if confirmed:
+                        pending_set.difference_update(confirmed)
+                pending_set.discard(rebuilt_open.time)
+                if not pending_set:
+                    self._incomplete_open_buckets.pop(stream_key, None)
             if mark_open_incomplete:
                 self._incomplete_open_bars.add(stream_key)
             else:

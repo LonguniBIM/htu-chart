@@ -4646,3 +4646,504 @@ async def test_f03_malformed_tick_with_huge_timestamp_does_not_crash_hub(
                 await live_feed.stop()
     finally:
         sqlite_store.close()
+
+
+async def test_f03_failed_rest_recovery_marks_open_bar_incomplete_across_boundary(
+    tmp_path: Path,
+) -> None:
+    """Contract: Failed REST recovery marks interrupted open bars incomplete so ticks cannot close.
+
+    Defect caught: Raising out of _recover_single_timeframe_rest on REST timeout/503 without marking
+    existing active open bars incomplete, letting subsequent ticks finalize an unconfirmed bar.
+    """
+    clock_ref = [BASE_T + 15]
+    transports: list[_MockSignalRTransport] = []
+    hist_mode = ["ok"]
+
+    async def ws_factory(_url: str, _headers: dict[str, str]) -> _MockSignalRTransport:
+        t = _MockSignalRTransport()
+        transports.append(t)
+        return t
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/Auth/loginKey":
+            return httpx.Response(200, json={"success": True, "token": "jwt-fail-open"})
+        if request.url.path == "/api/History/retrieveBars":
+            if hist_mode[0] == "fail":
+                return httpx.Response(503, json={"success": False, "errorMessage": "down"})
+            payload = json.loads(request.content.decode("utf-8"))
+            return httpx.Response(
+                200,
+                json={"success": True, "bars": _bars_for_history_payload(payload)},
+            )
+        return httpx.Response(404)
+
+    settings = Settings(data_dir=tmp_path / "data", upstream_max_retries=0)
+    sqlite_store = SqliteStore(tmp_path / "meta.db")
+    sqlite_store.initialize()
+    try:
+        parquet_store = ParquetStore(settings.data_dir, sqlite_store=sqlite_store)
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            auth = TopstepAuthService(settings, client)
+            await auth.login("alice", "key-fail-open")
+            rest = TopstepRestClient(settings, auth, client)
+            hub = SignalRMarketHub(
+                settings,
+                auth_service=auth,
+                ws_factory=ws_factory,
+                contracts=[CID_MES],
+                reconnect_initial_delay_sec=0.01,
+                reconnect_max_delay_sec=0.02,
+            )
+            live_feed = LiveFeedService(
+                settings,
+                auth,
+                rest,
+                parquet_store,
+                sqlite_store,
+                signalr_hub=hub,
+                recovery_timeframes=("1m",),
+                clock=lambda: clock_ref[0],
+            )
+            try:
+                await live_feed.set_active_contracts([CID_MES], live_mode=False)
+                await live_feed.start()
+                for _ in range(100):
+                    if live_feed.feed_state == "LIVE":
+                        break
+                    await asyncio.sleep(0.01)
+                assert live_feed.feed_state == "LIVE"
+
+                # Open BASE_T bar while LIVE.
+                await transports[0].push_frame(_quote_frame(CID_MES, BASE_T + 50, 5950.0, 2.0))
+                await asyncio.sleep(0.03)
+
+                # Fail REST during reconnect recovery, then advance across boundary BASE_T + 60.
+                hist_mode[0] = "fail"
+                clock_ref[0] = BASE_T + 75
+                await transports[0].drop()
+                for _ in range(100):
+                    if len(transports) >= 2 and live_feed.feed_state == "DEGRADED":
+                        break
+                    await asyncio.sleep(0.01)
+                assert live_feed.feed_state == "DEGRADED"
+
+                await transports[1].push_frame(_quote_frame(CID_MES, BASE_T + 75, 5955.0, 3.0))
+                await asyncio.sleep(0.03)
+                await live_feed.flush_pending_tasks()
+
+                key = StorageDatasetKey("topstepx", False, CID_MES, "1m")
+                assert await parquet_store.read_bars(key, start_ts=BASE_T, end_ts=BASE_T) == []
+                wm = await sqlite_store.get_watermark(key)
+                assert wm is not None and wm.last_closed_bar_time < BASE_T
+            finally:
+                await live_feed.stop()
+    finally:
+        sqlite_store.close()
+
+
+async def test_f03_rest_triggered_transient_jwt_refresh_failure_recovers_via_watchdog(
+    tmp_path: Path,
+) -> None:
+    """Contract: Transient JWT refresh failure triggered by REST recovers via watchdog to LIVE.
+
+    Defect caught: Gating watchdog retry_login() on _auth_retry_pending, leaving the feed stuck
+    DISCONNECTED when a REST request (not watchdog) triggered the transient refresh failure.
+    """
+    from datetime import timedelta
+
+    from app.topstep.errors import UpstreamHTTPError
+
+    clock_ref = [BASE_T + 15]
+    transports: list[_MockSignalRTransport] = []
+    login_mode = ["v1"]
+
+    async def ws_factory(_url: str, _headers: dict[str, str]) -> _MockSignalRTransport:
+        t = _MockSignalRTransport()
+        transports.append(t)
+        return t
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/Auth/loginKey":
+            if login_mode[0] == "v1":
+                return httpx.Response(200, json={"success": True, "token": "jwt-rest-v1"})
+            if login_mode[0] == "outage":
+                return httpx.Response(503, json={"success": False, "errorMessage": "unavailable"})
+            return httpx.Response(200, json={"success": True, "token": "jwt-rest-v2"})
+        if request.url.path == "/api/History/retrieveBars":
+            payload = json.loads(request.content.decode("utf-8"))
+            return httpx.Response(
+                200,
+                json={"success": True, "bars": _bars_for_history_payload(payload)},
+            )
+        return httpx.Response(404)
+
+    settings = Settings(
+        data_dir=tmp_path / "data",
+        jwt_refresh_hours=1,
+        upstream_max_retries=0,
+        signalr_reconnect_initial_delay_sec=0.01,
+        signalr_reconnect_max_delay_sec=0.02,
+    )
+    sqlite_store = SqliteStore(tmp_path / "meta.db")
+    sqlite_store.initialize()
+    try:
+        parquet_store = ParquetStore(settings.data_dir, sqlite_store=sqlite_store)
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            auth = TopstepAuthService(settings, client)
+            await auth.login("alice", "key-rest-jwt")
+            rest = TopstepRestClient(settings, auth, client)
+            hub = SignalRMarketHub(
+                settings,
+                auth_service=auth,
+                ws_factory=ws_factory,
+                contracts=[CID_MES],
+                reconnect_initial_delay_sec=0.01,
+                reconnect_max_delay_sec=0.02,
+            )
+            live_feed = LiveFeedService(
+                settings,
+                auth,
+                rest,
+                parquet_store,
+                sqlite_store,
+                signalr_hub=hub,
+                recovery_timeframes=("1m",),
+                clock=lambda: clock_ref[0],
+            )
+            try:
+                await live_feed.set_active_contracts([CID_MES], live_mode=False)
+                await live_feed.start()
+                for _ in range(100):
+                    if live_feed.feed_state == "LIVE":
+                        break
+                    await asyncio.sleep(0.01)
+                assert live_feed.feed_state == "LIVE"
+
+                # REST call triggers JWT refresh during 503 outage (never touching watchdog yet).
+                login_mode[0] = "outage"
+                assert auth._token_acquired_at is not None
+                auth._token_acquired_at = auth._token_acquired_at - timedelta(hours=2)
+                with pytest.raises(UpstreamHTTPError):
+                    await rest.retrieve_bars_paginated(
+                        contract_id=CID_MES,
+                        live=False,
+                        timeframe="1m",
+                        start_ts=BASE_T - 120,
+                        end_ts=BASE_T,
+                        include_partial_bar=False,
+                    )
+                assert auth.is_connected is False
+                assert auth.can_retry_login is True
+
+                # Watchdog runs while still in outage -> DISCONNECTED, then recovers when 200 OK.
+                await live_feed.run_watchdog_tick()
+                assert live_feed.feed_state == "DISCONNECTED"
+
+                login_mode[0] = "v2"
+                await asyncio.sleep(0.02)
+                await live_feed.run_watchdog_tick()
+                for _ in range(100):
+                    if len(transports) >= 2 and live_feed.feed_state == "LIVE":
+                        break
+                    await asyncio.sleep(0.02)
+                assert len(transports) >= 2
+                assert live_feed.feed_state == "LIVE"
+                assert live_feed.live_alerts_enabled is True
+            finally:
+                await live_feed.stop()
+    finally:
+        sqlite_store.close()
+
+
+def test_f03_reconcile_recovery_preserves_unconfirmed_future_incomplete_markers() -> None:
+    """Contract: reconcile_recovery keeps pending incomplete markers newer than closed history.
+
+    Defect caught: Clearing all _incomplete_open_buckets[stream_key] during reconciliation of an
+    earlier open bar (T), losing incomplete markers already queued for a future bucket (T+60).
+    """
+    from app.engine.bar_aggregator import NormalizedTick
+
+    agg = BarAggregator(timeframes=("1m",))
+    agg.process_tick(NormalizedTick(CID_MES, False, BASE_T + 10, 5950.0, 1.0), now_utc=BASE_T + 10)
+    agg.mark_open_bucket_incomplete(CID_MES, False, BASE_T + 65)
+
+    # Reconcile prior closed history up to BASE_T - 60 while BASE_T open bar is rebuilt.
+    hist_bar = OHLCVBar(BASE_T - 60, 5948.0, 5949.0, 5947.0, 5948.5, 5.0, True)
+    agg.reconcile_recovery(
+        contract_id=CID_MES,
+        live_mode=False,
+        timeframe="1m",
+        historical_bars=[hist_bar],
+        buffered_ticks=[NormalizedTick(CID_MES, False, BASE_T + 20, 5951.0, 2.0)],
+        now_utc=BASE_T + 30,
+        mark_open_incomplete=False,
+    )
+
+    # Now tick arrives in BASE_T + 60, then rolls into BASE_T + 120 -> BASE_T + 60 must discard!
+    r1 = agg.process_tick(
+        NormalizedTick(CID_MES, False, BASE_T + 70, 5952.0, 1.0),
+        now_utc=BASE_T + 70,
+    )
+    assert r1.accepted is True
+    r2 = agg.process_tick(
+        NormalizedTick(CID_MES, False, BASE_T + 130, 5953.0, 1.0),
+        now_utc=BASE_T + 130,
+    )
+    assert [e for e in r2.events if e.bar.is_closed] == []
+    discarded = agg.pop_discarded_incomplete_bars(contract_id=CID_MES, live_mode=False)
+    assert (CID_MES, False, "1m", BASE_T + 60) in discarded
+
+
+async def test_f03_malformed_tick_during_recovering_keeps_valid_ticks_buffered_for_htf(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Contract: Malformed tick during RECOVERING keeps buffering valid ticks until rebuild ends.
+
+    Defect caught: Flipping c_state.state to DEGRADED mid-recovery on malformed tick, causing
+    concurrent valid ticks to bypass _recovery_queue and be overwritten by HTF rebuild.
+    """
+    clock_ref = [BASE_T + 65]
+    transports: list[_MockSignalRTransport] = []
+
+    async def ws_factory(_url: str, _headers: dict[str, str]) -> _MockSignalRTransport:
+        t = _MockSignalRTransport()
+        transports.append(t)
+        return t
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/Auth/loginKey":
+            return httpx.Response(200, json={"success": True, "token": "jwt-htf-mal"})
+        if request.url.path == "/api/History/retrieveBars":
+            payload = json.loads(request.content.decode("utf-8"))
+            return httpx.Response(
+                200,
+                json={"success": True, "bars": _bars_for_history_payload(payload)},
+            )
+        return httpx.Response(404)
+
+    settings = Settings(data_dir=tmp_path / "data")
+    sqlite_store = SqliteStore(tmp_path / "meta.db")
+    sqlite_store.initialize()
+    try:
+        parquet_store = ParquetStore(settings.data_dir, sqlite_store=sqlite_store)
+        orig_read_bars = parquet_store.read_bars
+        htf_gate_entered = asyncio.Event()
+        htf_gate_release = asyncio.Event()
+
+        async def gated_read_bars(
+            key: StorageDatasetKey,
+            *,
+            start_ts: int | None = None,
+            end_ts: int | None = None,
+            include_provisional: bool = False,
+        ) -> list[OHLCVBar]:
+            # Pause specifically when _recover_higher_timeframes_from_1m reads 1m history.
+            if key.timeframe == "1m" and end_ts == BASE_T + 65:
+                htf_gate_entered.set()
+                await htf_gate_release.wait()
+            return await orig_read_bars(
+                key,
+                start_ts=start_ts,
+                end_ts=end_ts,
+                include_provisional=include_provisional,
+            )
+
+        monkeypatch.setattr(parquet_store, "read_bars", gated_read_bars)
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            auth = TopstepAuthService(settings, client)
+            await auth.login("alice", "key-htf-mal")
+            rest = TopstepRestClient(settings, auth, client)
+            hub = SignalRMarketHub(
+                settings,
+                auth_service=auth,
+                ws_factory=ws_factory,
+                contracts=[CID_MES],
+            )
+            agg = BarAggregator(timeframes=("1m", "5m"))
+            live_feed = LiveFeedService(
+                settings,
+                auth,
+                rest,
+                parquet_store,
+                sqlite_store,
+                aggregator=agg,
+                signalr_hub=hub,
+                recovery_timeframes=("1m", "5m"),
+                clock=lambda: clock_ref[0],
+            )
+            try:
+                await live_feed.set_active_contracts([CID_MES], live_mode=False)
+                await live_feed.start()
+                await asyncio.wait_for(htf_gate_entered.wait(), timeout=2.0)
+
+                # Malformed tick + valid trade arrive while HTF rebuild is awaiting Parquet.
+                await transports[0].push_frame(_quote_frame(CID_MES, BASE_T + 66, 5950.0, -2.0))
+                await transports[0].push_frame(_quote_frame(CID_MES, BASE_T + 68, 5958.0, 4.0))
+                await asyncio.sleep(0.03)
+                assert live_feed._contracts[CID_MES].state == "RECOVERING"
+
+                htf_gate_release.set()
+                for _ in range(100):
+                    if live_feed.feed_state == "DEGRADED":
+                        break
+                    await asyncio.sleep(0.01)
+                await live_feed.flush_pending_tasks()
+
+                assert live_feed.feed_state == "DEGRADED"
+                open_1m = agg.get_open_bar(CID_MES, False, "1m")
+                open_5m = agg.get_open_bar(CID_MES, False, "5m")
+                assert open_1m is not None and open_1m.close == 5958.0 and open_1m.volume == 4.0
+                # 5m bar combines the closed 1m history bar at BASE_T (vol=5.0) + live trade (4.0).
+                assert open_5m is not None and open_5m.close == 5958.0 and open_5m.volume == 9.0
+            finally:
+                htf_gate_release.set()
+                await live_feed.stop()
+    finally:
+        sqlite_store.close()
+
+
+async def test_f03_rest_out_of_window_bar_during_recovery_quarantined_and_degrades(
+    tmp_path: Path,
+) -> None:
+    """Contract: Out-of-window REST bars during recovery are quarantined and transition DEGRADED.
+
+    Defect caught: Passing valid-OHLCV REST bars outside [interval_start, interval_end] directly
+    into reconcile_recovery() and Parquet instead of quarantining out_of_window_timestamp.
+    """
+    clock_ref = [BASE_T + 180]
+
+    async def ws_factory(_url: str, _headers: dict[str, str]) -> _MockSignalRTransport:
+        return _MockSignalRTransport()
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/Auth/loginKey":
+            return httpx.Response(200, json={"success": True, "token": "jwt-oow"})
+        if request.url.path == "/api/History/retrieveBars":
+            payload = json.loads(request.content.decode("utf-8"))
+            bars = _bars_for_history_payload(payload)
+            # Inject an out-of-window bar 1 hour older than requested backfill window.
+            bars.insert(0, _wire_bar(BASE_T - 3600, 99.0, 100.0, 98.0, 99.5, 5.0))
+            return httpx.Response(200, json={"success": True, "bars": bars})
+        return httpx.Response(404)
+
+    settings = Settings(data_dir=tmp_path / "data")
+    sqlite_store = SqliteStore(tmp_path / "meta.db")
+    sqlite_store.initialize()
+    try:
+        parquet_store = ParquetStore(settings.data_dir, sqlite_store=sqlite_store)
+        key = StorageDatasetKey("topstepx", False, CID_MES, "1m")
+        await sqlite_store.upsert_watermark(key, BASE_T + 120)
+
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            auth = TopstepAuthService(settings, client)
+            await auth.login("alice", "key-oow")
+            rest = TopstepRestClient(settings, auth, client)
+            hub = SignalRMarketHub(
+                settings,
+                auth_service=auth,
+                ws_factory=ws_factory,
+                contracts=[CID_MES],
+            )
+            live_feed = LiveFeedService(
+                settings,
+                auth,
+                rest,
+                parquet_store,
+                sqlite_store,
+                signalr_hub=hub,
+                recovery_timeframes=("1m",),
+                clock=lambda: clock_ref[0],
+            )
+            try:
+                await live_feed.set_active_contracts([CID_MES], live_mode=False)
+                await live_feed.start()
+                for _ in range(100):
+                    if live_feed.feed_state == "DEGRADED":
+                        break
+                    await asyncio.sleep(0.01)
+                await live_feed.flush_pending_tasks()
+                assert live_feed.feed_state == "DEGRADED"
+                issues = await sqlite_store.list_quality_issues(key)
+                assert any(i["issue_code"] == "out_of_window_timestamp" for i in issues)
+                assert (
+                    await parquet_store.read_bars(
+                        key, start_ts=BASE_T - 3600, end_ts=BASE_T - 3600
+                    )
+                    == []
+                )
+            finally:
+                await live_feed.stop()
+    finally:
+        sqlite_store.close()
+
+
+async def test_f03_signalr_backoff_resets_after_successful_session_drop(
+    tmp_path: Path,
+) -> None:
+    """Contract: Reconnect backoff resets to initial_delay after a connected session later drops.
+
+    Defect caught: Only setting session_connected=True on normal return instead of after initial
+    handshake+subscribe, causing backoff to stay elevated across distinct session drops.
+    """
+    dial_times: list[float] = []
+
+    class _SessionResetTransport(_MockSignalRTransport):
+        def __init__(self, *, mode: str) -> None:
+            super().__init__()
+            self._mode = mode
+
+        async def recv(self) -> str:
+            if self._mode == "fail_dial":
+                raise ConnectionError("dial failed")
+            item = await self.incoming.get()
+            if isinstance(item, Exception):
+                raise item
+            return item
+
+    transports: list[_SessionResetTransport] = []
+
+    async def ws_factory(_url: str, _headers: dict[str, str]) -> _SessionResetTransport:
+        idx = len(dial_times)
+        dial_times.append(time.monotonic())
+        mode = "fail_dial" if idx in {0, 1} else "ok"
+        t = _SessionResetTransport(mode=mode)
+        transports.append(t)
+        return t
+
+    settings = Settings(data_dir=tmp_path / "data")
+    events: asyncio.Queue[Any] = asyncio.Queue()
+    hub = SignalRMarketHub(
+        settings,
+        token_provider=lambda: asyncio.sleep(0, result="jwt-backoff-reset"),
+        ws_factory=ws_factory,
+        contracts=[CID_MES],
+        event_queue=events,
+        reconnect_initial_delay_sec=0.06,
+        reconnect_max_delay_sec=0.50,
+    )
+    hub.start()
+    try:
+        # Wait for Session 2 (after two failed dials: ~0.06s + ~0.12s) to connect cleanly.
+        for _ in range(100):
+            if len(dial_times) >= 3 and hub.is_connected:
+                break
+            await asyncio.sleep(0.01)
+        assert len(dial_times) >= 3 and hub.is_connected is True
+
+        # Drop healthy Session 2 -> backoff MUST reset to initial ~0.06s (NOT ~0.24s!).
+        drop_at = time.monotonic()
+        await transports[2].drop(ConnectionError("mid-stream drop"))
+        for _ in range(100):
+            if len(dial_times) >= 4 and hub.is_connected:
+                break
+            await asyncio.sleep(0.01)
+        assert len(dial_times) >= 4
+        gap_fail_0 = dial_times[1] - dial_times[0]
+        gap_fail_1 = dial_times[2] - dial_times[1]
+        gap_after_healthy = dial_times[3] - drop_at
+        assert gap_fail_1 > gap_fail_0 * 1.4
+        assert gap_after_healthy < gap_fail_1 * 0.85
+    finally:
+        await hub.stop()
