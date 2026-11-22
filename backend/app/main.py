@@ -119,6 +119,7 @@ def create_app(
         ws_broadcaster = WsBroadcaster(
             client_queue_maxsize=resolved_settings.ws_client_queue_maxsize,
             send_timeout_sec=resolved_settings.ws_send_timeout_sec,
+            supported_timeframes=bar_aggregator.timeframes,
         )
         signalr_hub = SignalRMarketHub(
             resolved_settings,

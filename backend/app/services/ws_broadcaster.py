@@ -7,11 +7,11 @@ import contextlib
 import logging
 import uuid
 from collections import deque
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
-from app.engine.bar_aggregator import AggregatedBarEvent
+from app.engine.bar_aggregator import DEFAULT_AGGREGATION_TIMEFRAMES, AggregatedBarEvent
 from app.engine.session_calendar import normalize_timeframe
 
 logger = logging.getLogger("topstep_chart.ws")
@@ -146,16 +146,26 @@ class WsBroadcaster:
         *,
         client_queue_maxsize: int = 64,
         send_timeout_sec: float = 5.0,
+        supported_timeframes: Sequence[str] = DEFAULT_AGGREGATION_TIMEFRAMES,
     ) -> None:
         if client_queue_maxsize < 1:
             raise ValueError("client_queue_maxsize must be >= 1")
         if send_timeout_sec <= 0:
             raise ValueError("send_timeout_sec must be > 0")
+        canon_tfs = tuple(dict.fromkeys(normalize_timeframe(tf) for tf in supported_timeframes))
+        if not canon_tfs:
+            raise ValueError("supported_timeframes must contain at least one timeframe")
         self._queue_maxsize = client_queue_maxsize
         self._send_timeout_sec = send_timeout_sec
+        self._supported_timeframes: tuple[str, ...] = canon_tfs
         self._clients: dict[str, WsClientSession] = {}
         self._teardown_tasks: set[asyncio.Task[None]] = set()
         self._slow_disconnect_count = 0
+
+    @property
+    def supported_timeframes(self) -> tuple[str, ...]:
+        """Timeframes produced by the active live aggregator and accepted for WS subscribe."""
+        return self._supported_timeframes
 
     @property
     def client_count(self) -> int:
@@ -203,6 +213,12 @@ class WsBroadcaster:
         if not cid:
             raise ValueError("contract_id cannot be empty")
         tf = normalize_timeframe(timeframe)
+        if tf not in self._supported_timeframes:
+            supported_str = ", ".join(self._supported_timeframes)
+            raise ValueError(
+                f"Timeframe {tf!r} is not supported by live aggregation "
+                f"(supported: {supported_str})"
+            )
         session = self._clients.get(client_id)
         if session is not None:
             session.subscriptions.add((cid, tf))

@@ -251,6 +251,18 @@ class BarAggregator:
             else:
                 self._incomplete_open_buckets[stream_key] = bucket_ts
 
+    def _apply_pending_incomplete(
+        self,
+        stream_key: tuple[str, bool, str],
+        bucket_ts: int,
+    ) -> None:
+        pending_inc = self._incomplete_open_buckets.get(stream_key)
+        if pending_inc is not None:
+            if bucket_ts == pending_inc:
+                self._incomplete_open_bars.add(stream_key)
+            if bucket_ts >= pending_inc:
+                self._incomplete_open_buckets.pop(stream_key, None)
+
     def pop_discarded_incomplete_bars(
         self,
         *,
@@ -360,6 +372,7 @@ class BarAggregator:
                     if open_res.is_valid and open_res.bar is not None:
                         self._open_bars[stream_key] = open_res.bar
                         self._open_bar_ts_bounds[stream_key] = (raw_ts, raw_ts)
+                        self._apply_pending_incomplete(stream_key, bucket_ts)
                         emitted.append(
                             AggregatedBarEvent(
                                 contract_id=cid,
@@ -431,12 +444,7 @@ class BarAggregator:
                 if new_res.is_valid and new_res.bar is not None:
                     self._open_bars[stream_key] = new_res.bar
                     self._open_bar_ts_bounds[stream_key] = (raw_ts, raw_ts)
-                    pending_inc = self._incomplete_open_buckets.get(stream_key)
-                    if pending_inc is not None:
-                        if bucket_ts == pending_inc:
-                            self._incomplete_open_bars.add(stream_key)
-                        if bucket_ts >= pending_inc:
-                            self._incomplete_open_buckets.pop(stream_key, None)
+                    self._apply_pending_incomplete(stream_key, bucket_ts)
                     emitted.append(
                         AggregatedBarEvent(
                             contract_id=cid,

@@ -347,7 +347,15 @@ async def market_websocket(websocket: WebSocket) -> None:
                 raw_cid = str(msg.get("contract_id") or msg.get("contractId") or "")
                 raw_tf = str(msg.get("timeframe") or "1m")
                 try:
-                    cid, tf = broadcaster.subscribe(ws_session.client_id, raw_cid, raw_tf)
+                    norm_tf = normalize_timeframe(raw_tf)
+                    aggregator = getattr(websocket.app.state, "bar_aggregator", None)
+                    if aggregator is not None and norm_tf not in aggregator.timeframes:
+                        supported_str = ", ".join(aggregator.timeframes)
+                        raise ValueError(
+                            f"Timeframe {norm_tf!r} is not enabled in BarAggregator "
+                            f"(supported: {supported_str})"
+                        )
+                    cid, tf = broadcaster.subscribe(ws_session.client_id, raw_cid, norm_tf)
                     broadcaster.send_to_client(
                         ws_session.client_id,
                         {"type": "subscribed", "contract_id": cid, "timeframe": tf},

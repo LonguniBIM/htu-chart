@@ -56,6 +56,7 @@ class SignalRConnectedEvent:
     contracts: tuple[str, ...]
     live_mode: bool
     connected_monotonic: float
+    pre_connect_overflow_count: int = 0
 
 
 @dataclass(frozen=True)
@@ -814,9 +815,9 @@ class SignalRMarketHub:
 
             ack_timeout = min(self._connect_timeout, self._heartbeat_timeout)
             deadline_mono = time.monotonic() + ack_timeout
-            pre_connect_events: deque[SignalREvent] = deque(
-                maxlen=self._settings.signalr_recovery_queue_maxsize
-            )
+            pre_connect_cap = max(1, self._settings.signalr_recovery_queue_maxsize)
+            pre_connect_events: deque[SignalREvent] = deque(maxlen=pre_connect_cap)
+            pre_connect_overflow = 0
             while self._pending_subscriptions or set(self._contracts) != self._subscribed_contracts:
                 if set(self._contracts) != self._subscribed_contracts:
                     await self._sync_session_subscriptions(ws)
@@ -844,9 +845,14 @@ class SignalRMarketHub:
                         err_detail = frame.get("error") or "Server sent SignalR close frame"
                         disconnect_reason = self._redact(str(err_detail), token)
                         return
-                    pre_connect_events.extend(
-                        self._build_frame_events(frame, recv_mono=recv_mono, token=token)
+                    frame_events = self._build_frame_events(
+                        frame, recv_mono=recv_mono, token=token
                     )
+                    for pre_evt in frame_events:
+                        if len(pre_connect_events) >= pre_connect_cap:
+                            pre_connect_overflow += 1
+                            continue
+                        pre_connect_events.append(pre_evt)
 
             self._connected = True
             await self._emit(
@@ -854,6 +860,7 @@ class SignalRMarketHub:
                     contracts=tuple(self._contracts),
                     live_mode=self._live_mode,
                     connected_monotonic=time.monotonic(),
+                    pre_connect_overflow_count=pre_connect_overflow,
                 )
             )
             for pre_evt in pre_connect_events:

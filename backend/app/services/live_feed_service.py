@@ -271,6 +271,13 @@ class LiveFeedService:
             elif root is not None:
                 existing.root_symbol = root
 
+        if added_or_mode_changed or removed:
+            if not self._contracts:
+                self._feed_state = "DISCONNECTED"
+            else:
+                self._recompute_aggregate_state()
+            self._broadcast_status()
+
         await self._hub.update_contracts(list(self._contracts.keys()), live_mode=eff_live)
 
         if (
@@ -301,6 +308,9 @@ class LiveFeedService:
         existing = self._contracts.get(cid)
         newly_added = existing is None or existing.live_mode != eff_live
         self.register_contract(cid, live_mode=eff_live)
+        if newly_added:
+            self._recompute_aggregate_state()
+            self._broadcast_status()
         await self._hub.update_contracts(list(self._contracts.keys()), live_mode=eff_live)
 
         if self._running and self._settings.signalr_enabled and self._auth.is_connected:
@@ -324,6 +334,11 @@ class LiveFeedService:
         for old_cid in removed:
             self._contracts.pop(old_cid, None)
             self._aggregator.reset_contract(old_cid)
+        if not self._contracts:
+            self._feed_state = "DISCONNECTED"
+        else:
+            self._recompute_aggregate_state()
+        self._broadcast_status()
         await self._hub.update_contracts(list(self._contracts.keys()), live_mode=self._auth.live)
         if not self._contracts and self._hub.is_connected:
             await self._hub.stop()
@@ -477,6 +492,10 @@ class LiveFeedService:
                 self.register_contract(cid, live_mode=event.live_mode)
             self._bump_generation_and_cancel_live_tasks()
             self._reset_recovery_queue()
+            if event.pre_connect_overflow_count > 0:
+                self._queue_overflow_count += event.pre_connect_overflow_count
+                self._recovery_overflowed = True
+                self._global_unresolved_gaps += event.pre_connect_overflow_count
             self._transition_all_contracts("RECOVERING")
             self._start_recovery_task()
             return
@@ -505,8 +524,14 @@ class LiveFeedService:
             if c_state is not None:
                 c_state.last_event_monotonic = event.received_monotonic
 
-            if self._feed_state == "RECOVERING" or (
-                c_state is not None and c_state.state == "RECOVERING"
+            if (
+                self._feed_state == "RECOVERING"
+                or (c_state is not None and c_state.state == "RECOVERING")
+                or (
+                    self._hub.is_connected
+                    and c_state is not None
+                    and c_state.state == "DISCONNECTED"
+                )
             ):
                 total_buffered = (
                     self._recovery_queue.qsize() + self._pending_recovery_ticks_count
@@ -530,6 +555,30 @@ class LiveFeedService:
             c_state.unresolved_gaps += 1
         else:
             self._global_unresolved_gaps += 1
+
+    def _handle_rejected_live_tick(
+        self,
+        event: SignalRTickEvent,
+        *,
+        reason: str,
+    ) -> None:
+        is_ts_issue = "timestamp" in reason.lower()
+        bar_time: int | None = None if is_ts_issue else int(event.timestamp_utc_sec)
+        raw_summary = (
+            f"{{'target': {event.source_target!r}, 'ts': {event.timestamp_utc_sec!r}, "
+            f"'price': {event.price!r}, 'volume': {event.volume!r}}}"
+        )
+        self._handle_malformed_signalr_tick(
+            SignalRMalformedTickEvent(
+                contract_id=event.contract_id,
+                live_mode=event.live_mode,
+                reason=reason,
+                issue_code="invalid_timestamp" if is_ts_issue else "invalid_tick",
+                raw_summary=raw_summary,
+                bar_time=bar_time,
+                received_monotonic=event.received_monotonic,
+            )
+        )
 
     def _handle_malformed_signalr_tick(self, event: SignalRMalformedTickEvent) -> None:
         self._last_event_monotonic = event.received_monotonic
@@ -1370,7 +1419,13 @@ class LiveFeedService:
             contract_id=event.contract_id,
             live_mode=event.live_mode,
         )
-        if not res.accepted or not res.events:
+        if not res.accepted:
+            self._handle_rejected_live_tick(
+                event,
+                reason=res.reason or "Rejected live tick",
+            )
+            return []
+        if not res.events:
             return []
         for bar_evt in res.events:
             if self._broadcaster is not None:
@@ -1431,6 +1486,10 @@ class LiveFeedService:
             live_mode=event.live_mode,
         )
         if not res.accepted:
+            self._handle_rejected_live_tick(
+                event,
+                reason=res.reason or "Rejected live tick",
+            )
             return
         await self._safe_persist_and_signal_events(
             res.events,
