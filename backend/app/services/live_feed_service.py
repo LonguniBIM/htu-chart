@@ -84,6 +84,7 @@ class ContractFeedRuntime:
     last_error: str | None = None
     watermarks: dict[str, int] = field(default_factory=dict)
     unhealed_gap_starts: dict[str, int] = field(default_factory=dict)
+    unhealed_gap_buckets: dict[str, set[int]] = field(default_factory=dict)
 
 
 class LiveFeedService:
@@ -591,10 +592,7 @@ class LiveFeedService:
                     eff_ts = floor_ts
         gap_open_1m = bucket_open_utc(eff_ts, "1m")
         if c_state is not None:
-            prev_gap = c_state.unhealed_gap_starts.get("1m")
-            c_state.unhealed_gap_starts["1m"] = (
-                gap_open_1m if prev_gap is None else min(prev_gap, gap_open_1m)
-            )
+            self._record_gap_bucket(c_state, "1m", gap_open_1m)
             c_state.last_error = "SignalR recovery queue overflowed"
             self._aggregator.mark_open_bucket_incomplete(
                 c_state.contract_id, c_state.live_mode, eff_ts
@@ -605,6 +603,35 @@ class LiveFeedService:
                 self._auth.live if live_mode is None else bool(live_mode),
                 eff_ts,
             )
+
+    @staticmethod
+    def _record_gap_bucket(c_state: ContractFeedRuntime, tf: str, bucket_ts: int) -> None:
+        buckets = c_state.unhealed_gap_buckets.setdefault(tf, set())
+        buckets.add(bucket_ts)
+        c_state.unhealed_gap_starts[tf] = min(buckets)
+
+    @staticmethod
+    def _clear_healed_gap_buckets(
+        c_state: ContractFeedRuntime,
+        tf: str,
+        healed_before_ts: int,
+    ) -> bool:
+        """Prune gap buckets < healed_before_ts; return True if open/post-window gaps remain."""
+        buckets = c_state.unhealed_gap_buckets.get(tf)
+        if buckets is not None:
+            remaining = {b for b in buckets if b >= healed_before_ts}
+            if remaining:
+                c_state.unhealed_gap_buckets[tf] = remaining
+                c_state.unhealed_gap_starts[tf] = min(remaining)
+                return True
+            c_state.unhealed_gap_buckets.pop(tf, None)
+            c_state.unhealed_gap_starts.pop(tf, None)
+            return False
+        existing = c_state.unhealed_gap_starts.get(tf)
+        if existing is not None and existing >= healed_before_ts:
+            return True
+        c_state.unhealed_gap_starts.pop(tf, None)
+        return False
 
     def _record_recovery_overflow(
         self,
@@ -675,10 +702,7 @@ class LiveFeedService:
         if c_state is not None:
             c_state.unresolved_gaps += 1
             c_state.last_error = redacted_reason
-            prev_gap = c_state.unhealed_gap_starts.get("1m")
-            c_state.unhealed_gap_starts["1m"] = (
-                bar_open_1m if prev_gap is None else min(prev_gap, bar_open_1m)
-            )
+            self._record_gap_bucket(c_state, "1m", bar_open_1m)
             if c_state.state != "RECOVERING":
                 c_state.state = "DEGRADED"
         else:
@@ -761,9 +785,17 @@ class LiveFeedService:
             skip_corrupted_coverage = False
             if queued_gen != self._generation:
                 c_state = self._contracts.get(key.contract_id)
+                m1_buckets = (
+                    c_state.unhealed_gap_buckets.get("1m", set())
+                    if c_state is not None
+                    else set()
+                )
                 gap_1m = c_state.unhealed_gap_starts.get("1m") if c_state is not None else None
+                still_unhealed = c_state is not None and (
+                    bar_open_1m in m1_buckets or (gap_1m is not None and gap_1m <= bar_open_1m)
+                )
                 contract_healed = c_state is not None and (
-                    c_state.state == "LIVE" or gap_1m is None or gap_1m > bar_open_1m
+                    c_state.state == "LIVE" or not still_unhealed
                 )
                 if contract_healed or await self._sqlite.is_interval_complete(
                     key, bar_open_1m, bar_open_1m + 60
@@ -1078,14 +1110,19 @@ class LiveFeedService:
                 for t in contract_ticks
             ]
 
-            has_open_unhealed_gap = open_bucket_unhealed or any(
-                gap_ts >= open_bucket_utc_ts for gap_ts in c_state.unhealed_gap_starts.values()
+            has_open_unhealed_gap = (
+                open_bucket_unhealed
+                or any(
+                    any(g >= open_bucket_utc_ts for g in bset)
+                    for bset in c_state.unhealed_gap_buckets.values()
+                )
+                or any(
+                    gap_ts >= open_bucket_utc_ts
+                    for gap_ts in c_state.unhealed_gap_starts.values()
+                )
             )
             if gap_from_rest_issues:
-                c_state.unhealed_gap_starts[tf] = min(
-                    c_state.unhealed_gap_starts.get(tf, backfill_start),
-                    backfill_start,
-                )
+                self._record_gap_bucket(c_state, tf, backfill_start)
             mark_open_inc = (
                 self._last_connected_utc is None
                 or self._last_connected_utc >= open_bucket_utc_ts
@@ -1105,10 +1142,7 @@ class LiveFeedService:
             raise
         except Exception:
             if not open_bucket_unhealed:
-                c_state.unhealed_gap_starts[tf] = min(
-                    c_state.unhealed_gap_starts.get(tf, backfill_start),
-                    backfill_start,
-                )
+                self._record_gap_bucket(c_state, tf, backfill_start)
             self._aggregator.mark_active_open_bars_incomplete(cid, c_state.live_mode)
             self._aggregator.mark_open_bucket_incomplete(cid, c_state.live_mode, eff_now)
             raise
@@ -1185,7 +1219,7 @@ class LiveFeedService:
                 had_gap = True
                 c_state.unresolved_gaps += 1
             if not issues and not page_res.truncated and not page_res.provider_gap:
-                c_state.unhealed_gap_starts[tf] = missing_buckets[0]
+                self._record_gap_bucket(c_state, tf, missing_buckets[0])
                 await self._sqlite.record_coverage(
                     key,
                     missing_buckets[0],
@@ -1199,16 +1233,7 @@ class LiveFeedService:
             if not had_gap:
                 had_gap = True
                 c_state.unresolved_gaps += 1
-                c_state.unhealed_gap_starts[tf] = (
-                    earliest_post
-                    if unhealed_start is None
-                    else min(unhealed_start, earliest_post)
-                )
-            else:
-                prev_gap = c_state.unhealed_gap_starts.get(tf)
-                c_state.unhealed_gap_starts[tf] = (
-                    earliest_post if prev_gap is None else min(prev_gap, earliest_post)
-                )
+            self._record_gap_bucket(c_state, tf, earliest_post)
 
         self._ensure_generation(expected_gen)
         closed_bars = [evt.bar for evt in recon.closed_bars]
@@ -1221,26 +1246,22 @@ class LiveFeedService:
             )
             self._ensure_generation(expected_gen)
 
-        recorded_gap = c_state.unhealed_gap_starts.get(tf)
-        if not had_gap and recorded_gap is not None and recorded_gap >= closed_end:
-            # Never clear a newer unhealed gap occurring outside this recovery window (P1-NEW-002).
-            had_gap = True
         if not had_gap:
-            c_state.unhealed_gap_starts.pop(tf, None)
             if recon.last_closed_bar_time is not None:
                 updated_wm = await self._sqlite.upsert_watermark(
                     key, recon.last_closed_bar_time
                 )
                 c_state.watermarks[tf] = updated_wm.last_closed_bar_time
-
-        if not had_gap and closed_end > backfill_start:
-            await self._sqlite.record_coverage(
-                key,
-                backfill_start,
-                closed_end,
-                status="COMPLETE",
-                heal_existing=True,
-            )
+            if closed_end > backfill_start:
+                await self._sqlite.record_coverage(
+                    key,
+                    backfill_start,
+                    closed_end,
+                    status="COMPLETE",
+                    heal_existing=True,
+                )
+            if self._clear_healed_gap_buckets(c_state, tf, closed_end):
+                had_gap = True
 
         for closed_evt in recon.closed_bars:
             self._ensure_generation(expected_gen)
@@ -1345,7 +1366,10 @@ class LiveFeedService:
                 )
             )
             if htf_clean:
-                c_state.unhealed_gap_starts.pop(htf, None)
+                htf_closed_end = latest_closed_bucket_end_utc(
+                    eff_now, htf, root_symbol=c_state.root_symbol
+                )
+                self._clear_healed_gap_buckets(c_state, htf, htf_closed_end)
                 if recon_htf.last_closed_bar_time is not None:
                     updated_wm = await self._sqlite.upsert_watermark(
                         key_htf, recon_htf.last_closed_bar_time
@@ -1550,10 +1574,7 @@ class LiveFeedService:
             c_state = self._contracts.get(cid)
             if c_state is not None:
                 c_state.unresolved_gaps += 1
-                prev_gap = c_state.unhealed_gap_starts.get(tf)
-                c_state.unhealed_gap_starts[tf] = (
-                    bar_time if prev_gap is None else min(prev_gap, bar_time)
-                )
+                self._record_gap_bucket(c_state, tf, bar_time)
                 c_state.last_error = f"Unconfirmed interrupted {tf} bar at {bar_time}"
                 c_state.state = "DEGRADED"
         self._last_degraded_at_mono = time.monotonic()
@@ -1701,12 +1722,7 @@ class LiveFeedService:
                     c_state.last_error = redacted_err
                     c_state.state = "DEGRADED"
                     if bar_evt.bar.is_closed:
-                        prev_gap = c_state.unhealed_gap_starts.get(bar_evt.timeframe)
-                        c_state.unhealed_gap_starts[bar_evt.timeframe] = (
-                            bar_evt.bar.time
-                            if prev_gap is None
-                            else min(prev_gap, bar_evt.bar.time)
-                        )
+                        self._record_gap_bucket(c_state, bar_evt.timeframe, bar_evt.bar.time)
             if not marked_any:
                 self._global_unresolved_gaps += 1
             self._last_degraded_at_mono = time.monotonic()

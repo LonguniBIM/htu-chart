@@ -80,6 +80,10 @@ def _redact_arg(
     extra_secrets: tuple[str, ...],
     sensitive_keys: frozenset[str] = frozenset(),
 ) -> Any:
+    if isinstance(value, (int, float, bool)) or value is None:
+        return value
+    if isinstance(value, bytes):
+        return redact_secrets(value.decode("utf-8", errors="replace"), extra_secrets)
     if isinstance(value, str):
         return redact_secrets(value, extra_secrets)
     if isinstance(value, tuple):
@@ -97,7 +101,7 @@ def _redact_arg(
             else:
                 redacted_dict[k] = _redact_arg(v, extra_secrets, sensitive_keys)
         return redacted_dict
-    return value
+    return redact_secrets(str(value), extra_secrets)
 
 
 def _sensitive_positional_slots(msg: str) -> set[int]:
@@ -196,11 +200,26 @@ def redact_secrets(text: str, extra_secrets: Iterable[str] = ()) -> str:
 class SecretRedactionFilter(logging.Filter):
     """Logging filter that redacts credentials from log messages and tracebacks."""
 
-    def __init__(self, extra_secrets: Iterable[str] = ()) -> None:
+    def __init__(self, extra_secrets: Iterable[str] | Callable[[], Iterable[str]] = ()) -> None:
         super().__init__()
-        self._extra_secrets = tuple(s for s in extra_secrets if s and len(s) >= 6)
+        if callable(extra_secrets):
+            self._secrets_provider: Callable[[], Iterable[str]] | None = extra_secrets
+            self._extra_secrets: tuple[str, ...] = ()
+        else:
+            self._secrets_provider = None
+            self._extra_secrets = tuple(s for s in extra_secrets if s and len(s) >= 6)
+
+    def _effective_secrets(self) -> tuple[str, ...]:
+        dynamic = self._secrets_provider() if self._secrets_provider is not None else ()
+        combined = {
+            s
+            for s in (*self._extra_secrets, *dynamic, *_ACTIVE_EXTRA_SECRETS)
+            if s and len(s) >= 6
+        }
+        return tuple(sorted(combined, key=len, reverse=True))
 
     def filter(self, record: logging.LogRecord) -> bool:
+        eff_secrets = self._effective_secrets()
         sensitive_named: frozenset[str] = frozenset()
         if isinstance(record.msg, str):
             sensitive_slots = (
@@ -211,12 +230,12 @@ class SecretRedactionFilter(logging.Filter):
             if isinstance(record.args, dict):
                 sensitive_named = _sensitive_named_keys(record.msg)
             if record.args:
-                record.msg = _redact_log_message_template(record.msg, self._extra_secrets)
+                record.msg = _redact_log_message_template(record.msg, eff_secrets)
             else:
-                record.msg = redact_secrets(record.msg, self._extra_secrets)
+                record.msg = redact_secrets(record.msg, eff_secrets)
         else:
             sensitive_slots = set()
-            record.msg = _redact_arg(record.msg, self._extra_secrets)
+            record.msg = _redact_arg(record.msg, eff_secrets)
 
         if isinstance(record.args, tuple):
             redacted_items = []
@@ -224,12 +243,12 @@ class SecretRedactionFilter(logging.Filter):
                 if idx in sensitive_slots:
                     redacted_items.append("***REDACTED***")
                 else:
-                    redacted_items.append(_redact_arg(item, self._extra_secrets))
+                    redacted_items.append(_redact_arg(item, eff_secrets))
             record.args = tuple(redacted_items)
         elif record.args:
             record.args = _redact_arg(
                 record.args,
-                self._extra_secrets,
+                eff_secrets,
                 sensitive_keys=sensitive_named,
             )
 
@@ -237,11 +256,11 @@ class SecretRedactionFilter(logging.Filter):
             formatter = logging.Formatter()
             record.exc_text = redact_secrets(
                 formatter.formatException(record.exc_info),
-                self._extra_secrets,
+                eff_secrets,
             )
             record.exc_info = None
         elif record.exc_text:
-            record.exc_text = redact_secrets(record.exc_text, self._extra_secrets)
+            record.exc_text = redact_secrets(record.exc_text, eff_secrets)
         return True
 
 
@@ -276,6 +295,8 @@ def install_global_log_redaction(extra_secrets: Iterable[str] = ()) -> None:
         "uvicorn.access",
         "fastapi",
         "httpx",
+        "websockets",
+        "websockets.client",
     )
     for name in logger_names:
         target_logger = logging.getLogger(name)

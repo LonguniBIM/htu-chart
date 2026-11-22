@@ -20,7 +20,7 @@ from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 import websockets
 
 from app.config import Settings
-from app.security import redact_secrets
+from app.security import SecretRedactionFilter, redact_secrets
 from app.topstep.auth import TopstepAuthService
 
 logger = logging.getLogger("topstep_chart.signalr")
@@ -463,6 +463,11 @@ class SignalRMarketHub:
         self._pending_ack_futures: dict[str, asyncio.Future[None]] = {}
         self._subscribed_contracts: set[str] = set()
         self._sub_sync_lock = asyncio.Lock()
+        self._ws_logger = logging.getLogger(f"topstep_chart.signalr.ws.{id(self)}")
+        self._ws_logger.filters = [
+            flt for flt in self._ws_logger.filters if not isinstance(flt, SecretRedactionFilter)
+        ]
+        self._ws_logger.addFilter(SecretRedactionFilter(self._collect_secrets))
 
     @staticmethod
     def _normalize_contracts(contracts: Sequence[str]) -> list[str]:
@@ -546,6 +551,7 @@ class SignalRMarketHub:
             additional_headers=headers,
             open_timeout=self._connect_timeout,
             close_timeout=1.0,
+            logger=self._ws_logger,
         )
 
     async def _get_token(self) -> str:

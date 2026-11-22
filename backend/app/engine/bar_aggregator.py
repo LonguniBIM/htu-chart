@@ -342,6 +342,21 @@ class BarAggregator:
             if m1_last_closed is not None and bucket_open_utc(ts_sec, "1m") <= m1_last_closed:
                 # Never double-count ticks belonging to REST-confirmed 1m minutes into HTF bars.
                 return TickProcessResult(accepted=True, reason=None, events=())
+        for tf in self._timeframes:
+            stream_key = (cid, live_mode, tf)
+            bucket_ts = bucket_open_utc(ts_sec, tf)
+            last_closed = self._last_closed_times.get(stream_key)
+            if last_closed is not None and bucket_ts <= last_closed:
+                continue
+            existing = self._open_bars.get(stream_key)
+            if existing is not None and bucket_ts == existing.time:
+                sum_vol = existing.volume + volume
+                if not math.isfinite(sum_vol):
+                    return TickProcessResult(
+                        accepted=False,
+                        reason=f"Tick volume addition overflowed finite bounds for {tf}",
+                        events=(),
+                    )
         emitted: list[AggregatedBarEvent] = []
 
         for tf in self._timeframes:
@@ -440,19 +455,24 @@ class BarAggregator:
                         is_closed=False,
                         now_utc=max(eff_now, existing.time),
                     )
-                    if upd_res.is_valid and upd_res.bar is not None:
-                        self._open_bars[stream_key] = upd_res.bar
-                        self._open_bar_ts_bounds[stream_key] = (new_first, new_last)
-                        emitted.append(
-                            AggregatedBarEvent(
-                                contract_id=cid,
-                                live_mode=live_mode,
-                                timeframe=tf,
-                                bar=upd_res.bar,
-                                is_recovered_historical=False,
-                                root_symbol=eff_root,
-                            )
+                    if not upd_res.is_valid or upd_res.bar is None:
+                        return TickProcessResult(
+                            accepted=False,
+                            reason=upd_res.issue_detail or f"Invalid updated {tf} bar",
+                            events=(),
                         )
+                    self._open_bars[stream_key] = upd_res.bar
+                    self._open_bar_ts_bounds[stream_key] = (new_first, new_last)
+                    emitted.append(
+                        AggregatedBarEvent(
+                            contract_id=cid,
+                            live_mode=live_mode,
+                            timeframe=tf,
+                            bar=upd_res.bar,
+                            is_recovered_historical=False,
+                            root_symbol=eff_root,
+                        )
+                    )
             else:
                 new_candidate = {
                     "time": bucket_ts,
@@ -610,6 +630,9 @@ class BarAggregator:
         tick_closed_bars: dict[int, OHLCVBar] = {}
         for _, _, tick in eligible_ticks:
             res = temp_agg.process_tick(tick, now_utc=eff_now, root_symbol=eff_root)
+            if not res.accepted:
+                rejected_ticks.append((tick, res.reason or "Rejected buffered tick"))
+                continue
             for evt in res.events:
                 if evt.bar.is_closed:
                     tick_closed_bars[evt.bar.time] = evt.bar
@@ -832,10 +855,18 @@ class BarAggregator:
                     else (members[0].time == htf_open)
                 )
                 latest_open_bar = val.bar
+                m1_key = (cid, eff_live, "1m")
+                m1_pending_incomplete = self._incomplete_open_buckets.get(m1_key) or set()
                 open_1m_incomplete = (
-                    open_1m_bar is not None
-                    and any(b.time == open_1m_bar.time for b in members)
-                    and (cid, eff_live, "1m") in self._incomplete_open_bars
+                    (
+                        open_1m_bar is not None
+                        and any(b.time == open_1m_bar.time for b in members)
+                        and m1_key in self._incomplete_open_bars
+                    )
+                    or any(
+                        htf_open <= pending_1m < htf_end
+                        for pending_1m in m1_pending_incomplete
+                    )
                 )
                 latest_open_incomplete = (
                     not (covered_ok and all_elapsed_1m_present) or open_1m_incomplete
@@ -876,6 +907,12 @@ class BarAggregator:
             self._open_bars.pop(stream_key, None)
             self._open_bar_ts_bounds.pop(stream_key, None)
             self._incomplete_open_bars.discard(stream_key)
+            m1_pending = self._incomplete_open_buckets.get((cid, eff_live, "1m")) or set()
+            current_htf_start, current_htf_end = bucket_bounds(
+                current_htf_open, tf, root_symbol=eff_root
+            )
+            if any(current_htf_start <= p < current_htf_end for p in m1_pending):
+                self._incomplete_open_buckets.setdefault(stream_key, set()).add(current_htf_open)
 
         final_last_closed = max(
             (t for t in (*(e.bar.time for e in closed_events), prev_closed) if t is not None),
