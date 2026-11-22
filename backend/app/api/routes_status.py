@@ -22,6 +22,7 @@ from app.security import (
     require_dev_loopback,
     require_session,
 )
+from app.services.live_feed_service import LiveFeedService
 from app.storage.sqlite_store import SqliteStore
 from app.topstep.auth import TopstepAuthService
 from app.topstep.errors import (
@@ -58,6 +59,10 @@ def _get_login_guard(request: Request) -> LoginGuard:
 
 def _get_sqlite_store(request: Request) -> SqliteStore:
     return request.app.state.sqlite_store
+
+
+def _get_live_feed_service(request: Request) -> LiveFeedService:
+    return request.app.state.live_feed_service
 
 
 @router.get("/health")
@@ -136,10 +141,12 @@ async def get_status(
     _session: Annotated[SessionData, Depends(require_session)],
     topstep_auth: Annotated[TopstepAuthService, Depends(_get_topstep_auth)],
     sqlite_store: Annotated[SqliteStore, Depends(_get_sqlite_store)],
+    live_feed_service: Annotated[LiveFeedService, Depends(_get_live_feed_service)],
 ) -> dict[str, Any]:
-    """Return strictly redacted TopstepX connection, rotation, and data quality status."""
+    """Return strictly redacted TopstepX connection, rotation, feed, and data quality status."""
     payload = topstep_auth.get_status()
     payload["data_quality"] = await sqlite_store.get_quality_summary()
+    payload.update(live_feed_service.get_status_snapshot())
     return payload
 
 
@@ -150,6 +157,7 @@ async def connect_topstep(
     _dev_only: Annotated[None, Depends(require_dev_loopback)],
     settings: Annotated[Settings, Depends(get_settings)],
     topstep_auth: Annotated[TopstepAuthService, Depends(_get_topstep_auth)],
+    live_feed_service: Annotated[LiveFeedService, Depends(_get_live_feed_service)],
 ) -> dict[str, Any]:
     """Dev-only loopback endpoint to authenticate TopstepX credentials."""
     username = body.userName.strip() or settings.topstepx_username.strip()
@@ -183,6 +191,7 @@ async def connect_topstep(
             detail=redact_secrets(str(exc), (api_key, username)),
         ) from exc
 
+    await live_feed_service.on_auth_connected()
     return topstep_auth.get_status()
 
 
@@ -190,7 +199,9 @@ async def connect_topstep(
 async def disconnect_topstep(
     _session: Annotated[SessionData, Depends(require_csrf)],
     topstep_auth: Annotated[TopstepAuthService, Depends(_get_topstep_auth)],
+    live_feed_service: Annotated[LiveFeedService, Depends(_get_live_feed_service)],
 ) -> dict[str, Any]:
     """Clear in-memory TopstepX JWT and mark connection DISCONNECTED."""
+    await live_feed_service.on_auth_disconnected()
     await topstep_auth.disconnect()
     return topstep_auth.get_status()

@@ -17,6 +17,7 @@ from fastapi.responses import JSONResponse
 
 from app.api import routes_market, routes_status
 from app.config import Settings, load_settings
+from app.engine.bar_aggregator import BarAggregator
 from app.security import (
     HostOriginMiddleware,
     LoginGuard,
@@ -25,11 +26,14 @@ from app.security import (
     redact_secrets,
 )
 from app.services.history_service import HistoryBackfillService
+from app.services.live_feed_service import LiveFeedService
+from app.services.ws_broadcaster import WsBroadcaster
 from app.storage.parquet_store import ParquetStore
 from app.storage.sqlite_store import SqliteStore
 from app.topstep.auth import TopstepAuthService, build_httpx_timeout
 from app.topstep.errors import TopstepError
 from app.topstep.rest_client import TopstepRestClient
+from app.topstep.signalr_hub import SignalRMarketHub, WsConnectFactory
 
 logger = logging.getLogger("topstep_chart")
 
@@ -39,7 +43,11 @@ def _install_redaction_filter(settings: Settings) -> None:
     install_global_log_redaction(extra_secrets=extra)
 
 
-async def _background_auto_connect(auth_service: TopstepAuthService, settings: Settings) -> None:
+async def _background_auto_connect(
+    auth_service: TopstepAuthService,
+    settings: Settings,
+    live_feed_service: LiveFeedService | None = None,
+) -> None:
     try:
         await auth_service.login(
             username=settings.topstepx_username,
@@ -47,6 +55,8 @@ async def _background_auto_connect(auth_service: TopstepAuthService, settings: S
             live=settings.topstepx_live,
         )
         logger.info("TopstepX background auto-connect succeeded (live=%s)", settings.topstepx_live)
+        if live_feed_service is not None:
+            await live_feed_service.on_auth_connected()
     except asyncio.CancelledError:
         raise
     except TopstepError as exc:
@@ -61,6 +71,7 @@ async def _background_auto_connect(auth_service: TopstepAuthService, settings: S
 def create_app(
     settings: Settings | None = None,
     http_client: httpx.AsyncClient | None = None,
+    signalr_ws_factory: WsConnectFactory | None = None,
 ) -> FastAPI:
     """Create and configure the FastAPI application instance."""
     resolved_settings = settings or load_settings()
@@ -103,6 +114,26 @@ def create_app(
             window_seconds=resolved_settings.login_rate_limit_window_sec,
             max_concurrency=resolved_settings.login_max_concurrency,
         )
+        bar_aggregator = BarAggregator()
+        ws_broadcaster = WsBroadcaster(
+            client_queue_maxsize=resolved_settings.ws_client_queue_maxsize,
+            send_timeout_sec=resolved_settings.ws_send_timeout_sec,
+        )
+        signalr_hub = SignalRMarketHub(
+            resolved_settings,
+            auth_service=auth_service,
+            ws_factory=signalr_ws_factory,
+        )
+        live_feed_service = LiveFeedService(
+            resolved_settings,
+            auth_service,
+            rest_client,
+            parquet_store,
+            sqlite_store,
+            aggregator=bar_aggregator,
+            broadcaster=ws_broadcaster,
+            signalr_hub=signalr_hub,
+        )
 
         app_instance.state.settings = resolved_settings
         app_instance.state.http_client = client
@@ -114,6 +145,12 @@ def create_app(
         app_instance.state.history_service = history_service
         app_instance.state.session_manager = session_manager
         app_instance.state.login_guard = login_guard
+        app_instance.state.bar_aggregator = bar_aggregator
+        app_instance.state.ws_broadcaster = ws_broadcaster
+        app_instance.state.signalr_hub = signalr_hub
+        app_instance.state.live_feed_service = live_feed_service
+
+        await live_feed_service.start()
 
         auth_task: asyncio.Task[None] | None = None
         has_creds = bool(
@@ -122,7 +159,7 @@ def create_app(
         )
         if has_creds:
             auth_task = asyncio.create_task(
-                _background_auto_connect(auth_service, resolved_settings)
+                _background_auto_connect(auth_service, resolved_settings, live_feed_service)
             )
         app_instance.state.auto_connect_task = auth_task
 
@@ -133,6 +170,8 @@ def create_app(
                 auth_task.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
                     await auth_task
+            await live_feed_service.stop()
+            await ws_broadcaster.close_all()
             sqlite_store.close()
             if owns_client:
                 await client.aclose()
@@ -175,6 +214,7 @@ def create_app(
 
     application.include_router(routes_status.router)
     application.include_router(routes_market.router)
+    application.include_router(routes_market.ws_router)
     return application
 
 

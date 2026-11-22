@@ -57,6 +57,18 @@ class QualityIssueInput:
     raw_payload: str
 
 
+@dataclass(frozen=True)
+class FeedWatermark:
+    """Persistent closed-bar watermark for SignalR reconnect reconciliation (F03)."""
+
+    provider: str
+    live_mode: bool
+    contract_id: str
+    timeframe: str
+    last_closed_bar_time: int
+    updated_at_utc: int
+
+
 def _subtract_interval(
     pieces: list[tuple[int, int]],
     cut_start: int,
@@ -173,6 +185,16 @@ class SqliteStore:
                 ON data_quality_issues (
                     provider, live_mode, contract_id, timeframe, created_at_utc
                 );
+
+            CREATE TABLE IF NOT EXISTS feed_watermarks (
+                provider TEXT NOT NULL,
+                live_mode INTEGER NOT NULL,
+                contract_id TEXT NOT NULL,
+                timeframe TEXT NOT NULL,
+                last_closed_bar_time INTEGER NOT NULL,
+                updated_at_utc INTEGER NOT NULL,
+                PRIMARY KEY (provider, live_mode, contract_id, timeframe)
+            );
             """
         )
         conn.commit()
@@ -774,3 +796,165 @@ class SqliteStore:
     async def get_quality_summary(self) -> dict[str, Any]:
         """Return aggregated data quality counters for /api/status."""
         return await asyncio.to_thread(self._get_quality_summary_sync)
+
+    def _get_watermark_sync(self, key: StorageDatasetKey) -> FeedWatermark | None:
+        with self._lock:
+            conn = self._ensure_conn_locked()
+            row = conn.execute(
+                """
+                SELECT provider, live_mode, contract_id, timeframe,
+                       last_closed_bar_time, updated_at_utc
+                FROM feed_watermarks
+                WHERE provider = ? AND live_mode = ? AND contract_id = ? AND timeframe = ?
+                """,
+                self._key_params(key),
+            ).fetchone()
+            if row is None:
+                return None
+            return FeedWatermark(
+                provider=str(row["provider"]),
+                live_mode=bool(row["live_mode"]),
+                contract_id=str(row["contract_id"]),
+                timeframe=str(row["timeframe"]),
+                last_closed_bar_time=int(row["last_closed_bar_time"]),
+                updated_at_utc=int(row["updated_at_utc"]),
+            )
+
+    async def get_watermark(self, key: StorageDatasetKey) -> FeedWatermark | None:
+        """Return the persistent closed-bar watermark for a dataset key, or None."""
+        return await asyncio.to_thread(self._get_watermark_sync, key)
+
+    def _upsert_watermark_sync(
+        self,
+        key: StorageDatasetKey,
+        last_closed_bar_time: int,
+        *,
+        force: bool = False,
+    ) -> FeedWatermark:
+        if isinstance(last_closed_bar_time, bool) or not isinstance(last_closed_bar_time, int):
+            raise ValueError("last_closed_bar_time must be an integer Unix timestamp")
+        if not (_SQLITE_INT64_MIN <= last_closed_bar_time <= _SQLITE_INT64_MAX):
+            raise ValueError("last_closed_bar_time out of SQLite int64 range")
+
+        now_ts = self._now_utc()
+        key_params = self._key_params(key)
+        if force:
+            upsert_sql = """
+                INSERT INTO feed_watermarks (
+                    provider, live_mode, contract_id, timeframe,
+                    last_closed_bar_time, updated_at_utc
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT (provider, live_mode, contract_id, timeframe) DO UPDATE SET
+                    last_closed_bar_time = excluded.last_closed_bar_time,
+                    updated_at_utc = excluded.updated_at_utc
+                """
+        else:
+            upsert_sql = """
+                INSERT INTO feed_watermarks (
+                    provider, live_mode, contract_id, timeframe,
+                    last_closed_bar_time, updated_at_utc
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT (provider, live_mode, contract_id, timeframe) DO UPDATE SET
+                    last_closed_bar_time = MAX(
+                        feed_watermarks.last_closed_bar_time,
+                        excluded.last_closed_bar_time
+                    ),
+                    updated_at_utc = excluded.updated_at_utc
+                """
+        with self._lock:
+            conn = self._ensure_conn_locked()
+            conn.execute(upsert_sql, (*key_params, last_closed_bar_time, now_ts))
+            conn.commit()
+            row = conn.execute(
+                """
+                SELECT provider, live_mode, contract_id, timeframe,
+                       last_closed_bar_time, updated_at_utc
+                FROM feed_watermarks
+                WHERE provider = ? AND live_mode = ? AND contract_id = ? AND timeframe = ?
+                """,
+                key_params,
+            ).fetchone()
+            if row is None:
+                raise RuntimeError("Failed to read persisted feed watermark after upsert")
+            return FeedWatermark(
+                provider=str(row["provider"]),
+                live_mode=bool(row["live_mode"]),
+                contract_id=str(row["contract_id"]),
+                timeframe=str(row["timeframe"]),
+                last_closed_bar_time=int(row["last_closed_bar_time"]),
+                updated_at_utc=int(row["updated_at_utc"]),
+            )
+
+    async def upsert_watermark(
+        self,
+        key: StorageDatasetKey,
+        last_closed_bar_time: int,
+        *,
+        force: bool = False,
+    ) -> FeedWatermark:
+        """Persist a closed-bar watermark (advancing monotonically unless force=True)."""
+        return await asyncio.to_thread(
+            self._upsert_watermark_sync,
+            key,
+            last_closed_bar_time,
+            force=force,
+        )
+
+    def _list_watermarks_sync(
+        self,
+        *,
+        provider: str | None = None,
+        live_mode: bool | None = None,
+        contract_id: str | None = None,
+    ) -> list[FeedWatermark]:
+        norm_provider = provider.strip().lower() if provider is not None else None
+        norm_live = int(bool(live_mode)) if live_mode is not None else None
+        norm_contract = contract_id.strip().upper() if contract_id is not None else None
+
+        with self._lock:
+            conn = self._ensure_conn_locked()
+            rows = conn.execute(
+                """
+                SELECT provider, live_mode, contract_id, timeframe,
+                       last_closed_bar_time, updated_at_utc
+                FROM feed_watermarks
+                WHERE (? IS NULL OR provider = ?)
+                  AND (? IS NULL OR live_mode = ?)
+                  AND (? IS NULL OR contract_id = ?)
+                ORDER BY provider ASC, live_mode ASC, contract_id ASC, timeframe ASC
+                """,
+                (
+                    norm_provider,
+                    norm_provider,
+                    norm_live,
+                    norm_live,
+                    norm_contract,
+                    norm_contract,
+                ),
+            ).fetchall()
+            return [
+                FeedWatermark(
+                    provider=str(row["provider"]),
+                    live_mode=bool(row["live_mode"]),
+                    contract_id=str(row["contract_id"]),
+                    timeframe=str(row["timeframe"]),
+                    last_closed_bar_time=int(row["last_closed_bar_time"]),
+                    updated_at_utc=int(row["updated_at_utc"]),
+                )
+                for row in rows
+            ]
+
+    async def list_watermarks(
+        self,
+        *,
+        provider: str | None = None,
+        live_mode: bool | None = None,
+        contract_id: str | None = None,
+    ) -> list[FeedWatermark]:
+        """List persisted closed-bar watermarks with optional filters."""
+        return await asyncio.to_thread(
+            self._list_watermarks_sync,
+            provider=provider,
+            live_mode=live_mode,
+            contract_id=contract_id,
+        )

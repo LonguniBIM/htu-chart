@@ -7,6 +7,7 @@ import json
 from datetime import date
 from pathlib import Path
 from typing import Literal
+from urllib.parse import urlparse
 
 from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -88,6 +89,18 @@ class Settings(BaseSettings):
     history_max_pages: int = Field(default=50, ge=1, le=500)
     history_backfill_timeout_sec: float = Field(default=120.0, gt=0.0)
 
+    topstepx_rtc_url: str = "wss://rtc.topstepx.com/hubs/market"
+    signalr_enabled: bool = True
+    signalr_recovery_queue_maxsize: int = Field(default=4096, ge=1, le=65536)
+    signalr_recovery_timeout_sec: float = Field(default=30.0, gt=0.0)
+    signalr_reconnect_initial_delay_sec: float = Field(default=2.0, gt=0.0)
+    signalr_reconnect_max_delay_sec: float = Field(default=60.0, gt=0.0)
+    signalr_ping_interval_sec: float = Field(default=15.0, gt=0.0)
+    signalr_heartbeat_timeout_sec: float = Field(default=45.0, gt=0.0)
+
+    ws_client_queue_maxsize: int = Field(default=64, ge=1, le=4096)
+    ws_send_timeout_sec: float = Field(default=5.0, gt=0.0)
+
     data_dir: Path = Path("data")
 
     @field_validator("app_env", mode="before")
@@ -113,6 +126,19 @@ class Settings(BaseSettings):
     @classmethod
     def _validate_lists(cls, value: object) -> list[str] | None:
         return _parse_str_list(value)
+
+    @field_validator("topstepx_rtc_url")
+    @classmethod
+    def _validate_rtc_url(cls, value: str) -> str:
+        cleaned = value.strip()
+        parsed = urlparse(cleaned)
+        if parsed.scheme.lower() not in {"ws", "wss"} or not parsed.netloc:
+            raise ValueError("TOPSTEPX_RTC_URL must be a valid ws:// or wss:// URL")
+        if not parsed.path.lower().rstrip("/").endswith("/hubs/market"):
+            raise ValueError(
+                "TOPSTEPX_RTC_URL must target the read-only Market Hub (/hubs/market) (SEC-001)"
+            )
+        return cleaned
 
     @field_validator("topstepx_key_updated_at", mode="before")
     @classmethod

@@ -394,7 +394,7 @@ async def test_f01_secret_redaction_and_hard_readonly_order_boundary(
         status_json: dict[str, Any] = status_resp.json()
         assert raw_api_key not in str(status_json)
         assert TEST_PASSWORD_HASH not in str(status_json)
-        assert set(status_json.keys()) == {
+        assert {
             "connected",
             "connection_state",
             "live",
@@ -405,7 +405,7 @@ async def test_f01_secret_redaction_and_hard_readonly_order_boundary(
             "has_env_credentials",
             "last_error",
             "data_quality",
-        }
+        }.issubset(status_json.keys())
         assert set(status_json["data_quality"].keys()) == {
             "quarantined_bars",
             "corrupted_intervals",

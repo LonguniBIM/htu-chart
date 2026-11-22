@@ -2,15 +2,28 @@
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 from datetime import UTC, datetime
 from typing import Annotated, Any
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
+from fastapi import (
+    APIRouter,
+    Depends,
+    HTTPException,
+    Query,
+    Request,
+    WebSocket,
+    WebSocketDisconnect,
+    status,
+)
 
 from app.engine.ohlcv import validate_query_timestamp
 from app.engine.session_calendar import normalize_timeframe, timeframe_from_topstep_unit
-from app.security import SessionData, redact_secrets, require_session
+from app.security import SessionData, redact_secrets, require_session, validate_ws_handshake
 from app.services.history_service import HistoryBackfillService
+from app.services.live_feed_service import LiveFeedService
+from app.services.ws_broadcaster import WsBroadcaster
 from app.topstep.auth import TopstepAuthService
 from app.topstep.errors import (
     AmbiguousContractError,
@@ -23,6 +36,7 @@ from app.topstep.errors import (
 from app.topstep.rest_client import TopstepRestClient, resolve_contract
 
 router = APIRouter(prefix="/api", tags=["market"])
+ws_router = APIRouter(tags=["market-ws"])
 
 
 def _get_topstep_auth(request: Request) -> TopstepAuthService:
@@ -251,3 +265,119 @@ async def get_bars(
             for b in result.bars
         ],
     }
+
+
+@ws_router.websocket("/ws/market")
+async def market_websocket(websocket: WebSocket) -> None:
+    """Authenticated, Origin-validated local WebSocket stream for live OHLCV & feed status."""
+    settings = websocket.app.state.settings
+    session_manager = websocket.app.state.session_manager
+    session = await validate_ws_handshake(websocket, settings, session_manager)
+    if session is None:
+        return
+
+    await websocket.accept()
+    broadcaster: WsBroadcaster = websocket.app.state.ws_broadcaster
+    live_feed: LiveFeedService = websocket.app.state.live_feed_service
+    ws_session = broadcaster.register(websocket)
+    broadcaster.send_to_client(
+        ws_session.client_id,
+        {"type": "feed_status", **live_feed.get_status_snapshot()},
+    )
+
+    try:
+        while not ws_session.closed_event.is_set():
+            recv_task = asyncio.create_task(websocket.receive_json())
+            closed_task = asyncio.create_task(ws_session.closed_event.wait())
+            try:
+                done, pending = await asyncio.wait(
+                    {recv_task, closed_task},
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+            except BaseException:
+                for task in (recv_task, closed_task):
+                    if not task.done():
+                        task.cancel()
+                        with contextlib.suppress(asyncio.CancelledError, Exception):
+                            await task
+                raise
+
+            for pending_task in pending:
+                pending_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await pending_task
+
+            if closed_task in done and ws_session.closed_event.is_set():
+                break
+
+            try:
+                msg = recv_task.result()
+            except (WebSocketDisconnect, RuntimeError):
+                break
+            except ValueError as exc:
+                broadcaster.send_to_client(
+                    ws_session.client_id,
+                    {"type": "error", "detail": redact_secrets(str(exc))},
+                )
+                continue
+
+            if session_manager.get_session(session.session_id) is None:
+                await broadcaster.unregister(
+                    ws_session.client_id,
+                    close_transport=True,
+                    code=status.WS_1008_POLICY_VIOLATION,
+                    reason="Session expired",
+                )
+                break
+
+            if not isinstance(msg, dict):
+                broadcaster.send_to_client(
+                    ws_session.client_id,
+                    {"type": "error", "detail": "WebSocket payload must be a JSON object"},
+                )
+                continue
+
+            op = str(msg.get("type") or msg.get("action") or "").strip().lower()
+            if op == "ping":
+                broadcaster.send_to_client(ws_session.client_id, {"type": "pong"})
+            elif op == "subscribe":
+                raw_cid = str(msg.get("contract_id") or msg.get("contractId") or "")
+                raw_tf = str(msg.get("timeframe") or "1m")
+                try:
+                    cid, tf = broadcaster.subscribe(ws_session.client_id, raw_cid, raw_tf)
+                    broadcaster.send_to_client(
+                        ws_session.client_id,
+                        {"type": "subscribed", "contract_id": cid, "timeframe": tf},
+                    )
+                except ValueError as exc:
+                    broadcaster.send_to_client(
+                        ws_session.client_id,
+                        {"type": "error", "detail": redact_secrets(str(exc))},
+                    )
+            elif op == "unsubscribe":
+                raw_cid = str(msg.get("contract_id") or msg.get("contractId") or "")
+                raw_tf = str(msg.get("timeframe") or "1m")
+                try:
+                    broadcaster.unsubscribe(ws_session.client_id, raw_cid, raw_tf)
+                    broadcaster.send_to_client(
+                        ws_session.client_id,
+                        {
+                            "type": "unsubscribed",
+                            "contract_id": raw_cid.strip().upper(),
+                            "timeframe": normalize_timeframe(raw_tf),
+                        },
+                    )
+                except ValueError as exc:
+                    broadcaster.send_to_client(
+                        ws_session.client_id,
+                        {"type": "error", "detail": redact_secrets(str(exc))},
+                    )
+            else:
+                broadcaster.send_to_client(
+                    ws_session.client_id,
+                    {"type": "error", "detail": f"Unsupported message type: {op!r}"},
+                )
+    except WebSocketDisconnect:
+        pass
+    finally:
+        await broadcaster.unregister(ws_session.client_id)
