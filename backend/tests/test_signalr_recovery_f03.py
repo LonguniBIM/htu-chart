@@ -6232,3 +6232,360 @@ async def test_f03_signalr_huge_integer_timestamp_quarantined_without_overflow_e
         )
     finally:
         await hub.stop()
+
+
+@pytest.mark.asyncio
+async def test_f03_watchdog_expired_heartbeat_prevents_bar_close_and_signal(
+    tmp_path: Path,
+) -> None:
+    """Contract: P1-001 checks heartbeat timeout BEFORE watchdog bar flush/persistence/signal.
+    Defect caught: expired heartbeat letting watchdog finalize & emit tag=None stale bar.
+    """
+    settings = Settings(
+        data_dir=tmp_path / "data",
+        signalr_enabled=True,
+        signalr_heartbeat_timeout_sec=0.5,
+    )
+    sqlite = SqliteStore(tmp_path / "meta.db")
+    sqlite.initialize()
+    parquet = ParquetStore(settings.data_dir, sqlite_store=sqlite)
+
+    now_t = [BASE_T + 10]
+    emitted: list[tuple[str, int, str | None]] = []
+
+    class _RestEmpty:
+        async def retrieve_bars_paginated(self, **_kw: Any) -> Any:
+            return type("R", (), {"raw_bars": [], "truncated": False, "provider_gap": False})()
+
+    def _auth_handler(_req: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"success": True, "errorCode": 0, "token": "test-jwt"})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(_auth_handler)) as client:
+        auth = TopstepAuthService(settings, client)
+        await auth.login("alice", "api-key")
+        svc = LiveFeedService(
+            settings,
+            auth,
+            _RestEmpty(),
+            parquet,
+            sqlite,
+            recovery_timeframes=("1m",),
+            on_bar_signal=lambda evt, tag: emitted.append((evt.timeframe, evt.bar.time, tag)),
+            clock=lambda: now_t[0],
+        )
+        try:
+            await svc.set_active_contracts([CID_MES])
+            svc._contracts[CID_MES].state = "LIVE"
+            svc._feed_state = "LIVE"
+            svc._last_connected_utc = BASE_T - 30
+
+            await svc._process_live_tick(
+                SignalRTickEvent(CID_MES, False, BASE_T + 5, 100.0, 2.0, "GatewayTrade", 1.0),
+                now_utc=BASE_T + 10,
+            )
+            assert svc._aggregator.get_open_bar(CID_MES, False, "1m") is not None
+
+            expired_mono = time.monotonic() - 5.0
+            svc._last_event_monotonic = expired_mono
+            svc._hub._last_event_monotonic = expired_mono
+            now_t[0] = BASE_T + 70
+
+            await svc.run_watchdog_tick()
+
+            assert svc.feed_state == "DISCONNECTED"
+            assert emitted == []
+            persisted = await parquet.read_bars(
+                StorageDatasetKey("topstepx", False, CID_MES, "1m"),
+                start_ts=BASE_T - 60,
+                end_ts=BASE_T + 120,
+                include_provisional=True,
+            )
+            assert persisted == []
+            assert svc._aggregator.flush_closed_bars(BASE_T + 70, contract_id=CID_MES) == []
+        finally:
+            await svc.stop()
+            sqlite.close()
+
+
+def test_f03_non_loopback_plaintext_ws_rtc_url_rejected_before_token_or_ws(
+    tmp_path: Path,
+) -> None:
+    """Contract: P2-002 rejects non-loopback ws:// Market Hub URLs before token/WS calls.
+    Defect caught: plaintext ws:// sending TopstepX JWTs in URL/headers over network.
+    """
+    token_called = False
+    ws_called = False
+
+    def _token_prov() -> Any:
+        nonlocal token_called
+        token_called = True
+        return asyncio.sleep(0, result="secret-jwt")
+
+    async def _ws_factory(_u: str, _h: dict[str, str]) -> _MockSignalRTransport:
+        nonlocal ws_called
+        ws_called = True
+        return _MockSignalRTransport()
+
+    with pytest.raises(ValueError, match="wss://"):
+        Settings(data_dir=tmp_path / "data", topstepx_rtc_url="ws://rtc.topstepx.com/hubs/market")
+
+    bad_settings = Settings(data_dir=tmp_path / "data").model_copy(
+        update={"topstepx_rtc_url": "ws://rtc.topstepx.com/hubs/market"}
+    )
+    with pytest.raises(ValueError, match="wss://"):
+        SignalRMarketHub(
+            bad_settings,
+            token_provider=_token_prov,
+            contracts=[CID_MES],
+            ws_factory=_ws_factory,
+        )
+    assert token_called is False
+    assert ws_called is False
+
+    loopback_s = Settings(
+        data_dir=tmp_path / "data",
+        topstepx_rtc_url="ws://127.0.0.1:8080/hubs/market",
+    )
+    assert loopback_s.topstepx_rtc_url == "ws://127.0.0.1:8080/hubs/market"
+
+
+@pytest.mark.asyncio
+async def test_f03_unaligned_rest_bar_timestamp_quarantined_and_degrades(
+    tmp_path: Path,
+) -> None:
+    """Contract: P1-003 quarantines off-boundary REST timestamps and degrades the contract.
+    Defect caught: aligned 1m bars + extra off-boundary bar (t+1) corrupting 5m volume/Parquet.
+    """
+    settings = Settings(data_dir=tmp_path / "data", signalr_enabled=True)
+    sqlite = SqliteStore(tmp_path / "meta.db")
+    sqlite.initialize()
+    parquet = ParquetStore(settings.data_dir, sqlite_store=sqlite)
+
+    t0 = first_bucket_open_at_or_after(BASE_T, "5m")
+
+    class _OffBoundaryRest:
+        async def retrieve_bars_paginated(self, **_kw: Any) -> Any:
+            bars = [
+                {
+                    "t": t0 + i * 60,
+                    "o": 100.0,
+                    "h": 101.0,
+                    "l": 99.0,
+                    "c": 100.5,
+                    "v": 2.0,
+                }
+                for i in range(5)
+            ]
+            bars.append(
+                {"t": t0 + 1, "o": 50.0, "h": 250.0, "l": 10.0, "c": 120.0, "v": 999.0}
+            )
+            return type("R", (), {"raw_bars": bars, "truncated": False, "provider_gap": False})()
+
+    def _auth_handler(_req: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"success": True, "errorCode": 0, "token": "test-jwt"})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(_auth_handler)) as client:
+        auth = TopstepAuthService(settings, client)
+        await auth.login("alice", "api-key")
+        svc = LiveFeedService(
+            settings,
+            auth,
+            _OffBoundaryRest(),
+            parquet,
+            sqlite,
+            recovery_timeframes=("1m", "5m"),
+            initial_backfill_bars=5,
+            clock=lambda: t0 + 310,
+        )
+        try:
+            await svc.set_active_contracts([CID_MES])
+            await svc._run_recovery(now_utc=t0 + 310)
+
+            assert svc.feed_state == "DEGRADED"
+            assert svc.live_alerts_enabled is False
+            key_1m = StorageDatasetKey("topstepx", False, CID_MES, "1m")
+            issues = await sqlite.list_quality_issues(key_1m)
+            assert any(i["issue_code"] == "unaligned_bar_timestamp" for i in issues)
+
+            bars_1m = await parquet.read_bars(
+                key_1m, start_ts=t0, end_ts=t0 + 300, include_provisional=True
+            )
+            assert all(b.time == t0 + i * 60 for i, b in enumerate(bars_1m))
+            assert all(b.time != t0 + 1 for b in bars_1m)
+            bars_5m = await parquet.read_bars(
+                StorageDatasetKey("topstepx", False, CID_MES, "5m"),
+                start_ts=t0,
+                end_ts=t0 + 300,
+                include_provisional=True,
+            )
+            assert bars_5m == []
+            assert await sqlite.get_watermark(key_1m) is None
+        finally:
+            await svc.stop()
+            sqlite.close()
+
+
+@pytest.mark.asyncio
+async def test_f03_superseded_non_1m_recovery_does_not_double_apply_buffered_tick_volume(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Contract: P1-002 avoids re-applying buffered ticks to TFs already reconciled before cancel.
+    Defect caught: cancelling ('5m','15m') recovery after 5m reconcile doubling 5m volume (9->18).
+    """
+    settings = Settings(data_dir=tmp_path / "data", signalr_enabled=True)
+    sqlite = SqliteStore(tmp_path / "meta.db")
+    sqlite.initialize()
+    parquet = ParquetStore(settings.data_dir, sqlite_store=sqlite)
+
+    t0 = first_bucket_open_at_or_after(BASE_T, "15m")
+    upsert_5m_entered = asyncio.Event()
+    release_upsert = asyncio.Event()
+
+    class _Rest5m15m:
+        async def retrieve_bars_paginated(self, **kw: Any) -> Any:
+            step = 300 if kw.get("timeframe") == "5m" else 900
+            bars = [
+                {"t": t0 - step, "o": 100.0, "h": 101.0, "l": 99.0, "c": 100.0, "v": 4.0}
+            ]
+            return type("R", (), {"raw_bars": bars, "truncated": False, "provider_gap": False})()
+
+    orig_upsert = parquet.upsert_bars
+
+    async def _gated_upsert(*args: Any, **kwargs: Any) -> Any:
+        key = args[0]
+        if key.timeframe == "5m" and not upsert_5m_entered.is_set():
+            upsert_5m_entered.set()
+            await asyncio.wait_for(release_upsert.wait(), timeout=2.0)
+        return await orig_upsert(*args, **kwargs)
+
+    monkeypatch.setattr(parquet, "upsert_bars", _gated_upsert)
+
+    def _auth_handler(_req: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"success": True, "errorCode": 0, "token": "test-jwt"})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(_auth_handler)) as client:
+        auth = TopstepAuthService(settings, client)
+        await auth.login("alice", "api-key")
+        agg = BarAggregator(timeframes=("5m", "15m"))
+        svc = LiveFeedService(
+            settings,
+            auth,
+            _Rest5m15m(),
+            parquet,
+            sqlite,
+            aggregator=agg,
+            recovery_timeframes=("5m", "15m"),
+            initial_backfill_bars=1,
+            clock=lambda: t0 + 45,
+        )
+        try:
+            await svc.set_active_contracts([CID_MES])
+            svc._last_connected_utc = t0 - 30
+            svc._transition_all_contracts("RECOVERING")
+            svc.handle_hub_event(
+                SignalRTickEvent(CID_MES, False, t0 + 15, 105.5, 9.0, "GatewayTrade", 1.0)
+            )
+            t1 = svc._start_recovery_task(now_utc=t0 + 45)
+            await asyncio.wait_for(upsert_5m_entered.wait(), timeout=2.0)
+
+            svc._bump_generation_and_cancel_live_tasks()
+            t2 = svc._start_recovery_task(now_utc=t0 + 45)
+            release_upsert.set()
+            await asyncio.gather(t1, return_exceptions=True)
+            await asyncio.wait_for(t2, timeout=2.0)
+
+            open_5m = agg.get_open_bar(CID_MES, False, "5m")
+            open_15m = agg.get_open_bar(CID_MES, False, "15m")
+            assert open_5m is not None and open_5m.volume == 9.0
+            assert open_15m is not None and open_15m.volume == 9.0
+        finally:
+            release_upsert.set()
+            await svc.stop()
+            sqlite.close()
+
+
+@pytest.mark.asyncio
+async def test_f03_cancelled_recovery_maintains_pending_tick_count_within_maxsize(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Contract: P2-001 keeps _pending_recovery_ticks_count consistent on recovery cancel.
+    Defect caught: finally resetting count=0 while ticks stay in _pending_by_contract.
+    """
+    settings = Settings(
+        data_dir=tmp_path / "data",
+        signalr_enabled=True,
+        signalr_recovery_queue_maxsize=4,
+    )
+    sqlite = SqliteStore(tmp_path / "meta.db")
+    sqlite.initialize()
+    parquet = ParquetStore(settings.data_dir, sqlite_store=sqlite)
+
+    mnq = "CON.F.US.MNQ.Z26"
+    mes_gate = asyncio.Event()
+    release_mes = asyncio.Event()
+
+    class _StubRest:
+        async def retrieve_bars_paginated(self, **_kw: Any) -> Any:
+            bars = [{"t": BASE_T - 60, "o": 100.0, "h": 101.0, "l": 99.0, "c": 100.0, "v": 1.0}]
+            return type("R", (), {"raw_bars": bars, "truncated": False, "provider_gap": False})()
+
+    orig_upsert = parquet.upsert_bars
+
+    async def _gated_upsert(*args: Any, **kwargs: Any) -> Any:
+        if args[0].contract_id == CID_MES and not mes_gate.is_set():
+            mes_gate.set()
+            await asyncio.wait_for(release_mes.wait(), timeout=2.0)
+        return await orig_upsert(*args, **kwargs)
+
+    monkeypatch.setattr(parquet, "upsert_bars", _gated_upsert)
+
+    def _auth_handler(_req: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"success": True, "errorCode": 0, "token": "test-jwt"})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(_auth_handler)) as client:
+        auth = TopstepAuthService(settings, client)
+        await auth.login("alice", "api-key")
+        svc = LiveFeedService(
+            settings,
+            auth,
+            _StubRest(),
+            parquet,
+            sqlite,
+            recovery_timeframes=("1m",),
+            initial_backfill_bars=1,
+            clock=lambda: BASE_T + 20,
+        )
+        try:
+            await svc.set_active_contracts([CID_MES, mnq])
+            svc._last_connected_utc = BASE_T - 30
+            svc._transition_all_contracts("RECOVERING")
+            for idx in range(4):
+                svc.handle_hub_event(
+                    SignalRTickEvent(
+                        mnq, False, BASE_T + idx + 1, 20000.0, 1.0, "GatewayTrade", float(idx)
+                    )
+                )
+            t1 = svc._start_recovery_task(now_utc=BASE_T + 20)
+            await asyncio.wait_for(mes_gate.wait(), timeout=2.0)
+
+            t1.cancel()
+            release_mes.set()
+            await asyncio.gather(t1, return_exceptions=True)
+
+            assert len(svc._pending_by_contract.get(mnq, ())) == 4
+            assert svc._pending_recovery_ticks_count == 4
+            assert (
+                svc._recovery_queue.qsize() + svc._pending_recovery_ticks_count
+                <= settings.signalr_recovery_queue_maxsize
+            )
+            svc.handle_hub_event(
+                SignalRTickEvent(mnq, False, BASE_T + 10, 20001.0, 1.0, "GatewayTrade", 10.0)
+            )
+            assert svc._recovery_overflowed is True
+            assert svc._recovery_queue.qsize() == 0
+        finally:
+            release_mes.set()
+            await svc.stop()
+            sqlite.close()

@@ -19,7 +19,7 @@ from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
 import websockets
 
-from app.config import Settings
+from app.config import Settings, validate_market_hub_url
 from app.security import SecretRedactionFilter, redact_secrets
 from app.topstep.auth import TopstepAuthService
 
@@ -115,13 +115,7 @@ EventCallback = Callable[[SignalREvent], Awaitable[None] | None]
 
 
 def _validate_market_hub_url(url: str) -> str:
-    cleaned = url.strip()
-    parsed = urlparse(cleaned)
-    if parsed.scheme.lower() not in {"ws", "wss"} or not parsed.netloc:
-        raise ValueError("SignalR Market Hub URL must use ws:// or wss:// with a valid host")
-    if not parsed.path.lower().rstrip("/").endswith("/hubs/market"):
-        raise ValueError("SignalR URL must target the read-only Market Hub (/hubs/market)")
-    return cleaned
+    return validate_market_hub_url(url)
 
 
 def _build_authenticated_ws_url(base_url: str, token: str) -> str:

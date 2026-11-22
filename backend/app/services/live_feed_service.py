@@ -159,6 +159,7 @@ class LiveFeedService:
         self._quarantine_worker_task: asyncio.Task[None] | None = None
         self._recovery_overflowed = False
         self._pending_by_contract: dict[str, list[SignalRTickEvent]] = {}
+        self._replayed_tick_tfs: dict[int, set[str]] = {}
         self._pending_recovery_ticks_count = 0
         self._recovery_task: asyncio.Task[None] | None = None
         self._live_tick_tasks: set[asyncio.Task[None]] = set()
@@ -268,11 +269,7 @@ class LiveFeedService:
             self._explicit_contracts = set(normalized)
             for old_cid in removed:
                 self._contracts.pop(old_cid, None)
-                removed_ticks = self._pending_by_contract.pop(old_cid, None)
-                if removed_ticks:
-                    self._pending_recovery_ticks_count = max(
-                        0, self._pending_recovery_ticks_count - len(removed_ticks)
-                    )
+                self._consume_pending_contract_ticks(old_cid)
                 self._aggregator.reset_contract(old_cid)
 
             added_or_mode_changed = False
@@ -361,11 +358,7 @@ class LiveFeedService:
                 return
             for old_cid in removed:
                 self._contracts.pop(old_cid, None)
-                removed_ticks = self._pending_by_contract.pop(old_cid, None)
-                if removed_ticks:
-                    self._pending_recovery_ticks_count = max(
-                        0, self._pending_recovery_ticks_count - len(removed_ticks)
-                    )
+                self._consume_pending_contract_ticks(old_cid)
                 self._aggregator.reset_contract(old_cid)
             if not self._contracts:
                 self._feed_state = "DISCONNECTED"
@@ -866,12 +859,41 @@ class LiveFeedService:
                 task.cancel()
         return self._generation
 
+    def _recalc_pending_recovery_count(self) -> int:
+        self._pending_recovery_ticks_count = sum(
+            len(ticks) for ticks in self._pending_by_contract.values()
+        )
+        return self._pending_recovery_ticks_count
+
+    def _consume_pending_contract_ticks(
+        self,
+        cid: str,
+        count: int | None = None,
+    ) -> list[SignalRTickEvent]:
+        bucket = self._pending_by_contract.get(cid)
+        if not bucket:
+            self._pending_by_contract.pop(cid, None)
+            self._recalc_pending_recovery_count()
+            return []
+        if count is None:
+            consumed = self._pending_by_contract.pop(cid, [])
+        else:
+            consumed = list(bucket[:count])
+            del bucket[:count]
+            if not bucket:
+                self._pending_by_contract.pop(cid, None)
+        for tick_evt in consumed:
+            self._replayed_tick_tfs.pop(id(tick_evt), None)
+        self._recalc_pending_recovery_count()
+        return consumed
+
     def _reset_recovery_queue(self) -> None:
         self._recovery_queue = asyncio.Queue(
             maxsize=self._settings.signalr_recovery_queue_maxsize
         )
         self._recovery_overflowed = False
         self._pending_by_contract.clear()
+        self._replayed_tick_tfs.clear()
         self._pending_recovery_ticks_count = 0
 
     def _start_recovery_task(self, *, now_utc: int | None = None) -> asyncio.Task[None]:
@@ -966,7 +988,25 @@ class LiveFeedService:
             val = validate_ohlcv_bar(parsed, is_closed=bar_closed, now_utc=eff_now)
             if val.is_valid and val.bar is not None:
                 valid_window_start = bucket_open_utc(interval_start, tf)
-                if val.bar.time < valid_window_start or val.bar.time > interval_end:
+                if val.bar.time != bucket_open_utc(val.bar.time, tf):
+                    safe_bar_time = (
+                        val.bar.time
+                        if -(2**63) <= val.bar.time <= (2**63 - 1)
+                        else None
+                    )
+                    issues.append(
+                        QualityIssueInput(
+                            bar_time=safe_bar_time,
+                            interval_start=interval_start,
+                            interval_end=interval_end,
+                            issue_code="unaligned_bar_timestamp",
+                            detail=self._redact(
+                                f"Recovery bar timestamp {val.bar.time} not aligned to {tf}"
+                            ),
+                            raw_payload=self._redact(json.dumps(raw, default=str))[:2048],
+                        )
+                    )
+                elif val.bar.time < valid_window_start or val.bar.time > interval_end:
                     safe_bar_time = (
                         val.bar.time
                         if -(2**63) <= val.bar.time <= (2**63 - 1)
@@ -1147,12 +1187,12 @@ class LiveFeedService:
             else:
                 self._drain_into_contract_buckets(pending_by_contract)
                 if consume_pending:
-                    contract_ticks = pending_by_contract.pop(cid, [])
-                    self._pending_recovery_ticks_count = max(
-                        0, self._pending_recovery_ticks_count - len(contract_ticks)
-                    )
+                    contract_ticks = self._consume_pending_contract_ticks(cid)
                 else:
                     contract_ticks = list(pending_by_contract.get(cid, ()))
+            unapplied_ticks = [
+                t for t in contract_ticks if tf not in self._replayed_tick_tfs.get(id(t), ())
+            ]
             normalized_ticks = [
                 NormalizedTick(
                     contract_id=t.contract_id,
@@ -1161,7 +1201,7 @@ class LiveFeedService:
                     price=t.price,
                     volume=t.volume,
                 )
-                for t in contract_ticks
+                for t in unapplied_ticks
             ]
 
             has_open_unhealed_gap = (
@@ -1196,6 +1236,9 @@ class LiveFeedService:
                 root_symbol=c_state.root_symbol,
                 mark_open_incomplete=mark_open_inc,
             )
+            if not consume_pending:
+                for t in unapplied_ticks:
+                    self._replayed_tick_tfs.setdefault(id(t), set()).add(tf)
         except (asyncio.CancelledError, _StaleGenerationAbort):
             raise
         except Exception:
@@ -1533,34 +1576,34 @@ class LiveFeedService:
                                 recovered_closed = True
                     else:
                         replayed_ticks: list[SignalRTickEvent] | None = None
-                        for idx, tf in enumerate(self._recovery_timeframes):
-                            had_gap, _, _, had_tf_closed = (
-                                await self._recover_single_timeframe_rest(
-                                    cid=cid,
-                                    c_state=c_state,
-                                    tf=tf,
-                                    eff_now=eff_now,
-                                    expected_gen=recovery_gen,
-                                    pending_by_contract=pending_by_contract,
-                                    buffered_ticks_override=replayed_ticks,
-                                    consume_pending=False,
+                        try:
+                            for idx, tf in enumerate(self._recovery_timeframes):
+                                had_gap, _, _, had_tf_closed = (
+                                    await self._recover_single_timeframe_rest(
+                                        cid=cid,
+                                        c_state=c_state,
+                                        tf=tf,
+                                        eff_now=eff_now,
+                                        expected_gen=recovery_gen,
+                                        pending_by_contract=pending_by_contract,
+                                        buffered_ticks_override=replayed_ticks,
+                                        consume_pending=False,
+                                    )
                                 )
-                            )
-                            if idx == 0:
-                                replayed_ticks = list(pending_by_contract.get(cid, ()))
-                            if had_gap:
-                                contract_had_gap = True
-                            if had_tf_closed:
-                                recovered_closed = True
+                                if idx == 0:
+                                    replayed_ticks = list(pending_by_contract.get(cid, ()))
+                                if had_gap:
+                                    contract_had_gap = True
+                                if had_tf_closed:
+                                    recovered_closed = True
+                        except (asyncio.CancelledError, _StaleGenerationAbort):
+                            raise
+                        except Exception:
+                            if replayed_ticks:
+                                self._consume_pending_contract_ticks(cid, len(replayed_ticks))
+                            raise
                         if replayed_ticks:
-                            bucket = pending_by_contract.get(cid)
-                            if bucket is not None:
-                                del bucket[: len(replayed_ticks)]
-                                if not bucket:
-                                    pending_by_contract.pop(cid, None)
-                            self._pending_recovery_ticks_count = max(
-                                0, self._pending_recovery_ticks_count - len(replayed_ticks)
-                            )
+                            self._consume_pending_contract_ticks(cid, len(replayed_ticks))
                 except (asyncio.CancelledError, _StaleGenerationAbort):
                     raise
                 except Exception as exc:
@@ -1600,7 +1643,8 @@ class LiveFeedService:
                 for tick_list in pending_by_contract.values():
                     remaining.extend(tick_list)
                 pending_by_contract.clear()
-                self._pending_recovery_ticks_count = 0
+                self._replayed_tick_tfs.clear()
+                self._recalc_pending_recovery_count()
 
                 if not remaining:
                     self._recovery_duration_ms = int((time.monotonic() - started_mono) * 1000)
@@ -1653,7 +1697,7 @@ class LiveFeedService:
             self._transition_all_contracts("DEGRADED")
             logger.warning("Recovery coordinator error: %s", self._last_error)
         finally:
-            self._pending_recovery_ticks_count = 0
+            self._recalc_pending_recovery_count()
 
     def _on_live_task_done(self, task: asyncio.Task[None]) -> None:
         self._live_tick_tasks.discard(task)
@@ -1963,6 +2007,21 @@ class LiveFeedService:
                 self._transition_all_contracts("DISCONNECTED")
             return
 
+        effective_last = self._effective_last_activity_monotonic()
+        if (
+            self._feed_state in {"LIVE", "DEGRADED"}
+            and effective_last is not None
+            and (now_mono - effective_last) > self._settings.signalr_heartbeat_timeout_sec
+        ):
+            self._last_error = "SignalR heartbeat watchdog timeout"
+            self._bump_generation_and_cancel_live_tasks()
+            for cid, c_state in self._contracts.items():
+                self._aggregator.mark_active_open_bars_incomplete(cid, c_state.live_mode)
+                self._aggregator.mark_open_bucket_incomplete(cid, c_state.live_mode, now_ts)
+            self._transition_all_contracts("DISCONNECTED")
+            await self._hub.trigger_reconnect()
+            return
+
         # Only flush elapsed open bars for LIVE contracts; RECOVERING uses REST + buffered ticks.
         for cid, c_state in list(self._contracts.items()):
             if c_state.state != "LIVE":
@@ -1984,18 +2043,6 @@ class LiveFeedService:
                     broadcast=True,
                     expected_gen=live_gen,
                 )
-
-        effective_last = self._effective_last_activity_monotonic()
-        if (
-            self._feed_state in {"LIVE", "DEGRADED"}
-            and effective_last is not None
-            and (now_mono - effective_last) > self._settings.signalr_heartbeat_timeout_sec
-        ):
-            self._last_error = "SignalR heartbeat watchdog timeout"
-            self._bump_generation_and_cancel_live_tasks()
-            self._transition_all_contracts("DISCONNECTED")
-            await self._hub.trigger_reconnect()
-            return
 
         hub_token_stale = (
             self._feed_state in {"LIVE", "DEGRADED"}

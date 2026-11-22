@@ -13,6 +13,26 @@ from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 DEFAULT_LOOPBACK_HOSTS = ("127.0.0.1", "localhost", "[::1]", "::1")
+_LOOPBACK_URL_HOSTNAMES = frozenset({"127.0.0.1", "localhost", "::1"})
+
+
+def validate_market_hub_url(value: str) -> str:
+    """Validate TopstepX Market Hub URL: wss:// required unless host is loopback."""
+    cleaned = value.strip()
+    parsed = urlparse(cleaned)
+    scheme = parsed.scheme.lower()
+    if scheme not in {"ws", "wss"} or not parsed.netloc:
+        raise ValueError("TOPSTEPX_RTC_URL must be a valid ws:// or wss:// URL")
+    hostname = (parsed.hostname or "").lower()
+    if scheme == "ws" and hostname not in _LOOPBACK_URL_HOSTNAMES:
+        raise ValueError(
+            "Non-loopback SignalR Market Hub URL must use wss:// (TLS) to protect TopstepX JWTs"
+        )
+    if not parsed.path.lower().rstrip("/").endswith("/hubs/market"):
+        raise ValueError(
+            "TOPSTEPX_RTC_URL must target the read-only Market Hub (/hubs/market) (SEC-001)"
+        )
+    return cleaned
 
 
 def _is_forbidden_bind_host(host: str) -> bool:
@@ -130,15 +150,7 @@ class Settings(BaseSettings):
     @field_validator("topstepx_rtc_url")
     @classmethod
     def _validate_rtc_url(cls, value: str) -> str:
-        cleaned = value.strip()
-        parsed = urlparse(cleaned)
-        if parsed.scheme.lower() not in {"ws", "wss"} or not parsed.netloc:
-            raise ValueError("TOPSTEPX_RTC_URL must be a valid ws:// or wss:// URL")
-        if not parsed.path.lower().rstrip("/").endswith("/hubs/market"):
-            raise ValueError(
-                "TOPSTEPX_RTC_URL must target the read-only Market Hub (/hubs/market) (SEC-001)"
-            )
-        return cleaned
+        return validate_market_hub_url(value)
 
     @field_validator("topstepx_key_updated_at", mode="before")
     @classmethod
