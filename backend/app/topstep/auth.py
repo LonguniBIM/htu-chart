@@ -104,6 +104,17 @@ class TopstepAuthService:
         return self._token is not None
 
     @property
+    def can_retry_login(self) -> bool:
+        """Return True when cached session credentials remain eligible for transient re-auth."""
+        return bool(self._username and self._api_key)
+
+    async def retry_login(self, now: datetime | None = None) -> None:
+        """Re-authenticate using held in-memory credentials after a transient refresh failure."""
+        if not self._username or not self._api_key:
+            raise TopstepAuthError("Cannot retry login without active session credentials")
+        await self.login(self._username, self._api_key, live=self._live, now=now)
+
+    @property
     def token_generation(self) -> int:
         """Monotonic counter incremented each time a TopstepX JWT is acquired or refreshed."""
         return self._token_generation
@@ -265,7 +276,12 @@ class TopstepAuthService:
             raise
         except UpstreamHTTPError as exc:
             safe_msg = redact_secrets(str(exc), (cleaned_key, cleaned_user))
-            self._clear_session_state(safe_msg)
+            is_transient = (
+                exc.status_code is None
+                or exc.status_code == 429
+                or exc.status_code >= 500
+            )
+            self._clear_session_state(safe_msg, clear_credentials=not is_transient)
             raise
 
         token = data.get("token")

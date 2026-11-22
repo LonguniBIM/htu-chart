@@ -134,6 +134,7 @@ def _build_authenticated_ws_url(base_url: str, token: str) -> str:
 
 
 def _parse_signalr_timestamp(raw_ts: Any) -> float | None:
+    max_epoch_sec = 4_102_444_800.0  # 2100-01-01T00:00:00Z
     if raw_ts is None or isinstance(raw_ts, bool):
         return None
     if isinstance(raw_ts, (int, float)):
@@ -142,7 +143,9 @@ def _parse_signalr_timestamp(raw_ts: Any) -> float | None:
             return None
         # Convert millisecond epochs if upstream sends JS epoch ms.
         if fval > 10_000_000_000:
-            return fval / 1000.0
+            fval = fval / 1000.0
+        if fval < 0.0 or fval > max_epoch_sec:
+            return None
         return fval
     if isinstance(raw_ts, str):
         cleaned = raw_ts.strip()
@@ -156,7 +159,10 @@ def _parse_signalr_timestamp(raw_ts: Any) -> float | None:
             return None
         if dt.tzinfo is None or dt.utcoffset() is None:
             dt = dt.replace(tzinfo=UTC)
-        return dt.timestamp()
+        ts_val = dt.timestamp()
+        if ts_val < 0.0 or ts_val > max_epoch_sec:
+            return None
+        return ts_val
     return None
 
 

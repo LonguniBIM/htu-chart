@@ -44,6 +44,12 @@ from app.services.ws_broadcaster import WsBroadcaster
 from app.storage.parquet_store import ParquetStore
 from app.storage.sqlite_store import QualityIssueInput, SqliteStore
 from app.topstep.auth import TopstepAuthService
+from app.topstep.errors import (
+    KeyRotationRequiredError,
+    TopstepAuthError,
+    UpstreamHTTPError,
+    UpstreamTimeoutError,
+)
 from app.topstep.signalr_hub import (
     SignalRConnectedEvent,
     SignalRDisconnectedEvent,
@@ -146,7 +152,7 @@ class LiveFeedService:
             maxsize=settings.signalr_recovery_queue_maxsize
         )
         self._quarantine_queue: asyncio.Queue[
-            tuple[StorageDatasetKey, int | None, int, str, str, str]
+            tuple[StorageDatasetKey, int | None, int, str, str, str, int]
         ] = asyncio.Queue(maxsize=settings.signalr_recovery_queue_maxsize)
         self._quarantine_worker_task: asyncio.Task[None] | None = None
         self._recovery_overflowed = False
@@ -158,6 +164,9 @@ class LiveFeedService:
         self._generation = 0
         self._last_connected_utc: int | None = None
         self._last_degraded_at_mono: float | None = None
+        self._auth_retry_pending = False
+        self._last_auth_retry_mono: float | None = None
+        self._auth_retry_delay_sec = max(0.01, settings.signalr_reconnect_initial_delay_sec)
 
     @property
     def hub(self) -> SignalRMarketHub:
@@ -449,6 +458,7 @@ class LiveFeedService:
     async def stop(self) -> None:
         """Stop SignalR, recovery tasks, and watchdog cleanly on shutdown or disconnect."""
         self._running = False
+        self._auth_retry_pending = False
         self._bump_generation_and_cancel_live_tasks()
         if self._watchdog_task is not None and not self._watchdog_task.done():
             self._watchdog_task.cancel()
@@ -646,7 +656,18 @@ class LiveFeedService:
         cid = event.contract_id or next(iter(self._contracts), None)
         redacted_reason = self._redact(event.reason)
         self._last_error = redacted_reason
-        eff_ts = event.bar_time if event.bar_time is not None else self._clock()
+        clock_now = self._clock()
+        raw_bt = event.bar_time
+        if (
+            raw_bt is not None
+            and not isinstance(raw_bt, bool)
+            and DEFAULT_MIN_BAR_TIMESTAMP <= raw_bt <= clock_now + DEFAULT_MAX_FUTURE_SKEW_SEC
+        ):
+            eff_ts = int(raw_bt)
+            safe_bar_time: int | None = eff_ts
+        else:
+            eff_ts = clock_now
+            safe_bar_time = None
         bar_open_1m = bucket_open_utc(eff_ts, "1m")
 
         c_state = self._contracts.get(cid) if cid else None
@@ -666,11 +687,12 @@ class LiveFeedService:
             self._aggregator.mark_open_bucket_incomplete(cid, live_mode, eff_ts)
             item = (
                 StorageDatasetKey("topstepx", live_mode, cid, "1m"),
-                event.bar_time,
+                safe_bar_time,
                 bar_open_1m,
                 event.issue_code,
                 redacted_reason,
                 self._redact(event.raw_summary),
+                self._generation,
             )
             try:
                 self._quarantine_queue.put_nowait(item)
@@ -697,7 +719,7 @@ class LiveFeedService:
         while True:
             item = await self._quarantine_queue.get()
             try:
-                key, bar_time, bar_open_1m, issue_code, detail, raw_summary = item
+                key, bar_time, bar_open_1m, issue_code, detail, raw_summary, queued_gen = item
                 await self._quarantine_malformed_tick(
                     key=key,
                     bar_time=bar_time,
@@ -705,6 +727,7 @@ class LiveFeedService:
                     issue_code=issue_code,
                     detail=detail,
                     raw_summary=raw_summary,
+                    queued_gen=queued_gen,
                 )
             finally:
                 self._quarantine_queue.task_done()
@@ -718,6 +741,7 @@ class LiveFeedService:
         issue_code: str,
         detail: str,
         raw_summary: str,
+        queued_gen: int,
     ) -> None:
         try:
             await self._sqlite.record_quality_issues(
@@ -733,13 +757,25 @@ class LiveFeedService:
                     )
                 ],
             )
-            await self._sqlite.record_coverage(
-                key,
-                bar_open_1m,
-                bar_open_1m + 60,
-                status="CORRUPTED",
-                quarantined_count=1,
-            )
+            skip_corrupted_coverage = False
+            if queued_gen != self._generation:
+                c_state = self._contracts.get(key.contract_id)
+                gap_1m = c_state.unhealed_gap_starts.get("1m") if c_state is not None else None
+                contract_healed = c_state is not None and (
+                    c_state.state == "LIVE" or gap_1m is None or gap_1m > bar_open_1m
+                )
+                if contract_healed or await self._sqlite.is_interval_complete(
+                    key, bar_open_1m, bar_open_1m + 60
+                ):
+                    skip_corrupted_coverage = True
+            if not skip_corrupted_coverage:
+                await self._sqlite.record_coverage(
+                    key,
+                    bar_open_1m,
+                    bar_open_1m + 60,
+                    status="CORRUPTED",
+                    quarantined_count=1,
+                )
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -771,6 +807,7 @@ class LiveFeedService:
     async def trigger_recovery(self, *, now_utc: int | None = None) -> None:
         """Manually trigger RECOVERING reconciliation and await completion."""
         self._bump_generation_and_cancel_live_tasks()
+        self._recovery_overflowed = False
         self._transition_all_contracts("RECOVERING")
         task = self._start_recovery_task(now_utc=now_utc)
         await task
@@ -1427,6 +1464,8 @@ class LiveFeedService:
                             self._last_degraded_at_mono = time.monotonic()
                         else:
                             c_state.state = "LIVE"
+                            c_state.unresolved_gaps = 0
+                            c_state.last_error = None
                     if self._recovery_overflowed:
                         self._feed_state = "DEGRADED"
                         self._last_degraded_at_mono = time.monotonic()
@@ -1434,6 +1473,9 @@ class LiveFeedService:
                         self._recompute_aggregate_state()
                         if not self._contracts:
                             self._feed_state = "LIVE"
+                        if self._feed_state == "LIVE":
+                            self._global_unresolved_gaps = 0
+                            self._last_error = None
                     break
 
                 remaining.sort(key=lambda t: t.received_monotonic)
@@ -1558,6 +1600,10 @@ class LiveFeedService:
             await asyncio.gather(*tuple(self._live_tick_tasks), return_exceptions=True)
         if not self._quarantine_queue.empty():
             self._ensure_quarantine_worker()
+        if (
+            self._quarantine_worker_task is not None
+            and not self._quarantine_worker_task.done()
+        ):
             await self._quarantine_queue.join()
 
     async def _process_live_tick(
@@ -1711,8 +1757,9 @@ class LiveFeedService:
         rotation_blocked = rotation.key_rotation_enforced and (
             rotation.key_rotation_due or rotation.key_age_days is None
         )
-        if rotation_blocked or not self._auth.is_connected:
-            if rotation_blocked and self._auth.is_connected:
+        if rotation_blocked:
+            self._auth_retry_pending = False
+            if self._auth.is_connected:
                 with contextlib.suppress(Exception):
                     await self._auth.ensure_token()
             if self._hub.is_connected or self._feed_state != "DISCONNECTED":
@@ -1721,6 +1768,50 @@ class LiveFeedService:
                     self._redact(str(auth_err))
                     if auth_err
                     else "TopstepX authentication invalidated"
+                )
+                self._bump_generation_and_cancel_live_tasks()
+                await self._hub.stop()
+                self._transition_all_contracts("DISCONNECTED")
+            return
+
+        if not self._auth.is_connected:
+            if self._auth_retry_pending and self._auth.can_retry_login:
+                due_retry = (
+                    self._last_auth_retry_mono is None
+                    or (now_mono - self._last_auth_retry_mono) >= self._auth_retry_delay_sec
+                )
+                if due_retry:
+                    try:
+                        await self._auth.retry_login()
+                        self._auth_retry_pending = False
+                        self._auth_retry_delay_sec = max(
+                            0.01, self._settings.signalr_reconnect_initial_delay_sec
+                        )
+                        self._last_error = None
+                        if self._contracts and self._settings.signalr_enabled:
+                            self._transition_all_contracts("RECOVERING")
+                            self._hub.start()
+                        else:
+                            self._recompute_aggregate_state()
+                        self._broadcast_status()
+                        return
+                    except (UpstreamTimeoutError, UpstreamHTTPError) as exc:
+                        self._last_error = self._redact(str(exc) or type(exc).__name__)
+                        self._last_auth_retry_mono = now_mono
+                        self._auth_retry_delay_sec = min(
+                            self._settings.signalr_reconnect_max_delay_sec,
+                            self._auth_retry_delay_sec * 2.0,
+                        )
+                        self._auth_retry_pending = self._auth.can_retry_login
+                    except (TopstepAuthError, KeyRotationRequiredError, Exception) as exc:
+                        self._auth_retry_pending = False
+                        self._last_error = self._redact(str(exc) or type(exc).__name__)
+            if self._hub.is_connected or self._feed_state != "DISCONNECTED":
+                auth_err = self._auth.get_status().get("last_error")
+                self._last_error = (
+                    self._redact(str(auth_err))
+                    if auth_err
+                    else (self._last_error or "TopstepX authentication invalidated")
                 )
                 self._bump_generation_and_cancel_live_tasks()
                 await self._hub.stop()
@@ -1777,10 +1868,25 @@ class LiveFeedService:
             try:
                 if self._auth.needs_refresh():
                     await self._auth.ensure_token()
+                self._auth_retry_pending = False
+                self._auth_retry_delay_sec = max(
+                    0.01, self._settings.signalr_reconnect_initial_delay_sec
+                )
                 self._bump_generation_and_cancel_live_tasks()
                 self._transition_all_contracts("RECOVERING")
                 await self._hub.trigger_reconnect()
+            except (UpstreamTimeoutError, UpstreamHTTPError) as exc:
+                self._last_error = self._redact(str(exc) or type(exc).__name__)
+                self._auth_retry_pending = self._auth.can_retry_login
+                self._last_auth_retry_mono = now_mono
+                self._auth_retry_delay_sec = max(
+                    0.01, self._settings.signalr_reconnect_initial_delay_sec
+                )
+                self._bump_generation_and_cancel_live_tasks()
+                await self._hub.stop()
+                self._transition_all_contracts("DISCONNECTED")
             except Exception as exc:
+                self._auth_retry_pending = False
                 self._last_error = self._redact(str(exc) or type(exc).__name__)
                 self._bump_generation_and_cancel_live_tasks()
                 await self._hub.stop()

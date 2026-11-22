@@ -164,7 +164,7 @@ class BarAggregator:
         self._open_bars: dict[tuple[str, bool, str], OHLCVBar] = {}
         self._open_bar_ts_bounds: dict[tuple[str, bool, str], tuple[float, float]] = {}
         self._incomplete_open_bars: set[tuple[str, bool, str]] = set()
-        self._incomplete_open_buckets: dict[tuple[str, bool, str], int] = {}
+        self._incomplete_open_buckets: dict[tuple[str, bool, str], set[int]] = {}
         self._discarded_incomplete_bars: list[tuple[str, bool, str, int]] = []
         self._last_closed_times: dict[tuple[str, bool, str], int] = {}
         self._root_symbols: dict[tuple[str, bool], str | None] = {}
@@ -250,18 +250,26 @@ class BarAggregator:
             if existing is not None and existing.time == bucket_ts:
                 self._incomplete_open_bars.add(stream_key)
             else:
-                self._incomplete_open_buckets[stream_key] = bucket_ts
+                pending_set = self._incomplete_open_buckets.setdefault(stream_key, set())
+                pending_set.add(bucket_ts)
+                if existing is not None:
+                    obsolete = {b for b in pending_set if b < existing.time}
+                    if obsolete:
+                        pending_set.difference_update(obsolete)
 
     def _apply_pending_incomplete(
         self,
         stream_key: tuple[str, bool, str],
         bucket_ts: int,
     ) -> None:
-        pending_inc = self._incomplete_open_buckets.get(stream_key)
-        if pending_inc is not None:
-            if bucket_ts == pending_inc:
+        pending_set = self._incomplete_open_buckets.get(stream_key)
+        if pending_set:
+            if bucket_ts in pending_set:
                 self._incomplete_open_bars.add(stream_key)
-            if bucket_ts >= pending_inc:
+            obsolete = {b for b in pending_set if b <= bucket_ts}
+            if obsolete:
+                pending_set.difference_update(obsolete)
+            if not pending_set:
                 self._incomplete_open_buckets.pop(stream_key, None)
 
     def pop_discarded_incomplete_bars(
@@ -316,6 +324,11 @@ class BarAggregator:
 
         eff_root = self._resolve_root(cid, live_mode, root_symbol)
         raw_ts = float(tick.timestamp_utc_sec)
+        if "1m" in self._timeframes:
+            m1_last_closed = self._last_closed_times.get((cid, live_mode, "1m"))
+            if m1_last_closed is not None and bucket_open_utc(ts_sec, "1m") <= m1_last_closed:
+                # Never double-count ticks belonging to REST-confirmed 1m minutes into HTF bars.
+                return TickProcessResult(accepted=True, reason=None, events=())
         emitted: list[AggregatedBarEvent] = []
 
         for tf in self._timeframes:
@@ -546,6 +559,11 @@ class BarAggregator:
             (t for t in (latest_hist_closed, prev_closed) if t is not None),
             default=None,
         )
+        m1_last_closed = (
+            self._last_closed_times.get((cid, eff_live, "1m"))
+            if tf != "1m" and "1m" in self._timeframes
+            else None
+        )
 
         # Replay only valid buffered ticks belonging to buckets strictly newer than closed history.
         # Preserve exact float timestamps for sub-second ordering, tie-breaking by arrival index.
@@ -560,6 +578,8 @@ class BarAggregator:
                 continue
             bucket_ts = bucket_open_utc(ts_sec, tf)
             if auth_cutoff is not None and bucket_ts <= auth_cutoff:
+                continue
+            if m1_last_closed is not None and bucket_open_utc(ts_sec, "1m") <= m1_last_closed:
                 continue
             eligible_ticks.append((float(tick.timestamp_utc_sec), idx, tick))
 
@@ -633,10 +653,15 @@ class BarAggregator:
             self._open_bars.pop(stream_key, None)
             self._open_bar_ts_bounds.pop(stream_key, None)
             self._incomplete_open_bars.discard(stream_key)
+            recon_bucket = bucket_open_utc(eff_now, tf)
             if mark_open_incomplete:
-                self._incomplete_open_buckets[stream_key] = bucket_open_utc(eff_now, tf)
+                self._incomplete_open_buckets.setdefault(stream_key, set()).add(recon_bucket)
             else:
-                self._incomplete_open_buckets.pop(stream_key, None)
+                pending_set = self._incomplete_open_buckets.get(stream_key)
+                if pending_set is not None:
+                    pending_set.discard(recon_bucket)
+                    if not pending_set:
+                        self._incomplete_open_buckets.pop(stream_key, None)
 
         final_last_closed = max(
             (t for t in (*merged_closed.keys(), prev_closed) if t is not None),
@@ -799,15 +824,20 @@ class BarAggregator:
         if latest_open_bar is not None:
             self._open_bars[stream_key] = latest_open_bar
             open_1m_bounds = self._open_bar_ts_bounds.get((cid, eff_live, "1m"))
+            open_members = grouped.get(latest_open_bar.time, ())
+            max_closed_1m_end = max(
+                (float(b.time + 59) for b in open_members if b.is_closed),
+                default=float(latest_open_bar.time),
+            )
             if open_1m_bounds is not None and open_1m_bar is not None:
                 self._open_bar_ts_bounds[stream_key] = (
                     float(latest_open_bar.time),
-                    max(float(latest_open_bar.time), open_1m_bounds[1]),
+                    max(max_closed_1m_end, open_1m_bounds[1]),
                 )
             else:
                 self._open_bar_ts_bounds[stream_key] = (
                     float(latest_open_bar.time),
-                    float(latest_open_bar.time),
+                    max_closed_1m_end,
                 )
             if latest_open_incomplete:
                 self._incomplete_open_bars.add(stream_key)
