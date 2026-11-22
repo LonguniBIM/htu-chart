@@ -138,7 +138,10 @@ def _parse_signalr_timestamp(raw_ts: Any) -> float | None:
     if raw_ts is None or isinstance(raw_ts, bool):
         return None
     if isinstance(raw_ts, (int, float)):
-        fval = float(raw_ts)
+        try:
+            fval = float(raw_ts)
+        except (ValueError, TypeError, OverflowError):
+            return None
         if not math.isfinite(fval):
             return None
         # Convert millisecond epochs if upstream sends JS epoch ms.
@@ -456,6 +459,8 @@ class SignalRMarketHub:
         self._invocation_seq = 0
         self._last_event_monotonic: float | None = None
         self._task: asyncio.Task[None] | None = None
+        self._active_session_task: asyncio.Task[None] | None = None
+        self._session_generation = 0
         self._reconnect_now_event = asyncio.Event()
         self._send_lock = asyncio.Lock()
         self._recent_tokens: deque[str] = deque(maxlen=4)
@@ -685,11 +690,17 @@ class SignalRMarketHub:
 
     async def trigger_reconnect(self) -> None:
         """Force an immediate reconnect cycle (e.g. on JWT refresh)."""
+        self._session_generation += 1
         self._reconnect_now_event.set()
         ws = self._ws
         if ws is not None:
             with contextlib.suppress(Exception):
                 await asyncio.wait_for(ws.close(), timeout=1.0)
+        session_task = self._active_session_task
+        if session_task is not None and not session_task.done():
+            session_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await session_task
 
     def start(self) -> asyncio.Task[None]:
         """Start the background SignalR Market Hub loop if not already running."""
@@ -702,15 +713,22 @@ class SignalRMarketHub:
     async def stop(self) -> None:
         """Stop the background loop and close the active WebSocket cleanly."""
         self._stopping = True
+        self._session_generation += 1
         self._reconnect_now_event.set()
         ws = self._ws
         if ws is not None:
             with contextlib.suppress(Exception):
                 await asyncio.wait_for(ws.close(), timeout=1.0)
+        session_task = self._active_session_task
+        if session_task is not None and not session_task.done():
+            session_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await session_task
         if self._task is not None and not self._task.done():
             self._task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await self._task
+        self._active_session_task = None
         self._task = None
         self._ws = None
         self._connected = False
@@ -769,11 +787,13 @@ class SignalRMarketHub:
         *,
         recv_mono: float,
         token: str | None,
+        live_mode: bool | None = None,
     ) -> list[SignalRTickEvent | SignalRMalformedTickEvent]:
         out: list[SignalRTickEvent | SignalRMalformedTickEvent] = []
+        eff_live = self._live_mode if live_mode is None else live_mode
         for evt in parse_market_invocation_events(
             frame,
-            live_mode=self._live_mode,
+            live_mode=eff_live,
             received_monotonic=recv_mono,
         ):
             if isinstance(evt, SignalRMalformedTickEvent):
@@ -795,25 +815,34 @@ class SignalRMarketHub:
         *,
         recv_mono: float,
         token: str | None,
+        live_mode: bool | None = None,
     ) -> None:
-        for evt in self._build_frame_events(frame, recv_mono=recv_mono, token=token):
+        for evt in self._build_frame_events(
+            frame, recv_mono=recv_mono, token=token, live_mode=live_mode
+        ):
             await self._emit(evt)
 
-    async def _run_single_session(self) -> None:
+    async def _run_single_session(self, session_gen: int | None = None) -> None:
         token: str | None = None
         ws: SignalRWebSocketTransport | None = None
         heartbeat_task: asyncio.Task[None] | None = None
         disconnect_reason = "Connection closed"
+        eff_gen = self._session_generation if session_gen is None else session_gen
 
         try:
+            session_live = (
+                self._auth_service.live if self._auth_service is not None else self._live_mode
+            )
             token = await asyncio.wait_for(self._get_token(), timeout=self._connect_timeout)
+            if eff_gen != self._session_generation or self._stopping:
+                raise asyncio.CancelledError
             if token:
                 self._recent_tokens.append(token)
                 self._connected_token_digest = hashlib.sha256(token.encode("utf-8")).hexdigest()
             else:
                 self._connected_token_digest = None
             if self._auth_service is not None:
-                self._live_mode = self._auth_service.live
+                self._live_mode = session_live
             auth_url = _build_authenticated_ws_url(self._base_url, token)
             headers = {"Authorization": f"Bearer {token}"}
 
@@ -821,6 +850,8 @@ class SignalRMarketHub:
                 self._ws_factory(auth_url, headers),
                 timeout=self._connect_timeout,
             )
+            if eff_gen != self._session_generation or self._stopping:
+                raise asyncio.CancelledError
             self._ws = ws
 
             await asyncio.wait_for(ws.send(SIGNALR_HANDSHAKE_FRAME), timeout=self._connect_timeout)
@@ -872,7 +903,7 @@ class SignalRMarketHub:
                         disconnect_reason = self._redact(str(err_detail), token)
                         return
                     frame_events = self._build_frame_events(
-                        frame, recv_mono=recv_mono, token=token
+                        frame, recv_mono=recv_mono, token=token, live_mode=session_live
                     )
                     for pre_evt in frame_events:
                         if len(pre_connect_events) >= pre_connect_cap:
@@ -899,7 +930,7 @@ class SignalRMarketHub:
             await self._emit(
                 SignalRConnectedEvent(
                     contracts=tuple(self._contracts),
-                    live_mode=self._live_mode,
+                    live_mode=session_live,
                     connected_monotonic=time.monotonic(),
                     pre_connect_overflow_count=pre_connect_overflow,
                     pre_connect_overflow_buckets=tuple(sorted(overflow_buckets)),
@@ -936,15 +967,15 @@ class SignalRMarketHub:
                 except BaseException:
                     if not recv_task.done():
                         recv_task.cancel()
-                        with contextlib.suppress(asyncio.CancelledError, Exception):
-                            await recv_task
+                    with contextlib.suppress(asyncio.CancelledError, Exception):
+                        await recv_task
                     raise
 
                 if not done:
                     if not recv_task.done():
                         recv_task.cancel()
-                        with contextlib.suppress(asyncio.CancelledError, Exception):
-                            await recv_task
+                    with contextlib.suppress(asyncio.CancelledError, Exception):
+                        await recv_task
                     pending_desc = ", ".join(
                         f"{tgt}({cid})" for tgt, cid, _ts in self._pending_subscriptions.values()
                     )
@@ -956,8 +987,8 @@ class SignalRMarketHub:
                 if heartbeat_task in done:
                     if not recv_task.done():
                         recv_task.cancel()
-                        with contextlib.suppress(asyncio.CancelledError, Exception):
-                            await recv_task
+                    with contextlib.suppress(asyncio.CancelledError, Exception):
+                        await recv_task
                     exc = heartbeat_task.exception()
                     if exc is not None:
                         raise exc
@@ -978,7 +1009,9 @@ class SignalRMarketHub:
                         err_detail = frame.get("error") or "Server sent SignalR close frame"
                         disconnect_reason = self._redact(str(err_detail), token)
                         return
-                    await self._emit_frame_events(frame, recv_mono=recv_mono, token=token)
+                    await self._emit_frame_events(
+                        frame, recv_mono=recv_mono, token=token, live_mode=session_live
+                    )
 
         except asyncio.CancelledError:
             raise
@@ -1019,13 +1052,25 @@ class SignalRMarketHub:
             while not self._stopping:
                 self._reconnect_now_event.clear()
                 self._session_connected_and_subscribed = False
+                self._session_generation += 1
+                session_gen = self._session_generation
+                session_task = asyncio.create_task(
+                    self._run_single_session(session_gen),
+                    name="signalr-single-session",
+                )
+                self._active_session_task = session_task
                 try:
-                    await self._run_single_session()
+                    await session_task
                 except asyncio.CancelledError:
-                    raise
+                    cur_task = asyncio.current_task()
+                    if self._stopping or (cur_task is not None and cur_task.cancelling() > 0):
+                        raise
                 except Exception as exc:
                     safe_err = self._redact(str(exc) or type(exc).__name__)
                     logger.warning("SignalR Market Hub disconnected: %s", safe_err)
+                finally:
+                    if self._active_session_task is session_task:
+                        self._active_session_task = None
 
                 if self._stopping:
                     break

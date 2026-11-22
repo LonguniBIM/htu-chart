@@ -158,6 +158,7 @@ class LiveFeedService:
         ] = asyncio.Queue(maxsize=settings.signalr_recovery_queue_maxsize)
         self._quarantine_worker_task: asyncio.Task[None] | None = None
         self._recovery_overflowed = False
+        self._pending_by_contract: dict[str, list[SignalRTickEvent]] = {}
         self._pending_recovery_ticks_count = 0
         self._recovery_task: asyncio.Task[None] | None = None
         self._live_tick_tasks: set[asyncio.Task[None]] = set()
@@ -267,6 +268,11 @@ class LiveFeedService:
             self._explicit_contracts = set(normalized)
             for old_cid in removed:
                 self._contracts.pop(old_cid, None)
+                removed_ticks = self._pending_by_contract.pop(old_cid, None)
+                if removed_ticks:
+                    self._pending_recovery_ticks_count = max(
+                        0, self._pending_recovery_ticks_count - len(removed_ticks)
+                    )
                 self._aggregator.reset_contract(old_cid)
 
             added_or_mode_changed = False
@@ -355,6 +361,11 @@ class LiveFeedService:
                 return
             for old_cid in removed:
                 self._contracts.pop(old_cid, None)
+                removed_ticks = self._pending_by_contract.pop(old_cid, None)
+                if removed_ticks:
+                    self._pending_recovery_ticks_count = max(
+                        0, self._pending_recovery_ticks_count - len(removed_ticks)
+                    )
                 self._aggregator.reset_contract(old_cid)
             if not self._contracts:
                 self._feed_state = "DISCONNECTED"
@@ -440,6 +451,7 @@ class LiveFeedService:
                 with contextlib.suppress(asyncio.CancelledError):
                     await self._recovery_task
             self._recovery_task = None
+            self._reset_recovery_queue()
             for task in list(self._live_tick_tasks):
                 if not task.done():
                     with contextlib.suppress(asyncio.CancelledError):
@@ -642,12 +654,17 @@ class LiveFeedService:
     def _clear_healed_gap_buckets(
         c_state: ContractFeedRuntime,
         tf: str,
-        healed_before_ts: int,
+        healed_start_ts: int,
+        healed_end_ts: int,
     ) -> bool:
-        """Prune gap buckets < healed_before_ts; return True if open/post-window gaps remain."""
+        """Prune gaps in [healed_start_ts, healed_end_ts); return True if unhealed gaps remain."""
         buckets = c_state.unhealed_gap_buckets.get(tf)
+        if healed_end_ts <= healed_start_ts:
+            if buckets is not None:
+                return bool(buckets)
+            return tf in c_state.unhealed_gap_starts
         if buckets is not None:
-            remaining = {b for b in buckets if b >= healed_before_ts}
+            remaining = {b for b in buckets if b < healed_start_ts or b >= healed_end_ts}
             if remaining:
                 c_state.unhealed_gap_buckets[tf] = remaining
                 c_state.unhealed_gap_starts[tf] = min(remaining)
@@ -656,7 +673,7 @@ class LiveFeedService:
             c_state.unhealed_gap_starts.pop(tf, None)
             return False
         existing = c_state.unhealed_gap_starts.get(tf)
-        if existing is not None and existing >= healed_before_ts:
+        if existing is not None and (existing < healed_start_ts or existing >= healed_end_ts):
             return True
         c_state.unhealed_gap_starts.pop(tf, None)
         return False
@@ -854,6 +871,7 @@ class LiveFeedService:
             maxsize=self._settings.signalr_recovery_queue_maxsize
         )
         self._recovery_overflowed = False
+        self._pending_by_contract.clear()
         self._pending_recovery_ticks_count = 0
 
     def _start_recovery_task(self, *, now_utc: int | None = None) -> asyncio.Task[None]:
@@ -1021,6 +1039,8 @@ class LiveFeedService:
         expected_gen: int,
         pending_by_contract: dict[str, list[SignalRTickEvent]],
         align_for_higher_tfs: Sequence[str] = (),
+        buffered_ticks_override: Sequence[SignalRTickEvent] | None = None,
+        consume_pending: bool = True,
     ) -> tuple[bool, int, Any, bool]:
         self._ensure_generation(expected_gen)
         key = StorageDatasetKey("topstepx", c_state.live_mode, cid, tf)
@@ -1122,11 +1142,17 @@ class LiveFeedService:
                 gap_from_rest_issues = True
                 c_state.unresolved_gaps += 1
 
-            self._drain_into_contract_buckets(pending_by_contract)
-            contract_ticks = pending_by_contract.pop(cid, [])
-            self._pending_recovery_ticks_count = max(
-                0, self._pending_recovery_ticks_count - len(contract_ticks)
-            )
+            if buffered_ticks_override is not None:
+                contract_ticks = list(buffered_ticks_override)
+            else:
+                self._drain_into_contract_buckets(pending_by_contract)
+                if consume_pending:
+                    contract_ticks = pending_by_contract.pop(cid, [])
+                    self._pending_recovery_ticks_count = max(
+                        0, self._pending_recovery_ticks_count - len(contract_ticks)
+                    )
+                else:
+                    contract_ticks = list(pending_by_contract.get(cid, ()))
             normalized_ticks = [
                 NormalizedTick(
                     contract_id=t.contract_id,
@@ -1292,7 +1318,7 @@ class LiveFeedService:
                     status="COMPLETE",
                     heal_existing=True,
                 )
-            if self._clear_healed_gap_buckets(c_state, tf, closed_end):
+            if self._clear_healed_gap_buckets(c_state, tf, backfill_start, closed_end):
                 had_gap = True
 
         for closed_evt in recon.closed_bars:
@@ -1433,7 +1459,7 @@ class LiveFeedService:
                 htf_closed_end = latest_closed_bucket_end_utc(
                     eff_now, htf, root_symbol=c_state.root_symbol
                 )
-                self._clear_healed_gap_buckets(c_state, htf, htf_closed_end)
+                self._clear_healed_gap_buckets(c_state, htf, covered_start_utc, htf_closed_end)
                 if recon_htf.last_closed_bar_time is not None:
                     updated_wm = await self._sqlite.upsert_watermark(
                         key_htf, recon_htf.last_closed_bar_time
@@ -1462,7 +1488,7 @@ class LiveFeedService:
         if prior_tasks:
             await asyncio.gather(*prior_tasks, return_exceptions=True)
 
-        pending_by_contract: dict[str, list[SignalRTickEvent]] = {}
+        pending_by_contract = self._pending_by_contract
         contract_degraded: dict[str, bool] = {}
 
         try:
@@ -1506,7 +1532,8 @@ class LiveFeedService:
                             ):
                                 recovered_closed = True
                     else:
-                        for tf in self._recovery_timeframes:
+                        replayed_ticks: list[SignalRTickEvent] | None = None
+                        for idx, tf in enumerate(self._recovery_timeframes):
                             had_gap, _, _, had_tf_closed = (
                                 await self._recover_single_timeframe_rest(
                                     cid=cid,
@@ -1515,12 +1542,25 @@ class LiveFeedService:
                                     eff_now=eff_now,
                                     expected_gen=recovery_gen,
                                     pending_by_contract=pending_by_contract,
+                                    buffered_ticks_override=replayed_ticks,
+                                    consume_pending=False,
                                 )
                             )
+                            if idx == 0:
+                                replayed_ticks = list(pending_by_contract.get(cid, ()))
                             if had_gap:
                                 contract_had_gap = True
                             if had_tf_closed:
                                 recovered_closed = True
+                        if replayed_ticks:
+                            bucket = pending_by_contract.get(cid)
+                            if bucket is not None:
+                                del bucket[: len(replayed_ticks)]
+                                if not bucket:
+                                    pending_by_contract.pop(cid, None)
+                            self._pending_recovery_ticks_count = max(
+                                0, self._pending_recovery_ticks_count - len(replayed_ticks)
+                            )
                 except (asyncio.CancelledError, _StaleGenerationAbort):
                     raise
                 except Exception as exc:

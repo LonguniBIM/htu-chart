@@ -31,13 +31,16 @@ MUTATING_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
 LOOPBACK_IPS = frozenset({"127.0.0.1", "::1"})
 
 _REDACTED_FIELD_PATTERN = (
-    r"Authorization|access_token|apiKey|api_key|token|"
+    r"Authorization|Cookie|Set-Cookie|topstep_session|access_token|apiKey|api_key|token|"
     r"TOPSTEPX_API_KEY|TELEGRAM_BOT_TOKEN|botToken|APP_PASSWORD_HASH|APP_SESSION_SECRET|password"
 )
 _AUTH_SCHEMES = r"Bearer|Basic|Token|Digest|ApiKey|OAuth|Negotiate|NTLM|AWS4-HMAC-SHA256"
 _QUOTED_VALUE_ALT = r'(?:"(?:\\.|[^"\\])*"?(?:\\$)?|\'(?:\\.|[^\'\\])*\'?(?:\\$)?)'
 _BEARER_RE = re.compile(r"(?i)\bBearer\s+[A-Za-z0-9._~+/=-]+")
 _JWT_RE = re.compile(r"\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}(?:\.[A-Za-z0-9_-]*)?")
+_COOKIE_HEADER_RE = re.compile(
+    r"(?im)((?:^|[<>\s])(?:Set-)?Cookie\b\s*[:=]\s*)(?![\s'\"]*\*\*\*REDACTED\*\*\*)([^\r\n]+)"
+)
 _AUTH_HEADER_RE = re.compile(
     rf"""(?i)\bAuthorization\s*([:=])\s*(?!['"])(?:(?:{_AUTH_SCHEMES})\s+)?[^\s,;'"]+"""
 )
@@ -53,6 +56,9 @@ _KV_SECRET_RE = re.compile(
 )
 _SENSITIVE_DICT_KEYS = frozenset({
     "authorization",
+    "cookie",
+    "set-cookie",
+    "topstep_session",
     "access_token",
     "apikey",
     "api_key",
@@ -186,6 +192,7 @@ def _redact_log_message_template(msg: str, extra_secrets: tuple[str, ...]) -> st
     redacted = _safe_sub(_JSON_SECRET_RE, _redact_json_match, msg)
     redacted = _safe_sub(_QUOTED_KV_SECRET_RE, _redact_kv_quoted_match, redacted)
     redacted = _safe_sub(_AUTH_HEADER_RE, r"Authorization\1 ***REDACTED***", redacted)
+    redacted = _safe_sub(_COOKIE_HEADER_RE, r"\1***REDACTED***", redacted)
     redacted = _safe_sub(_BEARER_RE, "Bearer ***REDACTED***", redacted)
     redacted = _safe_sub(_KV_SECRET_RE, r"\1\2***REDACTED***", redacted)
     redacted = _safe_sub(_JWT_RE, "***REDACTED***", redacted)
@@ -249,6 +256,7 @@ def redact_secrets(text: str, extra_secrets: Iterable[str] = ()) -> str:
     redacted = _JSON_SECRET_RE.sub(_redact_json_match, text)
     redacted = _QUOTED_KV_SECRET_RE.sub(_redact_kv_quoted_match, redacted)
     redacted = _AUTH_HEADER_RE.sub(r"Authorization\1 ***REDACTED***", redacted)
+    redacted = _COOKIE_HEADER_RE.sub(r"\1***REDACTED***", redacted)
     redacted = _BEARER_RE.sub("Bearer ***REDACTED***", redacted)
     redacted = _KV_SECRET_RE.sub(r"\1\2***REDACTED***", redacted)
     redacted = _JWT_RE.sub("***REDACTED***", redacted)
@@ -287,6 +295,14 @@ class SecretRedactionFilter(logging.Filter):
                 if isinstance(record.args, tuple)
                 else set()
             )
+            if isinstance(record.args, tuple) and len(record.args) >= 2:
+                for idx in range(1, len(record.args)):
+                    prev_arg = record.args[idx - 1]
+                    if (
+                        isinstance(prev_arg, str)
+                        and prev_arg.strip().lower() in {"cookie", "set-cookie", "authorization"}
+                    ):
+                        sensitive_slots.add(idx)
             if isinstance(record.args, dict):
                 sensitive_named = _sensitive_named_keys(record.msg)
             if record.args:
@@ -357,6 +373,8 @@ def install_global_log_redaction(extra_secrets: Iterable[str] = ()) -> None:
         "httpx",
         "websockets",
         "websockets.client",
+        "websockets.server",
+        "websockets.protocol",
     )
     for name in logger_names:
         target_logger = logging.getLogger(name)

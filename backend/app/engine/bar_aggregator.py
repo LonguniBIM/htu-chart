@@ -96,9 +96,13 @@ def _validate_tick(
     raw_ts = tick.timestamp_utc_sec
     if isinstance(raw_ts, bool) or not isinstance(raw_ts, (int, float)):
         return None, False, None, None, None, f"Invalid tick timestamp type: {raw_ts!r}"
-    if not math.isfinite(float(raw_ts)):
+    try:
+        ts_float = float(raw_ts)
+    except (ValueError, TypeError, OverflowError):
+        return None, False, None, None, None, f"Overflow tick timestamp: {raw_ts!r}"
+    if not math.isfinite(ts_float):
         return None, False, None, None, None, f"Non-finite tick timestamp: {raw_ts!r}"
-    ts_sec = math.floor(float(raw_ts))
+    ts_sec = math.floor(ts_float)
     max_ts = now_utc + DEFAULT_MAX_FUTURE_SKEW_SEC
     if ts_sec < DEFAULT_MIN_BAR_TIMESTAMP or ts_sec > max_ts:
         return (

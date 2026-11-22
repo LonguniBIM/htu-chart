@@ -348,7 +348,9 @@ async def test_f03_reconnect_outage_overlapping_rest_reconciliation_and_watermar
                 emitted_signals.append(
                     (evt.timeframe, evt.bar.time, tag, evt.is_recovered_historical)
                 )
-                states_observed_during_signal.append(live_feed.feed_state)
+                states_observed_during_signal.append(
+                    (live_feed.feed_state, tag, evt.is_recovered_historical)
+                )
 
             hub = SignalRMarketHub(
                 settings,
@@ -432,6 +434,13 @@ async def test_f03_reconnect_outage_overlapping_rest_reconciliation_and_watermar
             recovered_signals = [s for s in emitted_signals if s[2] == "RECOVERED_HISTORICAL"]
             assert any(s[1] == b3 and s[3] is True for s in recovered_signals)
             assert all(s[3] is True for s in recovered_signals)
+            assert states_observed_during_signal
+            assert any(st == "RECOVERING" for st, _tag, _rec in states_observed_during_signal)
+            assert all(
+                tag == "RECOVERED_HISTORICAL" and is_rec is True
+                for st, tag, is_rec in states_observed_during_signal
+                if st == "RECOVERING"
+            )
 
             # Verify open bar b4 rebuilt from buffered ticks (without stale b3 tick!).
             rebuilt_open = agg.get_open_bar(CID_MES, False, "1m")
@@ -5627,6 +5636,7 @@ async def test_f03_dynamic_mid_candle_contract_add_keeps_first_partial_minute_in
                 ):
                     break
                 await asyncio.sleep(0.01)
+            assert svc._contracts[mnq].state == "LIVE"
 
             now_val[0] = BASE_T + 160
             svc.handle_hub_event(
@@ -5635,6 +5645,10 @@ async def test_f03_dynamic_mid_candle_contract_add_keeps_first_partial_minute_in
             now_val[0] = BASE_T + 190
             svc.handle_hub_event(
                 SignalRTickEvent(mnq, False, BASE_T + 190, 201.0, 1.0, "GatewayTrade", 1.1)
+            )
+            now_val[0] = BASE_T + 245
+            svc.handle_hub_event(
+                SignalRTickEvent(mnq, False, BASE_T + 245, 202.0, 1.0, "GatewayTrade", 1.2)
             )
             if svc._live_tick_tasks:
                 await asyncio.gather(*list(svc._live_tick_tasks))
@@ -5646,6 +5660,7 @@ async def test_f03_dynamic_mid_candle_contract_add_keeps_first_partial_minute_in
                 include_provisional=False,
             )
             assert all(b.time != BASE_T + 120 for b in mnq_bars)
+            assert any(b.time == BASE_T + 180 and b.close == 201.0 for b in mnq_bars)
             assert svc._contracts[mnq].state == "DEGRADED"
         finally:
             await svc.stop()
@@ -5802,3 +5817,418 @@ def test_f03_websockets_debug_frame_long_jwt_exceeding_max_log_size_redacts_frag
     finally:
         hub._ws_logger.removeHandler(handler)
         hub._ws_logger.setLevel(prev_level)
+
+
+@pytest.mark.asyncio
+async def test_f03_superseded_recovery_preserves_already_drained_ticks(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Contract: P1-001 preserves already-drained pending_by_contract ticks when recovery cancels.
+    Defect caught: local pending_by_contract losing drained ticks of another contract on cancel.
+    """
+    settings = Settings(data_dir=tmp_path / "data", signalr_enabled=True)
+    sqlite = SqliteStore(tmp_path / "meta.db")
+    sqlite.initialize()
+    parquet = ParquetStore(settings.data_dir, sqlite_store=sqlite)
+
+    mnq = "CON.F.US.MNQ.Z26"
+    es = "CON.F.US.ES.Z26"
+    now_t = BASE_T + 20
+    mes_post_drain = asyncio.Event()
+    release_mes = asyncio.Event()
+
+    class _BarrierRest:
+        async def retrieve_bars_paginated(self, **kw: Any) -> Any:
+            cid = kw.get("contract_id")
+            if cid == CID_MES:
+                bars = [
+                    {"t": BASE_T - 60, "o": 5000.0, "h": 5001.0, "l": 4999.0, "c": 5000.0, "v": 2}
+                ]
+                return type(
+                    "R", (), {"raw_bars": bars, "truncated": False, "provider_gap": False}
+                )()
+            bars = [{"t": BASE_T - 60, "o": 100.0, "h": 101.0, "l": 99.0, "c": 100.0, "v": 1}]
+            return type("R", (), {"raw_bars": bars, "truncated": False, "provider_gap": False})()
+
+    orig_upsert = parquet.upsert_bars
+
+    async def _gated_upsert(*args: Any, **kwargs: Any) -> Any:
+        key = args[0]
+        if key.contract_id == CID_MES and not mes_post_drain.is_set():
+            mes_post_drain.set()
+            await asyncio.wait_for(release_mes.wait(), timeout=2.0)
+        return await orig_upsert(*args, **kwargs)
+
+    monkeypatch.setattr(parquet, "upsert_bars", _gated_upsert)
+
+    def _auth_handler(_req: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"success": True, "errorCode": 0, "token": "test-jwt"})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(_auth_handler)) as client:
+        auth = TopstepAuthService(settings, client)
+        await auth.login("alice", "api-key")
+        svc = LiveFeedService(
+            settings,
+            auth,
+            _BarrierRest(),
+            parquet,
+            sqlite,
+            recovery_timeframes=("1m",),
+            initial_backfill_bars=1,
+            clock=lambda: now_t,
+        )
+        try:
+            await svc.set_active_contracts([CID_MES, mnq])
+            svc._last_connected_utc = BASE_T - 30
+            svc._transition_all_contracts("RECOVERING")
+            svc.handle_hub_event(
+                SignalRTickEvent(mnq, False, BASE_T + 5, 20050.0, 7.0, "GatewayTrade", 1.0)
+            )
+            svc._recovery_queue.put_nowait(
+                SignalRTickEvent(CID_MES, False, BASE_T - 60, 5000.0, 2.0, "GatewayTrade", 0.5)
+            )
+            t1 = svc._start_recovery_task(now_utc=now_t)
+            await asyncio.wait_for(mes_post_drain.wait(), timeout=2.0)
+            assert mnq in svc._pending_by_contract
+
+            svc.register_contract(es, live_mode=False)
+            svc._bump_generation_and_cancel_live_tasks()
+            t2 = svc._start_recovery_task(now_utc=now_t)
+            release_mes.set()
+            await asyncio.gather(t1, return_exceptions=True)
+            await asyncio.wait_for(t2, timeout=2.0)
+
+            open_mnq = svc._aggregator.get_open_bar(mnq, False, "1m")
+            assert open_mnq is not None
+            assert open_mnq.high == 20050.0
+            assert open_mnq.volume == 7.0
+        finally:
+            release_mes.set()
+            await svc.stop()
+            sqlite.close()
+
+
+@pytest.mark.asyncio
+async def test_f03_live_mode_switch_cancels_inflight_ws_factory_dial_and_isolates_ticks(
+    tmp_path: Path,
+) -> None:
+    """Contract: P2-001 cancels in-flight _ws_factory dial when live_mode switches mid-dial.
+    Defect caught: Sim ws_factory completing after Sim->Live switch and emitting ticks as Live.
+    """
+    settings = Settings(data_dir=tmp_path / "data", signalr_enabled=True)
+    dial_entered = asyncio.Event()
+    dial_cancelled = asyncio.Event()
+    release_old_dial = asyncio.Event()
+    dials: list[tuple[str, _MockSignalRTransport]] = []
+    emitted: list[Any] = []
+
+    async def ws_factory(url: str, _headers: dict[str, str]) -> _MockSignalRTransport:
+        tr = _MockSignalRTransport()
+        dials.append((url, tr))
+        if len(dials) == 1:
+            dial_entered.set()
+            try:
+                await asyncio.wait_for(release_old_dial.wait(), timeout=2.0)
+            except asyncio.CancelledError:
+                dial_cancelled.set()
+                raise
+        return tr
+
+    def token_prov() -> Any:
+        mode_tag = "live-jwt" if hub.live_mode else "sim-jwt"
+        return asyncio.sleep(0, result=mode_tag)
+
+    hub = SignalRMarketHub(
+        settings,
+        token_provider=token_prov,
+        contracts=[CID_MES],
+        live_mode=False,
+        ws_factory=ws_factory,
+        on_event=lambda evt: emitted.append(evt),
+    )
+    try:
+        hub.start()
+        await asyncio.wait_for(dial_entered.wait(), timeout=2.0)
+        assert "access_token=sim-jwt" in dials[0][0]
+
+        await hub.update_contracts([CID_MES], live_mode=True)
+        for _ in range(50):
+            if hub.is_connected and len(dials) >= 2:
+                break
+            await asyncio.sleep(0.01)
+
+        assert dial_cancelled.is_set()
+        assert dials[0][1].sent_frames == []
+        assert len(dials) >= 2
+        assert "access_token=live-jwt" in dials[-1][0]
+        await dials[-1][1].push_frame(
+            {
+                "type": 1,
+                "target": "GatewayTrade",
+                "arguments": [
+                    CID_MES,
+                    {"price": 5000.0, "volume": 1.0, "timestamp": BASE_T + 10},
+                ],
+            }
+        )
+        await asyncio.sleep(0.02)
+        tick_evts = [e for e in emitted if isinstance(e, SignalRTickEvent)]
+        assert tick_evts and all(e.live_mode is True for e in tick_evts)
+    finally:
+        release_old_dial.set()
+        await hub.stop()
+
+
+def test_f03_websocket_server_handshake_debug_log_redacts_session_cookie() -> None:
+    """Contract: P2-003 redacts Cookie/Set-Cookie and topstep_session in WS DEBUG logs.
+    Defect caught: Uvicorn websockets.server '< %s: %s' ('Cookie', 'topstep_session=...') leak.
+    """
+    from app.security import install_global_log_redaction
+
+    install_global_log_redaction()
+    ws_srv_logger = logging.getLogger("websockets.server")
+    captured: list[str] = []
+
+    class _ListHandler(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            captured.append(self.format(record))
+
+    handler = _ListHandler()
+    prev_level = ws_srv_logger.level
+    ws_srv_logger.setLevel(logging.DEBUG)
+    ws_srv_logger.addHandler(handler)
+    sess_val = "topstep_session=sess_secret_987654321; theme=dark"
+    try:
+        ws_srv_logger.debug("< %s: %s", "Cookie", sess_val)
+        ws_srv_logger.debug("< %s: %s", "Cookie", "opaque_cookie_abc999")
+        ws_srv_logger.debug("> Set-Cookie: %s", sess_val)
+        assert len(captured) == 3
+        for line in captured:
+            assert "sess_secret_987654321" not in line
+            assert "opaque_cookie_abc999" not in line
+            assert "***REDACTED***" in line
+    finally:
+        ws_srv_logger.removeHandler(handler)
+        ws_srv_logger.setLevel(prev_level)
+
+
+@pytest.mark.asyncio
+async def test_f03_multi_timeframe_recovery_without_1m_replays_buffered_ticks_to_all_tfs(
+    tmp_path: Path,
+) -> None:
+    """Contract: P1-002 replays the same buffered tick snapshot across all non-1m timeframes.
+    Defect caught: first timeframe popping pending_by_contract so later timeframes miss open ticks.
+    """
+    settings = Settings(data_dir=tmp_path / "data", signalr_enabled=True)
+    sqlite = SqliteStore(tmp_path / "meta.db")
+    sqlite.initialize()
+    parquet = ParquetStore(settings.data_dir, sqlite_store=sqlite)
+
+    t0 = first_bucket_open_at_or_after(BASE_T, "15m")
+    rest_entered = asyncio.Event()
+    rest_release = asyncio.Event()
+
+    class _BlockingMultiTfRest:
+        async def retrieve_bars_paginated(self, **kw: Any) -> Any:
+            tf = kw.get("timeframe")
+            if tf == "5m" and not rest_entered.is_set():
+                rest_entered.set()
+                await asyncio.wait_for(rest_release.wait(), timeout=2.0)
+            step = 300 if tf == "5m" else 900
+            bars = [
+                {
+                    "t": t0 - step,
+                    "o": 100.0,
+                    "h": 101.0,
+                    "l": 99.0,
+                    "c": 100.0,
+                    "v": 5.0,
+                }
+            ]
+            return type("R", (), {"raw_bars": bars, "truncated": False, "provider_gap": False})()
+
+    def _auth_handler(_req: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"success": True, "errorCode": 0, "token": "test-jwt"})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(_auth_handler)) as client:
+        auth = TopstepAuthService(settings, client)
+        await auth.login("alice", "api-key")
+        agg = BarAggregator(timeframes=("5m", "15m"))
+        svc = LiveFeedService(
+            settings,
+            auth,
+            _BlockingMultiTfRest(),
+            parquet,
+            sqlite,
+            aggregator=agg,
+            recovery_timeframes=("5m", "15m"),
+            initial_backfill_bars=1,
+            clock=lambda: t0 + 45,
+        )
+        try:
+            await svc.set_active_contracts([CID_MES])
+            svc._last_connected_utc = t0 - 30
+            svc._transition_all_contracts("RECOVERING")
+            rec_task = asyncio.create_task(svc._run_recovery(now_utc=t0 + 45))
+            await asyncio.wait_for(rest_entered.wait(), timeout=2.0)
+            svc.handle_hub_event(
+                SignalRTickEvent(CID_MES, False, t0 + 15, 105.5, 9.0, "GatewayTrade", 1.0)
+            )
+            rest_release.set()
+            await asyncio.wait_for(rec_task, timeout=2.0)
+
+            open_5m = agg.get_open_bar(CID_MES, False, "5m")
+            open_15m = agg.get_open_bar(CID_MES, False, "15m")
+            assert open_5m is not None and open_5m.close == 105.5 and open_5m.volume == 9.0
+            assert open_15m is not None and open_15m.close == 105.5 and open_15m.volume == 9.0
+        finally:
+            rest_release.set()
+            await svc.stop()
+            sqlite.close()
+
+
+@pytest.mark.asyncio
+async def test_f03_malformed_tick_prior_to_backfill_window_preserved_when_window_heals(
+    tmp_path: Path,
+) -> None:
+    """Contract: P2-002 only clears healed gap buckets within [backfill_start, closed_end).
+    Defect caught: gap < backfill_start injected during REST await being wiped by window heal.
+    """
+    settings = Settings(data_dir=tmp_path / "data", signalr_enabled=True)
+    sqlite = SqliteStore(tmp_path / "meta.db")
+    sqlite.initialize()
+    parquet = ParquetStore(settings.data_dir, sqlite_store=sqlite)
+
+    now_t = BASE_T + 125
+    rest_entered = asyncio.Event()
+    rest_release = asyncio.Event()
+
+    class _BarrierCleanRest:
+        async def retrieve_bars_paginated(self, **kw: Any) -> Any:
+            if not rest_entered.is_set():
+                rest_entered.set()
+                await asyncio.wait_for(rest_release.wait(), timeout=2.0)
+            s_ts = int(kw["start_ts"])
+            e_ts = int(kw["end_ts"])
+            bars = [
+                {"t": ts, "o": 100.0, "h": 101.0, "l": 99.0, "c": 100.5, "v": 2.0}
+                for ts in range(s_ts, e_ts, 60)
+                if ts < (now_t - (now_t % 60))
+            ]
+            return type("R", (), {"raw_bars": bars, "truncated": False, "provider_gap": False})()
+
+    def _auth_handler(_req: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"success": True, "errorCode": 0, "token": "test-jwt"})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(_auth_handler)) as client:
+        auth = TopstepAuthService(settings, client)
+        await auth.login("alice", "api-key")
+        svc = LiveFeedService(
+            settings,
+            auth,
+            _BarrierCleanRest(),
+            parquet,
+            sqlite,
+            recovery_timeframes=("1m",),
+            initial_backfill_bars=1,
+            clock=lambda: now_t,
+        )
+        try:
+            await svc.set_active_contracts([CID_MES])
+            svc._last_connected_utc = BASE_T - 30
+            svc._transition_all_contracts("RECOVERING")
+            rec_task = asyncio.create_task(svc._run_recovery(now_utc=now_t))
+            await asyncio.wait_for(rest_entered.wait(), timeout=2.0)
+
+            old_gap_ts = BASE_T - 600
+            svc.handle_hub_event(
+                SignalRMalformedTickEvent(
+                    contract_id=CID_MES,
+                    live_mode=False,
+                    reason="corrupt historical price",
+                    issue_code="invalid_tick",
+                    raw_summary="{}",
+                    bar_time=old_gap_ts,
+                    received_monotonic=1.0,
+                )
+            )
+            rest_release.set()
+            await asyncio.wait_for(rec_task, timeout=2.0)
+
+            c_state = svc._contracts[CID_MES]
+            assert old_gap_ts in c_state.unhealed_gap_buckets.get("1m", set())
+            assert c_state.state == "DEGRADED"
+            assert svc.live_alerts_enabled is False
+        finally:
+            rest_release.set()
+            await svc.stop()
+            sqlite.close()
+
+
+@pytest.mark.asyncio
+async def test_f03_signalr_huge_integer_timestamp_quarantined_without_overflow_error(
+    tmp_path: Path,
+) -> None:
+    """Contract: P1-003 converts huge integer timestamps cleanly to SignalRMalformedTickEvent.
+    Defect caught: 10**400 JSON int raising OverflowError and tearing down the SignalR session.
+    """
+    from app.engine.bar_aggregator import NormalizedTick
+
+    settings = Settings(data_dir=tmp_path / "data", signalr_enabled=True)
+    tr = _MockSignalRTransport()
+    emitted: list[Any] = []
+
+    async def _ws_factory(_u: str, _h: dict[str, str]) -> _MockSignalRTransport:
+        return tr
+
+    hub = SignalRMarketHub(
+        settings,
+        token_provider=lambda: asyncio.sleep(0, result="test-jwt"),
+        contracts=[CID_MES],
+        ws_factory=_ws_factory,
+        on_event=lambda evt: emitted.append(evt),
+    )
+    try:
+        hub.start()
+        for _ in range(50):
+            if hub.is_connected:
+                break
+            await asyncio.sleep(0.01)
+        assert hub.is_connected
+
+        await tr.push_frame(
+            {
+                "type": 1,
+                "target": "GatewayTrade",
+                "arguments": [CID_MES, {"price": 5000.0, "volume": 1.0, "timestamp": 10**400}],
+            }
+        )
+        await asyncio.sleep(0.02)
+        malformed = [e for e in emitted if isinstance(e, SignalRMalformedTickEvent)]
+        assert len(malformed) == 1
+        assert malformed[0].contract_id == CID_MES
+        assert hub.is_connected
+
+        agg = BarAggregator(timeframes=("1m",))
+        ok_res = agg.process_tick(
+            NormalizedTick(CID_MES, False, BASE_T + 5, 5000.0, 2.0),
+            now_utc=BASE_T + 10,
+        )
+        assert ok_res.accepted is True
+        bad_res = agg.process_tick(
+            NormalizedTick(CID_MES, False, 10**400, 9999.0, 99.0),
+            now_utc=BASE_T + 10,
+        )
+        assert bad_res.accepted is False
+        assert agg.get_open_bar(CID_MES, False, "1m") == OHLCVBar(
+            time=BASE_T,
+            open=5000.0,
+            high=5000.0,
+            low=5000.0,
+            close=5000.0,
+            volume=2.0,
+            is_closed=False,
+        )
+    finally:
+        await hub.stop()
