@@ -19,8 +19,14 @@ from starlette.websockets import WebSocketDisconnect
 from app.config import Settings
 from app.engine.bar_aggregator import AggregatedBarEvent
 from app.engine.ohlcv import OHLCVBar
+from app.engine.session_calendar import first_bucket_open_at_or_after, has_open_session_in_range
 from app.main import create_app
+from app.services.live_feed_service import LiveFeedService
 from app.services.ws_broadcaster import WS_CLOSE_SLOW_CONSUMER, WsBroadcaster
+from app.storage.parquet_store import ParquetStore
+from app.storage.sqlite_store import SqliteStore
+from app.topstep.auth import TopstepAuthService
+from app.topstep.rest_client import TopstepRestClient
 from app.topstep.signalr_hub import SIGNALR_RECORD_SEPARATOR
 
 TEST_PASSWORD = "ws-market-test-password"
@@ -432,8 +438,36 @@ class _MockSignalRTransport:
 
 
 def _receive_json_with_timeout(ws: Any, timeout_sec: float) -> dict[str, Any]:
-    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-        return pool.submit(ws.receive_json).result(timeout=timeout_sec)
+    pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    future = pool.submit(ws.receive_json)
+    try:
+        return future.result(timeout=timeout_sec)
+    finally:
+        pool.shutdown(wait=False, cancel_futures=True)
+
+
+def _bars_for_history_payload(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    raw_start = str(payload["startTime"]).replace("Z", "+00:00")
+    raw_end = str(payload["endTime"]).replace("Z", "+00:00")
+    req_start = int(datetime.fromisoformat(raw_start).timestamp())
+    req_end = int(datetime.fromisoformat(raw_end).timestamp())
+    limit = int(payload.get("limit") or 5000)
+    cursor = first_bucket_open_at_or_after(req_start, "1m")
+    bars: list[dict[str, Any]] = []
+    while cursor + 60 <= req_end:
+        if has_open_session_in_range(cursor, cursor + 60):
+            bars.append(
+                {
+                    "t": cursor,
+                    "o": 5950.0,
+                    "h": 5952.0,
+                    "l": 5949.0,
+                    "c": 5951.0,
+                    "v": 10.0,
+                }
+            )
+        cursor += 60
+    return bars[-limit:] if len(bars) > limit else bars
 
 
 def test_r06_ws_subscribe_triggers_upstream_signalr_and_streams_live_bars(
@@ -456,22 +490,20 @@ def test_r06_ws_subscribe_triggers_upstream_signalr_and_streams_live_bars(
         if request.url.path == "/api/Auth/loginKey":
             return httpx.Response(200, json={"success": True, "token": "jwt-e2e-ws"})
         if request.url.path == "/api/History/retrieveBars":
-            return httpx.Response(
-                200,
-                json={
-                    "success": True,
-                    "bars": [
-                        {
-                            "t": bar_open_ts - 60,
-                            "o": 5950.0,
-                            "h": 5952.0,
-                            "l": 5949.0,
-                            "c": 5951.0,
-                            "v": 10.0,
-                        }
-                    ],
-                },
-            )
+            req_payload = json.loads(request.content.decode("utf-8"))
+            bars = _bars_for_history_payload(req_payload)
+            if not bars:
+                bars = [
+                    {
+                        "t": bar_open_ts - 60,
+                        "o": 5950.0,
+                        "h": 5952.0,
+                        "l": 5949.0,
+                        "c": 5951.0,
+                        "v": 10.0,
+                    }
+                ]
+            return httpx.Response(200, json={"success": True, "bars": bars})
         return httpx.Response(404)
 
     settings = Settings(
@@ -599,3 +631,68 @@ def test_r06_revoked_session_closes_passive_websocket_before_push(tmp_path: Path
                     msg = ws.receive_json()
                 pytest.fail(f"Expected WebSocketDisconnect(1008), but received {msg!r}")
             assert exc_revoked.value.code == 1008
+
+
+async def test_r06_large_historical_recovery_does_not_overflow_healthy_ws_client(
+    tmp_path: Path,
+) -> None:
+    """Contract: Recovering >64 closed bars never overflows or disconnects healthy WS clients.
+
+    Defect caught: Publishing all recovered historical closed bars individually into bounded client
+    queues (maxsize=64) causing false 4008 disconnects (PASS1-002 / P2-003).
+    """
+    clock_now = BASE_T + (90 * 60) + 15  # 90 closed 1m bars available
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/Auth/loginKey":
+            return httpx.Response(200, json={"success": True, "token": "jwt-large-rec"})
+        if request.url.path == "/api/History/retrieveBars":
+            req_payload = json.loads(request.content.decode("utf-8"))
+            return httpx.Response(
+                200,
+                json={"success": True, "bars": _bars_for_history_payload(req_payload)},
+            )
+        return httpx.Response(404)
+
+    settings = Settings(data_dir=tmp_path / "data", ws_client_queue_maxsize=64)
+    sqlite_store = SqliteStore(tmp_path / "meta.db")
+    sqlite_store.initialize()
+    try:
+        parquet_store = ParquetStore(settings.data_dir, sqlite_store=sqlite_store)
+        broadcaster = WsBroadcaster(client_queue_maxsize=64, send_timeout_sec=1.0)
+        healthy_ws = _FakeWsClient()
+        broadcaster.register(healthy_ws, client_id="healthy-client")
+        broadcaster.subscribe("healthy-client", "CON.F.US.MES.Z26", "1m")
+
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            auth = TopstepAuthService(settings, client)
+            await auth.login("alice", "key-large-rec")
+            rest = TopstepRestClient(settings, auth, client)
+            live_feed = LiveFeedService(
+                settings,
+                auth,
+                rest,
+                parquet_store,
+                sqlite_store,
+                broadcaster=broadcaster,
+                recovery_timeframes=("1m",),
+                initial_backfill_bars=92,
+                clock=lambda: clock_now,
+            )
+            await live_feed.set_active_contracts(["CON.F.US.MES.Z26"], live_mode=False)
+            await live_feed.trigger_recovery(now_utc=clock_now)
+            await asyncio.sleep(0.05)
+
+            assert live_feed.feed_state == "LIVE"
+            assert live_feed.recovered_historical_count >= 90
+            assert broadcaster.client_count == 1
+            assert broadcaster.slow_disconnect_count == 0
+            resync_msgs = [m for m in healthy_ws.sent if m.get("type") == "resync_required"]
+            assert len(resync_msgs) == 1
+            assert resync_msgs[0]["reason"] == "recovery_complete"
+            assert resync_msgs[0]["contract_id"] == "CON.F.US.MES.Z26"
+
+            await broadcaster.close_all()
+            await live_feed.stop()
+    finally:
+        sqlite_store.close()

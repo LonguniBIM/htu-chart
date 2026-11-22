@@ -339,3 +339,83 @@ def test_reconcile_from_1m_bars_blocks_incomplete_cold_start_and_corrects_waterm
     assert res_corrected.closed_bars[0].bar.high == 250.0
     assert res_corrected.closed_bars[0].bar.volume == 120.0
     assert res_corrected.closed_bars[0].is_recovered_historical is True
+
+
+def test_reconcile_recovery_preserves_subsecond_tick_ordering() -> None:
+    """Contract: Buffered ticks within the same integer second replay in exact sub-second order.
+
+    Defect caught: Truncating tick timestamps to integer seconds before sorting, flipping open and
+    close on out-of-order sub-second ticks (PASS1-005).
+    """
+    agg = BarAggregator(timeframes=("1m",))
+    cid = "CON.F.US.MES.Z26"
+    b0 = int(datetime(2026, 11, 10, 14, 0, 0, tzinfo=UTC).timestamp())
+    b1 = b0 + 60
+    hist = [OHLCVBar(b0, 99.0, 101.0, 98.0, 100.0, 5.0, is_closed=True)]
+
+    # Later sub-second tick (b1 + 5.9) arrives BEFORE earlier tick (b1 + 5.1).
+    recon = agg.reconcile_recovery(
+        contract_id=cid,
+        live_mode=False,
+        timeframe="1m",
+        historical_bars=hist,
+        buffered_ticks=[
+            NormalizedTick(cid, False, b1 + 5.9, 110.0, 2.0),
+            NormalizedTick(cid, False, b1 + 5.1, 100.0, 3.0),
+        ],
+        now_utc=b1 + 10,
+    )
+    assert recon.open_bar is not None
+    assert recon.open_bar.bar == OHLCVBar(
+        time=b1,
+        open=100.0,
+        high=110.0,
+        low=100.0,
+        close=110.0,
+        volume=5.0,
+        is_closed=False,
+    )
+
+
+def test_incomplete_provisional_htf_bar_does_not_finalize_on_next_bucket_or_watchdog() -> None:
+    """Contract: Provisional HTF bars built from incomplete 1m history never finalize as closed.
+
+    Defect caught: Partial 1h open bar (only 14:50) getting finalized as closed when tick crosses
+    into 15:00 or watchdog flushes (P2-002).
+    """
+    cid = "CON.F.US.MES.Z26"
+    h0 = int(datetime(2026, 11, 10, 14, 0, 0, tzinfo=UTC).timestamp())
+
+    # Case A: Subsequent tick crosses into 15:00 bucket -> 14:00 must NOT emit is_closed=True.
+    agg_tick = BarAggregator(timeframes=("1h",))
+    res_inc = agg_tick.reconcile_from_1m_bars(
+        contract_id=cid,
+        live_mode=False,
+        timeframe="1h",
+        closed_1m_bars=[OHLCVBar(h0 + 50 * 60, 100.0, 105.0, 99.0, 102.0, 11.0, is_closed=True)],
+        now_utc=h0 + 51 * 60,
+    )
+    assert res_inc.open_bar is not None and res_inc.open_bar.bar.is_closed is False
+    tick_res = agg_tick.process_tick(
+        NormalizedTick(cid, False, h0 + 3600 + 5, 104.0, 2.0),
+        now_utc=h0 + 3600 + 5,
+    )
+    assert [e for e in tick_res.events if e.bar.is_closed] == []
+    assert agg_tick.get_last_closed_time(cid, False, "1h") is None
+    assert agg_tick.get_open_bar(cid, False, "1h") == OHLCVBar(
+        h0 + 3600, 104.0, 104.0, 104.0, 104.0, 2.0, is_closed=False
+    )
+
+    # Case B: Watchdog flush_closed_bars past 15:00 -> 14:00 discarded without closing.
+    agg_wd = BarAggregator(timeframes=("1h",))
+    agg_wd.reconcile_from_1m_bars(
+        contract_id=cid,
+        live_mode=False,
+        timeframe="1h",
+        closed_1m_bars=[OHLCVBar(h0 + 50 * 60, 100.0, 105.0, 99.0, 102.0, 11.0, is_closed=True)],
+        now_utc=h0 + 51 * 60,
+    )
+    flushed = agg_wd.flush_closed_bars(now_utc=h0 + 3605)
+    assert flushed == []
+    assert agg_wd.get_last_closed_time(cid, False, "1h") is None
+    assert agg_wd.get_open_bar(cid, False, "1h") is None

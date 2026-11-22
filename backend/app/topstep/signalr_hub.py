@@ -9,6 +9,7 @@ import json
 import logging
 import math
 import time
+from collections import deque
 from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -331,6 +332,7 @@ class SignalRMarketHub:
         self._task: asyncio.Task[None] | None = None
         self._reconnect_now_event = asyncio.Event()
         self._send_lock = asyncio.Lock()
+        self._recent_tokens: deque[str] = deque(maxlen=4)
 
     @staticmethod
     def _normalize_contracts(contracts: Sequence[str]) -> list[str]:
@@ -381,6 +383,7 @@ class SignalRMarketHub:
         }
         if self._auth_service is not None:
             secrets_set.update(self._auth_service.active_redaction_secrets())
+        secrets_set.update(t for t in self._recent_tokens if t)
         if self._extra_secrets_provider is not None:
             secrets_set.update(s for s in self._extra_secrets_provider() if s)
         return tuple(sorted(secrets_set, key=len, reverse=True))
@@ -530,6 +533,8 @@ class SignalRMarketHub:
 
         try:
             token = await asyncio.wait_for(self._get_token(), timeout=self._connect_timeout)
+            if token:
+                self._recent_tokens.append(token)
             if self._auth_service is not None:
                 self._live_mode = self._auth_service.live
             auth_url = _build_authenticated_ws_url(self._base_url, token)

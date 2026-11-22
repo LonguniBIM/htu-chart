@@ -18,6 +18,7 @@ from app.engine.session_calendar import (
     bucket_bounds,
     bucket_open_utc,
     is_bar_closed,
+    latest_closed_bucket_end_utc,
     normalize_timeframe,
 )
 
@@ -160,6 +161,7 @@ class BarAggregator:
             raise ValueError("BarAggregator requires at least one timeframe")
         self._timeframes: tuple[str, ...] = tuple(normalized)
         self._open_bars: dict[tuple[str, bool, str], OHLCVBar] = {}
+        self._incomplete_open_bars: set[tuple[str, bool, str]] = set()
         self._last_closed_times: dict[tuple[str, bool, str], int] = {}
         self._root_symbols: dict[tuple[str, bool], str | None] = {}
 
@@ -211,6 +213,7 @@ class BarAggregator:
         for key in list(self._open_bars):
             if key[0] == cid and (live_mode is None or key[1] == bool(live_mode)):
                 self._open_bars.pop(key, None)
+                self._incomplete_open_bars.discard(key)
         for key in list(self._last_closed_times):
             if key[0] == cid and (live_mode is None or key[1] == bool(live_mode)):
                 self._last_closed_times.pop(key, None)
@@ -263,24 +266,27 @@ class BarAggregator:
                 if bucket_ts < existing.time:
                     continue
                 if bucket_ts > existing.time:
-                    closed_res = validate_ohlcv_bar(
-                        _bar_to_mapping(existing, is_closed=True),
-                        is_closed=True,
-                        now_utc=max(eff_now, existing.time),
-                    )
-                    if closed_res.is_valid and closed_res.bar is not None:
-                        self._last_closed_times[stream_key] = closed_res.bar.time
-                        self._open_bars.pop(stream_key, None)
-                        emitted.append(
-                            AggregatedBarEvent(
-                                contract_id=cid,
-                                live_mode=live_mode,
-                                timeframe=tf,
-                                bar=closed_res.bar,
-                                is_recovered_historical=False,
-                                root_symbol=eff_root,
-                            )
+                    is_incomplete_existing = stream_key in self._incomplete_open_bars
+                    self._incomplete_open_bars.discard(stream_key)
+                    self._open_bars.pop(stream_key, None)
+                    if not is_incomplete_existing:
+                        closed_res = validate_ohlcv_bar(
+                            _bar_to_mapping(existing, is_closed=True),
+                            is_closed=True,
+                            now_utc=max(eff_now, existing.time),
                         )
+                        if closed_res.is_valid and closed_res.bar is not None:
+                            self._last_closed_times[stream_key] = closed_res.bar.time
+                            emitted.append(
+                                AggregatedBarEvent(
+                                    contract_id=cid,
+                                    live_mode=live_mode,
+                                    timeframe=tf,
+                                    bar=closed_res.bar,
+                                    is_recovered_historical=False,
+                                    root_symbol=eff_root,
+                                )
+                            )
                     open_candidate = {
                         "time": bucket_ts,
                         "open": price,
@@ -386,12 +392,16 @@ class BarAggregator:
             eff_root = self._resolve_root(cid, lmode, None)
             if not is_bar_closed(open_bar.time, tf, eff_now, root_symbol=eff_root):
                 continue
+            is_incomplete = stream_key in self._incomplete_open_bars
+            self._incomplete_open_bars.discard(stream_key)
+            self._open_bars.pop(stream_key, None)
+            if is_incomplete:
+                continue
             closed_res = validate_ohlcv_bar(
                 _bar_to_mapping(open_bar, is_closed=True),
                 is_closed=True,
                 now_utc=max(eff_now, open_bar.time),
             )
-            self._open_bars.pop(stream_key, None)
             if closed_res.is_valid and closed_res.bar is not None:
                 self._last_closed_times[stream_key] = closed_res.bar.time
                 flushed.append(
@@ -446,7 +456,8 @@ class BarAggregator:
         )
 
         # Replay only valid buffered ticks belonging to buckets strictly newer than closed history.
-        eligible_ticks: list[tuple[int, int, NormalizedTick]] = []
+        # Preserve exact float timestamps for sub-second ordering, tie-breaking by arrival index.
+        eligible_ticks: list[tuple[float, int, NormalizedTick]] = []
         for idx, tick in enumerate(buffered_ticks):
             t_cid, t_live, ts_sec, _, _, err = _validate_tick(tick, now_utc=eff_now)
             if err is not None or t_cid != cid or t_live != eff_live or ts_sec is None:
@@ -454,7 +465,7 @@ class BarAggregator:
             bucket_ts = bucket_open_utc(ts_sec, tf)
             if auth_cutoff is not None and bucket_ts <= auth_cutoff:
                 continue
-            eligible_ticks.append((ts_sec, idx, tick))
+            eligible_ticks.append((float(tick.timestamp_utc_sec), idx, tick))
 
         eligible_ticks.sort(key=lambda item: (item[0], item[1]))
 
@@ -492,6 +503,7 @@ class BarAggregator:
 
         rebuilt_open = temp_agg.get_open_bar(cid, eff_live, tf)
         open_event: AggregatedBarEvent | None = None
+        self._incomplete_open_bars.discard(stream_key)
         if rebuilt_open is not None:
             self._open_bars[stream_key] = rebuilt_open
             open_event = AggregatedBarEvent(
@@ -588,8 +600,10 @@ class BarAggregator:
             grouped.setdefault(htf_open, []).append(bar)
 
         current_htf_open = bucket_open_utc(eff_now, tf)
+        closed_1m_end = latest_closed_bucket_end_utc(eff_now, "1m", root_symbol=eff_root)
         closed_events: list[AggregatedBarEvent] = []
         latest_open_bar: OHLCVBar | None = None
+        latest_open_incomplete = False
 
         for htf_open in sorted(grouped):
             members = grouped[htf_open]
@@ -638,11 +652,27 @@ class BarAggregator:
                     )
                 )
             elif htf_open >= current_htf_open:
+                expected_closed_end = min(htf_end, closed_1m_end)
+                expected_closed_count = max(0, (expected_closed_end - htf_open) // 60)
+                closed_times = {b.time for b in members if b.is_closed}
+                all_elapsed_1m_present = (
+                    all(
+                        (htf_open + (idx * 60)) in closed_times
+                        for idx in range(expected_closed_count)
+                    )
+                    if expected_closed_count > 0
+                    else (members[0].time == htf_open)
+                )
                 latest_open_bar = val.bar
+                latest_open_incomplete = not (covered_ok and all_elapsed_1m_present)
 
         open_event: AggregatedBarEvent | None = None
         if latest_open_bar is not None:
             self._open_bars[stream_key] = latest_open_bar
+            if latest_open_incomplete:
+                self._incomplete_open_bars.add(stream_key)
+            else:
+                self._incomplete_open_bars.discard(stream_key)
             open_event = AggregatedBarEvent(
                 contract_id=cid,
                 live_mode=eff_live,
@@ -653,6 +683,7 @@ class BarAggregator:
             )
         else:
             self._open_bars.pop(stream_key, None)
+            self._incomplete_open_bars.discard(stream_key)
 
         final_last_closed = max(
             (t for t in (*(e.bar.time for e in closed_events), prev_closed) if t is not None),
