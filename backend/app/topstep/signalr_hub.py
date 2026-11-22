@@ -131,9 +131,7 @@ def _build_authenticated_ws_url(base_url: str, token: str) -> str:
 
 
 def _parse_signalr_timestamp(raw_ts: Any) -> float | None:
-    if raw_ts is None:
-        return datetime.now(UTC).timestamp()
-    if isinstance(raw_ts, bool):
+    if raw_ts is None or isinstance(raw_ts, bool):
         return None
     if isinstance(raw_ts, (int, float)):
         fval = float(raw_ts)
@@ -289,11 +287,24 @@ def parse_market_invocation_events(
         if target_lower == "gatewayquote":
             volume = 0.0
         else:
-            raw_vol: Any = 0.0
+            raw_vol: Any = None
             for vol_key in ("volume", "size", "qty", "v"):
                 if vol_key in item and item[vol_key] is not None:
                     raw_vol = item[vol_key]
                     break
+            if raw_vol is None:
+                events.append(
+                    SignalRMalformedTickEvent(
+                        contract_id=cid,
+                        live_mode=live_mode,
+                        reason=f"Missing trade volume in {target} tick",
+                        issue_code="missing_volume",
+                        raw_summary=raw_summary,
+                        bar_time=best_bar_time,
+                        received_monotonic=received_monotonic,
+                    )
+                )
+                continue
             parsed_vol = _parse_finite_number(raw_vol)
             if parsed_vol is None or parsed_vol < 0.0:
                 events.append(
@@ -437,7 +448,8 @@ class SignalRMarketHub:
         self._reconnect_now_event = asyncio.Event()
         self._send_lock = asyncio.Lock()
         self._recent_tokens: deque[str] = deque(maxlen=4)
-        self._pending_subscriptions: dict[str, tuple[str, str]] = {}
+        self._pending_subscriptions: dict[str, tuple[str, str, float]] = {}
+        self._pending_ack_futures: dict[str, asyncio.Future[None]] = {}
         self._subscribed_contracts: set[str] = set()
         self._sub_sync_lock = asyncio.Lock()
 
@@ -461,6 +473,16 @@ class SignalRMarketHub:
     def is_connected(self) -> bool:
         """Return True iff SignalR handshake succeeded and socket is active."""
         return self._connected
+
+    @property
+    def has_pending_subscriptions(self) -> bool:
+        """Return True iff any subscription invocation is still awaiting type=3 completion."""
+        return bool(self._pending_subscriptions)
+
+    def has_pending_subscription(self, contract_id: str) -> bool:
+        """Return True iff contract_id still has a pending subscribe type=3 completion."""
+        norm = contract_id.strip().upper()
+        return any(cid == norm for _tgt, cid, _ts in self._pending_subscriptions.values())
 
     @property
     def last_event_monotonic(self) -> float | None:
@@ -560,28 +582,42 @@ class SignalRMarketHub:
         await self._send_raw(ws, frame)
         return inv_id
 
-    async def _subscribe_contract(self, ws: SignalRWebSocketTransport, contract_id: str) -> None:
+    async def _subscribe_contract(
+        self, ws: SignalRWebSocketTransport, contract_id: str
+    ) -> list[asyncio.Future[None]]:
+        loop = asyncio.get_running_loop()
+        futures: list[asyncio.Future[None]] = []
         for target in ("SubscribeContractQuotes", "SubscribeContractTrades"):
             inv_id = self._next_invocation_id()
-            self._pending_subscriptions[inv_id] = (target, contract_id)
+            fut: asyncio.Future[None] = loop.create_future()
+            # Consume unawaited future errors when teardown occurs before gather.
+            fut.add_done_callback(lambda f: f.exception() if not f.cancelled() else None)
+            self._pending_subscriptions[inv_id] = (target, contract_id, time.monotonic())
+            self._pending_ack_futures[inv_id] = fut
             try:
                 await self._send_invocation(ws, target, [contract_id], invocation_id=inv_id)
             except Exception:
                 self._pending_subscriptions.pop(inv_id, None)
+                self._pending_ack_futures.pop(inv_id, None)
                 raise
+            futures.append(fut)
+        return futures
 
     async def _unsubscribe_contract(self, ws: SignalRWebSocketTransport, contract_id: str) -> None:
         await self._send_invocation(ws, "UnsubscribeContractQuotes", [contract_id])
         await self._send_invocation(ws, "UnsubscribeContractTrades", [contract_id])
 
-    async def _sync_session_subscriptions(self, ws: SignalRWebSocketTransport) -> None:
+    async def _sync_session_subscriptions(
+        self, ws: SignalRWebSocketTransport
+    ) -> list[asyncio.Future[None]]:
+        ack_futures: list[asyncio.Future[None]] = []
         async with self._sub_sync_lock:
             while self._ws is ws:
                 desired = set(self._contracts)
                 to_unsub = sorted(self._subscribed_contracts - desired)
                 to_sub = sorted(desired - self._subscribed_contracts)
                 if not to_unsub and not to_sub:
-                    return
+                    return ack_futures
                 for removed in to_unsub:
                     self._subscribed_contracts.discard(removed)
                     with contextlib.suppress(Exception):
@@ -589,10 +625,11 @@ class SignalRMarketHub:
                 for added in to_sub:
                     self._subscribed_contracts.add(added)
                     try:
-                        await self._subscribe_contract(ws, added)
+                        ack_futures.extend(await self._subscribe_contract(ws, added))
                     except Exception:
                         self._subscribed_contracts.discard(added)
                         raise
+        return ack_futures
 
     async def update_contracts(
         self,
@@ -600,7 +637,7 @@ class SignalRMarketHub:
         *,
         live_mode: bool | None = None,
     ) -> None:
-        """Update active contract subscriptions (unsubscribe removed, subscribe added)."""
+        """Update active contract subscriptions and await dynamic subscribe ACK with timeout."""
         new_contracts = self._normalize_contracts(contracts)
         self._contracts = new_contracts
 
@@ -612,7 +649,13 @@ class SignalRMarketHub:
         ws = self._ws
         if ws is not None and self._connected:
             try:
-                await self._sync_session_subscriptions(ws)
+                ack_futures = await self._sync_session_subscriptions(ws)
+                if ack_futures:
+                    ack_timeout = min(self._connect_timeout, self._heartbeat_timeout)
+                    await asyncio.wait_for(
+                        asyncio.gather(*ack_futures),
+                        timeout=ack_timeout,
+                    )
             except Exception as exc:
                 safe_err = self._redact(str(exc) or type(exc).__name__)
                 logger.warning("SignalR dynamic contract sync failed: %s", safe_err)
@@ -667,13 +710,21 @@ class SignalRMarketHub:
                 )
             await self._send_raw(ws, SIGNALR_PING_FRAME)
 
+    def _clear_pending_subscriptions(self, exc: BaseException | None = None) -> None:
+        self._pending_subscriptions.clear()
+        for fut in self._pending_ack_futures.values():
+            if not fut.done():
+                if exc is not None:
+                    fut.set_exception(exc)
+                else:
+                    fut.cancel()
+        self._pending_ack_futures.clear()
+
     def _handle_completion_frame(self, frame: Mapping[str, Any], token: str | None) -> None:
         inv_id = frame.get("invocationId")
-        sub_info = (
-            self._pending_subscriptions.pop(str(inv_id), None)
-            if inv_id is not None
-            else None
-        )
+        inv_key = str(inv_id) if inv_id is not None else None
+        sub_info = self._pending_subscriptions.pop(inv_key, None) if inv_key else None
+        fut = self._pending_ack_futures.pop(inv_key, None) if inv_key else None
         err_msg = frame.get("error")
         if err_msg:
             safe_err = self._redact(str(err_msg), token)
@@ -682,15 +733,21 @@ class SignalRMarketHub:
                 if sub_info is not None
                 else f"invocation={inv_id}"
             )
-            raise ConnectionError(f"SignalR invocation rejected ({target_desc}): {safe_err}")
+            rej_exc = ConnectionError(f"SignalR invocation rejected ({target_desc}): {safe_err}")
+            if fut is not None and not fut.done():
+                fut.set_exception(rej_exc)
+            raise rej_exc
+        if fut is not None and not fut.done():
+            fut.set_result(None)
 
-    async def _emit_frame_events(
+    def _build_frame_events(
         self,
         frame: Mapping[str, Any],
         *,
         recv_mono: float,
         token: str | None,
-    ) -> None:
+    ) -> list[SignalRTickEvent | SignalRMalformedTickEvent]:
+        out: list[SignalRTickEvent | SignalRMalformedTickEvent] = []
         for evt in parse_market_invocation_events(
             frame,
             live_mode=self._live_mode,
@@ -706,6 +763,17 @@ class SignalRMarketHub:
                     bar_time=evt.bar_time,
                     received_monotonic=evt.received_monotonic,
                 )
+            out.append(evt)
+        return out
+
+    async def _emit_frame_events(
+        self,
+        frame: Mapping[str, Any],
+        *,
+        recv_mono: float,
+        token: str | None,
+    ) -> None:
+        for evt in self._build_frame_events(frame, recv_mono=recv_mono, token=token):
             await self._emit(evt)
 
     async def _run_single_session(self) -> None:
@@ -737,7 +805,7 @@ class SignalRMarketHub:
             if handshake_frames[0].get("error"):
                 raise ConnectionError(f"SignalR handshake error: {handshake_frames[0]['error']}")
 
-            self._pending_subscriptions.clear()
+            self._clear_pending_subscriptions()
             self._subscribed_contracts.clear()
             now_mono = time.monotonic()
             self._last_event_monotonic = now_mono
@@ -746,6 +814,9 @@ class SignalRMarketHub:
 
             ack_timeout = min(self._connect_timeout, self._heartbeat_timeout)
             deadline_mono = time.monotonic() + ack_timeout
+            pre_connect_events: deque[SignalREvent] = deque(
+                maxlen=self._settings.signalr_recovery_queue_maxsize
+            )
             while self._pending_subscriptions or set(self._contracts) != self._subscribed_contracts:
                 if set(self._contracts) != self._subscribed_contracts:
                     await self._sync_session_subscriptions(ws)
@@ -753,7 +824,7 @@ class SignalRMarketHub:
                 remaining = deadline_mono - time.monotonic()
                 if remaining <= 0:
                     pending_desc = ", ".join(
-                        f"{tgt}({cid})" for tgt, cid in self._pending_subscriptions.values()
+                        f"{tgt}({cid})" for tgt, cid, _ts in self._pending_subscriptions.values()
                     )
                     raise TimeoutError(
                         f"SignalR subscribe completion timed out after {ack_timeout}s "
@@ -773,7 +844,9 @@ class SignalRMarketHub:
                         err_detail = frame.get("error") or "Server sent SignalR close frame"
                         disconnect_reason = self._redact(str(err_detail), token)
                         return
-                    await self._emit_frame_events(frame, recv_mono=recv_mono, token=token)
+                    pre_connect_events.extend(
+                        self._build_frame_events(frame, recv_mono=recv_mono, token=token)
+                    )
 
             self._connected = True
             await self._emit(
@@ -783,13 +856,32 @@ class SignalRMarketHub:
                     connected_monotonic=time.monotonic(),
                 )
             )
+            for pre_evt in pre_connect_events:
+                await self._emit(pre_evt)
 
             heartbeat_task = asyncio.create_task(self._heartbeat_loop(ws))
             while not self._stopping:
+                ack_wait_timeout: float | None = None
+                if self._pending_subscriptions:
+                    oldest_sent = min(
+                        sent_ts for _t, _c, sent_ts in self._pending_subscriptions.values()
+                    )
+                    ack_wait_timeout = max(0.0, ack_timeout - (time.monotonic() - oldest_sent))
+                    if ack_wait_timeout <= 0.0:
+                        pending_desc = ", ".join(
+                            f"{tgt}({cid})"
+                            for tgt, cid, _ts in self._pending_subscriptions.values()
+                        )
+                        raise TimeoutError(
+                            f"SignalR dynamic subscribe completion timed out after {ack_timeout}s "
+                            f"waiting for: {pending_desc}"
+                        )
+
                 recv_task = asyncio.create_task(ws.recv())
                 try:
                     done, _ = await asyncio.wait(
                         {recv_task, heartbeat_task},
+                        timeout=ack_wait_timeout,
                         return_when=asyncio.FIRST_COMPLETED,
                     )
                 except BaseException:
@@ -798,6 +890,19 @@ class SignalRMarketHub:
                         with contextlib.suppress(asyncio.CancelledError, Exception):
                             await recv_task
                     raise
+
+                if not done:
+                    if not recv_task.done():
+                        recv_task.cancel()
+                        with contextlib.suppress(asyncio.CancelledError, Exception):
+                            await recv_task
+                    pending_desc = ", ".join(
+                        f"{tgt}({cid})" for tgt, cid, _ts in self._pending_subscriptions.values()
+                    )
+                    raise TimeoutError(
+                        f"SignalR dynamic subscribe completion timed out after {ack_timeout}s "
+                        f"waiting for: {pending_desc}"
+                    )
 
                 if heartbeat_task in done:
                     if not recv_task.done():
@@ -845,7 +950,7 @@ class SignalRMarketHub:
             was_connected = self._connected
             self._connected = False
             self._ws = None
-            self._pending_subscriptions.clear()
+            self._clear_pending_subscriptions(ConnectionError(disconnect_reason))
             self._subscribed_contracts.clear()
             await self._close_ws(ws)
             if was_connected:

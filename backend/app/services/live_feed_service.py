@@ -144,6 +144,10 @@ class LiveFeedService:
         self._recovery_queue: asyncio.Queue[SignalRTickEvent] = asyncio.Queue(
             maxsize=settings.signalr_recovery_queue_maxsize
         )
+        self._quarantine_queue: asyncio.Queue[
+            tuple[StorageDatasetKey, int | None, int, str, str, str]
+        ] = asyncio.Queue(maxsize=settings.signalr_recovery_queue_maxsize)
+        self._quarantine_worker_task: asyncio.Task[None] | None = None
         self._recovery_overflowed = False
         self._pending_recovery_ticks_count = 0
         self._recovery_task: asyncio.Task[None] | None = None
@@ -277,8 +281,9 @@ class LiveFeedService:
         ):
             if not self._hub.is_connected:
                 self._hub.start()
-            elif added_or_mode_changed or removed:
+            elif (added_or_mode_changed or removed) and not self._hub.has_pending_subscriptions:
                 await self.trigger_recovery()
+        self._recompute_aggregate_state()
         self._broadcast_status()
 
     async def subscribe_ws_contract(
@@ -301,10 +306,11 @@ class LiveFeedService:
         if self._running and self._settings.signalr_enabled and self._auth.is_connected:
             if not self._hub.is_connected:
                 self._hub.start()
-            elif newly_added:
+            elif newly_added and not self._hub.has_pending_subscription(cid):
                 self._bump_generation_and_cancel_live_tasks()
                 self._transition_all_contracts("RECOVERING")
                 self._start_recovery_task()
+        self._recompute_aggregate_state()
         self._broadcast_status()
 
     async def sync_ws_contracts(self, active_ws_contracts: set[str]) -> None:
@@ -322,6 +328,8 @@ class LiveFeedService:
         if not self._contracts and self._hub.is_connected:
             await self._hub.stop()
             self._feed_state = "DISCONNECTED"
+        else:
+            self._recompute_aggregate_state()
         self._broadcast_status()
 
     def register_contract(
@@ -445,6 +453,16 @@ class LiveFeedService:
                     await task
         self._live_tick_tasks.clear()
 
+        if self._quarantine_worker_task is not None and not self._quarantine_worker_task.done():
+            self._quarantine_worker_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._quarantine_worker_task
+        self._quarantine_worker_task = None
+        while not self._quarantine_queue.empty():
+            with contextlib.suppress(asyncio.QueueEmpty):
+                self._quarantine_queue.get_nowait()
+                self._quarantine_queue.task_done()
+
         await self._hub.stop()
         self._last_connected_utc = None
         self._transition_all_contracts("DISCONNECTED")
@@ -536,22 +554,50 @@ class LiveFeedService:
 
         if cid:
             self._aggregator.mark_open_bucket_incomplete(cid, live_mode, eff_ts)
-            task = asyncio.create_task(
-                self._quarantine_malformed_tick(
-                    key=StorageDatasetKey("topstepx", live_mode, cid, "1m"),
-                    bar_time=event.bar_time,
-                    bar_open_1m=bar_open_1m,
-                    issue_code=event.issue_code,
-                    detail=redacted_reason,
-                    raw_summary=self._redact(event.raw_summary),
-                )
+            item = (
+                StorageDatasetKey("topstepx", live_mode, cid, "1m"),
+                event.bar_time,
+                bar_open_1m,
+                event.issue_code,
+                redacted_reason,
+                self._redact(event.raw_summary),
             )
-            self._live_tick_tasks.add(task)
-            task.add_done_callback(self._on_live_task_done)
+            try:
+                self._quarantine_queue.put_nowait(item)
+            except asyncio.QueueFull:
+                self._queue_overflow_count += 1
+                if c_state is not None:
+                    c_state.unresolved_gaps += 1
+                else:
+                    self._global_unresolved_gaps += 1
+            self._ensure_quarantine_worker()
 
         self._last_degraded_at_mono = time.monotonic()
         self._recompute_aggregate_state()
         self._broadcast_status()
+
+    def _ensure_quarantine_worker(self) -> None:
+        if self._quarantine_worker_task is None or self._quarantine_worker_task.done():
+            self._quarantine_worker_task = asyncio.create_task(
+                self._quarantine_worker_loop(),
+                name="live_feed_quarantine_worker",
+            )
+
+    async def _quarantine_worker_loop(self) -> None:
+        while True:
+            item = await self._quarantine_queue.get()
+            try:
+                key, bar_time, bar_open_1m, issue_code, detail, raw_summary = item
+                await self._quarantine_malformed_tick(
+                    key=key,
+                    bar_time=bar_time,
+                    bar_open_1m=bar_open_1m,
+                    issue_code=issue_code,
+                    detail=detail,
+                    raw_summary=raw_summary,
+                )
+            finally:
+                self._quarantine_queue.task_done()
 
     async def _quarantine_malformed_tick(
         self,
@@ -794,15 +840,19 @@ class LiveFeedService:
                     backfill_start = min(backfill_start, missing_ranges[0][0])
 
         unhealed_start = c_state.unhealed_gap_starts.get(tf)
-        if unhealed_start is not None:
+        closed_end = latest_closed_bucket_end_utc(eff_now, tf, root_symbol=c_state.root_symbol)
+        open_bucket_unhealed = unhealed_start is not None and unhealed_start >= closed_end
+        if unhealed_start is not None and not open_bucket_unhealed:
             backfill_start = min(backfill_start, unhealed_start)
 
         backfill_end = max(eff_now, backfill_start + TIMEFRAME_SECONDS[tf])
         # Track start defensively so any exception during REST/persistence retains gap start.
-        c_state.unhealed_gap_starts[tf] = min(
-            c_state.unhealed_gap_starts.get(tf, backfill_start),
-            backfill_start,
-        )
+        # Keep unhealed open-bucket gaps intact until the bucket closes and REST confirms it.
+        if not open_bucket_unhealed:
+            c_state.unhealed_gap_starts[tf] = min(
+                c_state.unhealed_gap_starts.get(tf, backfill_start),
+                backfill_start,
+            )
 
         page_res = await asyncio.wait_for(
             self._rest.retrieve_bars_paginated(
@@ -841,9 +891,17 @@ class LiveFeedService:
             )
             had_gap = True
             c_state.unresolved_gaps += 1
+            c_state.unhealed_gap_starts[tf] = min(
+                c_state.unhealed_gap_starts.get(tf, backfill_start),
+                backfill_start,
+            )
         elif page_res.truncated or page_res.provider_gap:
             had_gap = True
             c_state.unresolved_gaps += 1
+            c_state.unhealed_gap_starts[tf] = min(
+                c_state.unhealed_gap_starts.get(tf, backfill_start),
+                backfill_start,
+            )
 
         self._drain_into_contract_buckets(pending_by_contract)
         contract_ticks = pending_by_contract.pop(cid, [])
@@ -861,9 +919,14 @@ class LiveFeedService:
             for t in contract_ticks
         ]
 
+        open_bucket_utc_ts = bucket_open_utc(eff_now, tf)
+        has_open_unhealed_gap = open_bucket_unhealed or any(
+            gap_ts >= open_bucket_utc_ts for gap_ts in c_state.unhealed_gap_starts.values()
+        )
         mark_open_inc = (
             self._last_connected_utc is None
-            or self._last_connected_utc >= bucket_open_utc(eff_now, tf)
+            or self._last_connected_utc >= open_bucket_utc_ts
+            or has_open_unhealed_gap
         )
         recon = self._aggregator.reconcile_recovery(
             contract_id=cid,
@@ -875,7 +938,6 @@ class LiveFeedService:
             root_symbol=c_state.root_symbol,
             mark_open_incomplete=mark_open_inc,
         )
-        closed_end = latest_closed_bucket_end_utc(eff_now, tf, root_symbol=c_state.root_symbol)
         # Preserve any unconfirmed tick-closed buckets at or after closed_end (P1-NEW-002).
         discarded_in_recon = self._aggregator.pop_discarded_incomplete_bars(
             contract_id=cid, live_mode=c_state.live_mode
@@ -1107,6 +1169,9 @@ class LiveFeedService:
             self._ensure_generation(recovery_gen)
             for cid, c_state in list(self._contracts.items()):
                 self._ensure_generation(recovery_gen)
+                if self._hub.has_pending_subscription(cid):
+                    c_state.state = "DISCONNECTED"
+                    continue
                 c_state.state = "RECOVERING"
                 contract_had_gap = False
                 recovered_closed = False
@@ -1200,7 +1265,9 @@ class LiveFeedService:
                 if not remaining:
                     self._recovery_duration_ms = int((time.monotonic() - started_mono) * 1000)
                     for cid, c_state in self._contracts.items():
-                        if (
+                        if self._hub.has_pending_subscription(cid):
+                            c_state.state = "DISCONNECTED"
+                        elif (
                             self._recovery_overflowed
                             or contract_degraded.get(cid, False)
                             or c_state.unhealed_gap_starts
@@ -1327,11 +1394,14 @@ class LiveFeedService:
         return list(res.events)
 
     async def flush_pending_tasks(self) -> None:
-        """Await any in-flight recovery or closed-bar persistence tasks."""
+        """Await any in-flight recovery, closed-bar persistence, or quarantine tasks."""
         if self._recovery_task is not None and not self._recovery_task.done():
             await self._recovery_task
         if self._live_tick_tasks:
             await asyncio.gather(*tuple(self._live_tick_tasks), return_exceptions=True)
+        if not self._quarantine_queue.empty():
+            self._ensure_quarantine_worker()
+            await self._quarantine_queue.join()
 
     async def _process_live_tick(
         self,
