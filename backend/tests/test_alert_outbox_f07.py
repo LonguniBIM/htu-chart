@@ -250,7 +250,13 @@ async def test_f07_sqlite_outbox_deduplication_across_restart(tmp_path: Path) ->
     sent_requests: list[dict[str, Any]] = []
 
     async def tg_handler(request: httpx.Request) -> httpx.Response:
-        sent_requests.append(json.loads(request.content.decode("utf-8")))
+        assert request.method == "POST"
+        assert request.url.path == f"/bot{settings.telegram_bot_token}/sendMessage"
+        payload = json.loads(request.content.decode("utf-8"))
+        assert payload["chat_id"] == settings.telegram_chat_id
+        assert isinstance(payload["text"], str) and payload["text"]
+        assert payload["disable_web_page_preview"] is True
+        sent_requests.append(payload)
         return httpx.Response(200, json={"ok": True, "result": {"message_id": 101}})
 
     store1, up1, tg1, _, svc1 = _build_service_stack(
@@ -1317,3 +1323,208 @@ async def test_f07_telegram_semaphore_concurrency_and_cancellation(tmp_path: Pat
             cancel_task.cancel()
             with pytest.raises(asyncio.CancelledError):
                 await cancel_task
+
+
+async def test_f07_huge_backoff_clamped_to_expires_at_enforces_max_attempts(
+    tmp_path: Path,
+) -> None:
+    """Contract: Huge alert_retry_backoff_sec clamps to expires_at_utc without int64 overflow.
+
+    Defect caught: done_now + 1e20 overflowing SQLite int64 and leaving PENDING at attempt 0.
+    """
+    clock = _MutableClock(1_762_783_260)
+    settings = _make_settings(
+        tmp_path,
+        alert_ttl_seconds=90,
+        alert_max_retries=0,
+        backoff=[1e20],
+    )
+    tg_calls = 0
+
+    async def tg_handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal tg_calls
+        tg_calls += 1
+        return httpx.Response(503, json={"ok": False, "description": "Unavailable"})
+
+    store, up, tg, _, svc = _build_service_stack(
+        tmp_path, settings=settings, tg_handler=tg_handler, clock=clock
+    )
+    try:
+        enq = await svc.enqueue_candidate(_sample_candidate())
+        stats1 = await svc.process_once()
+        assert stats1.failed == 1
+        row = await store.get_outbox_alert(enq.record.id)
+        assert row is not None
+        assert row.status == "FAILED"
+        assert row.attempt_count == 1
+        assert tg_calls == 1
+
+        stats2 = await svc.process_once()
+        assert stats2.claimed == 0
+        assert tg_calls == 1
+    finally:
+        store.close()
+        await tg.aclose()
+        await up.aclose()
+
+
+async def test_f07_key_rotation_reminder_pins_created_at_across_boundary_tick(
+    tmp_path: Path,
+) -> None:
+    """Contract: Weekend key rotation reminder pins created_at_utc so expires_at_utc == sun_utc.
+
+    Defect caught: Second clock read ticking past sun_utc-1 allowing delivery at market open.
+    """
+    sun_open = int(datetime(2026, 11, 15, 18, 0, tzinfo=NY_TZ).timestamp())
+    tick_values = iter([sun_open - 1, sun_open, sun_open])
+    last_val = sun_open
+
+    def stepping_clock() -> int:
+        nonlocal last_val
+        try:
+            last_val = next(tick_values)
+        except StopIteration:
+            pass
+        return last_val
+
+    settings = _make_settings(
+        tmp_path,
+        key_updated_at="2026-10-01",
+        key_rotation_days=30,
+    )
+    tg_calls = 0
+
+    async def tg_handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal tg_calls
+        tg_calls += 1
+        return httpx.Response(200, json={"ok": True})
+
+    sqlite_store = SqliteStore(tmp_path / "metadata.db")
+    sqlite_store.initialize()
+    up_http = httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda _r: httpx.Response(200, json={"ok": True}))
+    )
+    tg_http = httpx.AsyncClient(transport=httpx.MockTransport(tg_handler))
+    auth = TopstepAuthService(settings, up_http)
+    engine = AlertEngine()
+    svc = AlertService(
+        settings,
+        engine,
+        sqlite_store,
+        TelegramClient(settings, tg_http),
+        auth,
+        clock=stepping_clock,
+    )
+    try:
+        res = await svc.check_key_rotation_reminder()
+        assert res is not None
+        assert res.inserted is True
+        assert res.record.created_at_utc == sun_open - 1
+        assert res.record.expires_at_utc == sun_open
+
+        stats = await svc.process_once()
+        assert stats.expired >= 1
+        assert tg_calls == 0
+        persisted = await sqlite_store.get_outbox_alert(res.record.id)
+        assert persisted is not None
+        assert persisted.status == "EXPIRED"
+    finally:
+        sqlite_store.close()
+        await tg_http.aclose()
+        await up_http.aclose()
+
+
+async def test_f07_mid_batch_ttl_expiry_skips_second_send(tmp_path: Path) -> None:
+    """Contract: Pre-send TTL check expires later alerts in a batch if clock advances mid-batch.
+
+    Defect caught: Sending a stale alert when earlier sends in the same batch exhausted its TTL.
+    """
+    t0 = 1_762_783_260
+    clock = _MutableClock(t0)
+    settings = _make_settings(tmp_path, alert_ttl_seconds=30)
+    sent_texts: list[str] = []
+
+    async def tg_handler(request: httpx.Request) -> httpx.Response:
+        sent_texts.append(json.loads(request.content.decode("utf-8"))["text"])
+        clock.now = t0 + 35
+        return httpx.Response(200, json={"ok": True})
+
+    store, up, tg, _, svc = _build_service_stack(
+        tmp_path, settings=settings, tg_handler=tg_handler, clock=clock
+    )
+    try:
+        enq_a = await svc.enqueue_candidate(_sample_candidate(bar_time=t0 - 300, direction="LONG"))
+        enq_b = await svc.enqueue_candidate(_sample_candidate(bar_time=t0 - 600, direction="SHORT"))
+
+        stats = await svc.process_once()
+        assert stats.claimed == 2
+        assert stats.delivered == 1
+        assert stats.expired == 1
+        assert len(sent_texts) == 1
+
+        row_a = await store.get_outbox_alert(enq_a.record.id)
+        row_b = await store.get_outbox_alert(enq_b.record.id)
+        assert row_a is not None and row_a.status == "DELIVERED"
+        assert row_b is not None and row_b.status == "EXPIRED"
+    finally:
+        store.close()
+        await tg.aclose()
+        await up.aclose()
+
+
+async def test_f07_hanging_transport_triggers_total_timeout_deadline(tmp_path: Path) -> None:
+    """Contract: TelegramClient enforces telegram_total_timeout_sec against a hanging transport.
+
+    Defect caught: Hung TCP/TLS read starving the outbox worker indefinitely.
+    """
+    settings = Settings(
+        data_dir=tmp_path,
+        app_password_hash=TEST_PASSWORD_HASH,
+        telegram_bot_token="123456:tg-secret-token-abcdef",
+        telegram_chat_id="-1001234567890",
+        telegram_total_timeout_sec=0.05,
+    )
+    never = asyncio.Event()
+
+    async def hanging_handler(_request: httpx.Request) -> httpx.Response:
+        await never.wait()
+        return httpx.Response(200, json={"ok": True})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(hanging_handler)) as tg_http:
+        client = TelegramClient(settings, tg_http)
+        result = await client.send_message("deadline-test")
+
+    assert result.ok is False
+    assert result.permanent_failure is False
+    assert result.status_code is None
+    assert result.error is not None
+    assert "timed out" in result.error.lower()
+
+
+async def test_f07_httpx_logger_redacts_bot_token_after_create_app(tmp_path: Path) -> None:
+    """Contract: Global log redaction installed by create_app masks /bot<token> on httpx logger.
+
+    Defect caught: httpx INFO request logs leaking TELEGRAM_BOT_TOKEN in URLs.
+    """
+    bot_token = "555666777:AAH_httpx_secret_token_xyz"
+    settings = _make_settings(tmp_path, bot_token=bot_token)
+    create_app(settings=settings)
+
+    log_buf = io.StringIO()
+    handler = logging.StreamHandler(log_buf)
+    httpx_logger = logging.getLogger("httpx")
+    prev_lvl = httpx_logger.level
+    httpx_logger.setLevel(logging.INFO)
+    httpx_logger.addHandler(handler)
+    try:
+        httpx_logger.info(
+            "HTTP Request: POST https://api.telegram.org/bot%s/sendMessage",
+            bot_token,
+        )
+    finally:
+        httpx_logger.removeHandler(handler)
+        httpx_logger.setLevel(prev_lvl)
+
+    emitted = log_buf.getvalue()
+    assert bot_token not in emitted
+    assert "/bot***REDACTED***/sendMessage" in emitted

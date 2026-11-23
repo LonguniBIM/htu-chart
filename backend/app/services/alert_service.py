@@ -129,22 +129,27 @@ class AlertService:
             logger.warning("Alert signal handling failed: %s", self._last_error)
             return results
 
-    async def enqueue_candidate(self, candidate: AlertCandidate) -> EnqueueAlertResult:
+    async def enqueue_candidate(
+        self,
+        candidate: AlertCandidate,
+        *,
+        created_at_utc: int | None = None,
+    ) -> EnqueueAlertResult:
         """Normalize and persist an AlertCandidate transactionally into SQLite alert_outbox."""
         normalized = normalize_candidate(candidate)
-        created_at_utc = self._clock()
+        eff_created = self._clock() if created_at_utc is None else int(created_at_utc)
         ttl = (
             normalized.ttl_seconds
             if normalized.ttl_seconds is not None
             else self._settings.alert_ttl_seconds
         )
         effective_ttl = max(1, int(ttl))
-        expires_at_utc = created_at_utc + effective_ttl
+        expires_at_utc = eff_created + effective_ttl
         max_attempts = 1 + self._settings.alert_max_retries
         payload_text = (
             normalized.message_text
             if normalized.message_text is not None
-            else format_entry_alert_message(normalized, created_at_utc)
+            else format_entry_alert_message(normalized, eff_created)
         )
         return await self._sqlite.enqueue_alert_outbox(
             strategy_id=normalized.strategy_id,
@@ -155,7 +160,7 @@ class AlertService:
             bar_time=normalized.bar_time,
             direction=normalized.direction,
             payload_text=payload_text,
-            created_at_utc=created_at_utc,
+            created_at_utc=eff_created,
             expires_at_utc=expires_at_utc,
             alert_kind=normalized.alert_kind,
             max_attempts=max_attempts,
@@ -214,7 +219,8 @@ class AlertService:
             record.attempt_count,
             result.retry_after_sec,
         )
-        next_attempt_at_utc = done_now + delay_sec
+        remaining = max(0, record.expires_at_utc - done_now)
+        next_attempt_at_utc = done_now + min(delay_sec, remaining)
         new_status = await self._sqlite.mark_outbox_retry(
             record.id,
             done_now,
@@ -275,7 +281,7 @@ class AlertService:
         )
         if candidate is None:
             return None
-        res = await self.enqueue_candidate(candidate)
+        res = await self.enqueue_candidate(candidate, created_at_utc=now)
         if res.inserted:
             self._wakeup.set()
         return res
@@ -304,7 +310,7 @@ class AlertService:
             ttl_seconds=self._settings.alert_ttl_seconds,
         )
         async with self._dispatch_lock:
-            enqueued = await self.enqueue_candidate(candidate)
+            enqueued = await self.enqueue_candidate(candidate, created_at_utc=now_utc)
             await self._dispatch_record_locked(enqueued.record)
         updated = await self._sqlite.get_outbox_alert(enqueued.record.id)
         return updated or enqueued.record
