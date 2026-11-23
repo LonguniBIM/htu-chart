@@ -9007,4 +9007,181 @@ async def test_f03_concurrent_history_backfill_5m_not_overwritten_by_paused_live
         sqlite.close()
 
 
+@pytest.mark.asyncio
+async def test_f03_toctou_parquet_lock_preserves_rest_5m_bar_and_blocks_stale_signal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Contract: C1-001/P2-001 preserves REST closed bars atomically across complete TOCTOU.
+
+    Defect caught: Live persistence seeing is_interval_complete==False, pausing before Parquet
+    upsert while HistoryBackfillService writes REST 5m bar + COMPLETE, then overwriting Parquet.
+    """
+    settings = Settings(data_dir=tmp_path / "data", signalr_enabled=True)
+    sqlite = SqliteStore(tmp_path / "meta.db")
+    sqlite.initialize()
+    parquet = ParquetStore(settings.data_dir, sqlite_store=sqlite)
+
+    t0 = first_bucket_open_at_or_after(BASE_T, "5m")
+    clock_ref = [t0 + 10]
+    signals: list[tuple[str, int, str | None]] = []
+    broadcasted_closed: list[tuple[str, int, float]] = []
+    broadcaster = WsBroadcaster()
+    orig_publish_bar = broadcaster.publish_bar
+
+    def _spy_publish_bar(evt: Any) -> None:
+        if evt.bar.is_closed:
+            broadcasted_closed.append((evt.timeframe, evt.bar.time, evt.bar.volume))
+        orig_publish_bar(evt)
+
+    monkeypatch.setattr(broadcaster, "publish_bar", _spy_publish_bar)
+
+    live_5m_upsert_entered = asyncio.Event()
+    release_live_5m = asyncio.Event()
+    hold_live_5m = [False]
+    in_history_call = [False]
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/Auth/loginKey":
+            return httpx.Response(200, json={"success": True, "token": "jwt-toctou"})
+        if request.url.path == "/api/History/retrieveBars":
+            payload = json.loads(request.content.decode("utf-8"))
+            unit = int(payload["unit"])
+            unit_number = int(payload["unitNumber"])
+            if unit == 2 and unit_number == 5:
+                bars = [_wire_bar(t0, 5945.0, 5999.0, 5940.0, 5988.0, 77.0)]
+            else:
+                bars = _bars_for_history_payload(payload)
+            return httpx.Response(200, json={"success": True, "bars": bars})
+        return httpx.Response(404)
+
+    orig_upsert = parquet.upsert_bars
+
+    async def _gated_upsert(key: StorageDatasetKey, bars: Any, **kwargs: Any) -> Any:
+        if (
+            hold_live_5m[0]
+            and not in_history_call[0]
+            and key.timeframe == "5m"
+            and not live_5m_upsert_entered.is_set()
+        ):
+            live_5m_upsert_entered.set()
+            await asyncio.wait_for(release_live_5m.wait(), timeout=2.0)
+        return await orig_upsert(key, bars, **kwargs)
+
+    monkeypatch.setattr(parquet, "upsert_bars", _gated_upsert)
+
+    try:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            auth = TopstepAuthService(settings, client)
+            await auth.login("alice", "api-key")
+            rest = TopstepRestClient(settings, auth, client)
+            history_svc = HistoryBackfillService(settings, rest, parquet, sqlite)
+            agg = BarAggregator(timeframes=("1m", "5m"))
+            svc = LiveFeedService(
+                settings,
+                auth,
+                rest,
+                parquet,
+                sqlite,
+                aggregator=agg,
+                broadcaster=broadcaster,
+                recovery_timeframes=("1m", "5m"),
+                initial_backfill_bars=1,
+                on_bar_signal=lambda evt, tag: signals.append((evt.timeframe, evt.bar.time, tag)),
+                clock=lambda: clock_ref[0],
+            )
+            try:
+                await svc.set_active_contracts([CID_MES], live_mode=False)
+                svc._last_connected_utc = t0 - 30
+                await svc.trigger_recovery(now_utc=clock_ref[0])
+                assert svc.feed_state == "LIVE"
+                signals.clear()
+                broadcasted_closed.clear()
+
+                svc.handle_hub_event(
+                    SignalRTickEvent(CID_MES, False, t0 + 250, 5952.0, 2.0, "GatewayTrade", 1.0)
+                )
+                await svc.flush_pending_tasks()
+
+                # Pause live persistence AFTER is_interval_complete returned False on 5m bar.
+                hold_live_5m[0] = True
+                clock_ref[0] = t0 + 305
+                svc.handle_hub_event(
+                    SignalRTickEvent(CID_MES, False, t0 + 305, 5955.0, 1.0, "GatewayTrade", 2.0)
+                )
+                await asyncio.wait_for(live_5m_upsert_entered.wait(), timeout=2.0)
+
+                in_history_call[0] = True
+                try:
+                    hist_res = await history_svc.sync_and_read_bars(
+                        contract_id=CID_MES,
+                        live=False,
+                        timeframe="5m",
+                        start_ts=t0,
+                        end_ts=t0 + 299,
+                        now_utc=clock_ref[0],
+                    )
+                finally:
+                    in_history_call[0] = False
+                assert hist_res.is_complete is True
+
+                release_live_5m.set()
+                await svc.flush_pending_tasks()
+
+                key_5m = StorageDatasetKey("topstepx", False, CID_MES, "5m")
+                persisted_5m = await parquet.read_bars(key_5m, start_ts=t0, end_ts=t0)
+                assert persisted_5m == [
+                    OHLCVBar(t0, 5945.0, 5999.0, 5940.0, 5988.0, 77.0, is_closed=True)
+                ]
+                assert not any(tf == "5m" and bt == t0 and tag is None for tf, bt, tag in signals)
+            finally:
+                release_live_5m.set()
+                await svc.stop()
+    finally:
+        sqlite.close()
+
+
+def test_f03_reconcile_from_1m_empty_propagates_1m_incomplete_marker_to_htf() -> None:
+    """Contract: C1-002 propagates 1m incomplete markers to HTF even when 1m history is empty.
+
+    Defect caught: reconcile_from_1m_bars returning early when dedup_1m is empty without
+    marking the HTF bucket incomplete, letting subsequent ticks finalize a partial 5m bar.
+    """
+    t0 = first_bucket_open_at_or_after(BASE_T, "5m")
+    agg = BarAggregator(timeframes=("1m", "5m"))
+
+    agg.reconcile_recovery(
+        contract_id=CID_MES,
+        live_mode=False,
+        timeframe="1m",
+        historical_bars=(),
+        buffered_ticks=(),
+        now_utc=t0 + 30,
+        mark_open_incomplete=True,
+    )
+    agg.reconcile_from_1m_bars(
+        contract_id=CID_MES,
+        live_mode=False,
+        timeframe="5m",
+        closed_1m_bars=(),
+        open_1m_bar=None,
+        now_utc=t0 + 30,
+    )
+
+    r1 = agg.process_tick(
+        NormalizedTick(CID_MES, False, t0 + 40, 5950.0, 2.0),
+        now_utc=t0 + 40,
+    )
+    assert r1.accepted is True
+
+    r2 = agg.process_tick(
+        NormalizedTick(CID_MES, False, t0 + 300, 5955.0, 3.0),
+        now_utc=t0 + 300,
+    )
+    assert r2.accepted is True
+    assert not any(evt.timeframe == "5m" and evt.bar.is_closed for evt in r2.events)
+    discarded = agg.pop_discarded_incomplete_bars(contract_id=CID_MES, live_mode=False)
+    assert (CID_MES, False, "5m", t0) in discarded
+
+
 

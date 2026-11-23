@@ -810,6 +810,7 @@ class BarAggregator:
         now_utc: int | None = None,
         root_symbol: str | None = None,
         covered_start_utc: int | None = None,
+        mark_open_incomplete: bool = False,
     ) -> ReconciliationResult:
         """Deterministically rebuild a higher timeframe from recovered 1m closed + open bars."""
         cid = _normalize_contract_id(contract_id)
@@ -833,6 +834,22 @@ class BarAggregator:
             dedup_1m[open_1m_bar.time] = open_1m_bar
 
         if not dedup_1m:
+            key_1m = (cid, eff_live, "1m")
+            open_1m_cur = self._open_bars.get(key_1m)
+            htf_incomplete_buckets: set[int] = {
+                bucket_open_utc(m_ts, tf)
+                for m_ts in (self._incomplete_open_buckets.get(key_1m) or ())
+            }
+            if key_1m in self._incomplete_open_bars and open_1m_cur is not None:
+                htf_incomplete_buckets.add(bucket_open_utc(open_1m_cur.time, tf))
+            if mark_open_incomplete:
+                htf_incomplete_buckets.add(bucket_open_utc(eff_now, tf))
+            for htf_bucket in htf_incomplete_buckets:
+                if pre_open is not None and pre_open.time == htf_bucket:
+                    self._incomplete_open_bars.add(stream_key)
+                else:
+                    self._incomplete_open_buckets.setdefault(stream_key, set()).add(htf_bucket)
+
             if pre_open is not None and (prev_closed is None or pre_open.time > prev_closed):
                 open_event = AggregatedBarEvent(
                     contract_id=cid,

@@ -2438,13 +2438,17 @@ class LiveFeedService:
                 self._ensure_generation(expected_gen)
                 if already_rest_confirmed:
                     continue
-                await self._parquet.upsert_bars(
+                upsert_res = await self._parquet.upsert_bars(
                     key,
                     [bar_evt.bar],
                     root_symbol=bar_evt.root_symbol,
                     now_utc=now_utc,
+                    preserve_existing_closed=True,
                 )
                 self._ensure_generation(expected_gen)
+                preserved = getattr(upsert_res, "preserved_existing_closed_times", ())
+                if bar_evt.bar.time in preserved:
+                    continue
                 c_state = self._contracts.get(bar_evt.contract_id)
                 blocked_by_gap = False
                 if c_state is not None:

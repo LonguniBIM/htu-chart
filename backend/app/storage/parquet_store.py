@@ -75,6 +75,7 @@ class UpsertResult:
     min_bar_time: int | None
     max_bar_time: int | None
     last_closed_bar_time: int | None
+    preserved_existing_closed_times: tuple[int, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -259,13 +260,15 @@ class ParquetStore:
             raise TypeError(f"Expected Polars DataFrame from Arrow table, got {type(df).__name__}")
         return df.cast(_POLARS_SCHEMA), existing_root
 
-    def _upsert_sync(
+    def _upsert_locked_sync(
         self,
         target: Path,
         key: StorageDatasetKey,
         valid_bars: list[OHLCVBar],
         root_symbol: str | None,
-    ) -> tuple[int, int | None, int | None, int | None, str | None]:
+        *,
+        preserve_existing_closed: bool,
+    ) -> tuple[int, int | None, int | None, int | None, str | None, tuple[int, ...]]:
         with self._get_thread_lock(key):
             existing_df = pl.DataFrame(schema=_POLARS_SCHEMA)
             existing_root: str | None = None
@@ -278,29 +281,43 @@ class ParquetStore:
                 stored_root_symbol=existing_root,
             )
 
-            if not valid_bars:
+            preserved: tuple[int, ...] = ()
+            eff_bars = valid_bars
+            if preserve_existing_closed and not existing_df.is_empty() and valid_bars:
+                existing_closed_times = set(
+                    existing_df.filter(pl.col("is_closed"))["time"].to_list()
+                )
+                if existing_closed_times:
+                    preserved = tuple(
+                        sorted({b.time for b in valid_bars if b.time in existing_closed_times})
+                    )
+                    if preserved:
+                        preserved_set = set(preserved)
+                        eff_bars = [b for b in valid_bars if b.time not in preserved_set]
+
+            if not eff_bars:
                 if existing_df.is_empty():
-                    return 0, None, None, None, eff_root
+                    return 0, None, None, None, eff_root, preserved
                 min_t = int(existing_df["time"].min())
                 max_t = int(existing_df["time"].max())
                 closed_df = existing_df.filter(pl.col("is_closed"))
                 last_closed = int(closed_df["time"].max()) if not closed_df.is_empty() else None
-                return existing_df.height, min_t, max_t, last_closed, eff_root
+                return existing_df.height, min_t, max_t, last_closed, eff_root, preserved
 
             incoming_df = pl.DataFrame(
                 {
-                    "time": [b.time for b in valid_bars],
-                    "open": [b.open for b in valid_bars],
-                    "high": [b.high for b in valid_bars],
-                    "low": [b.low for b in valid_bars],
-                    "close": [b.close for b in valid_bars],
-                    "volume": [b.volume for b in valid_bars],
-                    "is_closed": [b.is_closed for b in valid_bars],
+                    "time": [b.time for b in eff_bars],
+                    "open": [b.open for b in eff_bars],
+                    "high": [b.high for b in eff_bars],
+                    "low": [b.low for b in eff_bars],
+                    "close": [b.close for b in eff_bars],
+                    "volume": [b.volume for b in eff_bars],
+                    "is_closed": [b.is_closed for b in eff_bars],
                 },
                 schema=_POLARS_SCHEMA,
             ).with_columns(
                 pl.col("is_closed").cast(pl.Int8).alias("_closed_rank"),
-                pl.arange(1, len(valid_bars) + 1, dtype=pl.Int64).alias("_source_order"),
+                pl.arange(1, len(eff_bars) + 1, dtype=pl.Int64).alias("_source_order"),
             )
 
             if existing_df.is_empty():
@@ -350,7 +367,23 @@ class ParquetStore:
             max_t = int(merged["time"].max()) if not merged.is_empty() else None
             closed_df = merged.filter(pl.col("is_closed"))
             last_closed = int(closed_df["time"].max()) if not closed_df.is_empty() else None
-            return merged.height, min_t, max_t, last_closed, eff_root
+            return merged.height, min_t, max_t, last_closed, eff_root, preserved
+
+    def _upsert_sync(
+        self,
+        target: Path,
+        key: StorageDatasetKey,
+        valid_bars: list[OHLCVBar],
+        root_symbol: str | None,
+    ) -> tuple[int, int | None, int | None, int | None, str | None]:
+        written_rows, min_t, max_t, last_closed, eff_root, _ = self._upsert_locked_sync(
+            target,
+            key,
+            valid_bars,
+            root_symbol,
+            preserve_existing_closed=False,
+        )
+        return written_rows, min_t, max_t, last_closed, eff_root
 
     async def upsert_bars(
         self,
@@ -359,6 +392,7 @@ class ParquetStore:
         *,
         root_symbol: str | None = None,
         now_utc: int | None = None,
+        preserve_existing_closed: bool = False,
     ) -> UpsertResult:
         """Validate, merge with provisional-bar precedence, and atomically persist bars."""
         normalize_timeframe(key.timeframe)
@@ -390,14 +424,32 @@ class ParquetStore:
             else:
                 rejected.append(res)
 
-        async def _work() -> tuple[int, int | None, int | None, int | None]:
-            written_rows, min_t, max_t, last_closed, eff_root = await asyncio.to_thread(
-                self._upsert_sync,
-                target,
-                key,
-                valid_bars,
-                root_symbol,
-            )
+        async def _work() -> tuple[int, int | None, int | None, int | None, tuple[int, ...]]:
+            if preserve_existing_closed:
+                (
+                    written_rows,
+                    min_t,
+                    max_t,
+                    last_closed,
+                    eff_root,
+                    preserved,
+                ) = await asyncio.to_thread(
+                    self._upsert_locked_sync,
+                    target,
+                    key,
+                    valid_bars,
+                    root_symbol,
+                    preserve_existing_closed=True,
+                )
+            else:
+                written_rows, min_t, max_t, last_closed, eff_root = await asyncio.to_thread(
+                    self._upsert_sync,
+                    target,
+                    key,
+                    valid_bars,
+                    root_symbol,
+                )
+                preserved = ()
             if self._sqlite_store is not None and (valid_bars or target.exists()):
                 await self._sqlite_store.upsert_dataset_metadata(
                     key,
@@ -408,9 +460,9 @@ class ParquetStore:
                     max_bar_time=max_t,
                     last_closed_bar_time=last_closed,
                 )
-            return written_rows, min_t, max_t, last_closed
+            return written_rows, min_t, max_t, last_closed, preserved
 
-        written_rows, min_t, max_t, last_closed = await self._run_locked(key, _work)
+        written_rows, min_t, max_t, last_closed, preserved = await self._run_locked(key, _work)
 
         return UpsertResult(
             key=key,
@@ -420,6 +472,7 @@ class ParquetStore:
             min_bar_time=min_t,
             max_bar_time=max_t,
             last_closed_bar_time=last_closed,
+            preserved_existing_closed_times=preserved,
         )
 
     def _read_bars_sync(
