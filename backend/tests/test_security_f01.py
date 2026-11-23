@@ -932,3 +932,52 @@ async def test_f01_concurrent_login_rechecks_rate_limit_after_permit_acquire(
         r1, r2 = await asyncio.gather(task1, task2)
         assert sorted([r1.status_code, r2.status_code]) == [401, 429]
         assert call_count == 1
+
+
+async def test_f01_alert_routes_require_session_csrf_and_redact_telegram_secrets() -> None:
+    """Contract: /api/alerts/* enforces session/CSRF and redact_secrets masks bot URL & chat_id.
+
+    Defect caught: Unauthenticated/missing-CSRF alert mutations or /bot<token> URL secret leaks.
+    """
+    bot_token = "987654321:AAH_super_secret_bot_token_value"
+    chat_id = "-1009988776655"
+    settings = Settings(
+        app_password_hash=TEST_PASSWORD_HASH,
+        telegram_bot_token=bot_token,
+        telegram_chat_id=chat_id,
+    )
+
+    raw_url_error = (
+        f"POST https://api.telegram.org/bot{bot_token}/sendMessage "
+        f'payload={{"chat_id": "{chat_id}", "TELEGRAM_CHAT_ID": "{chat_id}"}}'
+    )
+    redacted = redact_secrets(raw_url_error, (bot_token, chat_id))
+    assert bot_token not in redacted
+    assert chat_id not in redacted
+    assert "/bot***REDACTED***/sendMessage" in redacted
+
+    async with _async_client(settings) as (client, _):
+        assert (await client.get("/api/alerts/status")).status_code == 401
+        assert (await client.get("/api/alerts/history")).status_code == 401
+        scanner_unauth = await client.post("/api/alerts/scanner", json={"enabled": False})
+        assert scanner_unauth.status_code == 401
+        assert (await client.post("/api/alerts/test")).status_code == 401
+
+        csrf_token = await _login_and_get_csrf(client)
+        assert (
+            await client.post("/api/alerts/scanner", json={"enabled": False})
+        ).status_code == 403
+        assert (await client.post("/api/alerts/test")).status_code == 403
+
+        ok_scanner = await client.post(
+            "/api/alerts/scanner",
+            json={"enabled": False},
+            headers={"X-CSRF-Token": csrf_token},
+        )
+        assert ok_scanner.status_code == 200
+        assert ok_scanner.json()["scanner_enabled"] is False
+
+        status_resp = await client.get("/api/alerts/status")
+        assert status_resp.status_code == 200
+        assert bot_token not in status_resp.text
+        assert chat_id not in status_resp.text

@@ -15,9 +15,11 @@ from fastapi import FastAPI, Request, status
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
-from app.api import routes_market, routes_status
+from app.api import routes_alerts, routes_market, routes_status
 from app.config import Settings, load_settings
+from app.engine.alert_engine import AlertEngine
 from app.engine.bar_aggregator import BarAggregator
+from app.notify.telegram import TelegramClient, build_telegram_httpx_timeout
 from app.security import (
     HostOriginMiddleware,
     LoginGuard,
@@ -25,6 +27,7 @@ from app.security import (
     install_global_log_redaction,
     redact_secrets,
 )
+from app.services.alert_service import AlertService
 from app.services.history_service import HistoryBackfillService
 from app.services.live_feed_service import LiveFeedService
 from app.services.ws_broadcaster import WsBroadcaster
@@ -39,7 +42,13 @@ logger = logging.getLogger("topstep_chart")
 
 
 def _install_redaction_filter(settings: Settings) -> None:
-    extra = (settings.topstepx_api_key, settings.app_password_hash, settings.app_session_secret)
+    extra = (
+        settings.topstepx_api_key,
+        settings.app_password_hash,
+        settings.app_session_secret,
+        settings.telegram_bot_token,
+        settings.telegram_chat_id,
+    )
     install_global_log_redaction(extra_secrets=extra)
 
 
@@ -73,6 +82,7 @@ def create_app(
     http_client: httpx.AsyncClient | None = None,
     signalr_ws_factory: WsConnectFactory | None = None,
     clock: Callable[[], int] | None = None,
+    telegram_http_client: httpx.AsyncClient | None = None,
 ) -> FastAPI:
     """Create and configure the FastAPI application instance."""
     resolved_settings = settings or load_settings()
@@ -82,7 +92,18 @@ def create_app(
     async def lifespan(app_instance: FastAPI) -> AsyncIterator[None]:
         owns_client = http_client is None
         client = http_client or httpx.AsyncClient(timeout=build_httpx_timeout(resolved_settings))
+        telegram_configured = bool(
+            resolved_settings.telegram_bot_token.strip()
+            and resolved_settings.telegram_chat_id.strip()
+        )
+        owns_telegram_client = telegram_http_client is None and telegram_configured
+        tg_client = telegram_http_client
+        if tg_client is None and telegram_configured:
+            tg_client = httpx.AsyncClient(
+                timeout=build_telegram_httpx_timeout(resolved_settings)
+            )
         upstream_semaphore = asyncio.Semaphore(resolved_settings.upstream_max_concurrency)
+        telegram_semaphore = asyncio.Semaphore(resolved_settings.telegram_max_concurrency)
         auth_service = TopstepAuthService(
             resolved_settings,
             client,
@@ -126,6 +147,20 @@ def create_app(
             auth_service=auth_service,
             ws_factory=signalr_ws_factory,
         )
+        alert_engine = AlertEngine(scanner_enabled=resolved_settings.alert_scanner_enabled)
+        telegram_notifier = TelegramClient(
+            resolved_settings,
+            tg_client,
+            semaphore=telegram_semaphore,
+        )
+        alert_service = AlertService(
+            resolved_settings,
+            alert_engine,
+            sqlite_store,
+            telegram_notifier,
+            auth_service,
+            clock=clock,
+        )
         live_feed_service = LiveFeedService(
             resolved_settings,
             auth_service,
@@ -135,12 +170,15 @@ def create_app(
             aggregator=bar_aggregator,
             broadcaster=ws_broadcaster,
             signalr_hub=signalr_hub,
+            on_bar_signal=alert_service.handle_bar_signal,
             clock=clock,
         )
 
         app_instance.state.settings = resolved_settings
         app_instance.state.http_client = client
+        app_instance.state.telegram_http_client = tg_client
         app_instance.state.upstream_semaphore = upstream_semaphore
+        app_instance.state.telegram_semaphore = telegram_semaphore
         app_instance.state.topstep_auth = auth_service
         app_instance.state.rest_client = rest_client
         app_instance.state.sqlite_store = sqlite_store
@@ -151,8 +189,12 @@ def create_app(
         app_instance.state.bar_aggregator = bar_aggregator
         app_instance.state.ws_broadcaster = ws_broadcaster
         app_instance.state.signalr_hub = signalr_hub
+        app_instance.state.alert_engine = alert_engine
+        app_instance.state.telegram_client = telegram_notifier
+        app_instance.state.alert_service = alert_service
         app_instance.state.live_feed_service = live_feed_service
 
+        await alert_service.start()
         await live_feed_service.start()
 
         auth_task: asyncio.Task[None] | None = None
@@ -174,8 +216,11 @@ def create_app(
                 with contextlib.suppress(asyncio.CancelledError):
                     await auth_task
             await live_feed_service.stop()
+            await alert_service.stop()
             await ws_broadcaster.close_all()
             sqlite_store.close()
+            if owns_telegram_client and tg_client is not None:
+                await tg_client.aclose()
             if owns_client:
                 await client.aclose()
 
@@ -195,6 +240,8 @@ def create_app(
             resolved_settings.topstepx_api_key,
             resolved_settings.app_password_hash,
             resolved_settings.app_session_secret,
+            resolved_settings.telegram_bot_token,
+            resolved_settings.telegram_chat_id,
         )
         sanitized: list[dict[str, Any]] = []
         for err in exc.errors():
@@ -216,6 +263,7 @@ def create_app(
         return JSONResponse(status_code=500, content={"detail": "Internal Server Error"})
 
     application.include_router(routes_status.router)
+    application.include_router(routes_alerts.router)
     application.include_router(routes_market.router)
     application.include_router(routes_market.ws_router)
     return application

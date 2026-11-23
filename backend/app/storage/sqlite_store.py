@@ -15,7 +15,10 @@ from app.engine.instruments import StorageDatasetKey
 
 CoverageStatus = Literal["COMPLETE", "CORRUPTED", "TRUNCATED", "PROVIDER_GAP"]
 _VALID_COVERAGE_STATUSES = frozenset({"COMPLETE", "CORRUPTED", "TRUNCATED", "PROVIDER_GAP"})
+AlertStatus = Literal["PENDING", "DELIVERED", "EXPIRED", "FAILED"]
+_VALID_ALERT_STATUSES = frozenset({"PENDING", "DELIVERED", "EXPIRED", "FAILED"})
 _MAX_RAW_PAYLOAD_CHARS = 2048
+_MAX_ALERT_ERROR_CHARS = 512
 _SQLITE_INT64_MIN = -(2**63)
 _SQLITE_INT64_MAX = 2**63 - 1
 
@@ -26,6 +29,20 @@ def _clamp_sqlite_int64(value: int | None) -> int | None:
     if _SQLITE_INT64_MIN <= value <= _SQLITE_INT64_MAX:
         return value
     return None
+
+
+def _validate_sqlite_int64(value: int, field_name: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"{field_name} must be an integer, got {type(value).__name__}")
+    if not (_SQLITE_INT64_MIN <= value <= _SQLITE_INT64_MAX):
+        raise ValueError(f"{field_name} out of SQLite int64 range: {value}")
+    return value
+
+
+def _validate_non_empty_str(value: str, field_name: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{field_name} must be a non-empty string")
+    return value.strip()
 
 
 @dataclass(frozen=True)
@@ -67,6 +84,39 @@ class FeedWatermark:
     timeframe: str
     last_closed_bar_time: int
     updated_at_utc: int
+
+
+@dataclass(frozen=True)
+class AlertOutboxRecord:
+    """Persisted transactional alert outbox row (F07)."""
+
+    id: int
+    strategy_id: str
+    strategy_version: str
+    live_mode: bool
+    contract_id: str
+    timeframe: str
+    bar_time: int
+    direction: str
+    alert_kind: str
+    payload_text: str
+    status: AlertStatus
+    attempt_count: int
+    max_attempts: int
+    created_at_utc: int
+    expires_at_utc: int
+    next_attempt_at_utc: int
+    delivered_at_utc: int | None
+    updated_at_utc: int
+    last_error: str | None
+
+
+@dataclass(frozen=True)
+class EnqueueAlertResult:
+    """Result of transactional outbox enqueue (inserted=False on duplicate key)."""
+
+    inserted: bool
+    record: AlertOutboxRecord
 
 
 def _subtract_interval(
@@ -195,6 +245,42 @@ class SqliteStore:
                 updated_at_utc INTEGER NOT NULL,
                 PRIMARY KEY (provider, live_mode, contract_id, timeframe)
             );
+
+            CREATE TABLE IF NOT EXISTS alert_outbox (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                strategy_id TEXT NOT NULL,
+                strategy_version TEXT NOT NULL,
+                live_mode INTEGER NOT NULL,
+                contract_id TEXT NOT NULL,
+                timeframe TEXT NOT NULL,
+                bar_time INTEGER NOT NULL,
+                direction TEXT NOT NULL,
+                alert_kind TEXT NOT NULL DEFAULT 'ENTRY',
+                payload_text TEXT NOT NULL,
+                status TEXT NOT NULL CHECK (
+                    status IN ('PENDING', 'DELIVERED', 'EXPIRED', 'FAILED')
+                ),
+                attempt_count INTEGER NOT NULL DEFAULT 0,
+                max_attempts INTEGER NOT NULL DEFAULT 4,
+                created_at_utc INTEGER NOT NULL,
+                expires_at_utc INTEGER NOT NULL,
+                next_attempt_at_utc INTEGER NOT NULL,
+                delivered_at_utc INTEGER,
+                updated_at_utc INTEGER NOT NULL,
+                last_error TEXT,
+                UNIQUE (
+                    strategy_id,
+                    strategy_version,
+                    live_mode,
+                    contract_id,
+                    timeframe,
+                    bar_time,
+                    direction
+                )
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_alert_outbox_status_next
+                ON alert_outbox (status, next_attempt_at_utc, id);
             """
         )
         conn.commit()
@@ -967,3 +1053,480 @@ class SqliteStore:
             live_mode=live_mode,
             contract_id=contract_id,
         )
+
+    @staticmethod
+    def _row_to_alert_outbox_record(row: sqlite3.Row) -> AlertOutboxRecord:
+        delivered_raw = row["delivered_at_utc"]
+        return AlertOutboxRecord(
+            id=int(row["id"]),
+            strategy_id=str(row["strategy_id"]),
+            strategy_version=str(row["strategy_version"]),
+            live_mode=bool(row["live_mode"]),
+            contract_id=str(row["contract_id"]),
+            timeframe=str(row["timeframe"]),
+            bar_time=int(row["bar_time"]),
+            direction=str(row["direction"]),
+            alert_kind=str(row["alert_kind"]),
+            payload_text=str(row["payload_text"]),
+            status=row["status"],
+            attempt_count=int(row["attempt_count"]),
+            max_attempts=int(row["max_attempts"]),
+            created_at_utc=int(row["created_at_utc"]),
+            expires_at_utc=int(row["expires_at_utc"]),
+            next_attempt_at_utc=int(row["next_attempt_at_utc"]),
+            delivered_at_utc=int(delivered_raw) if delivered_raw is not None else None,
+            updated_at_utc=int(row["updated_at_utc"]),
+            last_error=str(row["last_error"]) if row["last_error"] is not None else None,
+        )
+
+    _ALERT_OUTBOX_SELECT = """
+        SELECT id, strategy_id, strategy_version, live_mode, contract_id, timeframe,
+               bar_time, direction, alert_kind, payload_text, status, attempt_count,
+               max_attempts, created_at_utc, expires_at_utc, next_attempt_at_utc,
+               delivered_at_utc, updated_at_utc, last_error
+        FROM alert_outbox
+    """
+
+    def _enqueue_alert_outbox_sync(
+        self,
+        *,
+        strategy_id: str,
+        strategy_version: str,
+        live_mode: bool,
+        contract_id: str,
+        timeframe: str,
+        bar_time: int,
+        direction: str,
+        payload_text: str,
+        created_at_utc: int,
+        expires_at_utc: int,
+        alert_kind: str = "ENTRY",
+        max_attempts: int = 4,
+        next_attempt_at_utc: int | None = None,
+    ) -> EnqueueAlertResult:
+        if not isinstance(live_mode, bool):
+            raise ValueError(f"live_mode must be a bool, got {type(live_mode).__name__}")
+        clean_strategy = _validate_non_empty_str(strategy_id, "strategy_id")
+        clean_version = _validate_non_empty_str(strategy_version, "strategy_version")
+        clean_contract = _validate_non_empty_str(contract_id, "contract_id").upper()
+        clean_tf = _validate_non_empty_str(timeframe, "timeframe").lower()
+        clean_dir = _validate_non_empty_str(direction, "direction").upper()
+        clean_kind = _validate_non_empty_str(alert_kind, "alert_kind").upper()
+        if not isinstance(payload_text, str) or not payload_text.strip():
+            raise ValueError("payload_text must be a non-empty string")
+
+        safe_bar_time = _validate_sqlite_int64(bar_time, "bar_time")
+        safe_created = _validate_sqlite_int64(created_at_utc, "created_at_utc")
+        safe_expires = _validate_sqlite_int64(expires_at_utc, "expires_at_utc")
+        if safe_expires <= safe_created:
+            raise ValueError("expires_at_utc must be strictly greater than created_at_utc")
+        if isinstance(max_attempts, bool) or not isinstance(max_attempts, int) or max_attempts < 1:
+            raise ValueError("max_attempts must be an integer >= 1")
+        raw_next = safe_created if next_attempt_at_utc is None else next_attempt_at_utc
+        safe_next = _validate_sqlite_int64(raw_next, "next_attempt_at_utc")
+
+        with self._lock:
+            conn = self._ensure_conn_locked()
+            cursor = conn.execute(
+                """
+                INSERT OR IGNORE INTO alert_outbox (
+                    strategy_id, strategy_version, live_mode, contract_id, timeframe,
+                    bar_time, direction, alert_kind, payload_text, status,
+                    attempt_count, max_attempts, created_at_utc, expires_at_utc,
+                    next_attempt_at_utc, delivered_at_utc, updated_at_utc, last_error
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDING', 0, ?, ?, ?, ?, NULL, ?, NULL)
+                """,
+                (
+                    clean_strategy,
+                    clean_version,
+                    int(live_mode),
+                    clean_contract,
+                    clean_tf,
+                    safe_bar_time,
+                    clean_dir,
+                    clean_kind,
+                    payload_text,
+                    max_attempts,
+                    safe_created,
+                    safe_expires,
+                    safe_next,
+                    safe_created,
+                ),
+            )
+            inserted = cursor.rowcount == 1
+            if inserted and cursor.lastrowid is not None:
+                row = conn.execute(
+                    f"{self._ALERT_OUTBOX_SELECT} WHERE id = ?",
+                    (cursor.lastrowid,),
+                ).fetchone()
+            else:
+                row = conn.execute(
+                    f"""
+                    {self._ALERT_OUTBOX_SELECT}
+                    WHERE strategy_id = ? AND strategy_version = ? AND live_mode = ?
+                      AND contract_id = ? AND timeframe = ? AND bar_time = ? AND direction = ?
+                    """,
+                    (
+                        clean_strategy,
+                        clean_version,
+                        int(live_mode),
+                        clean_contract,
+                        clean_tf,
+                        safe_bar_time,
+                        clean_dir,
+                    ),
+                ).fetchone()
+            conn.commit()
+            if row is None:
+                raise RuntimeError("Failed to read alert_outbox row after enqueue")
+            return EnqueueAlertResult(
+                inserted=inserted,
+                record=self._row_to_alert_outbox_record(row),
+            )
+
+    async def enqueue_alert_outbox(
+        self,
+        strategy_id: str,
+        strategy_version: str,
+        live_mode: bool,
+        contract_id: str,
+        timeframe: str,
+        bar_time: int,
+        direction: str,
+        payload_text: str,
+        created_at_utc: int,
+        expires_at_utc: int,
+        *,
+        alert_kind: str = "ENTRY",
+        max_attempts: int = 4,
+        next_attempt_at_utc: int | None = None,
+    ) -> EnqueueAlertResult:
+        """Transactionally enqueue an alert into alert_outbox with UNIQUE dedup."""
+        return await asyncio.to_thread(
+            self._enqueue_alert_outbox_sync,
+            strategy_id=strategy_id,
+            strategy_version=strategy_version,
+            live_mode=live_mode,
+            contract_id=contract_id,
+            timeframe=timeframe,
+            bar_time=bar_time,
+            direction=direction,
+            payload_text=payload_text,
+            created_at_utc=created_at_utc,
+            expires_at_utc=expires_at_utc,
+            alert_kind=alert_kind,
+            max_attempts=max_attempts,
+            next_attempt_at_utc=next_attempt_at_utc,
+        )
+
+    def _expire_stale_outbox_alerts_sync(self, now_utc: int) -> int:
+        safe_now = _validate_sqlite_int64(now_utc, "now_utc")
+        with self._lock:
+            conn = self._ensure_conn_locked()
+            cursor = conn.execute(
+                """
+                UPDATE alert_outbox
+                SET status = 'EXPIRED', updated_at_utc = ?
+                WHERE status = 'PENDING' AND expires_at_utc <= ?
+                """,
+                (safe_now, safe_now),
+            )
+            conn.commit()
+            return int(cursor.rowcount)
+
+    async def expire_stale_outbox_alerts(self, now_utc: int) -> int:
+        """Atomically expire all PENDING outbox alerts whose TTL has elapsed."""
+        return await asyncio.to_thread(self._expire_stale_outbox_alerts_sync, now_utc)
+
+    def _claim_due_outbox_alerts_sync(
+        self,
+        now_utc: int,
+        limit: int = 20,
+    ) -> list[AlertOutboxRecord]:
+        safe_now = _validate_sqlite_int64(now_utc, "now_utc")
+        safe_limit = max(1, min(int(limit), 500))
+        with self._lock:
+            conn = self._ensure_conn_locked()
+            conn.execute(
+                """
+                UPDATE alert_outbox
+                SET status = 'EXPIRED', updated_at_utc = ?
+                WHERE status = 'PENDING' AND expires_at_utc <= ?
+                """,
+                (safe_now, safe_now),
+            )
+            rows = conn.execute(
+                f"""
+                {self._ALERT_OUTBOX_SELECT}
+                WHERE status = 'PENDING'
+                  AND expires_at_utc > ?
+                  AND next_attempt_at_utc <= ?
+                ORDER BY next_attempt_at_utc ASC, id ASC
+                LIMIT ?
+                """,
+                (safe_now, safe_now, safe_limit),
+            ).fetchall()
+            conn.commit()
+            return [self._row_to_alert_outbox_record(row) for row in rows]
+
+    async def claim_due_outbox_alerts(
+        self,
+        now_utc: int,
+        limit: int = 20,
+    ) -> list[AlertOutboxRecord]:
+        """Expire stale rows and return non-expired PENDING alerts due for delivery."""
+        return await asyncio.to_thread(self._claim_due_outbox_alerts_sync, now_utc, limit)
+
+    def _mark_outbox_delivered_sync(self, alert_id: int, now_utc: int) -> bool:
+        safe_id = _validate_sqlite_int64(alert_id, "alert_id")
+        safe_now = _validate_sqlite_int64(now_utc, "now_utc")
+        with self._lock:
+            conn = self._ensure_conn_locked()
+            cursor = conn.execute(
+                """
+                UPDATE alert_outbox
+                SET status = 'DELIVERED',
+                    attempt_count = attempt_count + 1,
+                    delivered_at_utc = ?,
+                    updated_at_utc = ?,
+                    last_error = NULL
+                WHERE id = ? AND status = 'PENDING'
+                """,
+                (safe_now, safe_now, safe_id),
+            )
+            conn.commit()
+            return cursor.rowcount == 1
+
+    async def mark_outbox_delivered(self, alert_id: int, now_utc: int) -> bool:
+        """Transition a PENDING outbox alert to terminal DELIVERED state."""
+        return await asyncio.to_thread(self._mark_outbox_delivered_sync, alert_id, now_utc)
+
+    def _mark_outbox_retry_sync(
+        self,
+        alert_id: int,
+        now_utc: int,
+        next_attempt_at_utc: int,
+        error: str,
+    ) -> AlertStatus | None:
+        safe_id = _validate_sqlite_int64(alert_id, "alert_id")
+        safe_now = _validate_sqlite_int64(now_utc, "now_utc")
+        safe_next = _validate_sqlite_int64(next_attempt_at_utc, "next_attempt_at_utc")
+        bounded_error = str(error)[:_MAX_ALERT_ERROR_CHARS]
+        with self._lock:
+            conn = self._ensure_conn_locked()
+            row = conn.execute(
+                """
+                SELECT status, attempt_count, max_attempts, expires_at_utc
+                FROM alert_outbox
+                WHERE id = ?
+                """,
+                (safe_id,),
+            ).fetchone()
+            if row is None or row["status"] != "PENDING":
+                return None
+            next_attempt_count = int(row["attempt_count"]) + 1
+            expires_at_utc = int(row["expires_at_utc"])
+            max_attempts = int(row["max_attempts"])
+            if safe_now >= expires_at_utc:
+                new_status: AlertStatus = "EXPIRED"
+                effective_next = expires_at_utc
+            elif next_attempt_count >= max_attempts:
+                new_status = "FAILED"
+                effective_next = safe_now
+            else:
+                new_status = "PENDING"
+                effective_next = min(max(safe_next, safe_now), expires_at_utc)
+
+            cursor = conn.execute(
+                """
+                UPDATE alert_outbox
+                SET status = ?,
+                    attempt_count = ?,
+                    next_attempt_at_utc = ?,
+                    updated_at_utc = ?,
+                    last_error = ?
+                WHERE id = ? AND status = 'PENDING'
+                """,
+                (new_status, next_attempt_count, effective_next, safe_now, bounded_error, safe_id),
+            )
+            conn.commit()
+            return new_status if cursor.rowcount == 1 else None
+
+    async def mark_outbox_retry(
+        self,
+        alert_id: int,
+        now_utc: int,
+        next_attempt_at_utc: int,
+        error: str,
+    ) -> AlertStatus | None:
+        """Record a transient failure, respecting TTL expiry and max_attempts bounds."""
+        return await asyncio.to_thread(
+            self._mark_outbox_retry_sync,
+            alert_id,
+            now_utc,
+            next_attempt_at_utc,
+            error,
+        )
+
+    def _mark_outbox_failed_sync(
+        self,
+        alert_id: int,
+        now_utc: int,
+        error: str,
+        *,
+        increment_attempt: bool = True,
+    ) -> bool:
+        safe_id = _validate_sqlite_int64(alert_id, "alert_id")
+        safe_now = _validate_sqlite_int64(now_utc, "now_utc")
+        bounded_error = str(error)[:_MAX_ALERT_ERROR_CHARS]
+        attempt_delta = 1 if increment_attempt else 0
+        with self._lock:
+            conn = self._ensure_conn_locked()
+            cursor = conn.execute(
+                """
+                UPDATE alert_outbox
+                SET status = 'FAILED',
+                    attempt_count = attempt_count + ?,
+                    updated_at_utc = ?,
+                    last_error = ?
+                WHERE id = ? AND status = 'PENDING'
+                """,
+                (attempt_delta, safe_now, bounded_error, safe_id),
+            )
+            conn.commit()
+            return cursor.rowcount == 1
+
+    async def mark_outbox_failed(
+        self,
+        alert_id: int,
+        now_utc: int,
+        error: str,
+        *,
+        increment_attempt: bool = True,
+    ) -> bool:
+        """Transition a PENDING outbox alert to terminal FAILED state."""
+        return await asyncio.to_thread(
+            self._mark_outbox_failed_sync,
+            alert_id,
+            now_utc,
+            error,
+            increment_attempt=increment_attempt,
+        )
+
+    def _mark_outbox_expired_sync(
+        self,
+        alert_id: int,
+        now_utc: int,
+        error: str | None = None,
+    ) -> bool:
+        safe_id = _validate_sqlite_int64(alert_id, "alert_id")
+        safe_now = _validate_sqlite_int64(now_utc, "now_utc")
+        bounded_error = str(error)[:_MAX_ALERT_ERROR_CHARS] if error is not None else None
+        with self._lock:
+            conn = self._ensure_conn_locked()
+            cursor = conn.execute(
+                """
+                UPDATE alert_outbox
+                SET status = 'EXPIRED',
+                    updated_at_utc = ?,
+                    last_error = COALESCE(?, last_error)
+                WHERE id = ? AND status = 'PENDING'
+                """,
+                (safe_now, bounded_error, safe_id),
+            )
+            conn.commit()
+            return cursor.rowcount == 1
+
+    async def mark_outbox_expired(
+        self,
+        alert_id: int,
+        now_utc: int,
+        error: str | None = None,
+    ) -> bool:
+        """Transition a PENDING outbox alert to terminal EXPIRED state."""
+        return await asyncio.to_thread(
+            self._mark_outbox_expired_sync,
+            alert_id,
+            now_utc,
+            error,
+        )
+
+    def _get_outbox_alert_sync(self, alert_id: int) -> AlertOutboxRecord | None:
+        safe_id = _validate_sqlite_int64(alert_id, "alert_id")
+        with self._lock:
+            conn = self._ensure_conn_locked()
+            row = conn.execute(
+                f"{self._ALERT_OUTBOX_SELECT} WHERE id = ?",
+                (safe_id,),
+            ).fetchone()
+            return self._row_to_alert_outbox_record(row) if row is not None else None
+
+    async def get_outbox_alert(self, alert_id: int) -> AlertOutboxRecord | None:
+        """Fetch a single outbox alert record by ID, or None if absent."""
+        return await asyncio.to_thread(self._get_outbox_alert_sync, alert_id)
+
+    def _list_outbox_alerts_sync(
+        self,
+        status: AlertStatus | None = None,
+        limit: int = 50,
+    ) -> list[AlertOutboxRecord]:
+        if status is not None and status not in _VALID_ALERT_STATUSES:
+            raise ValueError(f"Invalid alert status: {status!r}")
+        safe_limit = max(1, min(int(limit), 500))
+        with self._lock:
+            conn = self._ensure_conn_locked()
+            if status is not None:
+                rows = conn.execute(
+                    f"""
+                    {self._ALERT_OUTBOX_SELECT}
+                    WHERE status = ?
+                    ORDER BY id DESC
+                    LIMIT ?
+                    """,
+                    (status, safe_limit),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    f"""
+                    {self._ALERT_OUTBOX_SELECT}
+                    ORDER BY id DESC
+                    LIMIT ?
+                    """,
+                    (safe_limit,),
+                ).fetchall()
+            return [self._row_to_alert_outbox_record(row) for row in rows]
+
+    async def list_outbox_alerts(
+        self,
+        status: AlertStatus | None = None,
+        limit: int = 50,
+    ) -> list[AlertOutboxRecord]:
+        """List alert outbox records ordered newest-first, optionally filtered by status."""
+        return await asyncio.to_thread(self._list_outbox_alerts_sync, status, limit)
+
+    def _get_outbox_summary_sync(self) -> dict[str, int]:
+        with self._lock:
+            conn = self._ensure_conn_locked()
+            rows = conn.execute(
+                """
+                SELECT status, COUNT(*) AS cnt
+                FROM alert_outbox
+                GROUP BY status
+                """
+            ).fetchall()
+        counts = {str(row["status"]): int(row["cnt"]) for row in rows}
+        pending = counts.get("PENDING", 0)
+        delivered = counts.get("DELIVERED", 0)
+        expired = counts.get("EXPIRED", 0)
+        failed = counts.get("FAILED", 0)
+        return {
+            "pending": pending,
+            "delivered": delivered,
+            "expired": expired,
+            "failed": failed,
+            "total": pending + delivered + expired + failed,
+        }
+
+    async def get_outbox_summary(self) -> dict[str, int]:
+        """Return aggregate alert_outbox row counts by status."""
+        return await asyncio.to_thread(self._get_outbox_summary_sync)

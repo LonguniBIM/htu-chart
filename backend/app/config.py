@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ipaddress
 import json
+import math
 from datetime import date
 from pathlib import Path
 from typing import Literal
@@ -33,6 +34,68 @@ def validate_market_hub_url(value: str) -> str:
             "TOPSTEPX_RTC_URL must target the read-only Market Hub (/hubs/market) (SEC-001)"
         )
     return cleaned
+
+
+def validate_telegram_api_base_url(value: str) -> str:
+    """Validate Telegram Bot API base URL: https:// required unless host is loopback."""
+    cleaned = value.strip()
+    try:
+        parsed = urlparse(cleaned)
+        _ = parsed.port
+    except ValueError as exc:
+        raise ValueError("TELEGRAM_API_BASE_URL must be a valid http:// or https:// URL") from exc
+    scheme = parsed.scheme.lower()
+    if scheme not in {"http", "https"} or not parsed.netloc:
+        raise ValueError("TELEGRAM_API_BASE_URL must be a valid http:// or https:// URL")
+    if parsed.username is not None or parsed.password is not None:
+        raise ValueError("TELEGRAM_API_BASE_URL must not contain embedded credentials")
+    if parsed.query or parsed.fragment:
+        raise ValueError("TELEGRAM_API_BASE_URL must not contain query or fragment components")
+    hostname = (parsed.hostname or "").lower()
+    if not hostname:
+        raise ValueError("TELEGRAM_API_BASE_URL must include a valid hostname")
+    if scheme == "http" and hostname not in _LOOPBACK_URL_HOSTNAMES:
+        raise ValueError(
+            "Non-loopback TELEGRAM_API_BASE_URL must use https:// (TLS) to protect bot tokens"
+        )
+    return cleaned.rstrip("/")
+
+
+def _parse_float_list(value: object) -> list[float]:
+    if isinstance(value, str):
+        stripped = value.strip()
+        if not stripped:
+            raise ValueError("ALERT_RETRY_BACKOFF_SEC cannot be empty")
+        if stripped.startswith("["):
+            try:
+                parsed: object = json.loads(stripped)
+            except json.JSONDecodeError as exc:
+                raise ValueError("ALERT_RETRY_BACKOFF_SEC JSON array is invalid") from exc
+            if not isinstance(parsed, list):
+                raise ValueError("ALERT_RETRY_BACKOFF_SEC JSON must be an array of numbers")
+            raw_items: list[object] = parsed
+        else:
+            raw_items = [part.strip() for part in stripped.split(",") if part.strip()]
+    elif isinstance(value, (list, tuple)):
+        raw_items = list(value)
+    else:
+        raise ValueError("ALERT_RETRY_BACKOFF_SEC must be a list or comma-separated string")
+
+    if not raw_items:
+        raise ValueError("ALERT_RETRY_BACKOFF_SEC must contain at least one positive delay")
+
+    floats: list[float] = []
+    for item in raw_items:
+        if isinstance(item, bool) or not isinstance(item, (int, float, str)):
+            raise ValueError("ALERT_RETRY_BACKOFF_SEC entries must be positive numbers")
+        try:
+            num = float(item)
+        except ValueError as exc:
+            raise ValueError("ALERT_RETRY_BACKOFF_SEC entries must be positive numbers") from exc
+        if not math.isfinite(num) or num <= 0.0:
+            raise ValueError("ALERT_RETRY_BACKOFF_SEC entries must be positive finite floats")
+        floats.append(num)
+    return floats
 
 
 def _is_forbidden_bind_host(host: str) -> bool:
@@ -121,6 +184,22 @@ class Settings(BaseSettings):
     ws_client_queue_maxsize: int = Field(default=64, ge=1, le=4096)
     ws_send_timeout_sec: float = Field(default=5.0, gt=0.0)
 
+    telegram_bot_token: str = ""
+    telegram_chat_id: str = ""
+    telegram_api_base_url: str = "https://api.telegram.org"
+    alert_ttl_seconds: int = Field(default=90, ge=1, le=3600)
+    alert_max_retries: int = Field(default=3, ge=0, le=10)
+    alert_retry_backoff_sec: list[float] = Field(default_factory=lambda: [2.0, 5.0, 15.0])
+    alert_dispatch_poll_interval_sec: float = Field(default=1.0, gt=0.0, le=60.0)
+    telegram_connect_timeout_sec: float = Field(default=5.0, gt=0.0)
+    telegram_read_timeout_sec: float = Field(default=10.0, gt=0.0)
+    telegram_write_timeout_sec: float = Field(default=10.0, gt=0.0)
+    telegram_pool_timeout_sec: float = Field(default=5.0, gt=0.0)
+    telegram_total_timeout_sec: float = Field(default=15.0, gt=0.0)
+    telegram_max_concurrency: int = Field(default=2, ge=1, le=8)
+    alert_scanner_enabled: bool = True
+    alert_dispatcher_enabled: bool = True
+
     data_dir: Path = Path("data")
 
     @field_validator("app_env", mode="before")
@@ -151,6 +230,16 @@ class Settings(BaseSettings):
     @classmethod
     def _validate_rtc_url(cls, value: str) -> str:
         return validate_market_hub_url(value)
+
+    @field_validator("telegram_api_base_url")
+    @classmethod
+    def _validate_telegram_api_base_url(cls, value: str) -> str:
+        return validate_telegram_api_base_url(value)
+
+    @field_validator("alert_retry_backoff_sec", mode="before")
+    @classmethod
+    def _validate_alert_retry_backoff_sec(cls, value: object) -> list[float]:
+        return _parse_float_list(value)
 
     @field_validator("topstepx_key_updated_at", mode="before")
     @classmethod

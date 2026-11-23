@@ -32,8 +32,10 @@ LOOPBACK_IPS = frozenset({"127.0.0.1", "::1"})
 
 _REDACTED_FIELD_PATTERN = (
     r"Authorization|Cookie|Set-Cookie|topstep_session|access_token|apiKey|api_key|token|"
-    r"TOPSTEPX_API_KEY|TELEGRAM_BOT_TOKEN|botToken|APP_PASSWORD_HASH|APP_SESSION_SECRET|password"
+    r"TOPSTEPX_API_KEY|TELEGRAM_BOT_TOKEN|TELEGRAM_CHAT_ID|chat_id|chatId|botToken|"
+    r"APP_PASSWORD_HASH|APP_SESSION_SECRET|password"
 )
+_TELEGRAM_BOT_URL_RE = re.compile(r"/bot\d+:[^/\s?#\"'<>\\]+", re.IGNORECASE)
 _AUTH_SCHEMES = r"Bearer|Basic|Token|Digest|ApiKey|OAuth|Negotiate|NTLM|AWS4-HMAC-SHA256"
 _QUOTED_VALUE_ALT = r'(?:"(?:\\.|[^"\\])*"?(?:\\$)?|\'(?:\\.|[^\'\\])*\'?(?:\\$)?)'
 _BEARER_RE = re.compile(r"(?i)\bBearer\s+[A-Za-z0-9._~+/=-]+")
@@ -66,6 +68,9 @@ _SENSITIVE_DICT_KEYS = frozenset({
     "bottoken",
     "topstepx_api_key",
     "telegram_bot_token",
+    "telegram_chat_id",
+    "chat_id",
+    "chatid",
     "app_password_hash",
     "app_session_secret",
     "password",
@@ -195,6 +200,7 @@ def _redact_log_message_template(msg: str, extra_secrets: tuple[str, ...]) -> st
     redacted = _safe_sub(_COOKIE_HEADER_RE, r"\1***REDACTED***", redacted)
     redacted = _safe_sub(_BEARER_RE, "Bearer ***REDACTED***", redacted)
     redacted = _safe_sub(_KV_SECRET_RE, r"\1\2***REDACTED***", redacted)
+    redacted = _safe_sub(_TELEGRAM_BOT_URL_RE, "/bot***REDACTED***", redacted)
     redacted = _safe_sub(_JWT_RE, "***REDACTED***", redacted)
     for secret in extra_secrets:
         redacted = _redact_extra_secret(redacted, secret)
@@ -259,6 +265,7 @@ def redact_secrets(text: str, extra_secrets: Iterable[str] = ()) -> str:
     redacted = _COOKIE_HEADER_RE.sub(r"\1***REDACTED***", redacted)
     redacted = _BEARER_RE.sub("Bearer ***REDACTED***", redacted)
     redacted = _KV_SECRET_RE.sub(r"\1\2***REDACTED***", redacted)
+    redacted = _TELEGRAM_BOT_URL_RE.sub("/bot***REDACTED***", redacted)
     redacted = _JWT_RE.sub("***REDACTED***", redacted)
     for secret in extra_secrets:
         redacted = _redact_extra_secret(redacted, secret)

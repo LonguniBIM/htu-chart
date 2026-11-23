@@ -1,0 +1,1032 @@
+"""Value-first offline tests for F07 durable SQLite alert outbox, AlertEngine, and Telegram."""
+
+from __future__ import annotations
+
+import asyncio
+import io
+import json
+import logging
+from contextlib import asynccontextmanager
+from datetime import UTC, datetime
+from pathlib import Path
+from typing import Any
+from zoneinfo import ZoneInfo
+
+import httpx
+import pytest
+from argon2 import PasswordHasher
+from pydantic import ValidationError
+
+from app.config import Settings
+from app.engine.alert_engine import (
+    AlertCandidate,
+    AlertDirection,
+    AlertEngine,
+    cme_weekend_window_bounds,
+    format_entry_alert_message,
+    is_cme_weekend_window,
+)
+from app.engine.bar_aggregator import AggregatedBarEvent, BarAggregator
+from app.engine.ohlcv import OHLCVBar
+from app.engine.session_calendar import (
+    NY_TZ,
+    first_bucket_open_at_or_after,
+    has_open_session_in_range,
+)
+from app.main import create_app
+from app.notify.telegram import TelegramClient
+from app.services.alert_service import AlertService, TelegramNotConfiguredError
+from app.services.live_feed_service import LiveFeedService
+from app.storage.parquet_store import ParquetStore
+from app.storage.sqlite_store import SqliteStore
+from app.topstep.auth import TopstepAuthService
+from app.topstep.rest_client import TopstepRestClient
+from app.topstep.signalr_hub import SIGNALR_RECORD_SEPARATOR, SignalRMarketHub
+
+CID_MES = "CON.F.US.MES.Z26"
+CID_MNQ = "CON.F.US.MNQ.Z26"
+VN_TZ = ZoneInfo("Asia/Ho_Chi_Minh")
+TEST_PASSWORD = "correct-horse-battery-staple"
+TEST_PASSWORD_HASH = PasswordHasher().hash(TEST_PASSWORD)
+
+
+class _MutableClock:
+    def __init__(self, initial_utc: int) -> None:
+        self.now = initial_utc
+
+    def __call__(self) -> int:
+        return self.now
+
+
+class _MockSignalRTransport:
+    """In-memory SignalR WebSocket transport speaking 0x1e-delimited JSON frames."""
+
+    def __init__(self) -> None:
+        self.sent_frames: list[dict[str, Any]] = []
+        self.incoming: asyncio.Queue[str | Exception] = asyncio.Queue()
+        self.closed = False
+        self.handshake_done = asyncio.Event()
+
+    async def send(self, data: str) -> None:
+        for chunk in data.split(SIGNALR_RECORD_SEPARATOR):
+            if chunk.strip():
+                frame = json.loads(chunk)
+                self.sent_frames.append(frame)
+                if frame.get("protocol") == "json":
+                    await self.incoming.put("{}" + SIGNALR_RECORD_SEPARATOR)
+                    self.handshake_done.set()
+                elif (
+                    frame.get("target") in {"SubscribeContractQuotes", "SubscribeContractTrades"}
+                    and frame.get("invocationId") is not None
+                ):
+                    comp = {"type": 3, "invocationId": frame["invocationId"]}
+                    await self.incoming.put(json.dumps(comp) + SIGNALR_RECORD_SEPARATOR)
+
+    async def recv(self) -> str:
+        item = await self.incoming.get()
+        if isinstance(item, Exception):
+            raise item
+        return item
+
+    async def close(self) -> None:
+        self.closed = True
+        await self.incoming.put(ConnectionError("mock socket closed"))
+
+    async def push_frame(self, payload: dict[str, Any]) -> None:
+        await self.incoming.put(json.dumps(payload) + SIGNALR_RECORD_SEPARATOR)
+
+
+def _make_settings(
+    tmp_path: Path,
+    *,
+    bot_token: str | None = None,
+    chat_id: str | None = None,
+    alert_ttl_seconds: int = 90,
+    alert_max_retries: int = 3,
+    backoff: list[float] | None = None,
+    key_updated_at: str | None = None,
+    key_rotation_days: int = 30,
+    key_rotation_enforce: bool = False,
+) -> Settings:
+    eff_bot_token = "123456:tg-secret-token-abcdef" if bot_token is None else bot_token
+    eff_chat_id = "-1001234567890" if chat_id is None else chat_id
+    return Settings(
+        data_dir=tmp_path,
+        app_password_hash=TEST_PASSWORD_HASH,
+        telegram_bot_token=eff_bot_token,
+        telegram_chat_id=eff_chat_id,
+        telegram_api_base_url="https://api.telegram.org",
+        alert_ttl_seconds=alert_ttl_seconds,
+        alert_max_retries=alert_max_retries,
+        alert_retry_backoff_sec=backoff if backoff is not None else [2.0, 5.0, 15.0],
+        topstepx_key_updated_at=key_updated_at,
+        key_rotation_days=key_rotation_days,
+        key_rotation_enforce=key_rotation_enforce,
+    )
+
+
+def _closed_bar_event(
+    *,
+    contract_id: str = CID_MES,
+    live_mode: bool = True,
+    timeframe: str = "5m",
+    bar_time: int = 1_762_783_200,
+    close_price: float = 5950.25,
+    is_closed: bool = True,
+    is_recovered_historical: bool = False,
+) -> AggregatedBarEvent:
+    return AggregatedBarEvent(
+        contract_id=contract_id,
+        live_mode=live_mode,
+        timeframe=timeframe,
+        bar=OHLCVBar(
+            time=bar_time,
+            open=close_price - 1.0,
+            high=close_price + 0.5,
+            low=close_price - 1.5,
+            close=close_price,
+            volume=42.0,
+            is_closed=is_closed,
+        ),
+        is_recovered_historical=is_recovered_historical,
+        root_symbol="MES" if "MES" in contract_id else "MNQ",
+    )
+
+
+def _sample_candidate(
+    *,
+    strategy_id: str = "fvg_sweep",
+    strategy_version: str = "1.0.0",
+    live_mode: bool = True,
+    contract_id: str = CID_MES,
+    timeframe: str = "5m",
+    bar_time: int = 1_762_783_200,
+    direction: AlertDirection = "LONG",
+) -> AlertCandidate:
+    return AlertCandidate(
+        strategy_id=strategy_id,
+        strategy_version=strategy_version,
+        live_mode=live_mode,
+        contract_id=contract_id,
+        root_symbol="MES" if "MES" in contract_id else "MNQ",
+        timeframe=timeframe,
+        bar_time=bar_time,
+        direction=direction,
+        alert_kind="ENTRY",
+        reason="Bullish FVG + Liquidity Sweep",
+        entry_price=5950.25,
+        stop_loss=5945.0,
+        take_profit=5960.75,
+        risk_reward=2.0,
+    )
+
+
+def _build_service_stack(
+    tmp_path: Path,
+    *,
+    settings: Settings,
+    tg_handler: Any,
+    clock: _MutableClock,
+) -> tuple[SqliteStore, httpx.AsyncClient, httpx.AsyncClient, AlertEngine, AlertService]:
+    sqlite_store = SqliteStore(tmp_path / "metadata.db")
+    sqlite_store.initialize()
+    upstream_http = httpx.AsyncClient(
+        transport=httpx.MockTransport(
+            lambda _req: httpx.Response(200, json={"success": True, "token": "jwt-test-token"})
+        )
+    )
+    tg_http = httpx.AsyncClient(transport=httpx.MockTransport(tg_handler))
+    auth = TopstepAuthService(settings, upstream_http)
+    engine = AlertEngine(scanner_enabled=settings.alert_scanner_enabled)
+    tg_client = TelegramClient(settings, tg_http)
+    service = AlertService(
+        settings,
+        engine,
+        sqlite_store,
+        tg_client,
+        auth,
+        clock=clock,
+    )
+    return sqlite_store, upstream_http, tg_http, engine, service
+
+
+@asynccontextmanager
+async def _async_app_client(
+    settings: Settings,
+    *,
+    tg_transport: httpx.AsyncBaseTransport,
+    clock: _MutableClock | None = None,
+):
+    upstream_http = httpx.AsyncClient(
+        transport=httpx.MockTransport(
+            lambda _req: httpx.Response(200, json={"success": True, "token": "jwt-test-token"})
+        )
+    )
+    tg_http = httpx.AsyncClient(transport=tg_transport)
+    app = create_app(
+        settings=settings,
+        http_client=upstream_http,
+        telegram_http_client=tg_http,
+        clock=clock,
+    )
+    try:
+        async with app.router.lifespan_context(app):
+            asgi = httpx.ASGITransport(app=app, client=("127.0.0.1", 54321))
+            async with httpx.AsyncClient(
+                transport=asgi,
+                base_url="http://127.0.0.1:8000",
+            ) as client:
+                yield client, app
+    finally:
+        await tg_http.aclose()
+        await upstream_http.aclose()
+
+
+async def test_f07_sqlite_outbox_deduplication_across_restart(tmp_path: Path) -> None:
+    """Contract: UNIQUE constraint deduplicates identical alerts across SQLite restarts.
+
+    Defect caught: Duplicate Telegram alerts fired on restart or version/contract collisions.
+    """
+    clock = _MutableClock(1_762_783_260)
+    settings = _make_settings(tmp_path)
+    sent_requests: list[dict[str, Any]] = []
+
+    async def tg_handler(request: httpx.Request) -> httpx.Response:
+        sent_requests.append(json.loads(request.content.decode("utf-8")))
+        return httpx.Response(200, json={"ok": True, "result": {"message_id": 101}})
+
+    store1, up1, tg1, _, svc1 = _build_service_stack(
+        tmp_path, settings=settings, tg_handler=tg_handler, clock=clock
+    )
+    try:
+        base = _sample_candidate()
+        res1 = await svc1.enqueue_candidate(base)
+        assert res1.inserted is True
+        assert res1.record.status == "PENDING"
+        stats = await svc1.process_once()
+        assert stats.delivered == 1
+        assert len(sent_requests) == 1
+    finally:
+        store1.close()
+        await tg1.aclose()
+        await up1.aclose()
+
+    # Simulated process restart: reopen SqliteStore on same DB file
+    clock.now += 10
+    store2, up2, tg2, _, svc2 = _build_service_stack(
+        tmp_path, settings=settings, tg_handler=tg_handler, clock=clock
+    )
+    try:
+        dup_res = await svc2.enqueue_candidate(_sample_candidate())
+        assert dup_res.inserted is False
+        assert dup_res.record.id == res1.record.id
+        assert dup_res.record.status == "DELIVERED"
+
+        # Changing strategy_version, contract_id, or live_mode must be treated as distinct alerts.
+        ver_res = await svc2.enqueue_candidate(_sample_candidate(strategy_version="2.0.0"))
+        cid_res = await svc2.enqueue_candidate(_sample_candidate(contract_id=CID_MNQ))
+        mode_res = await svc2.enqueue_candidate(_sample_candidate(live_mode=False))
+        assert ver_res.inserted is True
+        assert cid_res.inserted is True
+        assert mode_res.inserted is True
+
+        stats2 = await svc2.process_once()
+        assert stats2.delivered == 3
+        assert len(sent_requests) == 4
+    finally:
+        store2.close()
+        await tg2.aclose()
+        await up2.aclose()
+
+
+async def test_f07_crash_restart_delivery_recovery_within_ttl(tmp_path: Path) -> None:
+    """Contract: PENDING alert persisted before crash is delivered once after restart within TTL.
+
+    Defect caught: Lost alerts when process crashes between enqueue and Telegram send.
+    """
+    clock = _MutableClock(1_762_783_260)
+    settings = _make_settings(tmp_path, alert_ttl_seconds=90)
+    sent_payloads: list[str] = []
+
+    async def tg_handler(request: httpx.Request) -> httpx.Response:
+        sent_payloads.append(json.loads(request.content.decode("utf-8"))["text"])
+        return httpx.Response(200, json={"ok": True})
+
+    store1, up1, tg1, eng1, svc1 = _build_service_stack(
+        tmp_path, settings=settings, tg_handler=tg_handler, clock=clock
+    )
+    try:
+        eng1.register_evaluator("fvg_sweep", lambda _evt: [_sample_candidate()])
+        results = await svc1.handle_bar_signal(_closed_bar_event(), tag=None)
+        assert len(results) == 1
+        assert results[0].inserted is True
+        assert results[0].record.status == "PENDING"
+        assert len(sent_payloads) == 0
+    finally:
+        store1.close()
+        await tg1.aclose()
+        await up1.aclose()
+
+    # Restart 30s later (still well inside 90s TTL)
+    clock.now += 30
+    store2, up2, tg2, _, svc2 = _build_service_stack(
+        tmp_path, settings=settings, tg_handler=tg_handler, clock=clock
+    )
+    try:
+        stats = await svc2.process_once()
+        assert stats.delivered == 1
+        assert len(sent_payloads) == 1
+        persisted = await store2.get_outbox_alert(results[0].record.id)
+        assert persisted is not None
+        assert persisted.status == "DELIVERED"
+        assert persisted.attempt_count == 1
+        assert persisted.delivered_at_utc == clock.now
+
+        # Second pass does not re-send
+        stats2 = await svc2.process_once()
+        assert stats2.claimed == 0
+        assert len(sent_payloads) == 1
+    finally:
+        store2.close()
+        await tg2.aclose()
+        await up2.aclose()
+
+
+async def test_f07_staleness_ttl_expiry_across_restart(tmp_path: Path) -> None:
+    """Contract: PENDING alert past ALERT_TTL_SECONDS expires without calling Telegram.
+
+    Defect caught: Stale intraday entry signals delivered late after prolonged outage.
+    """
+    clock = _MutableClock(1_762_783_260)
+    settings = _make_settings(tmp_path, alert_ttl_seconds=90)
+    tg_calls = 0
+
+    async def tg_handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal tg_calls
+        tg_calls += 1
+        return httpx.Response(200, json={"ok": True})
+
+    store1, up1, tg1, _, svc1 = _build_service_stack(
+        tmp_path, settings=settings, tg_handler=tg_handler, clock=clock
+    )
+    try:
+        enq = await svc1.enqueue_candidate(_sample_candidate())
+        assert enq.record.expires_at_utc == 1_762_783_260 + 90
+    finally:
+        store1.close()
+        await tg1.aclose()
+        await up1.aclose()
+
+    # Advance exactly to expires_at_utc
+    clock.now += 90
+    store2, up2, tg2, _, svc2 = _build_service_stack(
+        tmp_path, settings=settings, tg_handler=tg_handler, clock=clock
+    )
+    try:
+        stats = await svc2.process_once()
+        assert stats.expired >= 1
+        assert stats.claimed == 0
+        assert tg_calls == 0
+        row = await store2.get_outbox_alert(enq.record.id)
+        assert row is not None
+        assert row.status == "EXPIRED"
+    finally:
+        store2.close()
+        await tg2.aclose()
+        await up2.aclose()
+
+
+async def test_f07_bounded_transient_retry_and_backoff_recovery(tmp_path: Path) -> None:
+    """Contract: Transient 503 and 429 retry with backoff/Retry-After and deliver within TTL.
+
+    Defect caught: Dropping alerts on transient errors or ignoring Telegram Retry-After.
+    """
+    clock = _MutableClock(1_762_783_260)
+    settings = _make_settings(
+        tmp_path,
+        alert_ttl_seconds=90,
+        alert_max_retries=3,
+        backoff=[2.0, 5.0, 15.0],
+    )
+    attempt_idx = 0
+
+    async def tg_handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal attempt_idx
+        attempt_idx += 1
+        if attempt_idx == 1:
+            return httpx.Response(503, json={"ok": False, "description": "Service Unavailable"})
+        if attempt_idx == 2:
+            return httpx.Response(
+                429,
+                json={"ok": False, "error_code": 429, "parameters": {"retry_after": 7}},
+            )
+        return httpx.Response(200, json={"ok": True})
+
+    store, up, tg, _, svc = _build_service_stack(
+        tmp_path, settings=settings, tg_handler=tg_handler, clock=clock
+    )
+    try:
+        enq = await svc.enqueue_candidate(_sample_candidate())
+        alert_id = enq.record.id
+
+        # Attempt 1 -> 503 -> PENDING with +2s backoff
+        s1 = await svc.process_once()
+        assert s1.retried == 1
+        r1 = await store.get_outbox_alert(alert_id)
+        assert r1 is not None
+        assert r1.status == "PENDING"
+        assert r1.attempt_count == 1
+        assert r1.next_attempt_at_utc == clock.now + 2
+
+        # Before next_attempt_at_utc -> not claimed
+        clock.now += 1
+        s_early = await svc.process_once()
+        assert s_early.claimed == 0
+
+        # Attempt 2 -> 429 retry_after=7 (> backoff[1]=5.0) -> PENDING with +7s
+        clock.now += 1
+        s2 = await svc.process_once()
+        assert s2.retried == 1
+        r2 = await store.get_outbox_alert(alert_id)
+        assert r2 is not None
+        assert r2.status == "PENDING"
+        assert r2.attempt_count == 2
+        assert r2.next_attempt_at_utc == clock.now + 7
+
+        # Attempt 3 -> 200 -> DELIVERED
+        clock.now += 7
+        s3 = await svc.process_once()
+        assert s3.delivered == 1
+        r3 = await store.get_outbox_alert(alert_id)
+        assert r3 is not None
+        assert r3.status == "DELIVERED"
+        assert r3.attempt_count == 3
+        assert r3.last_error is None
+    finally:
+        store.close()
+        await tg.aclose()
+        await up.aclose()
+
+
+async def test_f07_exhausted_retries_and_permanent_4xx_transition_to_failed(
+    tmp_path: Path,
+) -> None:
+    """Contract: Exhausted max_attempts or permanent 4xx transitions cleanly to FAILED.
+
+    Defect caught: Infinite retry loops on permanent 400/401/403 or exhausted transient errors.
+    """
+    clock = _MutableClock(1_762_783_260)
+    settings = _make_settings(
+        tmp_path,
+        alert_ttl_seconds=300,
+        alert_max_retries=2,
+        backoff=[1.0, 1.0],
+    )
+    mode = {"kind": "timeout"}
+    calls = 0
+
+    async def tg_handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        if mode["kind"] == "timeout":
+            raise httpx.ReadTimeout("simulated timeout")
+        if mode["kind"] == "perm_403":
+            return httpx.Response(403, json={"ok": False, "description": "Forbidden: bot blocked"})
+        return httpx.Response(200, json={"ok": False, "error_code": 400, "description": "Bad Chat"})
+
+    store, up, tg, _, svc = _build_service_stack(
+        tmp_path, settings=settings, tg_handler=tg_handler, clock=clock
+    )
+    try:
+        # Case A: max_attempts = 1 + 2 = 3 transient timeouts -> FAILED on 3rd attempt
+        enq_a = await svc.enqueue_candidate(_sample_candidate(bar_time=1_762_783_200))
+        for _ in range(3):
+            await svc.process_once()
+            clock.now += 2
+        row_a = await store.get_outbox_alert(enq_a.record.id)
+        assert row_a is not None
+        assert row_a.status == "FAILED"
+        assert row_a.attempt_count == 3
+        assert calls == 3
+
+        await svc.process_once()
+        assert calls == 3
+
+        # Case B: permanent HTTP 403 -> FAILED immediately on attempt 1
+        mode["kind"] = "perm_403"
+        enq_b = await svc.enqueue_candidate(_sample_candidate(bar_time=1_762_783_500))
+        stats_b = await svc.process_once()
+        assert stats_b.failed == 1
+        row_b = await store.get_outbox_alert(enq_b.record.id)
+        assert row_b is not None
+        assert row_b.status == "FAILED"
+        assert row_b.attempt_count == 1
+        assert calls == 4
+
+        # Case C: HTTP 200 ok=false error_code=400 -> permanent FAILED on attempt 1
+        mode["kind"] = "ok_false_400"
+        enq_c = await svc.enqueue_candidate(_sample_candidate(bar_time=1_762_783_800))
+        stats_c = await svc.process_once()
+        assert stats_c.failed == 1
+        row_c = await store.get_outbox_alert(enq_c.record.id)
+        assert row_c is not None
+        assert row_c.status == "FAILED"
+        assert row_c.attempt_count == 1
+        assert calls == 5
+    finally:
+        store.close()
+        await tg.aclose()
+        await up.aclose()
+
+
+async def test_f07_f03_live_feed_signal_suppression_integration(tmp_path: Path) -> None:
+    """Contract: ONLY LIVE (tag=None) closed bars enqueue; RECOVERED_HISTORICAL/SUPPRESSED do not.
+
+    Defect caught: False Telegram alerts fired on reconnect backfill or DEGRADED ticks.
+    """
+    base_t = int(datetime(2026, 11, 10, 14, 0, 0, tzinfo=UTC).timestamp())
+    clock = _MutableClock(base_t + 120)
+    settings = _make_settings(tmp_path)
+    sent_texts: list[str] = []
+
+    def rest_handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/Auth/loginKey":
+            return httpx.Response(200, json={"success": True, "token": "jwt-f03-test"})
+        if request.url.path == "/api/History/retrieveBars":
+            payload = json.loads(request.content.decode("utf-8"))
+            raw_start = str(payload["startTime"]).replace("Z", "+00:00")
+            raw_end = str(payload["endTime"]).replace("Z", "+00:00")
+            req_start = int(datetime.fromisoformat(raw_start).timestamp())
+            req_end = int(datetime.fromisoformat(raw_end).timestamp())
+            cursor = first_bucket_open_at_or_after(req_start, "1m")
+            bars: list[dict[str, Any]] = []
+            while cursor + 60 <= req_end:
+                if has_open_session_in_range(cursor, cursor + 60):
+                    bars.append(
+                        {"t": cursor, "o": 5950.0, "h": 5951.0, "l": 5949.5, "c": 5950.5, "v": 10.0}
+                    )
+                cursor += 60
+            return httpx.Response(200, json={"success": True, "bars": bars})
+        return httpx.Response(404, json={"errorMessage": "Not found"})
+
+    async def tg_handler(request: httpx.Request) -> httpx.Response:
+        sent_texts.append(json.loads(request.content.decode("utf-8"))["text"])
+        return httpx.Response(200, json={"ok": True})
+
+    sqlite_store = SqliteStore(tmp_path / "metadata.db")
+    sqlite_store.initialize()
+    parquet_store = ParquetStore(tmp_path, sqlite_store=sqlite_store)
+    up_http = httpx.AsyncClient(transport=httpx.MockTransport(rest_handler))
+    tg_http = httpx.AsyncClient(transport=httpx.MockTransport(tg_handler))
+    auth = TopstepAuthService(settings, up_http)
+    rest = TopstepRestClient(settings, auth, up_http)
+    aggregator = BarAggregator(timeframes=("1m",))
+    engine = AlertEngine(scanner_enabled=True)
+    engine.register_evaluator(
+        "live_breakout",
+        lambda evt: [
+            AlertCandidate(
+                strategy_id="live_breakout",
+                strategy_version="1",
+                live_mode=evt.live_mode,
+                contract_id=evt.contract_id,
+                root_symbol=evt.root_symbol,
+                timeframe=evt.timeframe,
+                bar_time=evt.bar.time,
+                direction="LONG",
+                alert_kind="ENTRY",
+                reason="Live close breakout",
+                entry_price=evt.bar.close,
+            )
+        ],
+    )
+    tg_client = TelegramClient(settings, tg_http)
+    alert_service = AlertService(settings, engine, sqlite_store, tg_client, auth, clock=clock)
+
+    transports: list[_MockSignalRTransport] = []
+
+    async def ws_factory(*_args: Any, **_kwargs: Any) -> _MockSignalRTransport:
+        tr = _MockSignalRTransport()
+        transports.append(tr)
+        return tr
+
+    hub = SignalRMarketHub(settings, auth_service=auth, ws_factory=ws_factory)
+    live_feed = LiveFeedService(
+        settings,
+        auth,
+        rest,
+        parquet_store,
+        sqlite_store,
+        aggregator=aggregator,
+        signalr_hub=hub,
+        recovery_timeframes=("1m",),
+        initial_backfill_bars=3,
+        on_bar_signal=alert_service.handle_bar_signal,
+        clock=clock,
+    )
+
+    try:
+        await auth.login("user1", "api-key-123456", live=False)
+        await live_feed.set_active_contracts([CID_MES], live_mode=False)
+        await live_feed.start()
+
+        for _ in range(100):
+            if live_feed.feed_state == "LIVE":
+                break
+            await asyncio.sleep(0.02)
+        assert live_feed.feed_state == "LIVE"
+
+        # Historical recovery bars must have been skipped, zero enqueued during recovery
+        assert engine.recovered_historical_skipped >= 1
+        assert (await sqlite_store.get_outbox_summary())["total"] == 0
+
+        # Emit a SUPPRESSED signal (DEGRADED state) directly via handle_bar_signal
+        suppressed_evt = _closed_bar_event(
+            live_mode=False,
+            timeframe="1m",
+            bar_time=base_t + 180,
+        )
+        sup_res = await alert_service.handle_bar_signal(suppressed_evt, tag="SUPPRESSED")
+        assert sup_res == []
+        assert engine.suppressed_signals == 1
+        assert (await sqlite_store.get_outbox_summary())["total"] == 0
+
+        # Now feed real live ticks across a complete live minute boundary (m2_open -> m3_open)
+        tr = transports[-1]
+        await tr.handshake_done.wait()
+        m2_open = base_t + 180  # First full live 1m bucket after LIVE transition
+        m3_open = base_t + 240
+        clock.now = m2_open + 15
+        await tr.push_frame(
+            {
+                "type": 1,
+                "target": "GatewayTrade",
+                "arguments": [
+                    CID_MES,
+                    {
+                        "symbolId": "F.US.MES",
+                        "price": 5952.0,
+                        "volume": 6,
+                        "timestamp": datetime.fromtimestamp(m2_open + 15, tz=UTC)
+                        .isoformat()
+                        .replace("+00:00", "Z"),
+                    },
+                ],
+            }
+        )
+        await asyncio.sleep(0.02)
+        clock.now = m3_open + 5
+        await tr.push_frame(
+            {
+                "type": 1,
+                "target": "GatewayTrade",
+                "arguments": [
+                    CID_MES,
+                    {
+                        "symbolId": "F.US.MES",
+                        "price": 5952.5,
+                        "volume": 7,
+                        "timestamp": datetime.fromtimestamp(m3_open + 5, tz=UTC)
+                        .isoformat()
+                        .replace("+00:00", "Z"),
+                    },
+                ],
+            }
+        )
+        for _ in range(100):
+            summary = await sqlite_store.get_outbox_summary()
+            if summary["total"] >= 1:
+                break
+            await asyncio.sleep(0.02)
+
+        summary = await sqlite_store.get_outbox_summary()
+        assert summary["total"] == 1
+        assert summary["pending"] == 1
+
+        stats = await alert_service.process_once()
+        assert stats.delivered == 1
+        assert len(sent_texts) == 1
+        assert "MES" in sent_texts[0]
+        assert "UTC+7" in sent_texts[0]
+
+        # Scanner kill-switch suppresses LIVE bars too
+        alert_service.set_scanner_enabled(False)
+        killed_evt = _closed_bar_event(live_mode=False, timeframe="1m", bar_time=m3_open)
+        assert await alert_service.handle_bar_signal(killed_evt, tag=None) == []
+        assert (await sqlite_store.get_outbox_summary())["total"] == 1
+    finally:
+        await live_feed.stop()
+        await alert_service.stop()
+        sqlite_store.close()
+        await tg_http.aclose()
+        await up_http.aclose()
+
+
+async def test_f07_zero_secret_redaction_and_alert_api_routes(tmp_path: Path) -> None:
+    """Contract: Bot token & chat_id never leak in errors, logs, or /api/alerts/* responses.
+
+    Defect caught: Leaking TELEGRAM_BOT_TOKEN in /bot<token>/sendMessage URLs or chat_id in JSON.
+    """
+    short_token = "99:ab"
+    short_chat = "1234"
+    clock = _MutableClock(1_762_783_260)
+
+    # First verify unconfigured 503 on POST /api/alerts/test
+    unconfigured = _make_settings(tmp_path / "unconf", bot_token="", chat_id="")
+    async with _async_app_client(
+        unconfigured,
+        tg_transport=httpx.MockTransport(lambda _r: httpx.Response(200, json={"ok": True})),
+        clock=clock,
+    ) as (client, _):
+        login_resp = await client.post("/api/auth/login", json={"password": TEST_PASSWORD})
+        csrf = login_resp.json()["csrf_token"]
+        test_503 = await client.post("/api/alerts/test", headers={"X-CSRF-Token": csrf})
+        assert test_503.status_code == 503
+
+    # Now configure short secrets and simulate TransportError leaking full URL + chat_id
+    settings = _make_settings(tmp_path / "conf", bot_token=short_token, chat_id=short_chat)
+    fail_mode = {"fail": True}
+
+    async def tg_handler(request: httpx.Request) -> httpx.Response:
+        if fail_mode["fail"]:
+            raise httpx.ConnectError(
+                f"Failed POST {request.url} for chat_id={short_chat} token={short_token}",
+                request=request,
+            )
+        return httpx.Response(200, json={"ok": True, "result": {"message_id": 77}})
+
+    log_buf = io.StringIO()
+    handler = logging.StreamHandler(log_buf)
+    tg_logger = logging.getLogger("topstep_chart")
+    prev_lvl = tg_logger.level
+    tg_logger.setLevel(logging.DEBUG)
+    tg_logger.addHandler(handler)
+    try:
+        async with _async_app_client(
+            settings,
+            tg_transport=httpx.MockTransport(tg_handler),
+            clock=clock,
+        ) as (client, app):
+            login_resp = await client.post("/api/auth/login", json={"password": TEST_PASSWORD})
+            csrf = login_resp.json()["csrf_token"]
+
+            # Trigger failing test alert -> transient error stored redacted in outbox & last_error
+            test_fail_resp = await client.post("/api/alerts/test", headers={"X-CSRF-Token": csrf})
+            assert test_fail_resp.status_code == 200
+            body_fail = test_fail_resp.json()
+            assert body_fail["ok"] is False
+            assert body_fail["alert"]["status"] == "PENDING"
+
+            # Verify /api/status, /api/alerts/status, /api/alerts/history redact all secrets
+            status_resp = await client.get("/api/status")
+            alerts_status = await client.get("/api/alerts/status")
+            alerts_history = await client.get("/api/alerts/history?status=PENDING&limit=10")
+            assert status_resp.status_code == 200
+            assert alerts_status.status_code == 200
+            assert alerts_history.status_code == 200
+            assert status_resp.json()["alerts"]["telegram_configured"] is True
+
+            # Toggle scanner via POST /api/alerts/scanner
+            toggle_resp = await client.post(
+                "/api/alerts/scanner",
+                json={"enabled": False},
+                headers={"X-CSRF-Token": csrf},
+            )
+            assert toggle_resp.status_code == 200
+            assert toggle_resp.json()["scanner_enabled"] is False
+
+            # Now succeed on a fresh test alert
+            fail_mode["fail"] = False
+            test_ok_resp = await client.post("/api/alerts/test", headers={"X-CSRF-Token": csrf})
+            assert test_ok_resp.status_code == 200
+            assert test_ok_resp.json()["ok"] is True
+            assert test_ok_resp.json()["alert"]["status"] == "DELIVERED"
+
+            delivered_hist = await client.get("/api/alerts/history?status=DELIVERED&limit=5")
+            assert delivered_hist.status_code == 200
+            assert delivered_hist.json()["count"] >= 1
+
+            combined_text = "\n".join(
+                [
+                    test_fail_resp.text,
+                    status_resp.text,
+                    alerts_status.text,
+                    alerts_history.text,
+                    test_ok_resp.text,
+                    delivered_hist.text,
+                    app.state.alert_service.last_error or "",
+                ]
+            )
+            assert short_token not in combined_text
+            assert short_chat not in combined_text
+            assert "/bot***REDACTED***" in combined_text
+    finally:
+        tg_logger.removeHandler(handler)
+        tg_logger.setLevel(prev_lvl)
+
+    log_text = log_buf.getvalue()
+    assert short_token not in log_text
+    assert short_chat not in log_text
+
+
+async def test_f07_weekend_key_rotation_reminder_and_weekday_suppression(tmp_path: Path) -> None:
+    """Contract: Key rotation reminder fires once per CME weekend and never on weekdays.
+
+    Defect caught: Reminders firing during active Globex hours or repeating on restart.
+    """
+    # 2026-11-11 is Wednesday, 2026-11-13 is Friday, 2026-11-14 is Saturday, 2026-11-15 is Sunday
+    wed_open = int(datetime(2026, 11, 11, 10, 0, tzinfo=NY_TZ).timestamp())
+    fri_before_close = int(datetime(2026, 11, 13, 16, 59, tzinfo=NY_TZ).timestamp())
+    fri_closed = int(datetime(2026, 11, 13, 17, 0, tzinfo=NY_TZ).timestamp())
+    sat_noon = int(datetime(2026, 11, 14, 12, 0, tzinfo=NY_TZ).timestamp())
+    sun_before_open = int(datetime(2026, 11, 15, 17, 59, tzinfo=NY_TZ).timestamp())
+    sun_open = int(datetime(2026, 11, 15, 18, 0, tzinfo=NY_TZ).timestamp())
+
+    assert is_cme_weekend_window(wed_open) is False
+    assert is_cme_weekend_window(fri_before_close) is False
+    assert is_cme_weekend_window(fri_closed) is True
+    assert is_cme_weekend_window(sat_noon) is True
+    assert is_cme_weekend_window(sun_before_open) is True
+    assert is_cme_weekend_window(sun_open) is False
+
+    bounds = cme_weekend_window_bounds(sat_noon)
+    assert bounds == (fri_closed, sun_open)
+
+    clock = _MutableClock(wed_open)
+    settings = _make_settings(
+        tmp_path,
+        key_updated_at="2026-10-01",
+        key_rotation_days=30,
+        key_rotation_enforce=False,
+    )
+    sent_texts: list[str] = []
+
+    async def tg_handler(request: httpx.Request) -> httpx.Response:
+        sent_texts.append(json.loads(request.content.decode("utf-8"))["text"])
+        return httpx.Response(200, json={"ok": True})
+
+    store1, up1, tg1, _, svc1 = _build_service_stack(
+        tmp_path, settings=settings, tg_handler=tg_handler, clock=clock
+    )
+    try:
+        # Weekday -> no reminder
+        assert await svc1.check_key_rotation_reminder() is None
+        clock.now = fri_before_close
+        assert await svc1.check_key_rotation_reminder() is None
+
+        # Saturday -> enqueues 1 reminder expiring at Sunday 18:00 ET
+        clock.now = sat_noon
+        res1 = await svc1.check_key_rotation_reminder()
+        assert res1 is not None
+        assert res1.inserted is True
+        assert res1.record.alert_kind == "KEY_ROTATION"
+        assert res1.record.expires_at_utc == sun_open
+        assert "topstepx.com/settings?tab=api" in res1.record.payload_text
+
+        stats1 = await svc1.process_once()
+        assert stats1.delivered == 1
+        assert len(sent_texts) == 1
+    finally:
+        store1.close()
+        await tg1.aclose()
+        await up1.aclose()
+
+    # Simulated restart on Sunday afternoon -> deduplicates same weekend
+    clock.now = sun_before_open
+    store2, up2, tg2, _, svc2 = _build_service_stack(
+        tmp_path, settings=settings, tg_handler=tg_handler, clock=clock
+    )
+    try:
+        res2 = await svc2.check_key_rotation_reminder()
+        assert res2 is not None
+        assert res2.inserted is False
+        assert res2.record.status == "DELIVERED"
+        stats2 = await svc2.process_once()
+        assert stats2.claimed == 0
+        assert len(sent_texts) == 1
+
+        # Sunday 18:00 ET market reopen -> outside weekend window
+        clock.now = sun_open
+        assert await svc2.check_key_rotation_reminder() is None
+    finally:
+        store2.close()
+        await tg2.aclose()
+        await up2.aclose()
+
+
+async def test_f07_terminal_state_invariants_and_pure_alert_engine(tmp_path: Path) -> None:
+    """Contract: Terminal rows are immutable; AlertEngine formats VN UTC+7 and validates config.
+
+    Defect caught: Terminal DELIVERED/EXPIRED/FAILED rows reverting to PENDING or bad URL config.
+    """
+    store = SqliteStore(tmp_path / "metadata.db")
+    store.initialize()
+    try:
+        now = 1_762_783_260
+        for idx, terminal in enumerate(("DELIVERED", "EXPIRED", "FAILED")):
+            enq = await store.enqueue_alert_outbox(
+                strategy_id="term_check",
+                strategy_version="1",
+                live_mode=True,
+                contract_id=CID_MES,
+                timeframe="5m",
+                bar_time=now + idx * 300,
+                direction="LONG",
+                payload_text="msg",
+                created_at_utc=now,
+                expires_at_utc=now + 90,
+                max_attempts=3,
+            )
+            aid = enq.record.id
+            if terminal == "DELIVERED":
+                assert await store.mark_outbox_delivered(aid, now + 1) is True
+            elif terminal == "EXPIRED":
+                assert await store.mark_outbox_expired(aid, now + 1, "expired") is True
+            else:
+                assert await store.mark_outbox_failed(aid, now + 1, "perm") is True
+
+            assert await store.mark_outbox_delivered(aid, now + 5) is False
+            assert await store.mark_outbox_expired(aid, now + 5, "again") is False
+            assert await store.mark_outbox_failed(aid, now + 5, "again") is False
+            assert await store.mark_outbox_retry(aid, now + 5, now + 10, "retry") is None
+
+            row = await store.get_outbox_alert(aid)
+            assert row is not None
+            assert row.status == terminal
+    finally:
+        store.close()
+
+    # Pure Vietnam UTC+7 message formatting check
+    candidate = _sample_candidate()
+    created_utc = int(datetime(2026, 11, 10, 14, 0, 0, tzinfo=UTC).timestamp())
+    formatted = format_entry_alert_message(candidate, created_utc)
+    expected_vn = datetime.fromtimestamp(created_utc, tz=UTC).astimezone(VN_TZ).strftime(
+        "%Y-%m-%d %H:%M:%S"
+    )
+    assert expected_vn in formatted
+    assert "UTC+7" in formatted
+    assert "Bullish FVG + Liquidity Sweep" in formatted
+    assert "Entry: 5950.25" in formatted
+    assert "SL: 5945" in formatted
+    assert "TP: 5960.75" in formatted
+    assert "R:R: 2" in formatted
+
+    # Provisional open bars are ignored by default unless allow_provisional=True
+    engine = AlertEngine()
+    engine.register_evaluator("default_closed_only", lambda _e: [_sample_candidate()])
+    open_evt = _closed_bar_event(is_closed=False)
+    assert engine.evaluate_bar_signal(open_evt, tag=None) == ()
+    assert engine.unregister_evaluator("default_closed_only") is True
+
+    # Config validation checks
+    with pytest.raises(ValidationError):
+        Settings(telegram_api_base_url="http://api.telegram.org")
+    with pytest.raises(ValidationError):
+        Settings(telegram_api_base_url="https://user:pass@api.telegram.org")
+    with pytest.raises(ValidationError):
+        Settings(telegram_api_base_url="https://api.telegram.org?foo=bar")
+    with pytest.raises(ValidationError):
+        Settings(alert_retry_backoff_sec=[0.0, 2.0])
+    with pytest.raises(ValidationError):
+        Settings(alert_retry_backoff_sec="2, -1")
+
+    loopback_cfg = Settings(
+        telegram_api_base_url="http://127.0.0.1:9090/",
+        alert_retry_backoff_sec="1.5, 3, 6.5",
+    )
+    assert loopback_cfg.telegram_api_base_url == "http://127.0.0.1:9090"
+    assert loopback_cfg.alert_retry_backoff_sec == [1.5, 3.0, 6.5]
+
+    # Unconfigured TelegramClient check + TelegramNotConfiguredError export check
+    assert issubclass(TelegramNotConfiguredError, RuntimeError)
+
+
+async def test_f07_lifespan_creates_and_closes_dedicated_telegram_client(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Contract: Lifespan creates and closes a dedicated Telegram AsyncClient when configured.
+
+    Defect caught: Leaked Telegram httpx connection pool or missing client initialization.
+    """
+    created_clients: list[httpx.AsyncClient] = []
+    orig_async_client = httpx.AsyncClient
+
+    def fake_async_client(*args: object, **kwargs: object) -> httpx.AsyncClient:
+        client = orig_async_client(
+            transport=httpx.MockTransport(lambda _r: httpx.Response(200, json={"ok": True}))
+        )
+        created_clients.append(client)
+        return client
+
+    monkeypatch.setattr("app.main.httpx.AsyncClient", fake_async_client)
+
+    settings = _make_settings(tmp_path)
+    app = create_app(settings=settings)
+    async with app.router.lifespan_context(app):
+        assert len(created_clients) == 2
+        assert created_clients[0].is_closed is False
+        assert created_clients[1].is_closed is False
+        assert app.state.telegram_http_client is created_clients[1]
+    assert created_clients[0].is_closed is True
+    assert created_clients[1].is_closed is True

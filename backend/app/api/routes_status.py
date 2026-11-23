@@ -22,6 +22,7 @@ from app.security import (
     require_dev_loopback,
     require_session,
 )
+from app.services.alert_service import AlertService
 from app.services.live_feed_service import LiveFeedService
 from app.storage.sqlite_store import SqliteStore
 from app.topstep.auth import TopstepAuthService
@@ -63,6 +64,10 @@ def _get_sqlite_store(request: Request) -> SqliteStore:
 
 def _get_live_feed_service(request: Request) -> LiveFeedService:
     return request.app.state.live_feed_service
+
+
+def _get_alert_service(request: Request) -> AlertService:
+    return request.app.state.alert_service
 
 
 @router.get("/health")
@@ -142,11 +147,13 @@ async def get_status(
     topstep_auth: Annotated[TopstepAuthService, Depends(_get_topstep_auth)],
     sqlite_store: Annotated[SqliteStore, Depends(_get_sqlite_store)],
     live_feed_service: Annotated[LiveFeedService, Depends(_get_live_feed_service)],
+    alert_service: Annotated[AlertService, Depends(_get_alert_service)],
 ) -> dict[str, Any]:
-    """Return strictly redacted TopstepX connection, rotation, feed, and data quality status."""
+    """Return strictly redacted TopstepX connection, rotation, feed, and alert status."""
     payload = topstep_auth.get_status()
     payload["data_quality"] = await sqlite_store.get_quality_summary()
     payload.update(live_feed_service.get_status_snapshot())
+    payload["alerts"] = await alert_service.get_status_snapshot()
     return payload
 
 
