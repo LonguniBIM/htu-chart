@@ -9134,8 +9134,138 @@ async def test_f03_toctou_parquet_lock_preserves_rest_5m_bar_and_blocks_stale_si
                     OHLCVBar(t0, 5945.0, 5999.0, 5940.0, 5988.0, 77.0, is_closed=True)
                 ]
                 assert not any(tf == "5m" and bt == t0 and tag is None for tf, bt, tag in signals)
+                assert not any(tf == "5m" and bt == t0 for tf, bt, _ in broadcasted_closed)
             finally:
                 release_live_5m.set()
+                await svc.stop()
+    finally:
+        sqlite.close()
+
+
+@pytest.mark.asyncio
+async def test_f03_live_tick_close_and_watchdog_flush_do_not_broadcast_rest_confirmed_bar(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Contract: P1-001/P2-001 gates closed-bar WS broadcast on REST-authority checks.
+
+    Defect caught: _ingest_live_tick_sync and run_watchdog_tick broadcasting local closed bars
+    synchronously before _safe_persist_and_signal_events checks is_interval_complete/Parquet.
+    """
+    settings = Settings(data_dir=tmp_path / "data", signalr_enabled=True)
+    sqlite = SqliteStore(tmp_path / "meta.db")
+    sqlite.initialize()
+    parquet = ParquetStore(settings.data_dir, sqlite_store=sqlite)
+
+    t0 = first_bucket_open_at_or_after(BASE_T, "5m")
+    t1 = t0 + 300
+    clock_ref = [t0 + 10]
+    broadcasted_closed: list[tuple[str, int, float]] = []
+    broadcaster = WsBroadcaster()
+    orig_publish_bar = broadcaster.publish_bar
+
+    def _spy_publish_bar(evt: Any) -> None:
+        if evt.bar.is_closed:
+            broadcasted_closed.append((evt.timeframe, evt.bar.time, evt.bar.volume))
+        orig_publish_bar(evt)
+
+    monkeypatch.setattr(broadcaster, "publish_bar", _spy_publish_bar)
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/Auth/loginKey":
+            return httpx.Response(200, json={"success": True, "token": "jwt-ws-gate"})
+        if request.url.path == "/api/History/retrieveBars":
+            payload = json.loads(request.content.decode("utf-8"))
+            unit = int(payload["unit"])
+            unit_number = int(payload["unitNumber"])
+            if unit == 2 and unit_number == 5:
+                s_ts = int(
+                    datetime.fromisoformat(
+                        str(payload["startTime"]).replace("Z", "+00:00")
+                    ).timestamp()
+                )
+                if s_ts >= t1:
+                    bars = [_wire_bar(t1, 5946.0, 5999.0, 5941.0, 5989.0, 88.0)]
+                else:
+                    bars = [_wire_bar(t0, 5945.0, 5999.0, 5940.0, 5988.0, 77.0)]
+            else:
+                bars = _bars_for_history_payload(payload)
+            return httpx.Response(200, json={"success": True, "bars": bars})
+        return httpx.Response(404)
+
+    try:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            auth = TopstepAuthService(settings, client)
+            await auth.login("alice", "api-key")
+            rest = TopstepRestClient(settings, auth, client)
+            history_svc = HistoryBackfillService(settings, rest, parquet, sqlite)
+            agg = BarAggregator(timeframes=("1m", "5m"))
+            svc = LiveFeedService(
+                settings,
+                auth,
+                rest,
+                parquet,
+                sqlite,
+                aggregator=agg,
+                broadcaster=broadcaster,
+                recovery_timeframes=("1m", "5m"),
+                initial_backfill_bars=1,
+                clock=lambda: clock_ref[0],
+            )
+            try:
+                await svc.set_active_contracts([CID_MES], live_mode=False)
+                svc._last_connected_utc = t0 - 30
+                await svc.trigger_recovery(now_utc=clock_ref[0])
+                assert svc.feed_state == "LIVE"
+                broadcasted_closed.clear()
+
+                # (a) Open local 5m bar t0, complete REST 5m backfill, then close via live tick.
+                svc.handle_hub_event(
+                    SignalRTickEvent(CID_MES, False, t0 + 250, 5952.0, 2.0, "GatewayTrade", 1.0)
+                )
+                await svc.flush_pending_tasks()
+
+                clock_ref[0] = t0 + 305
+                hist0 = await history_svc.sync_and_read_bars(
+                    contract_id=CID_MES,
+                    live=False,
+                    timeframe="5m",
+                    start_ts=t0,
+                    end_ts=t0 + 299,
+                    now_utc=clock_ref[0],
+                )
+                assert hist0.is_complete is True
+
+                svc.handle_hub_event(
+                    SignalRTickEvent(CID_MES, False, t0 + 305, 5955.0, 1.0, "GatewayTrade", 2.0)
+                )
+                await svc.flush_pending_tasks()
+                assert not any(tf == "5m" and bt == t0 for tf, bt, _ in broadcasted_closed)
+
+                # (b) Open local 5m bar t1, complete REST 5m backfill, then flush via watchdog.
+                svc.handle_hub_event(
+                    SignalRTickEvent(CID_MES, False, t1 + 250, 5953.0, 3.0, "GatewayTrade", 3.0)
+                )
+                await svc.flush_pending_tasks()
+
+                clock_ref[0] = t1 + 305
+                hist1 = await history_svc.sync_and_read_bars(
+                    contract_id=CID_MES,
+                    live=False,
+                    timeframe="5m",
+                    start_ts=t1,
+                    end_ts=t1 + 299,
+                    now_utc=clock_ref[0],
+                )
+                assert hist1.is_complete is True
+
+                await svc.run_watchdog_tick()
+                assert not any(tf == "5m" and bt == t1 for tf, bt, _ in broadcasted_closed)
+
+                key_5m = StorageDatasetKey("topstepx", False, CID_MES, "5m")
+                bars_5m = await parquet.read_bars(key_5m, start_ts=t0, end_ts=t1)
+                assert [b.volume for b in bars_5m] == [77.0, 88.0]
+            finally:
                 await svc.stop()
     finally:
         sqlite.close()

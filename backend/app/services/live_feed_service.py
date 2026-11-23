@@ -164,6 +164,9 @@ class LiveFeedService:
         self._pending_recovery_ticks_count = 0
         self._recovery_task: asyncio.Task[None] | None = None
         self._live_tick_tasks: set[asyncio.Task[None]] = set()
+        self._inflight_closed_broadcast_events: dict[
+            tuple[str, bool, str], list[asyncio.Event]
+        ] = {}
         self._watchdog_task: asyncio.Task[None] | None = None
         self._running = False
         self._generation = 0
@@ -2282,21 +2285,24 @@ class LiveFeedService:
             )
         if not res.events:
             return []
-        for bar_evt in res.events:
-            if self._broadcaster is not None:
+        has_closed = any(evt.bar.is_closed for evt in res.events)
+        prior_barriers, registered_barriers, done_evt = self._register_closed_broadcast_barrier(
+            res.events
+        )
+        if not has_closed and not prior_barriers and self._broadcaster is not None:
+            for bar_evt in res.events:
                 self._broadcaster.publish_bar(bar_evt)
-        closed_or_signal = [
-            evt
-            for evt in res.events
-            if evt.bar.is_closed or self._on_bar_signal is not None
-        ]
-        if closed_or_signal:
+        if has_closed or prior_barriers or self._on_bar_signal is not None:
+            broadcast_in_task = has_closed or bool(prior_barriers)
             task = asyncio.create_task(
                 self._safe_persist_and_signal_events(
                     res.events,
                     now_utc=eff_now,
-                    broadcast=False,
+                    broadcast=broadcast_in_task,
                     expected_gen=gen,
+                    wait_for_events=prior_barriers,
+                    registered_barriers=registered_barriers,
+                    done_evt=done_evt,
                 )
             )
             self._live_tick_tasks.add(task)
@@ -2368,6 +2374,48 @@ class LiveFeedService:
             reraise_abort=True,
         )
 
+    def _register_closed_broadcast_barrier(
+        self,
+        events: Sequence[AggregatedBarEvent],
+    ) -> tuple[
+        list[asyncio.Event],
+        list[tuple[tuple[str, bool, str], asyncio.Event]],
+        asyncio.Event | None,
+    ]:
+        streams = list(
+            dict.fromkeys((e.contract_id, e.live_mode, e.timeframe) for e in events)
+        )
+        prior: list[asyncio.Event] = []
+        seen_ids: set[int] = set()
+        for skey in streams:
+            for ev in self._inflight_closed_broadcast_events.get(skey, ()):
+                if id(ev) not in seen_ids:
+                    seen_ids.add(id(ev))
+                    prior.append(ev)
+        if any(e.bar.is_closed for e in events):
+            done_evt = asyncio.Event()
+            registered: list[tuple[tuple[str, bool, str], asyncio.Event]] = []
+            for skey in streams:
+                self._inflight_closed_broadcast_events.setdefault(skey, []).append(done_evt)
+                registered.append((skey, done_evt))
+            return prior, registered, done_evt
+        return prior, [], None
+
+    def _release_closed_broadcast_barrier(
+        self,
+        registered: Sequence[tuple[tuple[str, bool, str], asyncio.Event]],
+        done_evt: asyncio.Event | None,
+    ) -> None:
+        for skey, ev in registered:
+            bucket = self._inflight_closed_broadcast_events.get(skey)
+            if bucket is not None:
+                with contextlib.suppress(ValueError):
+                    bucket.remove(ev)
+                if not bucket:
+                    self._inflight_closed_broadcast_events.pop(skey, None)
+        if done_evt is not None:
+            done_evt.set()
+
     async def _safe_persist_and_signal_events(
         self,
         events: Sequence[AggregatedBarEvent],
@@ -2376,8 +2424,13 @@ class LiveFeedService:
         broadcast: bool = True,
         expected_gen: int | None = None,
         reraise_abort: bool = False,
+        wait_for_events: Sequence[asyncio.Event] = (),
+        registered_barriers: Sequence[tuple[tuple[str, bool, str], asyncio.Event]] = (),
+        done_evt: asyncio.Event | None = None,
     ) -> None:
         try:
+            if wait_for_events:
+                await asyncio.gather(*(ev.wait() for ev in wait_for_events))
             await self._persist_and_signal_events(
                 events,
                 now_utc=now_utc,
@@ -2409,6 +2462,9 @@ class LiveFeedService:
             self._recompute_aggregate_state()
             self._broadcast_status()
             logger.warning("Live persistence/signal failure: %s", redacted_err)
+        finally:
+            if done_evt is not None or registered_barriers:
+                self._release_closed_broadcast_barrier(registered_barriers, done_evt)
 
     async def _persist_and_signal_events(
         self,
@@ -2582,14 +2638,17 @@ class LiveFeedService:
                 live_mode=c_state.live_mode,
             )
             if flushed:
-                if self._broadcaster is not None:
-                    for bar_evt in flushed:
-                        self._broadcaster.publish_bar(bar_evt)
+                prior_barriers, registered_barriers, done_evt = (
+                    self._register_closed_broadcast_barrier(flushed)
+                )
                 await self._safe_persist_and_signal_events(
                     flushed,
                     now_utc=now_ts,
-                    broadcast=False,
+                    broadcast=True,
                     expected_gen=live_gen,
+                    wait_for_events=prior_barriers,
+                    registered_barriers=registered_barriers,
+                    done_evt=done_evt,
                 )
 
         hub_token_stale = (
