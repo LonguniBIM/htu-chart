@@ -1,6 +1,6 @@
 # Task List: TopstepX Futures Terminal (`topstep-chart-app`)
 
-> **Status**: Phase 1 `VERIFIED` — Part 1 (`backend/` init, `F01`, `F02`, `R03`, Key Rotation & Redaction) on `1918f9156d45`; Part 2 (`F04`, `R04`, `F05`, `R05`, Phase 1 `pytest` suite) on `7d724bc79a76`. Ready for Phase 2.
+> **Status**: Phase 1 `VERIFIED` (`1918f9156d45`, `7d724bc79a76`); Phase 2 Part 1 (`F03`, `R06`: SignalR Market Hub, Reconnect Recovery, `BarAggregator`, Local WS `/ws/market`) **`VERIFIED`** on `84abff087ab3` (213 backend tests passed, 2-pass review `PASSED`, immutable receipt `VERIFIED`). Ready for Phase 2 Part 2 (`F07` Durable Telegram Outbox).
 
 ## Phase 1 — Backend FastAPI, Parquet Cache, Security & Contract Integrity (F01, F02, F04, F05, R03, R04, R05)
 - [x] Initialize `topstep-chart-app/backend/` with `uv` (`pyproject.toml`, FastAPI, Polars, PyArrow, SQLite, httpx, argon2-cffi, pytest) and remove temporary `server.mjs`
@@ -14,8 +14,8 @@
 - [x] Write & pass Phase 1 `pytest` suite (security, contract identity, timeouts, OHLCV validation, Parquet concurrency, pagination, CME session bucketing, zero order endpoints)
 
 ## Phase 2 — Single SignalR Real-Time Hub, Reconnect Recovery & Durable Telegram Outbox (F03, F07, R06)
-- [ ] **[F03]** Implement single SignalR Market Hub worker (`signalr_hub.py`) with `DISCONNECTED -> RECOVERING -> LIVE` state machine, per-contract closed-bar watermarks, bounded tick queue, overlapping REST reconciliation, and status telemetry
-- [ ] **[R06]** Implement real-time `bar_aggregator.py` + local WebSocket `/ws/market` (caller session + Origin check, per-client bounded queue, open-bar coalescing, send timeout, slow-consumer disconnect & resync)
+- [x] **[F03]** Implement single SignalR Market Hub worker (`signalr_hub.py`) with `DISCONNECTED -> RECOVERING -> LIVE` state machine, per-contract closed-bar watermarks, bounded tick queue, overlapping REST reconciliation, and status telemetry
+- [x] **[R06]** Implement real-time `bar_aggregator.py` + local WebSocket `/ws/market` (caller session + Origin check, per-client bounded queue, open-bar coalescing, send timeout, slow-consumer disconnect & resync)
 - [ ] **[F07]** Implement SQLite transactional `alert_outbox` with `(strategy_id, strategy_version, live_mode, contract_id, timeframe, bar_time, direction)` unique key, `expires_at` staleness TTL, bounded retry, and Telegram dispatcher (`telegram.py`) + weekend key rotation reminder
 - [ ] Write & pass Phase 2 `pytest` suite (reconnect outage simulation, bar aggregation, slow-client containment, outbox crash-recovery & TTL expiry)
 

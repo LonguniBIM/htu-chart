@@ -8,6 +8,7 @@
 
 ## 2. Entry Points
 - `backend/app/topstep/signalr_hub.py`
+- `backend/app/services/live_feed_service.py`, `backend/app/services/ws_broadcaster.py`
 - `backend/app/engine/bar_aggregator.py`, `backend/app/engine/alert_engine.py`
 - `backend/app/notify/telegram.py`
 - `backend/app/api/routes_market.py` (`WS /ws/market`), `backend/app/api/routes_alerts.py`, `backend/app/api/routes_status.py`
