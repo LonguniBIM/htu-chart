@@ -662,17 +662,19 @@ def _run_codex_pass(
 def _build_agy_cli_prompt(prompt_text: str, prompt_file: Path) -> str:
     """Build a strictly read-only CLI prompt for `agy -p`, avoiding Windows argv limits."""
     readonly_prefix = (
-        "STRICT READ-ONLY INDEPENDENT REVIEW PASS. "
+        "STRICT READ-ONLY INDEPENDENT REVIEW PASS (HEADLESS MODE). "
         "Do NOT create, edit, delete, or modify any files, do NOT spawn subagents, "
-        "and do NOT run mutating shell commands. "
-        "Use read-only file/git inspection only, and return ONLY valid JSON matching the provided schema.\n\n"
+        "and NEVER invoke any shell, terminal, or command execution tool (headless mode auto-denies all shell commands). "
+        "Use ONLY built-in read-only file/search tools (read_file, grep/search, find/list); "
+        "all commit SHA, diff stat, and changed-file metadata are already provided in the prompt. "
+        "Return ONLY valid JSON matching the provided schema.\n\n"
     )
     if len(prompt_text) <= AGY_INLINE_PROMPT_CHAR_LIMIT:
         return readonly_prefix + prompt_text
     return (
         readonly_prefix
-        + f"Read and execute the complete review instructions from `{prompt_file}` using read-only tools, "
-        + "then return ONLY the final JSON object matching the provided schema."
+        + f"Read and execute the complete review instructions from `{prompt_file}` using ONLY read-only file/search tools "
+        + "(never call shell/command tools), then return ONLY the final JSON object matching the provided schema."
     )
 
 
