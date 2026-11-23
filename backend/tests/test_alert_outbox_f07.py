@@ -1639,3 +1639,124 @@ async def test_f07_handle_bar_signal_wakes_worker_per_insert_and_isolates_bad_ca
         store.close()
         await tg.aclose()
         await up.aclose()
+
+
+async def test_f07_send_test_alert_cuts_in_and_uses_post_lock_clock(tmp_path: Path) -> None:
+    """Contract: send_test_alert cuts in after current single send and reads clock inside lock.
+
+    Defect caught: Stale pre-lock clock expiring TEST alert and batch lock stalling behind 8 rows.
+    """
+    t0 = 1_762_783_260
+    clock = _MutableClock(t0)
+    settings = _make_settings(tmp_path, alert_ttl_seconds=90)
+    send_order: list[str] = []
+    first_in_flight = asyncio.Event()
+    release_first = asyncio.Event()
+
+    async def tg_handler(request: httpx.Request) -> httpx.Response:
+        text = json.loads(request.content.decode("utf-8"))["text"]
+        if "Telegram test alert OK" in text:
+            send_order.append("TEST")
+        else:
+            send_order.append("BATCH")
+            if len(send_order) == 1:
+                first_in_flight.set()
+                await release_first.wait()
+        return httpx.Response(200, json={"ok": True})
+
+    store, up, tg, _, svc = _build_service_stack(
+        tmp_path, settings=settings, tg_handler=tg_handler, clock=clock
+    )
+    try:
+        batch_ids: list[int] = []
+        for idx in range(8):
+            enq = await svc.enqueue_candidate(
+                _sample_candidate(bar_time=t0 + idx * 300)
+            )
+            batch_ids.append(enq.record.id)
+
+        batch_task = asyncio.create_task(svc.process_once())
+        await asyncio.wait_for(first_in_flight.wait(), timeout=2.0)
+
+        # Start send_test_alert() while batch alert #1 is in flight, then advance clock past 90s
+        test_task = asyncio.create_task(svc.send_test_alert())
+        await asyncio.sleep(0.02)
+        clock.now = t0 + 98
+        release_first.set()
+
+        test_record = await asyncio.wait_for(test_task, timeout=2.0)
+        stats = await asyncio.wait_for(batch_task, timeout=2.0)
+
+        assert test_record.status == "DELIVERED"
+        assert test_record.attempt_count == 1
+        assert test_record.created_at_utc == t0 + 98
+        assert send_order[:2] == ["BATCH", "TEST"]
+        assert stats.delivered == 1
+        assert stats.expired == 7
+
+        row0 = await store.get_outbox_alert(batch_ids[0])
+        assert row0 is not None and row0.status == "DELIVERED"
+        for bid in batch_ids[1:]:
+            row = await store.get_outbox_alert(bid)
+            assert row is not None and row.status == "EXPIRED"
+    finally:
+        release_first.set()
+        store.close()
+        await tg.aclose()
+        await up.aclose()
+
+
+async def test_f07_concurrent_process_once_claims_no_duplicates(tmp_path: Path) -> None:
+    """Contract: Concurrent process_once() calls never double-claim or double-send any row.
+
+    Defect caught: Releasing batch lock between rows causing concurrent claimer to re-send.
+    """
+    t0 = 1_762_783_260
+    clock = _MutableClock(t0)
+    settings = _make_settings(tmp_path, alert_ttl_seconds=300)
+    sent_texts: list[str] = []
+    first_in_flight = asyncio.Event()
+    release_first = asyncio.Event()
+
+    async def tg_handler(request: httpx.Request) -> httpx.Response:
+        text = json.loads(request.content.decode("utf-8"))["text"]
+        sent_texts.append(text)
+        if len(sent_texts) == 1:
+            first_in_flight.set()
+            await release_first.wait()
+        return httpx.Response(200, json={"ok": True})
+
+    store, up, tg, _, svc = _build_service_stack(
+        tmp_path, settings=settings, tg_handler=tg_handler, clock=clock
+    )
+    try:
+        batch_ids: list[int] = []
+        for idx in range(8):
+            enq = await svc.enqueue_candidate(
+                _sample_candidate(strategy_id=f"s{idx}", bar_time=t0 + idx * 60)
+            )
+            batch_ids.append(enq.record.id)
+
+        t1 = asyncio.create_task(svc.process_once(limit=20))
+        await asyncio.wait_for(first_in_flight.wait(), timeout=2.0)
+
+        t2 = asyncio.create_task(svc.process_once(limit=20))
+        await asyncio.sleep(0.02)
+        release_first.set()
+
+        s1, s2 = await asyncio.gather(t1, t2)
+        assert s1.delivered + s2.delivered == 8
+        assert len(sent_texts) == 8
+        assert len(set(sent_texts)) == 8
+        assert svc._in_flight_ids == set()
+
+        for bid in batch_ids:
+            row = await store.get_outbox_alert(bid)
+            assert row is not None
+            assert row.status == "DELIVERED"
+            assert row.attempt_count == 1
+    finally:
+        release_first.set()
+        store.close()
+        await tg.aclose()
+        await up.aclose()

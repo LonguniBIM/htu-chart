@@ -71,6 +71,7 @@ class AlertService:
         self._auth = topstep_auth
         self._clock = clock or (lambda: int(datetime.now(UTC).timestamp()))
         self._dispatch_lock = asyncio.Lock()
+        self._in_flight_ids: set[int] = set()
         self._wakeup = asyncio.Event()
         self._worker_task: asyncio.Task[None] | None = None
         self._running = False
@@ -239,17 +240,28 @@ class AlertService:
         return current.status if current is not None else "FAILED"
 
     async def process_once(self, limit: int = 20) -> DispatchCycleStats:
-        """Expire stale rows and deliver due PENDING outbox alerts sequentially under lock."""
+        """Expire stale rows and deliver due PENDING outbox alerts without holding batch lock."""
         async with self._dispatch_lock:
             now_utc = self._clock()
             expired_count = await self._sqlite.expire_stale_outbox_alerts(now_utc)
-            due_alerts = await self._sqlite.claim_due_outbox_alerts(now_utc, limit=limit)
-            delivered = 0
-            retried = 0
-            failed = 0
+            due_alerts = await self._sqlite.claim_due_outbox_alerts(
+                now_utc,
+                limit=limit,
+                exclude_ids=self._in_flight_ids,
+            )
+            claimed_ids = [record.id for record in due_alerts]
+            self._in_flight_ids.update(claimed_ids)
 
+        delivered = 0
+        retried = 0
+        failed = 0
+        try:
             for record in due_alerts:
-                outcome = await self._dispatch_record_locked(record)
+                async with self._dispatch_lock:
+                    try:
+                        outcome = await self._dispatch_record_locked(record)
+                    finally:
+                        self._in_flight_ids.discard(record.id)
                 if outcome == "DELIVERED":
                     delivered += 1
                 elif outcome == "EXPIRED":
@@ -258,14 +270,17 @@ class AlertService:
                     failed += 1
                 elif outcome == "PENDING":
                     retried += 1
+        finally:
+            for cid in claimed_ids:
+                self._in_flight_ids.discard(cid)
 
-            return DispatchCycleStats(
-                expired=expired_count,
-                claimed=len(due_alerts),
-                delivered=delivered,
-                retried=retried,
-                failed=failed,
-            )
+        return DispatchCycleStats(
+            expired=expired_count,
+            claimed=len(due_alerts),
+            delivered=delivered,
+            retried=retried,
+            failed=failed,
+        )
 
     async def check_key_rotation_reminder(self) -> EnqueueAlertResult | None:
         """Enqueue a weekend-only TopstepX API key rotation reminder when due."""
@@ -297,25 +312,25 @@ class AlertService:
         if not self._telegram.is_configured:
             raise TelegramNotConfiguredError("Telegram bot token or chat ID is not configured")
 
-        now_utc = self._clock()
-        candidate = AlertCandidate(
-            strategy_id=f"__manual_test__:{secrets.token_hex(8)}",
-            strategy_version="1",
-            live_mode=self._auth.live,
-            contract_id="__SYSTEM__",
-            root_symbol=None,
-            timeframe="1m",
-            bar_time=now_utc,
-            direction="INFO",
-            alert_kind="TEST",
-            reason="Manual Telegram connectivity test",
-            message_text=(
-                "TopstepX Chart Terminal: Telegram test alert OK "
-                f"({format_vn_timestamp(now_utc)})"
-            ),
-            ttl_seconds=self._settings.alert_ttl_seconds,
-        )
         async with self._dispatch_lock:
+            now_utc = self._clock()
+            candidate = AlertCandidate(
+                strategy_id=f"__manual_test__:{secrets.token_hex(8)}",
+                strategy_version="1",
+                live_mode=self._auth.live,
+                contract_id="__SYSTEM__",
+                root_symbol=None,
+                timeframe="1m",
+                bar_time=now_utc,
+                direction="INFO",
+                alert_kind="TEST",
+                reason="Manual Telegram connectivity test",
+                message_text=(
+                    "TopstepX Chart Terminal: Telegram test alert OK "
+                    f"({format_vn_timestamp(now_utc)})"
+                ),
+                ttl_seconds=self._settings.alert_ttl_seconds,
+            )
             enqueued = await self.enqueue_candidate(candidate, created_at_utc=now_utc)
             await self._dispatch_record_locked(enqueued.record)
         updated = await self._sqlite.get_outbox_alert(enqueued.record.id)

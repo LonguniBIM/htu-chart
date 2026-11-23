@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import sqlite3
 import threading
-from collections.abc import Sequence
+from collections.abc import Collection, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -1242,9 +1243,14 @@ class SqliteStore:
         self,
         now_utc: int,
         limit: int = 20,
+        *,
+        exclude_ids: Collection[int] = (),
     ) -> list[AlertOutboxRecord]:
         safe_now = _validate_sqlite_int64(now_utc, "now_utc")
         safe_limit = max(1, min(int(limit), 500))
+        clean_excludes = sorted(
+            {_validate_sqlite_int64(eid, "exclude_id") for eid in exclude_ids}
+        )
         with self._lock:
             conn = self._ensure_conn_locked()
             conn.execute(
@@ -1255,17 +1261,36 @@ class SqliteStore:
                 """,
                 (safe_now, safe_now),
             )
-            rows = conn.execute(
-                f"""
-                {self._ALERT_OUTBOX_SELECT}
-                WHERE status = 'PENDING'
-                  AND expires_at_utc > ?
-                  AND next_attempt_at_utc <= ?
-                ORDER BY next_attempt_at_utc ASC, id ASC
-                LIMIT ?
-                """,
-                (safe_now, safe_now, safe_limit),
-            ).fetchall()
+            if clean_excludes:
+                excludes_json = json.dumps(clean_excludes)
+                rows = conn.execute(
+                    """
+                    SELECT id, strategy_id, strategy_version, live_mode, contract_id, timeframe,
+                           bar_time, direction, alert_kind, payload_text, status, attempt_count,
+                           max_attempts, created_at_utc, expires_at_utc, next_attempt_at_utc,
+                           delivered_at_utc, updated_at_utc, last_error
+                    FROM alert_outbox
+                    WHERE status = 'PENDING'
+                      AND expires_at_utc > ?
+                      AND next_attempt_at_utc <= ?
+                      AND id NOT IN (SELECT value FROM json_each(?))
+                    ORDER BY next_attempt_at_utc ASC, id ASC
+                    LIMIT ?
+                    """,
+                    (safe_now, safe_now, excludes_json, safe_limit),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    f"""
+                    {self._ALERT_OUTBOX_SELECT}
+                    WHERE status = 'PENDING'
+                      AND expires_at_utc > ?
+                      AND next_attempt_at_utc <= ?
+                    ORDER BY next_attempt_at_utc ASC, id ASC
+                    LIMIT ?
+                    """,
+                    (safe_now, safe_now, safe_limit),
+                ).fetchall()
             conn.commit()
             return [self._row_to_alert_outbox_record(row) for row in rows]
 
@@ -1273,9 +1298,16 @@ class SqliteStore:
         self,
         now_utc: int,
         limit: int = 20,
+        *,
+        exclude_ids: Collection[int] = (),
     ) -> list[AlertOutboxRecord]:
         """Expire stale rows and return non-expired PENDING alerts due for delivery."""
-        return await asyncio.to_thread(self._claim_due_outbox_alerts_sync, now_utc, limit)
+        return await asyncio.to_thread(
+            self._claim_due_outbox_alerts_sync,
+            now_utc,
+            limit,
+            exclude_ids=exclude_ids,
+        )
 
     def _mark_outbox_delivered_sync(self, alert_id: int, now_utc: int) -> bool:
         safe_id = _validate_sqlite_int64(alert_id, "alert_id")
