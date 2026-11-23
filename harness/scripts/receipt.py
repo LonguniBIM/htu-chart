@@ -136,6 +136,10 @@ def _evaluate_review_gate(
         "passes_completed": passes,
         "independent_contexts": independent,
         "revision_sha": rev_sha,
+        "review_backend": review_data.get("review_backend", "codex"),
+        "review_model": review_data.get("review_model"),
+        "fallback_used": bool(review_data.get("fallback_used", False)),
+        "fallback_reason": review_data.get("fallback_reason"),
         "total_findings": len(review_data.get("consolidated_findings", [])),
         "resolved_blocking": resolved,
         "unresolved_blocking": unresolved,
@@ -258,8 +262,13 @@ def render_receipt_markdown(receipt: dict[str, Any]) -> str:
     )
     cmds_row = "<br>".join(receipt["commands_summary"]) or "Chưa có lệnh được ghi nhận."
     rev_sum = receipt["review_summary"]
+    backend_tag = str(rev_sum.get("review_backend", "codex"))
+    if rev_sum.get("review_model"):
+        backend_tag += f"/{rev_sum['review_model']}"
+    if rev_sum.get("fallback_used"):
+        backend_tag += ", fallback"
     review_row = (
-        f"Revision `{rev_short}`, passes={rev_sum.get('passes_completed', 0)}, "
+        f"Revision `{rev_short}`, backend=`{backend_tag}`, passes={rev_sum.get('passes_completed', 0)}, "
         f"gate=`{receipt['gates']['review']}`, unresolved={len(rev_sum.get('unresolved_blocking', []))}"
     )
     verifier_row = f"gate=`{receipt['gates']['verifier']}` on `{rev_short}`"

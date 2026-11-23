@@ -10,7 +10,7 @@
 | **Human** | Project Owner | Product goals, priority, cost, TopstepX credentials (`.env`), irreversible changes. |
 | **Supervisor + Lead** | **Gemini Neon** (this session) | Scope & Prop Firm compliance guard, Task Packets, equal-colleague debate resolution, dispatching Codex Room review, and final acceptance (`test pass ≠ acceptance`). |
 | **Peer (Coder & Debater)** | **Lower Model (`flash`)** via `peer-coder` / swarm worker | Implements scoped Task Packet, writes value-first tests, challenges flawed assumptions (`REOPEN_REQUEST`, `DEPENDENCY_REQUEST`, `BLOCKED`), delivers immutable git commit (`CANDIDATE_READY`). |
-| **Lead Review** | **Codex CLI** (`codex-room`: `pass1` + `pass2`) | Independent 2-pass **read-only** review on exact candidate commit SHA (`correctness_and_tests` + `security_and_invariants`). Never edits files or spawns sub-agents. |
+| **Lead Review** | **Codex CLI** (`codex-room`: `pass1` + `pass2`; auto-fallback to `agy` `claude-opus-5-5-medium` on Codex quota exhaustion) | Independent 2-pass **read-only** review on exact candidate commit SHA (`correctness_and_tests` + `security_and_invariants`). Always prioritizes Codex CLI when available; never edits files or spawns sub-agents. |
 
 ## 2. Rule ↔ Mechanical Enforcement Map
 

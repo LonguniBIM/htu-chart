@@ -35,8 +35,13 @@ python topstep-chart-app/harness/scripts/build_verifier.py --phase 0 --out topst
 # Kiểm tra render prompt & schema không tốn API:
 python topstep-chart-app/harness/scripts/codex_room_review.py --commit HEAD --task-id P1-01 --dry-run
 
-# Chạy thật 2 lượt độc lập (read-only) trên đúng SHA commit:
+# Chạy thật 2 lượt độc lập (read-only) trên đúng SHA commit
+# Mặc định `--backend auto`: luôn ưu tiên Codex CLI trước; chỉ fallback sang `agy` (`claude-opus-5-5-medium`) khi Codex CLI hết quota / chưa sẵn sàng:
 python topstep-chart-app/harness/scripts/codex_room_review.py --commit <SHA> --task-id P1-01 --task-packet <path> --fail-on-blocking
+
+# Ép chạy thẳng `agy` Opus 5.5 (khi biết chắc Codex CLI đang hết quota) hoặc ép chỉ dùng Codex CLI:
+python topstep-chart-app/harness/scripts/codex_room_review.py --commit <SHA> --task-id P1-01 --backend agy --fallback-model claude-opus-5-5-medium --fail-on-blocking
+python topstep-chart-app/harness/scripts/codex_room_review.py --commit <SHA> --task-id P1-01 --backend codex --fail-on-blocking
 ```
 
 ### 5. Xuất biên lai (Receipt) chốt nghiệm thu

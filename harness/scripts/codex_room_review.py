@@ -1,8 +1,12 @@
 """Independent 2-pass Codex Room Lead Review and finding consolidator.
 
-Runs two isolated read-only Codex CLI passes on an immutable commit SHA:
+Runs two isolated read-only review passes on an immutable commit SHA:
   Pass 1: Correctness, spec adherence, concurrency, and test strength.
   Pass 2: Security, Prop Firm Read-Only, F01-F08 & R01-R06 reliability.
+
+Prioritizes Codex CLI (`codex exec -s read-only`), with optional fallback to
+Antigravity CLI (`agy --mode plan --sandbox --model claude-opus-5-5-medium`)
+when Codex CLI quota is exhausted or unavailable (`--backend auto`).
 
 Enforces test-required.md §7: no stale-SHA approval, no majority-vote
 dismissal (any blocking finding from either pass keeps status OPEN).
@@ -33,6 +37,22 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 CODEX_ROOM_DIR = REPO_ROOT / "harness" / "codex-room"
 SCHEMA_PATH = CODEX_ROOM_DIR / "schemas" / "review-output.schema.json"
 PROMPTS_DIR = CODEX_ROOM_DIR / "prompts"
+
+DEFAULT_AGY_FALLBACK_MODEL = "claude-opus-5-5-medium"
+AGY_INLINE_PROMPT_CHAR_LIMIT = 16000
+CODEX_QUOTA_ERROR_MARKERS = (
+    "usage_limit_reached",
+    "insufficient_quota",
+    "rate_limit_exceeded",
+    "rate_limit",
+    "quota",
+    "too many requests",
+    "429",
+    "usage limit",
+    "billing",
+    "credit balance",
+    "exceeded your current quota",
+)
 
 SEVERITY_RANK = {
     "critical": 4,
@@ -83,6 +103,96 @@ def resolve_codex_command() -> list[str]:
     if ps1:
         return ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", ps1]
     raise FileNotFoundError("Codex CLI (`codex`) not found on PATH.")
+
+
+def resolve_agy_command() -> list[str]:
+    """Resolve Antigravity CLI (`agy`) executable safely across Windows and POSIX."""
+    for candidate in ("agy.exe", "agy.cmd", "agy"):
+        found = shutil.which(candidate)
+        if found:
+            return [found]
+    raise FileNotFoundError("Antigravity CLI (`agy`) not found on PATH.")
+
+
+def _detect_codex_quota_error(out_dir: Path, pass_names: tuple[str, ...] = ("pass1", "pass2")) -> str | None:
+    """Inspect Codex pass logs for quota exhaustion or rate-limit errors."""
+    for pass_name in pass_names:
+        for suffix in (".stderr.log", ".raw.jsonl"):
+            log_path = out_dir / f"{pass_name}{suffix}"
+            if not log_path.is_file():
+                continue
+            text = log_path.read_text(encoding="utf-8", errors="replace").lower()
+            for marker in CODEX_QUOTA_ERROR_MARKERS:
+                if marker in text:
+                    return f"codex_quota_exhausted ({pass_name}{suffix}: matched '{marker}')"
+    return None
+
+
+def _strip_json_fences(raw_text: str) -> str:
+    cleaned = raw_text.strip()
+    if cleaned.startswith("```"):
+        cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r"\s*```$", "", cleaned)
+    return cleaned.strip()
+
+
+def _extract_agy_structured_output(stdout_lines: list[str]) -> dict[str, Any] | None:
+    """Parse structured review output from `agy --output-format stream-json` or `json`."""
+    result_events: list[dict[str, Any]] = []
+    for line in stdout_lines:
+        stripped = line.strip()
+        if not stripped:
+            continue
+        try:
+            event = json.loads(stripped)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(event, dict) and event.get("event") == "result":
+            result_events.append(event)
+
+    if result_events:
+        last_result = result_events[-1].get("result")
+        if not isinstance(last_result, dict):
+            return None
+        status = str(last_result.get("status", "")).upper()
+        if status and status != "SUCCESS":
+            return None
+        structured = last_result.get("structured_output")
+        if isinstance(structured, dict):
+            return structured
+        response_text = last_result.get("response")
+        if isinstance(response_text, str) and response_text.strip():
+            try:
+                parsed = json.loads(_strip_json_fences(response_text))
+                if isinstance(parsed, dict):
+                    return parsed
+            except json.JSONDecodeError:
+                return None
+        return None
+
+    full_text = "".join(stdout_lines).strip()
+    if not full_text:
+        return None
+    try:
+        parsed_full = json.loads(_strip_json_fences(full_text))
+    except json.JSONDecodeError:
+        return None
+    if isinstance(parsed_full, dict):
+        if isinstance(parsed_full.get("structured_output"), dict):
+            return parsed_full["structured_output"]
+        if "revision_sha" in parsed_full and "lens" in parsed_full:
+            return parsed_full
+    return None
+
+
+def _archive_failed_codex_logs(out_dir: Path, pass_names: tuple[str, ...] = ("pass1", "pass2")) -> None:
+    """Preserve failed Codex pass logs before running fallback backend."""
+    for pass_name in pass_names:
+        for suffix in (".json", ".raw.jsonl", ".stderr.log"):
+            src = out_dir / f"{pass_name}{suffix}"
+            if src.is_file():
+                dst = out_dir / f"{pass_name}.codex-failed{suffix}"
+                src.replace(dst)
 
 
 def _git_output(repo_root: Path, args: list[str]) -> subprocess.CompletedProcess[str]:
@@ -300,11 +410,19 @@ def _dedup_ordered(items: list[str]) -> list[str]:
 
 def render_consolidated_markdown(report: dict[str, Any]) -> str:
     """Format consolidated Codex Room review as readable markdown."""
+    backend = report.get("review_backend", "codex")
+    model = report.get("review_model")
+    backend_label = f"`{backend}`" + (f" (`{model}`)" if model else "")
+    if report.get("fallback_used"):
+        reason = report.get("fallback_reason") or "codex_unavailable"
+        backend_label += f" — fallback ({reason})"
+
     lines = [
         f"# Consolidated Codex Room Review — `{report['revision_sha'][:12]}`",
         "",
         f"- **Gate Status**: `{report['review_gate_status']}`",
         f"- **Revision SHA**: `{report['revision_sha']}`",
+        f"- **Review Backend**: {backend_label}",
         f"- **Passes Completed**: `{report['passes_completed']}` (independent contexts: `{report['independent_contexts']}`)",
         f"- **Blocking Open Findings**: `{report['blocking_open_count']}`",
         f"- **Advisory Findings**: `{report['advisory_count']}`",
@@ -377,6 +495,112 @@ def _terminate_process_tree(proc: subprocess.Popen[str]) -> None:
         pass
 
 
+def _run_subprocess_with_watchdog(
+    cmd: list[str],
+    *,
+    pass_name: str,
+    timeout_sec: float,
+    idle_timeout_sec: float,
+    stdin_text: str | None = None,
+    env: dict[str, str] | None = None,
+    cwd: Path | None = None,
+) -> tuple[int, list[str], list[str], str | None]:
+    """Run a review subprocess with activity-based idle timeout and hard ceiling."""
+    proc = subprocess.Popen(
+        cmd,
+        stdin=subprocess.PIPE if stdin_text is not None else subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        bufsize=1,
+        env=env,
+        cwd=str(cwd) if cwd else None,
+    )
+
+    stdout_lines: list[str] = []
+    stderr_lines: list[str] = []
+    activity_lock = threading.Lock()
+    started_at = time.monotonic()
+    last_activity = started_at
+
+    def _touch_activity() -> None:
+        nonlocal last_activity
+        with activity_lock:
+            last_activity = time.monotonic()
+
+    def _write_stdin() -> None:
+        if proc.stdin is None or stdin_text is None:
+            return
+        try:
+            proc.stdin.write(stdin_text)
+            proc.stdin.flush()
+        except OSError:
+            pass
+        finally:
+            try:
+                proc.stdin.close()
+            except OSError:
+                pass
+
+    def _pump_stream(stream: Any, bucket: list[str]) -> None:
+        if stream is None:
+            return
+        try:
+            for line in iter(stream.readline, ""):
+                bucket.append(line)
+                _touch_activity()
+        except OSError:
+            pass
+        finally:
+            try:
+                stream.close()
+            except OSError:
+                pass
+
+    writer_thread = threading.Thread(target=_write_stdin, daemon=True) if stdin_text is not None else None
+    stdout_thread = threading.Thread(target=_pump_stream, args=(proc.stdout, stdout_lines), daemon=True)
+    stderr_thread = threading.Thread(target=_pump_stream, args=(proc.stderr, stderr_lines), daemon=True)
+    if writer_thread is not None:
+        writer_thread.start()
+    stdout_thread.start()
+    stderr_thread.start()
+
+    termination_reason: str | None = None
+    while proc.poll() is None:
+        now = time.monotonic()
+        with activity_lock:
+            idle_elapsed = now - last_activity
+        total_elapsed = now - started_at
+
+        if idle_timeout_sec > 0 and idle_elapsed >= idle_timeout_sec:
+            termination_reason = (
+                f"[codex_room_review] pass={pass_name} terminated: "
+                f"idle_timeout={idle_timeout_sec:.1f}s (total={total_elapsed:.1f}s)\n"
+            )
+            _terminate_process_tree(proc)
+            break
+        if timeout_sec > 0 and total_elapsed >= timeout_sec:
+            termination_reason = (
+                f"[codex_room_review] pass={pass_name} terminated: "
+                f"total_timeout={timeout_sec:.1f}s (idle={idle_elapsed:.1f}s)\n"
+            )
+            _terminate_process_tree(proc)
+            break
+        time.sleep(0.05)
+
+    if writer_thread is not None:
+        writer_thread.join(timeout=2.0)
+    stdout_thread.join(timeout=2.0)
+    stderr_thread.join(timeout=2.0)
+
+    if termination_reason:
+        stderr_lines.append(termination_reason)
+
+    return proc.returncode if proc.returncode is not None else 1, stdout_lines, stderr_lines, termination_reason
+
+
 def _run_codex_pass(
     codex_prefix: list[str],
     role: str,
@@ -415,104 +639,111 @@ def _run_codex_pass(
     env = dict(os.environ)
     env["CODEX_HOME"] = str(runtime_dir)
 
-    proc = subprocess.Popen(
+    rc, stdout_lines, stderr_lines, termination_reason = _run_subprocess_with_watchdog(
         cmd,
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        bufsize=1,
+        pass_name=pass_name,
+        timeout_sec=timeout_sec,
+        idle_timeout_sec=idle_timeout_sec,
+        stdin_text=prompt_text,
         env=env,
     )
-
-    stdout_lines: list[str] = []
-    stderr_lines: list[str] = []
-    activity_lock = threading.Lock()
-    started_at = time.monotonic()
-    last_activity = started_at
-
-    def _touch_activity() -> None:
-        nonlocal last_activity
-        with activity_lock:
-            last_activity = time.monotonic()
-
-    def _write_stdin() -> None:
-        if proc.stdin is None:
-            return
-        try:
-            proc.stdin.write(prompt_text)
-            proc.stdin.flush()
-        except OSError:
-            pass
-        finally:
-            try:
-                proc.stdin.close()
-            except OSError:
-                pass
-
-    def _pump_stream(stream: Any, bucket: list[str]) -> None:
-        if stream is None:
-            return
-        try:
-            for line in iter(stream.readline, ""):
-                bucket.append(line)
-                _touch_activity()
-        except OSError:
-            pass
-        finally:
-            try:
-                stream.close()
-            except OSError:
-                pass
-
-    writer_thread = threading.Thread(target=_write_stdin, daemon=True)
-    stdout_thread = threading.Thread(target=_pump_stream, args=(proc.stdout, stdout_lines), daemon=True)
-    stderr_thread = threading.Thread(target=_pump_stream, args=(proc.stderr, stderr_lines), daemon=True)
-    writer_thread.start()
-    stdout_thread.start()
-    stderr_thread.start()
-
-    termination_reason: str | None = None
-    while proc.poll() is None:
-        now = time.monotonic()
-        with activity_lock:
-            idle_elapsed = now - last_activity
-        total_elapsed = now - started_at
-
-        if idle_timeout_sec > 0 and idle_elapsed >= idle_timeout_sec:
-            termination_reason = (
-                f"[codex_room_review] pass={pass_name} terminated: "
-                f"idle_timeout={idle_timeout_sec:.1f}s (total={total_elapsed:.1f}s)\n"
-            )
-            _terminate_process_tree(proc)
-            break
-        if timeout_sec > 0 and total_elapsed >= timeout_sec:
-            termination_reason = (
-                f"[codex_room_review] pass={pass_name} terminated: "
-                f"total_timeout={timeout_sec:.1f}s (idle={idle_elapsed:.1f}s)\n"
-            )
-            _terminate_process_tree(proc)
-            break
-        time.sleep(0.05)
-
-    writer_thread.join(timeout=2.0)
-    stdout_thread.join(timeout=2.0)
-    stderr_thread.join(timeout=2.0)
-
-    if termination_reason:
-        stderr_lines.append(termination_reason)
 
     raw_jsonl.write_text("".join(stdout_lines), encoding="utf-8")
     stderr_log.write_text("".join(stderr_lines), encoding="utf-8")
 
-    if termination_reason is not None or proc.returncode != 0 or not pass_json.is_file():
+    if termination_reason is not None or rc != 0 or not pass_json.is_file():
         return None
     try:
         return json.loads(pass_json.read_text(encoding="utf-8"))
     except json.JSONDecodeError:
         return None
+
+
+def _build_agy_cli_prompt(prompt_text: str, prompt_file: Path) -> str:
+    """Build a strictly read-only CLI prompt for `agy -p`, avoiding Windows argv limits."""
+    readonly_prefix = (
+        "STRICT READ-ONLY INDEPENDENT REVIEW PASS. "
+        "Do NOT create, edit, delete, or modify any files, do NOT spawn subagents, "
+        "and do NOT run mutating shell commands. "
+        "Use read-only file/git inspection only, and return ONLY valid JSON matching the provided schema.\n\n"
+    )
+    if len(prompt_text) <= AGY_INLINE_PROMPT_CHAR_LIMIT:
+        return readonly_prefix + prompt_text
+    return (
+        readonly_prefix
+        + f"Read and execute the complete review instructions from `{prompt_file}` using read-only tools, "
+        + "then return ONLY the final JSON object matching the provided schema."
+    )
+
+
+def _run_agy_pass(
+    agy_prefix: list[str],
+    role: str,
+    repo_root: Path,
+    schema_path: Path,
+    prompt_text: str,
+    prompt_file: Path,
+    out_dir: Path,
+    pass_name: str,
+    model: str,
+    timeout_sec: float,
+    idle_timeout_sec: float = 180.0,
+) -> dict[str, Any] | None:
+    """Run one isolated read-only review pass via Antigravity CLI (`agy`)."""
+    pass_json = out_dir / f"{pass_name}.json"
+    raw_jsonl = out_dir / f"{pass_name}.raw.jsonl"
+    stderr_log = out_dir / f"{pass_name}.stderr.log"
+
+    cli_prompt = _build_agy_cli_prompt(prompt_text, prompt_file)
+    cmd = [
+        *agy_prefix,
+        "--sandbox",
+        "--mode",
+        "plan",
+        "--model",
+        model,
+        "--output-format",
+        "stream-json",
+        "--json-schema",
+        str(schema_path),
+        "-p",
+        cli_prompt,
+    ]
+
+    rc, stdout_lines, stderr_lines, termination_reason = _run_subprocess_with_watchdog(
+        cmd,
+        pass_name=f"{pass_name}:agy",
+        timeout_sec=timeout_sec,
+        idle_timeout_sec=idle_timeout_sec,
+        stdin_text=None,
+        cwd=repo_root,
+    )
+
+    raw_jsonl.write_text("".join(stdout_lines), encoding="utf-8")
+    stderr_log.write_text("".join(stderr_lines), encoding="utf-8")
+
+    if termination_reason is not None or rc != 0:
+        return None
+    parsed = _extract_agy_structured_output(stdout_lines)
+    if not isinstance(parsed, dict):
+        return None
+    pass_json.write_text(json.dumps(parsed, indent=2) + "\n", encoding="utf-8")
+    return parsed
+
+
+def _execute_two_passes(
+    runner: Any,
+    pass1_kwargs: dict[str, Any],
+    pass2_kwargs: dict[str, Any],
+    *,
+    sequential: bool,
+) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+    if sequential:
+        return runner(**pass1_kwargs), runner(**pass2_kwargs)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+        fut1 = pool.submit(runner, **pass1_kwargs)
+        fut2 = pool.submit(runner, **pass2_kwargs)
+        return fut1.result(), fut2.result()
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -524,7 +755,22 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--repo-root", type=Path, default=REPO_ROOT)
     parser.add_argument("--out-dir", type=Path, default=None)
     parser.add_argument("--runtime-root", type=Path, default=Path.home() / ".codex-runtime")
-    parser.add_argument("--model", type=str, default=None)
+    parser.add_argument("--model", type=str, default=None, help="Optional explicit model override for active backend.")
+    parser.add_argument(
+        "--backend",
+        choices=("auto", "codex", "agy"),
+        default="auto",
+        help=(
+            "Review backend: 'auto' (default — prioritize Codex CLI, fallback to agy Opus 5.5 on "
+            "quota exhaustion or unavailability), 'codex' (Codex CLI only), or 'agy' (Antigravity CLI directly)."
+        ),
+    )
+    parser.add_argument(
+        "--fallback-model",
+        type=str,
+        default=DEFAULT_AGY_FALLBACK_MODEL,
+        help=f"Antigravity CLI model used for fallback or --backend agy. Default: {DEFAULT_AGY_FALLBACK_MODEL}.",
+    )
     parser.add_argument(
         "--timeout",
         type=float,
@@ -589,16 +835,26 @@ def main(argv: list[str] | None = None) -> int:
     )
     prompt1 = render_prompt(PROMPTS_DIR / "pass1-correctness.md", info, task_text)
     prompt2 = render_prompt(PROMPTS_DIR / "pass2-security.md", info, task_text)
+    prompt1_path = out_dir / "pass1.prompt.md"
+    prompt2_path = out_dir / "pass2.prompt.md"
+    prompt1_path.write_text(prompt1, encoding="utf-8")
+    prompt2_path.write_text(prompt2, encoding="utf-8")
 
     if args.dry_run:
-        (out_dir / "pass1.prompt.md").write_text(prompt1, encoding="utf-8")
-        (out_dir / "pass2.prompt.md").write_text(prompt2, encoding="utf-8")
+        try:
+            resolve_agy_command()
+            agy_available = True
+        except FileNotFoundError:
+            agy_available = False
         meta = {
             "dry_run": True,
             "candidate_sha": candidate_sha,
             "base_sha": info["base_sha"],
             "worktree_dirty": info["worktree_dirty"],
             "schema_valid": True,
+            "backend": args.backend,
+            "fallback_model": args.fallback_model,
+            "agy_available": agy_available,
             "out_dir": str(out_dir),
             "runtime_pass1": str(args.runtime_root / "topstep-review-pass1"),
             "runtime_pass2": str(args.runtime_root / "topstep-review-pass2"),
@@ -606,65 +862,155 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(meta, indent=2))
         return 0
 
-    v1 = verify_role("pass1", args.runtime_root)
-    v2 = verify_role("pass2", args.runtime_root)
-    if not (v1["ok"] and v2["ok"]):
-        print(
-            "[codex_room_review] Codex Room runtimes not ready. Run codex_room_sync.py --role all first.\n"
-            f"  pass1: {v1['errors']}\n  pass2: {v2['errors']}",
-            file=sys.stderr,
+    p1_data: dict[str, Any] | None = None
+    p2_data: dict[str, Any] | None = None
+    active_backend = "codex"
+    active_model: str | None = args.model
+    fallback_used = False
+    fallback_reason: str | None = None
+    readonly_violation: str | None = None
+
+    def _run_agy_review_pair(agy_model: str) -> tuple[dict[str, Any] | None, dict[str, Any] | None, str | None]:
+        agy_prefix = resolve_agy_command()
+        before_status = _git_output(repo_root, ["status", "--porcelain"]).stdout
+        p1_kw = dict(
+            agy_prefix=agy_prefix,
+            role="pass1",
+            repo_root=repo_root,
+            schema_path=SCHEMA_PATH,
+            prompt_text=prompt1,
+            prompt_file=prompt1_path,
+            out_dir=out_dir,
+            pass_name="pass1",
+            model=agy_model,
+            timeout_sec=args.timeout,
+            idle_timeout_sec=args.idle_timeout,
         )
-        return 2
+        p2_kw = dict(
+            agy_prefix=agy_prefix,
+            role="pass2",
+            repo_root=repo_root,
+            schema_path=SCHEMA_PATH,
+            prompt_text=prompt2,
+            prompt_file=prompt2_path,
+            out_dir=out_dir,
+            pass_name="pass2",
+            model=agy_model,
+            timeout_sec=args.timeout,
+            idle_timeout_sec=args.idle_timeout,
+        )
+        res1, res2 = _execute_two_passes(_run_agy_pass, p1_kw, p2_kw, sequential=args.sequential)
+        after_status = _git_output(repo_root, ["status", "--porcelain"]).stdout
+        violation = (
+            "Read-only violation: git worktree changed during agy review pass."
+            if after_status != before_status
+            else None
+        )
+        return res1, res2, violation
 
-    codex_prefix = resolve_codex_command()
-    (out_dir / "pass1.prompt.md").write_text(prompt1, encoding="utf-8")
-    (out_dir / "pass2.prompt.md").write_text(prompt2, encoding="utf-8")
-
-    pass1_kwargs = dict(
-        codex_prefix=codex_prefix,
-        role="pass1",
-        runtime_dir=args.runtime_root / "topstep-review-pass1",
-        repo_root=repo_root,
-        schema_path=SCHEMA_PATH,
-        prompt_text=prompt1,
-        out_dir=out_dir,
-        pass_name="pass1",
-        model=args.model,
-        timeout_sec=args.timeout,
-        idle_timeout_sec=args.idle_timeout,
-    )
-    pass2_kwargs = dict(
-        codex_prefix=codex_prefix,
-        role="pass2",
-        runtime_dir=args.runtime_root / "topstep-review-pass2",
-        repo_root=repo_root,
-        schema_path=SCHEMA_PATH,
-        prompt_text=prompt2,
-        out_dir=out_dir,
-        pass_name="pass2",
-        model=args.model,
-        timeout_sec=args.timeout,
-        idle_timeout_sec=args.idle_timeout,
-    )
-
-    if args.sequential:
-        p1_data = _run_codex_pass(**pass1_kwargs)
-        p2_data = _run_codex_pass(**pass2_kwargs)
+    if args.backend == "agy":
+        active_backend = "agy"
+        active_model = args.model or args.fallback_model
+        try:
+            p1_data, p2_data, readonly_violation = _run_agy_review_pair(active_model)
+        except FileNotFoundError as exc:
+            print(f"[codex_room_review] {exc}", file=sys.stderr)
+            return 2
     else:
-        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
-            fut1 = pool.submit(_run_codex_pass, **pass1_kwargs)
-            fut2 = pool.submit(_run_codex_pass, **pass2_kwargs)
-            p1_data = fut1.result()
-            p2_data = fut2.result()
+        v1 = verify_role("pass1", args.runtime_root)
+        v2 = verify_role("pass2", args.runtime_root)
+        codex_prefix: list[str] | None = None
+        codex_precheck_reason: str | None = None
+
+        if not (v1["ok"] and v2["ok"]):
+            codex_precheck_reason = "codex_runtime_not_ready"
+        else:
+            try:
+                codex_prefix = resolve_codex_command()
+            except FileNotFoundError:
+                codex_precheck_reason = "codex_cli_not_found"
+
+        if codex_precheck_reason is not None:
+            if args.backend == "codex":
+                if codex_precheck_reason == "codex_runtime_not_ready":
+                    print(
+                        "[codex_room_review] Codex Room runtimes not ready. Run codex_room_sync.py --role all first.\n"
+                        f"  pass1: {v1['errors']}\n  pass2: {v2['errors']}",
+                        file=sys.stderr,
+                    )
+                else:
+                    print("[codex_room_review] Codex CLI (`codex`) not found on PATH.", file=sys.stderr)
+                return 2
+            fallback_reason = codex_precheck_reason
+        else:
+            assert codex_prefix is not None
+            pass1_kwargs = dict(
+                codex_prefix=codex_prefix,
+                role="pass1",
+                runtime_dir=args.runtime_root / "topstep-review-pass1",
+                repo_root=repo_root,
+                schema_path=SCHEMA_PATH,
+                prompt_text=prompt1,
+                out_dir=out_dir,
+                pass_name="pass1",
+                model=args.model,
+                timeout_sec=args.timeout,
+                idle_timeout_sec=args.idle_timeout,
+            )
+            pass2_kwargs = dict(
+                codex_prefix=codex_prefix,
+                role="pass2",
+                runtime_dir=args.runtime_root / "topstep-review-pass2",
+                repo_root=repo_root,
+                schema_path=SCHEMA_PATH,
+                prompt_text=prompt2,
+                out_dir=out_dir,
+                pass_name="pass2",
+                model=args.model,
+                timeout_sec=args.timeout,
+                idle_timeout_sec=args.idle_timeout,
+            )
+            p1_data, p2_data = _execute_two_passes(
+                _run_codex_pass, pass1_kwargs, pass2_kwargs, sequential=args.sequential
+            )
+
+            if args.backend == "auto" and (p1_data is None or p2_data is None):
+                quota_reason = _detect_codex_quota_error(out_dir)
+                if quota_reason:
+                    fallback_reason = quota_reason
+                    _archive_failed_codex_logs(out_dir)
+
+        if fallback_reason is not None and args.backend == "auto":
+            print(
+                f"[codex_room_review] Codex CLI unavailable ({fallback_reason}); "
+                f"falling back to agy ({args.fallback_model}).",
+                file=sys.stderr,
+            )
+            try:
+                active_backend = "agy"
+                active_model = args.fallback_model
+                fallback_used = True
+                p1_data, p2_data, readonly_violation = _run_agy_review_pair(active_model)
+            except FileNotFoundError as exc:
+                print(f"[codex_room_review] Fallback failed: {exc}", file=sys.stderr)
+                return 2
 
     report = consolidate_reviews(p1_data, p2_data, expected_sha=candidate_sha)
+    if readonly_violation:
+        report["errors"].append(readonly_violation)
+        report["review_gate_status"] = "BLOCKED"
     report["worktree_dirty_at_review"] = info["worktree_dirty"]
+    report["review_backend"] = active_backend
+    report["review_model"] = active_model
+    report["fallback_used"] = fallback_used
+    report["fallback_reason"] = fallback_reason
     (out_dir / "consolidated-review.json").write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
     (out_dir / "consolidated-review.md").write_text(render_consolidated_markdown(report), encoding="utf-8")
 
     print(
-        f"[codex_room_review] sha={candidate_sha[:12]} status={report['review_gate_status']} "
-        f"blocking_open={report['blocking_open_count']} out={out_dir}"
+        f"[codex_room_review] sha={candidate_sha[:12]} backend={active_backend} "
+        f"model={active_model or 'default'} fallback={fallback_used} "
+        f"status={report['review_gate_status']} blocking_open={report['blocking_open_count']} out={out_dir}"
     )
     if report["review_gate_status"] == "BLOCKED":
         return 2

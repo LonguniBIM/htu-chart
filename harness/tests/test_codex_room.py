@@ -8,8 +8,15 @@ import sys
 import tomllib
 from pathlib import Path
 
+import pytest
+
+from harness.scripts import codex_room_review
 from harness.scripts.codex_room_review import (
+    DEFAULT_AGY_FALLBACK_MODEL,
     _build_parser,
+    _detect_codex_quota_error,
+    _extract_agy_structured_output,
+    _run_agy_pass,
     _run_codex_pass,
     consolidate_reviews,
     validate_strict_json_schema,
@@ -303,3 +310,191 @@ def test_codex_room_review_parser_defaults_enable_parallel_and_idle_watchdog() -
     assert args.timeout == 1200.0
     assert args.idle_timeout == 180.0
     assert args.sequential is False
+    assert args.backend == "auto"
+    assert args.fallback_model == DEFAULT_AGY_FALLBACK_MODEL
+
+
+def test_extract_agy_structured_output_parses_stream_json_and_rejects_failed_status() -> None:
+    sha = "e" * 40
+    payload = _sample_pass(sha, "correctness_and_tests")
+    stream_lines = [
+        json.dumps({"event": "init", "init": {"model": DEFAULT_AGY_FALLBACK_MODEL}}) + "\n",
+        json.dumps(
+            {
+                "event": "result",
+                "result": {
+                    "status": "SUCCESS",
+                    "structured_output": payload,
+                    "response": json.dumps(payload),
+                },
+            }
+        )
+        + "\n",
+    ]
+    assert _extract_agy_structured_output(stream_lines) == payload
+
+    fenced_lines = [
+        json.dumps(
+            {
+                "event": "result",
+                "result": {
+                    "status": "SUCCESS",
+                    "response": f"```json\n{json.dumps(payload)}\n```",
+                },
+            }
+        )
+        + "\n",
+    ]
+    assert _extract_agy_structured_output(fenced_lines) == payload
+
+    failed_lines = [
+        json.dumps({"event": "result", "result": {"status": "ERROR", "structured_output": payload}}) + "\n",
+    ]
+    assert _extract_agy_structured_output(failed_lines) is None
+
+
+def test_run_agy_pass_passes_readonly_flags_and_writes_schema_json(tmp_path: Path) -> None:
+    out_dir = tmp_path / "run"
+    out_dir.mkdir()
+    prompt_file = out_dir / "pass1.prompt.md"
+    prompt_file.write_text("review prompt", encoding="utf-8")
+    args_capture = tmp_path / "captured_args.json"
+    sha = "f" * 40
+    script = tmp_path / "fake_agy.py"
+    prefix = _write_fake_codex_script(
+        script,
+        (
+            "import json, sys\n"
+            f"with open({str(args_capture)!r}, 'w', encoding='utf-8') as fh:\n"
+            "    json.dump(sys.argv[1:], fh)\n"
+            f"payload = {{'revision_sha': {sha!r}, 'lens': 'correctness_and_tests', 'verdict': 'APPROVE', "
+            "'summary': 'ok', 'findings': [], 'test_quality_issues': [], 'unverified_areas': []}\n"
+            "print(json.dumps({'event': 'init', 'init': {'model': 'claude-opus-5-5-medium'}}), flush=True)\n"
+            "print(json.dumps({'event': 'result', 'result': {'status': 'SUCCESS', 'structured_output': payload}}), flush=True)\n"
+        ),
+    )
+
+    result = _run_agy_pass(
+        agy_prefix=prefix,
+        role="pass1",
+        repo_root=REPO_ROOT,
+        schema_path=SCHEMA_PATH,
+        prompt_text="review prompt",
+        prompt_file=prompt_file,
+        out_dir=out_dir,
+        pass_name="pass1",
+        model="claude-opus-5-5-medium",
+        timeout_sec=10.0,
+        idle_timeout_sec=5.0,
+    )
+    assert result is not None
+    assert result["revision_sha"] == sha
+    assert json.loads((out_dir / "pass1.json").read_text(encoding="utf-8")) == result
+    captured = json.loads(args_capture.read_text(encoding="utf-8"))
+    assert "--sandbox" in captured
+    assert "--mode" in captured and captured[captured.index("--mode") + 1] == "plan"
+    assert "--model" in captured and captured[captured.index("--model") + 1] == "claude-opus-5-5-medium"
+    assert "--output-format" in captured and captured[captured.index("--output-format") + 1] == "stream-json"
+    assert "--json-schema" in captured
+
+
+def test_auto_backend_prioritizes_codex_and_falls_back_to_agy_on_quota_exhaustion(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    head_sha = codex_room_review.resolve_commit_info(REPO_ROOT, "HEAD", None)["candidate_sha"]
+    agy_called = tmp_path / "agy_called.flag"
+
+    codex_ok_script = tmp_path / "fake_codex_ok.py"
+    codex_ok_prefix = _write_fake_codex_script(
+        codex_ok_script,
+        (
+            "import json, sys\n"
+            "args = sys.argv[1:]\n"
+            "out_path = args[args.index('-o') + 1]\n"
+            "prompt = sys.stdin.read()\n"
+            "lens = 'security_and_invariants' if 'security_and_invariants' in prompt else 'correctness_and_tests'\n"
+            f"payload = {{'revision_sha': {head_sha!r}, 'lens': lens, 'verdict': 'APPROVE', "
+            "'summary': 'codex ok', 'findings': [], 'test_quality_issues': [], 'unverified_areas': []}\n"
+            "with open(out_path, 'w', encoding='utf-8') as fh:\n"
+            "    json.dump(payload, fh)\n"
+        ),
+    )
+
+    codex_quota_script = tmp_path / "fake_codex_quota.py"
+    codex_quota_prefix = _write_fake_codex_script(
+        codex_quota_script,
+        (
+            "import sys\n"
+            "_ = sys.stdin.read()\n"
+            "sys.stderr.write('Error: usage_limit_reached - Codex CLI quota exhausted\\n')\n"
+            "sys.exit(1)\n"
+        ),
+    )
+
+    codex_crash_script = tmp_path / "fake_codex_crash.py"
+    codex_crash_prefix = _write_fake_codex_script(
+        codex_crash_script,
+        (
+            "import sys\n"
+            "_ = sys.stdin.read()\n"
+            "sys.stderr.write('Error: unexpected internal parser failure\\n')\n"
+            "sys.exit(1)\n"
+        ),
+    )
+
+    agy_ok_script = tmp_path / "fake_agy_ok.py"
+    agy_ok_prefix = _write_fake_codex_script(
+        agy_ok_script,
+        (
+            "import json, pathlib, sys\n"
+            f"pathlib.Path({str(agy_called)!r}).write_text('called', encoding='utf-8')\n"
+            "args = sys.argv[1:]\n"
+            "prompt = args[args.index('-p') + 1]\n"
+            "lens = 'security_and_invariants' if 'security_and_invariants' in prompt else 'correctness_and_tests'\n"
+            f"payload = {{'revision_sha': {head_sha!r}, 'lens': lens, 'verdict': 'APPROVE', "
+            "'summary': 'agy opus ok', 'findings': [], 'test_quality_issues': [], 'unverified_areas': []}\n"
+            "print(json.dumps({'event': 'result', 'result': {'status': 'SUCCESS', 'structured_output': payload}}), flush=True)\n"
+        ),
+    )
+
+    monkeypatch.setattr(codex_room_review, "verify_role", lambda role, root: {"ok": True, "errors": []})
+    monkeypatch.setattr(codex_room_review, "resolve_agy_command", lambda: agy_ok_prefix)
+
+    # Case A: Codex CLI healthy -> auto prioritizes Codex CLI and never calls agy.
+    monkeypatch.setattr(codex_room_review, "resolve_codex_command", lambda: codex_ok_prefix)
+    out_a = tmp_path / "out_codex_ok"
+    rc_a = codex_room_review.main(["--commit", "HEAD", "--out-dir", str(out_a), "--backend", "auto"])
+    assert rc_a == 0
+    report_a = json.loads((out_a / "consolidated-review.json").read_text(encoding="utf-8"))
+    assert report_a["review_backend"] == "codex"
+    assert report_a["fallback_used"] is False
+    assert not agy_called.exists()
+
+    # Case B: Codex CLI hits quota limit -> auto falls back to agy Opus 5.5 and archives failed Codex logs.
+    monkeypatch.setattr(codex_room_review, "resolve_codex_command", lambda: codex_quota_prefix)
+    out_b = tmp_path / "out_auto_fallback"
+    rc_b = codex_room_review.main(["--commit", "HEAD", "--out-dir", str(out_b), "--backend", "auto"])
+    assert rc_b == 0
+    assert agy_called.exists()
+    assert (out_b / "pass1.codex-failed.stderr.log").is_file()
+    report_b = json.loads((out_b / "consolidated-review.json").read_text(encoding="utf-8"))
+    assert report_b["review_gate_status"] == "PASSED"
+    assert report_b["review_backend"] == "agy"
+    assert report_b["review_model"] == DEFAULT_AGY_FALLBACK_MODEL
+    assert report_b["fallback_used"] is True
+    assert "usage_limit_reached" in str(report_b["fallback_reason"])
+
+    # Case C: --backend codex never falls back even on quota exhaustion.
+    agy_called.unlink()
+    out_c = tmp_path / "out_strict_codex"
+    rc_c = codex_room_review.main(["--commit", "HEAD", "--out-dir", str(out_c), "--backend", "codex"])
+    assert rc_c == 2
+    assert not agy_called.exists()
+    assert _detect_codex_quota_error(out_c) is not None
+
+    # Case D: --backend auto does NOT silently fall back on non-quota Codex failure.
+    monkeypatch.setattr(codex_room_review, "resolve_codex_command", lambda: codex_crash_prefix)
+    out_d = tmp_path / "out_non_quota_fail"
+    rc_d = codex_room_review.main(["--commit", "HEAD", "--out-dir", str(out_d), "--backend", "auto"])
+    assert rc_d == 2
+    assert not agy_called.exists()

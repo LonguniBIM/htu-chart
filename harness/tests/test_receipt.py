@@ -7,7 +7,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from harness.scripts.receipt import evaluate_receipt
+from harness.scripts.receipt import evaluate_receipt, render_receipt_markdown
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
@@ -214,3 +214,31 @@ def test_verified_when_all_gates_pass_and_cli_writes_markdown_table(tmp_path: Pa
         "Kết luận",
     ):
         assert required_row in md_text
+
+
+def test_receipt_records_agy_fallback_provenance_in_json_and_markdown() -> None:
+    base = "1" * 40
+    cand = "2" * 40
+    review = _review(cand)
+    review.update(
+        {
+            "review_backend": "agy",
+            "review_model": "claude-opus-5-5-medium",
+            "fallback_used": True,
+            "fallback_reason": "codex_quota_exhausted (pass1.stderr.log: matched 'usage_limit_reached')",
+        }
+    )
+    receipt = evaluate_receipt(
+        task_id="P3-01",
+        phase=3,
+        base_sha=base,
+        candidate_sha=cand,
+        verifier_data=_verifier(cand),
+        review_data=review,
+    )
+    assert receipt["conclusion"] == "VERIFIED"
+    assert receipt["review_summary"]["review_backend"] == "agy"
+    assert receipt["review_summary"]["review_model"] == "claude-opus-5-5-medium"
+    assert receipt["review_summary"]["fallback_used"] is True
+    md = render_receipt_markdown(receipt)
+    assert "agy/claude-opus-5-5-medium, fallback" in md
