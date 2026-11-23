@@ -23,6 +23,7 @@ from app.engine.instruments import StorageDatasetKey
 from app.engine.ohlcv import OHLCVBar
 from app.engine.session_calendar import first_bucket_open_at_or_after, has_open_session_in_range
 from app.main import create_app
+from app.services.history_service import HistoryBackfillService
 from app.services.live_feed_service import LiveFeedService
 from app.services.ws_broadcaster import WsBroadcaster
 from app.storage.parquet_store import ParquetStore
@@ -8762,6 +8763,246 @@ async def test_f03_restart_restores_persisted_corrupted_gap_prior_to_watermark_o
                 assert await sqlite.is_interval_complete(key_1m, t_gap, t_gap + 60) is True
             finally:
                 await svc3.stop()
+    finally:
+        sqlite.close()
+
+
+@pytest.mark.asyncio
+async def test_f03_late_trade_after_local_close_persists_corrupted_gap_across_restart(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Contract: P1-001 persists stale local bucket gaps to SQLite before restart recovery.
+
+    Defect caught: _handle_stale_local_buckets recording unhealed_gap_buckets only in RAM so
+    restarting after a failed recovery backfills only from watermark-2m and falsely goes LIVE.
+    """
+    settings = Settings(data_dir=tmp_path / "data", signalr_enabled=True)
+    sqlite = SqliteStore(tmp_path / "meta.db")
+    sqlite.initialize()
+    parquet = ParquetStore(settings.data_dir, sqlite_store=sqlite)
+
+    t0 = BASE_T  # 14:00:00
+    t_gap = t0 + 120  # 14:02:00
+    t_wm = t0 + 540  # 14:09:00
+    clock_ref = [t0 + 10]
+    rest_calls: list[tuple[int, int]] = []
+    rest_mode = ["initial"]  # "initial" -> "fail" -> "heal"
+
+    class _LateLocalRest:
+        async def retrieve_bars_paginated(self, **kw: Any) -> Any:
+            s_ts = int(kw["start_ts"])
+            e_ts = int(kw["end_ts"])
+            rest_calls.append((s_ts, e_ts))
+            if rest_mode[0] == "fail":
+                raise ConnectionError("REST down after stale local tick")
+            cutoff = clock_ref[0] - (clock_ref[0] % 60)
+            bars = [
+                {"t": ts, "o": 5950.0, "h": 5952.0, "l": 5949.0, "c": 5951.0, "v": 4.0}
+                for ts in range(s_ts - (s_ts % 60), min(e_ts, cutoff), 60)
+            ]
+            return type("R", (), {"raw_bars": bars, "truncated": False, "provider_gap": False})()
+
+    def _auth_handler(_req: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"success": True, "errorCode": 0, "token": "jwt-stale-rst"})
+
+    key_1m = StorageDatasetKey("topstepx", False, CID_MES, "1m")
+    try:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(_auth_handler)) as client:
+            auth = TopstepAuthService(settings, client)
+            await auth.login("alice", "api-key")
+
+            svc1 = LiveFeedService(
+                settings,
+                auth,
+                _LateLocalRest(),
+                parquet,
+                sqlite,
+                aggregator=BarAggregator(timeframes=("1m",)),
+                recovery_timeframes=("1m",),
+                initial_backfill_bars=1,
+                clock=lambda: clock_ref[0],
+            )
+            try:
+                await svc1.set_active_contracts([CID_MES], live_mode=False)
+                svc1._last_connected_utc = t0 - 30
+                await svc1.trigger_recovery(now_utc=clock_ref[0])
+                assert svc1.feed_state == "LIVE"
+
+                # Locally close 14:01..14:09 (watermark=14:09, NOT REST-confirmed).
+                now_mono = time.monotonic()
+                for idx in range(1, 11):
+                    ts = t0 + (idx * 60) + 10
+                    clock_ref[0] = ts
+                    svc1.handle_hub_event(
+                        SignalRTickEvent(
+                            CID_MES, False, ts, 5950.0 + idx, 1.0, "GatewayTrade", now_mono + idx
+                        )
+                    )
+                await svc1.flush_pending_tasks()
+                wm = await sqlite.get_watermark(key_1m)
+                assert wm is not None and wm.last_closed_bar_time == t_wm
+                assert await sqlite.is_interval_complete(key_1m, t_gap, t_gap + 60) is False
+
+                # REST fails, then late trade for local bar 14:02 triggers stale-bucket handling.
+                rest_mode[0] = "fail"
+                svc1._running = True
+                monkeypatch.setattr(svc1._hub, "_connected", True)
+                svc1.handle_hub_event(
+                    SignalRTickEvent(
+                        CID_MES, False, t_gap + 30, 5960.0, 2.0, "GatewayTrade", now_mono + 20.0
+                    )
+                )
+                await svc1.flush_pending_tasks()
+                assert svc1.feed_state == "DEGRADED"
+            finally:
+                svc1._running = False
+                await svc1.stop()
+
+            # Simulate restart: brand-new LiveFeedService on same SQLite, REST still fails.
+            svc2 = LiveFeedService(
+                settings,
+                auth,
+                _LateLocalRest(),
+                parquet,
+                sqlite,
+                aggregator=BarAggregator(timeframes=("1m",)),
+                recovery_timeframes=("1m",),
+                initial_backfill_bars=1,
+                clock=lambda: clock_ref[0],
+            )
+            try:
+                await svc2.set_active_contracts([CID_MES], live_mode=False)
+                svc2._last_connected_utc = t0 - 30
+                await svc2.trigger_recovery(now_utc=clock_ref[0])
+                assert rest_calls[-1][0] <= t_gap
+                assert svc2.feed_state == "DEGRADED"
+                assert svc2.live_alerts_enabled is False
+
+                # Once REST recovers, recovery heals 14:02..14:09 and transitions to LIVE.
+                rest_mode[0] = "heal"
+                await svc2.trigger_recovery(now_utc=clock_ref[0])
+                assert svc2.feed_state == "LIVE"
+                assert await sqlite.is_interval_complete(key_1m, t_gap, t_gap + 60) is True
+            finally:
+                await svc2.stop()
+    finally:
+        sqlite.close()
+
+
+@pytest.mark.asyncio
+async def test_f03_concurrent_history_backfill_5m_not_overwritten_by_paused_live_persist(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Contract: P1-002/P2-001 preserves REST COMPLETE bars against delayed live upsert/signal.
+
+    Defect caught: Delayed realtime persistence overwriting authoritative 5m REST bars written by
+    HistoryBackfillService in the same generation and emitting stale local LIVE signals.
+    """
+    settings = Settings(data_dir=tmp_path / "data", signalr_enabled=True)
+    sqlite = SqliteStore(tmp_path / "meta.db")
+    sqlite.initialize()
+    parquet = ParquetStore(settings.data_dir, sqlite_store=sqlite)
+
+    t0 = first_bucket_open_at_or_after(BASE_T, "5m")
+    clock_ref = [t0 + 10]
+    signals: list[tuple[str, int, str | None]] = []
+    wm_1m_entered = asyncio.Event()
+    release_wm_1m = asyncio.Event()
+    hold_1m_wm = [False]
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/Auth/loginKey":
+            return httpx.Response(200, json={"success": True, "token": "jwt-rest-auth"})
+        if request.url.path == "/api/History/retrieveBars":
+            payload = json.loads(request.content.decode("utf-8"))
+            unit = int(payload["unit"])
+            unit_number = int(payload["unitNumber"])
+            if unit == 2 and unit_number == 5:
+                bars = [_wire_bar(t0, 5945.0, 5999.0, 5940.0, 5988.0, 77.0)]
+            else:
+                bars = _bars_for_history_payload(payload)
+            return httpx.Response(200, json={"success": True, "bars": bars})
+        return httpx.Response(404)
+
+    orig_upsert_wm = sqlite.upsert_watermark
+
+    async def _gated_upsert_wm(key: StorageDatasetKey, bar_time: int) -> Any:
+        res = await orig_upsert_wm(key, bar_time)
+        if hold_1m_wm[0] and key.timeframe == "1m" and not wm_1m_entered.is_set():
+            wm_1m_entered.set()
+            await asyncio.wait_for(release_wm_1m.wait(), timeout=2.0)
+        return res
+
+    monkeypatch.setattr(sqlite, "upsert_watermark", _gated_upsert_wm)
+
+    try:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            auth = TopstepAuthService(settings, client)
+            await auth.login("alice", "api-key")
+            rest = TopstepRestClient(settings, auth, client)
+            history_svc = HistoryBackfillService(settings, rest, parquet, sqlite)
+            agg = BarAggregator(timeframes=("1m", "5m"))
+            svc = LiveFeedService(
+                settings,
+                auth,
+                rest,
+                parquet,
+                sqlite,
+                aggregator=agg,
+                recovery_timeframes=("1m", "5m"),
+                initial_backfill_bars=1,
+                on_bar_signal=lambda evt, tag: signals.append((evt.timeframe, evt.bar.time, tag)),
+                clock=lambda: clock_ref[0],
+            )
+            try:
+                await svc.set_active_contracts([CID_MES], live_mode=False)
+                svc._last_connected_utc = t0 - 30
+                await svc.trigger_recovery(now_utc=clock_ref[0])
+                assert svc.feed_state == "LIVE"
+                signals.clear()
+
+                # Open 5m bar t0 with local ticks, then cross t0+300 while pausing at 1m wm write.
+                svc.handle_hub_event(
+                    SignalRTickEvent(CID_MES, False, t0 + 250, 5952.0, 2.0, "GatewayTrade", 1.0)
+                )
+                await svc.flush_pending_tasks()
+
+                hold_1m_wm[0] = True
+                clock_ref[0] = t0 + 305
+                svc.handle_hub_event(
+                    SignalRTickEvent(CID_MES, False, t0 + 305, 5955.0, 1.0, "GatewayTrade", 2.0)
+                )
+                await asyncio.wait_for(wm_1m_entered.wait(), timeout=2.0)
+
+                # Concurrent HistoryBackfillService writes REST 5m bar (high=5999, vol=77).
+                hist_res = await history_svc.sync_and_read_bars(
+                    contract_id=CID_MES,
+                    live=False,
+                    timeframe="5m",
+                    start_ts=t0,
+                    end_ts=t0 + 299,
+                    now_utc=clock_ref[0],
+                )
+                assert hist_res.is_complete is True
+                assert hist_res.bars == [
+                    OHLCVBar(t0, 5945.0, 5999.0, 5940.0, 5988.0, 77.0, is_closed=True)
+                ]
+
+                # Release paused live persistence task and verify REST 5m bar & signals stay clean.
+                release_wm_1m.set()
+                await svc.flush_pending_tasks()
+
+                key_5m = StorageDatasetKey("topstepx", False, CID_MES, "5m")
+                persisted_5m = await parquet.read_bars(key_5m, start_ts=t0, end_ts=t0)
+                assert persisted_5m == [
+                    OHLCVBar(t0, 5945.0, 5999.0, 5940.0, 5988.0, 77.0, is_closed=True)
+                ]
+                assert not any(tf == "5m" and bt == t0 and tag is None for tf, bt, tag in signals)
+            finally:
+                release_wm_1m.set()
+                await svc.stop()
     finally:
         sqlite.close()
 

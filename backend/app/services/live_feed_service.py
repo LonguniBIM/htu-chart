@@ -518,9 +518,12 @@ class LiveFeedService:
         self._live_tick_tasks.clear()
 
         if self._quarantine_worker_task is not None and not self._quarantine_worker_task.done():
-            self._quarantine_worker_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await self._quarantine_worker_task
+            with contextlib.suppress(TimeoutError):
+                await asyncio.wait_for(self._quarantine_queue.join(), timeout=0.5)
+            if not self._quarantine_worker_task.done():
+                self._quarantine_worker_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await self._quarantine_worker_task
         self._quarantine_worker_task = None
         while not self._quarantine_queue.empty():
             with contextlib.suppress(asyncio.QueueEmpty):
@@ -2118,9 +2121,11 @@ class LiveFeedService:
         c_state = self._contracts.get(contract_id)
         if c_state is None:
             return
+        stale_tfs_and_ts: list[tuple[str, int]] = []
         for gap_tf, gap_ts in stale_buckets:
             if gap_tf in self._recovery_timeframes:
                 self._record_gap_bucket(c_state, gap_tf, gap_ts)
+                stale_tfs_and_ts.append((gap_tf, gap_ts))
         c_state.unresolved_gaps += 1
         c_state.last_error = "Late trade arrived after local bar close; reconciliation required"
         self._last_error = c_state.last_error
@@ -2141,6 +2146,30 @@ class LiveFeedService:
                 c_state.state = "DEGRADED"
             self._recompute_aggregate_state()
             self._broadcast_status()
+
+        queued_gen = self._generation
+        queued_heal_seq = c_state.coverage_heal_seq
+        for gap_tf, gap_ts in stale_tfs_and_ts:
+            raw_summary = self._redact(
+                f"{{'contract_id': {c_state.contract_id!r}, 'tf': {gap_tf!r}, "
+                f"'bar_time': {gap_ts}}}"
+            )
+            item = (
+                StorageDatasetKey("topstepx", c_state.live_mode, c_state.contract_id, gap_tf),
+                gap_ts,
+                gap_ts,
+                "stale_local_bucket",
+                c_state.last_error,
+                raw_summary,
+                queued_gen,
+                queued_heal_seq,
+            )
+            try:
+                self._quarantine_queue.put_nowait(item)
+            except asyncio.QueueFull:
+                self._queue_overflow_count += 1
+                c_state.unresolved_gaps += 1
+            self._ensure_quarantine_worker()
 
     def _guard_unconfirmed_historical_tick(
         self,
@@ -2398,6 +2427,17 @@ class LiveFeedService:
                     bar_evt.contract_id,
                     bar_evt.timeframe,
                 )
+                _, bar_end = bucket_bounds(
+                    bar_evt.bar.time,
+                    bar_evt.timeframe,
+                    root_symbol=bar_evt.root_symbol,
+                )
+                already_rest_confirmed = await self._sqlite.is_interval_complete(
+                    key, bar_evt.bar.time, bar_end
+                )
+                self._ensure_generation(expected_gen)
+                if already_rest_confirmed:
+                    continue
                 await self._parquet.upsert_bars(
                     key,
                     [bar_evt.bar],
