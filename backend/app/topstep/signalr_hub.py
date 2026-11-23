@@ -595,35 +595,71 @@ class SignalRMarketHub:
     def _surface_queue_overflow(self, dropped_event: SignalREvent) -> None:
         if self._event_queue is None:
             return
-        try:
-            oldest = self._event_queue.get_nowait()
-        except asyncio.QueueEmpty:
-            with contextlib.suppress(asyncio.QueueFull):
-                self._event_queue.put_nowait(dropped_event)
-            return
-        self._event_queue.task_done()
+        items: list[SignalREvent] = []
+        while True:
+            try:
+                item = self._event_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            self._event_queue.task_done()
+            items.append(item)
 
-        if isinstance(dropped_event, (SignalRDisconnectedEvent, SignalRConnectedEvent)):
-            # Lifecycle transitions supersede stale queued ticks/errors so consumers resync.
-            replacement: SignalREvent = dropped_event
-        elif isinstance(
-            oldest,
-            (SignalRDisconnectedEvent, SignalRConnectedEvent, SignalRErrorEvent),
+        overflow_err = SignalRErrorEvent(
+            message=(
+                "SignalR event_queue overflowed "
+                f"(count={self._queue_overflow_count}); resync required"
+            ),
+            occurred_monotonic=time.monotonic(),
+        )
+        if isinstance(
+            dropped_event,
+            (SignalRConnectedEvent, SignalRDisconnectedEvent, SignalRErrorEvent),
         ):
-            # Keep an already-queued lifecycle or overflow/error marker intact.
-            replacement = oldest
-        elif isinstance(dropped_event, SignalRErrorEvent):
-            replacement = dropped_event
+            tail_event: SignalREvent = dropped_event
         else:
-            replacement = SignalRErrorEvent(
-                message=(
-                    "SignalR event_queue overflowed "
-                    f"(count={self._queue_overflow_count}); resync required"
-                ),
-                occurred_monotonic=time.monotonic(),
-            )
-        with contextlib.suppress(asyncio.QueueFull):
-            self._event_queue.put_nowait(replacement)
+            tail_event = overflow_err
+
+        maxsize = self._event_queue.maxsize
+        if maxsize > 0:
+            # Evict oldest non-lifecycle item first (ticks before errors)
+            # so lifecycle events stay in strict FIFO order.
+            while len(items) >= maxsize:
+                evict_idx = next(
+                    (
+                        idx
+                        for idx, ev in enumerate(items)
+                        if not isinstance(
+                            ev,
+                            (SignalRConnectedEvent, SignalRDisconnectedEvent, SignalRErrorEvent),
+                        )
+                    ),
+                    None,
+                )
+                if evict_idx is None:
+                    evict_idx = next(
+                        (
+                            idx
+                            for idx, ev in enumerate(items)
+                            if isinstance(ev, SignalRErrorEvent)
+                        ),
+                        None,
+                    )
+                if evict_idx is None:
+                    break
+                items.pop(evict_idx)
+
+            if len(items) >= maxsize and isinstance(
+                dropped_event, (SignalRDisconnectedEvent, SignalRConnectedEvent)
+            ):
+                items.pop(0)
+            if len(items) < maxsize:
+                items.append(tail_event)
+        else:
+            items.append(tail_event)
+
+        for ev in items:
+            with contextlib.suppress(asyncio.QueueFull):
+                self._event_queue.put_nowait(ev)
 
     async def _emit(self, event: SignalREvent) -> None:
         if self._event_queue is not None:

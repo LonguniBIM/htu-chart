@@ -9974,5 +9974,78 @@ async def test_f03_expired_unconfirmed_htf_pre_open_discarded_when_1m_recovery_e
         sqlite.close()
 
 
+@pytest.mark.asyncio
+async def test_f03_signalr_queue_overflow_preserves_lifecycle_fifo_and_surfaces_error(
+    tmp_path: Path,
+) -> None:
+    """Contract: P1-001 preserves lifecycle FIFO order and surfaces overflow error on QueueFull.
+
+    Defect caught: _surface_queue_overflow popped oldest SignalRConnectedEvent and re-appended
+    it at the tail, reordering ticks before Connected and hiding the overflow error marker.
+    """
+    settings = Settings(data_dir=tmp_path / "data", signalr_enabled=True)
+    event_queue: asyncio.Queue[Any] = asyncio.Queue(maxsize=3)
+    transports: list[_MockSignalRTransport] = []
+
+    async def fake_ws_factory(_url: str, _headers: dict[str, str]) -> _MockSignalRTransport:
+        tr = _MockSignalRTransport()
+        transports.append(tr)
+        return tr
+
+    hub = SignalRMarketHub(
+        settings,
+        token_provider=lambda: asyncio.sleep(0, result="test-jwt"),
+        ws_factory=fake_ws_factory,
+        event_queue=event_queue,
+        contracts=[CID_MES],
+        reconnect_initial_delay_sec=0.5,
+        reconnect_max_delay_sec=1.0,
+    )
+    task = hub.start()
+    try:
+        for _ in range(50):
+            if transports and hub.is_connected and event_queue.qsize() >= 1:
+                break
+            await asyncio.sleep(0.01)
+        assert hub.is_connected is True
+        assert event_queue.qsize() == 1
+
+        # Fill remaining 2 slots with tick1 and tick2 without draining SignalRConnectedEvent.
+        tr0 = transports[0]
+        await tr0.push_frame(_quote_frame(CID_MES, BASE_T + 1, 5950.0, 1.0))
+        await tr0.push_frame(_quote_frame(CID_MES, BASE_T + 2, 5951.0, 2.0))
+        for _ in range(50):
+            if event_queue.full():
+                break
+            await asyncio.sleep(0.01)
+        assert event_queue.full() is True
+
+        # Emit tick3 to trigger queue overflow while [connected, tick1, tick2] are queued.
+        await tr0.push_frame(_quote_frame(CID_MES, BASE_T + 3, 5952.0, 3.0))
+        for _ in range(50):
+            if hub.queue_overflow_count >= 1:
+                break
+            await asyncio.sleep(0.01)
+        assert hub.queue_overflow_count >= 1
+
+        drained: list[Any] = []
+        while not event_queue.empty():
+            drained.append(event_queue.get_nowait())
+            event_queue.task_done()
+
+        assert len(drained) == 3
+        assert isinstance(drained[0], SignalRConnectedEvent)
+        assert any(
+            isinstance(ev, SignalRErrorEvent)
+            and "overflowed" in ev.message
+            and "resync required" in ev.message
+            for ev in drained
+        )
+        await asyncio.wait_for(event_queue.join(), timeout=0.2)
+    finally:
+        await hub.stop()
+        assert task.done()
+
+
 
 
