@@ -1528,3 +1528,114 @@ async def test_f07_httpx_logger_redacts_bot_token_after_create_app(tmp_path: Pat
     emitted = log_buf.getvalue()
     assert bot_token not in emitted
     assert "/bot***REDACTED***/sendMessage" in emitted
+
+
+async def test_f07_handle_bar_signal_wakes_worker_per_insert_and_isolates_bad_candidate(
+    tmp_path: Path,
+) -> None:
+    """Contract: Valid inserts wake sleeping worker immediately even if a sibling candidate fails.
+
+    Defect caught: A failing candidate skipping _wakeup.set() for earlier inserted rows.
+    """
+    clock = _MutableClock(1_762_783_260)
+    settings = Settings(
+        data_dir=tmp_path,
+        app_password_hash=TEST_PASSWORD_HASH,
+        telegram_bot_token="123456:tg-secret-token-abcdef",
+        telegram_chat_id="-1001234567890",
+        alert_ttl_seconds=5,
+        alert_dispatch_poll_interval_sec=60.0,
+    )
+    sent_texts: list[str] = []
+    two_delivered = asyncio.Event()
+
+    async def tg_handler(request: httpx.Request) -> httpx.Response:
+        sent_texts.append(json.loads(request.content.decode("utf-8"))["text"])
+        if len(sent_texts) >= 2:
+            two_delivered.set()
+        return httpx.Response(200, json={"ok": True})
+
+    store, up, tg, eng, svc = _build_service_stack(
+        tmp_path, settings=settings, tg_handler=tg_handler, clock=clock
+    )
+    valid_1 = _sample_candidate(strategy_id="strat_1", direction="LONG")
+    bad_whitespace = AlertCandidate(
+        strategy_id="strat_bad",
+        strategy_version="1",
+        live_mode=True,
+        contract_id=CID_MES,
+        root_symbol="MES",
+        timeframe="5m",
+        bar_time=1_762_783_200,
+        direction="INFO",
+        alert_kind="ENTRY",
+        message_text="   ",
+    )
+    valid_2 = _sample_candidate(strategy_id="strat_2", direction="SHORT")
+    eng.register_evaluator("mixed", lambda _evt: [valid_1, bad_whitespace, valid_2])
+
+    log_buf = io.StringIO()
+    handler = logging.StreamHandler(log_buf)
+    svc_logger = logging.getLogger("topstep_chart.alert_service")
+    prev_lvl = svc_logger.level
+    svc_logger.setLevel(logging.DEBUG)
+    svc_logger.addHandler(handler)
+    try:
+        # First verify synchronous wakeup + last_error recording when worker is stopped
+        eng.unregister_evaluator("mixed")
+        eng.register_evaluator("pre_check", lambda _evt: [valid_1, bad_whitespace])
+        pre_res = await svc.handle_bar_signal(
+            _closed_bar_event(bar_time=1_762_783_200),
+            tag=None,
+        )
+        assert len(pre_res) == 1 and pre_res[0].inserted is True
+        assert svc._wakeup.is_set() is True
+        assert svc.last_error is not None
+        assert "payload_text" in svc.last_error
+        await svc.process_once()
+        assert len(sent_texts) == 1
+        sent_texts.clear()
+        two_delivered.clear()
+
+        # Now start background worker with 60s poll interval and let it sleep on _wakeup.wait()
+        eng.unregister_evaluator("pre_check")
+        valid_3 = _sample_candidate(strategy_id="strat_3", bar_time=1_762_783_500, direction="LONG")
+        valid_4 = _sample_candidate(
+            strategy_id="strat_4", bar_time=1_762_783_500, direction="SHORT"
+        )
+        eng.register_evaluator("mixed", lambda _evt: [valid_3, bad_whitespace, valid_4])
+
+        await svc.start()
+        await asyncio.sleep(0.05)
+
+        results = await svc.handle_bar_signal(
+            _closed_bar_event(bar_time=1_762_783_500),
+            tag=None,
+        )
+        assert len(results) == 2
+        assert all(r.inserted for r in results)
+
+        # Awakened worker must deliver both valid alerts promptly (< 1.0s, not 60s)
+        await asyncio.wait_for(two_delivered.wait(), timeout=1.0)
+        for _ in range(50):
+            row_3 = await store.get_outbox_alert(results[0].record.id)
+            row_4 = await store.get_outbox_alert(results[1].record.id)
+            if (
+                row_3 is not None
+                and row_4 is not None
+                and row_3.status == "DELIVERED"
+                and row_4.status == "DELIVERED"
+            ):
+                break
+            await asyncio.sleep(0.02)
+
+        assert row_3 is not None and row_3.status == "DELIVERED"
+        assert row_4 is not None and row_4.status == "DELIVERED"
+        assert "payload_text must be a non-empty string" in log_buf.getvalue()
+    finally:
+        svc_logger.removeHandler(handler)
+        svc_logger.setLevel(prev_lvl)
+        await svc.stop()
+        store.close()
+        await tg.aclose()
+        await up.aclose()

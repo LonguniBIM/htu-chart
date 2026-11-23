@@ -110,24 +110,30 @@ class AlertService:
         results: list[EnqueueAlertResult] = []
         try:
             candidates = self._engine.evaluate_bar_signal(event, tag)
-            # Defense-in-depth F03 guard: never enqueue non-LIVE or recovered historical signals.
-            if tag is not None or event.is_recovered_historical:
-                return []
-            any_inserted = False
-            for candidate in candidates:
-                res = await self.enqueue_candidate(candidate)
-                results.append(res)
-                if res.inserted:
-                    any_inserted = True
-            if any_inserted:
-                self._wakeup.set()
-            return results
         except asyncio.CancelledError:
             raise
         except Exception as exc:
             self._last_error = self._redact(str(exc))
-            logger.warning("Alert signal handling failed: %s", self._last_error)
+            logger.warning("Alert signal evaluation failed: %s", self._last_error)
             return results
+
+        # Defense-in-depth F03 guard: never enqueue non-LIVE or recovered historical signals.
+        if tag is not None or event.is_recovered_historical:
+            return []
+
+        for candidate in candidates:
+            try:
+                res = await self.enqueue_candidate(candidate)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                self._last_error = self._redact(str(exc))
+                logger.warning("Alert signal enqueue failed: %s", self._last_error)
+                continue
+            results.append(res)
+            if res.inserted:
+                self._wakeup.set()
+        return results
 
     async def enqueue_candidate(
         self,
