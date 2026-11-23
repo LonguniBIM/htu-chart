@@ -11029,5 +11029,356 @@ async def test_f03_conflicting_signalr_contract_id_is_quarantined(tmp_path: Path
         sqlite.close()
 
 
+@pytest.mark.asyncio
+async def test_f03_recovery_does_not_drop_pending_ticks_when_superseded_during_cache_load(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Contract: P1-001 never loses buffered ticks if recovery is superseded during cache load.
+
+    Defect caught: _consume_pending_contract_ticks(cid) removing ticks before awaiting
+    _load_authoritative_cached_bars, dropping buffered ticks forever when superseded.
+    """
+    t0 = BASE_T
+    now_ts = t0 + 75
+    settings = Settings(data_dir=tmp_path / "data", signalr_enabled=True)
+    sqlite = SqliteStore(tmp_path / "meta.db")
+    sqlite.initialize()
+    parquet = ParquetStore(settings.data_dir, sqlite_store=sqlite)
+
+    cache_read_entered = asyncio.Event()
+    release_cache_read = asyncio.Event()
+    orig_read_bars = parquet.read_bars
+    pause_first_read = [True]
+
+    async def gated_read_bars(*args: Any, **kwargs: Any) -> Any:
+        if pause_first_read[0]:
+            pause_first_read[0] = False
+            cache_read_entered.set()
+            await release_cache_read.wait()
+        return await orig_read_bars(*args, **kwargs)
+
+    monkeypatch.setattr(parquet, "read_bars", gated_read_bars)
+
+    class _MockHub:
+        def __init__(self) -> None:
+            self.is_connected = True
+            self.last_event_monotonic: float | None = 100.0
+            self.queue_overflow_count = 0
+            self.connected_token_digest: str | None = None
+            self._on_event: Any = None
+
+        def has_pending_subscription(self, _cid: str) -> bool:
+            return False
+
+        async def update_contracts(self, _contracts: Any, *, live_mode: bool) -> None:
+            return None
+
+        async def sync_contracts(self, _contracts: Any, *, live_mode: bool) -> None:
+            return None
+
+        async def stop(self) -> None:
+            self.is_connected = False
+
+    class _RestOk:
+        async def retrieve_bars_paginated(self, **kw: Any) -> Any:
+            s_ts = int(kw["start_ts"])
+            e_ts = int(kw["end_ts"])
+            cutoff = t0 + 60
+            bars = [
+                _wire_bar(ts, 5950.0, 5952.0, 5949.0, 5951.0, 2.0)
+                for ts in range(s_ts - (s_ts % 60), min(e_ts, cutoff), 60)
+                if has_open_session_in_range(ts, ts + 60)
+            ]
+            return type("R", (), {"raw_bars": bars, "truncated": False, "provider_gap": False})()
+
+    def _auth_handler(_req: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"success": True, "errorCode": 0, "token": "jwt-sup"})
+
+    try:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(_auth_handler)) as client:
+            auth = TopstepAuthService(settings, client)
+            await auth.login("alice", "api-key")
+            agg = BarAggregator(timeframes=("1m",))
+            svc = LiveFeedService(
+                settings,
+                auth,
+                _RestOk(),
+                parquet,
+                sqlite,
+                aggregator=agg,
+                signalr_hub=cast(Any, _MockHub()),
+                recovery_timeframes=("1m",),
+                initial_backfill_bars=1,
+                clock=lambda: now_ts,
+            )
+            try:
+                await svc.set_active_contracts([CID_MES], live_mode=False)
+                svc._last_connected_utc = t0
+                svc._transition_all_contracts("RECOVERING")
+                svc.handle_hub_event(
+                    SignalRTickEvent(
+                        CID_MES, False, t0 + 72, 5956.25, 7.0, "GatewayTrade", 101.0
+                    )
+                )
+                task1 = asyncio.create_task(svc.trigger_recovery(now_utc=now_ts))
+                await asyncio.wait_for(cache_read_entered.wait(), timeout=2.0)
+
+                # Supersede recovery while task1 is paused in _load_authoritative_cached_bars.
+                task2 = asyncio.create_task(svc.trigger_recovery(now_utc=now_ts))
+                await asyncio.sleep(0)
+                release_cache_read.set()
+                await asyncio.gather(task1, return_exceptions=True)
+                await asyncio.wait_for(task2, timeout=2.0)
+
+                assert svc.feed_state == "LIVE"
+                open_bar = agg.get_open_bar(CID_MES, False, "1m")
+                assert open_bar is not None
+                assert open_bar.time == t0 + 60
+                assert open_bar.open == 5956.25
+                assert open_bar.close == 5956.25
+                assert open_bar.volume == 7.0
+            finally:
+                release_cache_read.set()
+                await svc.stop()
+    finally:
+        sqlite.close()
+
+
+@pytest.mark.asyncio
+async def test_f03_missing_parquet_bar_with_complete_sqlite_degrades_and_heals_on_recovery(
+    tmp_path: Path,
+) -> None:
+    """Contract: P2-001 degrades and marks CORRUPTED when Parquet bar is missing under COMPLETE.
+
+    Defect caught: _resolve_rest_authoritative_event returning None without degrading state,
+    recording gap/CORRUPTED coverage, or suppressing LIVE alerts when Parquet lacks a closed bar
+    that SQLite coverage marks COMPLETE.
+    """
+    t0 = BASE_T  # 2026-11-10 14:00:00 UTC (5m aligned)
+    clock_ref = [t0 + 5]
+    settings = Settings(data_dir=tmp_path / "data", signalr_enabled=True)
+    sqlite = SqliteStore(tmp_path / "meta.db")
+    sqlite.initialize()
+    parquet = ParquetStore(settings.data_dir, sqlite_store=sqlite)
+    key_5m = StorageDatasetKey("topstepx", False, CID_MES, "5m")
+
+    emitted_signals: list[tuple[str, int, str | None]] = []
+
+    def _on_signal(evt: AggregatedBarEvent, tag: str | None) -> None:
+        emitted_signals.append((evt.timeframe, evt.bar.time, tag))
+
+    class _MockHub:
+        def __init__(self) -> None:
+            self.is_connected = True
+            self.last_event_monotonic: float | None = 100.0
+            self.queue_overflow_count = 0
+            self.connected_token_digest: str | None = None
+            self._on_event: Any = None
+
+        def has_pending_subscription(self, _cid: str) -> bool:
+            return False
+
+        async def update_contracts(self, _contracts: Any, *, live_mode: bool) -> None:
+            return None
+
+        async def sync_contracts(self, _contracts: Any, *, live_mode: bool) -> None:
+            return None
+
+        async def stop(self) -> None:
+            self.is_connected = False
+
+    class _RestOk:
+        async def retrieve_bars_paginated(self, **kw: Any) -> Any:
+            s_ts = int(kw["start_ts"])
+            e_ts = int(kw["end_ts"])
+            cutoff = clock_ref[0] - (clock_ref[0] % 60)
+            bars = [
+                _wire_bar(ts, 5950.0, 5952.0, 5949.0, 5951.0, 2.0)
+                for ts in range(s_ts - (s_ts % 60), min(e_ts, cutoff), 60)
+                if has_open_session_in_range(ts, ts + 60)
+            ]
+            return type("R", (), {"raw_bars": bars, "truncated": False, "provider_gap": False})()
+
+    def _auth_handler(_req: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"success": True, "errorCode": 0, "token": "jwt-p2001"})
+
+    try:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(_auth_handler)) as client:
+            auth = TopstepAuthService(settings, client)
+            await auth.login("alice", "api-key")
+            agg = BarAggregator(timeframes=("1m", "5m"))
+            svc = LiveFeedService(
+                settings,
+                auth,
+                _RestOk(),
+                parquet,
+                sqlite,
+                aggregator=agg,
+                signalr_hub=cast(Any, _MockHub()),
+                recovery_timeframes=("1m", "5m"),
+                initial_backfill_bars=5,
+                on_bar_signal=_on_signal,
+                clock=lambda: clock_ref[0],
+                monotonic_clock=lambda: 102.0,
+            )
+            try:
+                await svc.set_active_contracts([CID_MES], live_mode=False)
+                svc._last_connected_utc = t0 - 60
+                svc._contracts[CID_MES].subscribed_at_utc = t0 - 60
+                await svc.trigger_recovery(now_utc=clock_ref[0])
+                assert svc.feed_state == "LIVE"
+
+                # Build clean 5m bar t0 across [t0, t0 + 300) via live ticks.
+                for offset in (10, 70, 130, 190, 250):
+                    clock_ref[0] = t0 + offset
+                    svc.handle_hub_event(
+                        SignalRTickEvent(
+                            CID_MES, False, t0 + offset, 5952.0, 2.0, "GatewayTrade", 101.0
+                        )
+                    )
+                await svc.flush_pending_tasks()
+                assert svc.feed_state == "LIVE"
+
+                # Inject SQLite COMPLETE coverage for 5m [t0, t0 + 300) with NO Parquet 5m bar.
+                await sqlite.record_coverage(key_5m, t0, t0 + 300, status="COMPLETE")
+                assert await parquet.read_bars(key_5m, start_ts=t0, end_ts=t0 + 299) == []
+
+                emitted_signals.clear()
+                clock_ref[0] = t0 + 305
+                await svc.run_watchdog_tick()
+                await svc.flush_pending_tasks()
+
+                assert svc.feed_state == "DEGRADED"
+                assert svc.live_alerts_enabled is False
+                assert svc.get_status_snapshot()["unresolved_gaps"] > 0
+                assert not any(tf == "5m" and bt == t0 for tf, bt, _tag in emitted_signals)
+                assert await sqlite.is_interval_complete(key_5m, t0, t0 + 300) is False
+
+                # Subsequent recovery heals missing 5m bar t0 and returns to LIVE.
+                await svc.trigger_recovery(now_utc=t0 + 305)
+                assert svc.feed_state == "LIVE"
+                assert svc.live_alerts_enabled is True
+                healed = await parquet.read_bars(
+                    key_5m, start_ts=t0, end_ts=t0 + 299, include_provisional=False
+                )
+                assert [b.time for b in healed] == [t0]
+            finally:
+                await svc.stop()
+    finally:
+        sqlite.close()
+
+
+@pytest.mark.asyncio
+async def test_f03_mixed_contract_states_suppress_signals_when_aggregate_degraded(
+    tmp_path: Path,
+) -> None:
+    """Contract: P1-002 suppresses closed-bar live signals when aggregate feed is DEGRADED.
+
+    Defect caught: _persist_and_signal_events gating signal tag only on
+    is_contract_live_alerts_enabled(cid) instead of aggregate live_alerts_enabled, emitting tag=None
+    actionable signals for LIVE contract MES while MNQ failed recovery (feed_state == DEGRADED).
+    """
+    t0 = BASE_T
+    cid_mnq = "CON.F.US.MNQ.Z26"
+    clock_ref = [t0 + 65]
+    settings = Settings(data_dir=tmp_path / "data", signalr_enabled=True)
+    sqlite = SqliteStore(tmp_path / "meta.db")
+    sqlite.initialize()
+    parquet = ParquetStore(settings.data_dir, sqlite_store=sqlite)
+
+    emitted_signals: list[tuple[str, str, int, str | None]] = []
+
+    def _on_signal(evt: AggregatedBarEvent, tag: str | None) -> None:
+        emitted_signals.append((evt.contract_id, evt.timeframe, evt.bar.time, tag))
+
+    class _MockHub:
+        def __init__(self) -> None:
+            self.is_connected = True
+            self.last_event_monotonic: float | None = 100.0
+            self.queue_overflow_count = 0
+            self.connected_token_digest: str | None = None
+            self._on_event: Any = None
+
+        def has_pending_subscription(self, _cid: str) -> bool:
+            return False
+
+        async def update_contracts(self, _contracts: Any, *, live_mode: bool) -> None:
+            return None
+
+        async def sync_contracts(self, _contracts: Any, *, live_mode: bool) -> None:
+            return None
+
+        async def stop(self) -> None:
+            self.is_connected = False
+
+    class _SelectiveRest:
+        async def retrieve_bars_paginated(self, **kw: Any) -> Any:
+            if kw["contract_id"] == cid_mnq:
+                raise UpstreamHTTPError("MNQ backfill failed", status_code=503)
+            s_ts = int(kw["start_ts"])
+            e_ts = int(kw["end_ts"])
+            cutoff = clock_ref[0] - (clock_ref[0] % 60)
+            bars = [
+                _wire_bar(ts, 5950.0, 5952.0, 5949.0, 5951.0, 2.0)
+                for ts in range(s_ts - (s_ts % 60), min(e_ts, cutoff), 60)
+                if has_open_session_in_range(ts, ts + 60)
+            ]
+            return type("R", (), {"raw_bars": bars, "truncated": False, "provider_gap": False})()
+
+    def _auth_handler(_req: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"success": True, "errorCode": 0, "token": "jwt-mixed"})
+
+    try:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(_auth_handler)) as client:
+            auth = TopstepAuthService(settings, client)
+            await auth.login("alice", "api-key")
+            agg = BarAggregator(timeframes=("1m",))
+            svc = LiveFeedService(
+                settings,
+                auth,
+                _SelectiveRest(),
+                parquet,
+                sqlite,
+                aggregator=agg,
+                signalr_hub=cast(Any, _MockHub()),
+                recovery_timeframes=("1m",),
+                initial_backfill_bars=1,
+                on_bar_signal=_on_signal,
+                clock=lambda: clock_ref[0],
+                monotonic_clock=lambda: 102.0,
+            )
+            try:
+                await svc.set_active_contracts([CID_MES, cid_mnq], live_mode=False)
+                svc._last_connected_utc = t0
+                await svc.trigger_recovery(now_utc=clock_ref[0])
+
+                assert svc.feed_state == "DEGRADED"
+                assert svc.live_alerts_enabled is False
+                assert svc.is_contract_live_alerts_enabled(CID_MES) is True
+                assert svc.is_contract_live_alerts_enabled(cid_mnq) is False
+
+                emitted_signals.clear()
+                clock_ref[0] = t0 + 130
+                svc.handle_hub_event(
+                    SignalRTickEvent(
+                        CID_MES, False, t0 + 130, 5954.0, 3.0, "GatewayTrade", 102.0
+                    )
+                )
+                clock_ref[0] = t0 + 185
+                await svc.run_watchdog_tick()
+                await svc.flush_pending_tasks()
+
+                mes_closed = [
+                    s for s in emitted_signals if s[0] == CID_MES and s[2] == t0 + 120
+                ]
+                assert len(mes_closed) == 1
+                assert mes_closed[0][3] == "SUPPRESSED"
+            finally:
+                await svc.stop()
+    finally:
+        sqlite.close()
+
+
 
 

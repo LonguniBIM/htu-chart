@@ -1570,6 +1570,18 @@ class LiveFeedService:
                 gap_from_rest_issues = True
                 c_state.unresolved_gaps += 1
 
+            if gap_from_rest_issues:
+                self._record_gap_bucket(c_state, tf, backfill_start)
+            auth_cached_bars = await self._load_authoritative_cached_bars(
+                key=key,
+                c_state=c_state,
+                tf=tf,
+                backfill_start=backfill_start,
+                closed_end=closed_end,
+                expected_gen=expected_gen,
+            )
+
+            # Consume pending ticks only after all awaits so superseding never drops buffered ticks.
             if buffered_ticks_override is not None:
                 contract_ticks = list(buffered_ticks_override)
             else:
@@ -1603,8 +1615,6 @@ class LiveFeedService:
                     for gap_ts in c_state.unhealed_gap_starts.values()
                 )
             )
-            if gap_from_rest_issues:
-                self._record_gap_bucket(c_state, tf, backfill_start)
             eff_connected_utc = max(
                 (t for t in (self._last_connected_utc, c_state.subscribed_at_utc) if t is not None),
                 default=None,
@@ -1613,14 +1623,6 @@ class LiveFeedService:
                 eff_connected_utc is None
                 or eff_connected_utc >= open_bucket_utc_ts
                 or has_open_unhealed_gap
-            )
-            auth_cached_bars = await self._load_authoritative_cached_bars(
-                key=key,
-                c_state=c_state,
-                tf=tf,
-                backfill_start=backfill_start,
-                closed_end=closed_end,
-                expected_gen=expected_gen,
             )
             merged_hist: dict[int, OHLCVBar] = {b.time: b for b in auth_cached_bars}
             for b in valid_bars:
@@ -2631,6 +2633,32 @@ class LiveFeedService:
             None,
         )
         if rest_bar is None:
+            await self._record_coverage_locked(
+                key,
+                bar_evt.bar.time,
+                bar_end,
+                status="CORRUPTED",
+                expected_gen=expected_gen,
+                quarantined_count=1,
+            )
+            prev_feed_state = self._feed_state
+            err_msg = (
+                f"Missing closed {bar_evt.timeframe} bar at {bar_evt.bar.time} "
+                "in Parquet despite COMPLETE SQLite coverage"
+            )
+            self._last_error = err_msg
+            c_state = self._contracts.get(bar_evt.contract_id)
+            if c_state is not None:
+                self._record_gap_bucket(c_state, bar_evt.timeframe, bar_evt.bar.time)
+                c_state.unresolved_gaps += 1
+                c_state.last_error = err_msg
+                if c_state.state != "DISCONNECTED":
+                    c_state.state = "DEGRADED"
+            else:
+                self._global_unresolved_gaps += 1
+            self._recompute_aggregate_state()
+            self._mark_degraded_timestamp(prev_feed_state)
+            self._broadcast_status()
             if broadcast and self._broadcaster is not None:
                 self._broadcaster.publish_resync_required(
                     "rest_bar_authoritative",
@@ -2764,7 +2792,10 @@ class LiveFeedService:
                             )
                 tag = (
                     None
-                    if self.is_contract_live_alerts_enabled(effective_evt.contract_id)
+                    if (
+                        self.live_alerts_enabled
+                        and self.is_contract_live_alerts_enabled(effective_evt.contract_id)
+                    )
                     else "SUPPRESSED"
                 )
                 await self._emit_signal(effective_evt, tag)
