@@ -8,14 +8,16 @@
 
 ## 2. Entry Points
 - `backend/app/topstep/signalr_hub.py`
-- `backend/app/services/live_feed_service.py`, `backend/app/services/ws_broadcaster.py`
+- `backend/app/services/live_feed_service.py`, `backend/app/services/ws_broadcaster.py`, `backend/app/services/alert_service.py`
 - `backend/app/engine/bar_aggregator.py`, `backend/app/engine/alert_engine.py`
+- `backend/app/storage/sqlite_store.py` (`feed_watermarks`, `alert_outbox`)
 - `backend/app/notify/telegram.py`
-- `backend/app/api/routes_market.py` (`WS /ws/market`), `backend/app/api/routes_alerts.py`, `backend/app/api/routes_status.py`
+- `backend/app/api/routes_market.py` (`WS /ws/market`), `backend/app/api/routes_alerts.py` (`GET /api/alerts/status`, `GET /api/alerts/history`, `POST /api/alerts/scanner`, `POST /api/alerts/test`), `backend/app/api/routes_status.py` (`GET /api/status` including `alerts` snapshot)
 
 ## 3. Driving & Verification
-- Automated tests simulating: SignalR drop during open candles + REST backfill reconciliation; slow WS client blocking without stalling healthy panes; process restart with `PENDING` outbox alerts before vs after `expires_at`.
-- Telemetry fields in `/api/status`: `feed_state`, `last_event_age_sec`, `recovery_duration_ms`, `unresolved_gaps`, `queue_overflow_count`.
+- Automated tests (`backend/tests/test_bar_aggregator.py`, `test_signalr_recovery_f03.py`, `test_ws_broadcaster_r06.py`, `test_alert_outbox_f07.py`, `test_security_f01.py`) simulating: SignalR drop during open candles + REST backfill reconciliation; slow WS client blocking without stalling healthy panes; process restart with `PENDING` outbox alerts before vs after `expires_at`; bounded transient retry & permanent 4xx `FAILED`; `F03` `RECOVERED_HISTORICAL`/`SUPPRESSED` suppression; secret redaction on `/bot<token>` and `chat_id`; CME weekend-only key rotation reminder.
+- Telemetry fields in `/api/status`: `feed_state`, `last_event_age_sec`, `recovery_duration_ms`, `unresolved_gaps`, `queue_overflow_count`, and redacted `alerts` (`telegram_configured`, `scanner_enabled`, `alert_ttl_seconds`, `outbox` counts, `suppressed_signals`, `recovered_historical_skipped`, `last_error`).
+- Verified commits: Phase 2 Part 1 (`84abff087ab3`) & Phase 2 Part 2 (`bb81eb9add7d`).
 
 ## 4. Gotchas & Invariants
 - Never emit live Telegram entry alerts while in `RECOVERING` or `DEGRADED` (`F03`).
