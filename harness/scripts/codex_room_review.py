@@ -800,6 +800,38 @@ def _build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _merge_prior_pass_findings(
+    fallback_payload: dict[str, Any] | None,
+    prior_payload: dict[str, Any] | None,
+    expected_sha: str,
+) -> dict[str, Any] | None:
+    """Preserve findings/issues from a completed Codex pass when falling back to agy."""
+    if not isinstance(prior_payload, dict):
+        return fallback_payload
+    if str(prior_payload.get("revision_sha", "")).strip() != expected_sha:
+        return fallback_payload
+    if not isinstance(fallback_payload, dict):
+        return prior_payload
+
+    merged = dict(fallback_payload)
+    prior_findings = list(prior_payload.get("findings", []))
+    fb_findings = list(fallback_payload.get("findings", []))
+    merged["findings"] = [*prior_findings, *fb_findings]
+    merged["test_quality_issues"] = _dedup_ordered(
+        [*prior_payload.get("test_quality_issues", []), *fallback_payload.get("test_quality_issues", [])]
+    )
+    merged["unverified_areas"] = _dedup_ordered(
+        [*prior_payload.get("unverified_areas", []), *fallback_payload.get("unverified_areas", [])]
+    )
+    has_blocking = any(
+        str(f.get("severity", "medium")).lower() in BLOCKING_SEVERITIES
+        for f in merged["findings"]
+    )
+    if merged.get("verdict") == "APPROVE" and has_blocking:
+        merged["verdict"] = "CHANGES_REQUESTED"
+    return merged
+
+
 def main(argv: list[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
     repo_root = args.repo_root.resolve()
@@ -986,11 +1018,15 @@ def main(argv: list[str] | None = None) -> int:
                 f"falling back to agy ({args.fallback_model}).",
                 file=sys.stderr,
             )
+            prior_codex_p1 = p1_data
+            prior_codex_p2 = p2_data
             try:
                 active_backend = "agy"
                 active_model = args.fallback_model
                 fallback_used = True
-                p1_data, p2_data, readonly_violation = _run_agy_review_pair(active_model)
+                fb_p1, fb_p2, readonly_violation = _run_agy_review_pair(active_model)
+                p1_data = _merge_prior_pass_findings(fb_p1, prior_codex_p1, candidate_sha)
+                p2_data = _merge_prior_pass_findings(fb_p2, prior_codex_p2, candidate_sha)
             except FileNotFoundError as exc:
                 print(f"[codex_room_review] Fallback failed: {exc}", file=sys.stderr)
                 return 2

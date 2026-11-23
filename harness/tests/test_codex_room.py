@@ -498,3 +498,63 @@ def test_auto_backend_prioritizes_codex_and_falls_back_to_agy_on_quota_exhaustio
     rc_d = codex_room_review.main(["--commit", "HEAD", "--out-dir", str(out_d), "--backend", "auto"])
     assert rc_d == 2
     assert not agy_called.exists()
+
+
+def test_codex_partial_blocking_finding_preserved_across_agy_fallback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """When one Codex pass returns a blocking finding and the other hits quota, fallback must not erase it."""
+    head_sha = codex_room_review.resolve_commit_info(REPO_ROOT, "HEAD", None)["candidate_sha"]
+
+    codex_partial_script = tmp_path / "fake_codex_partial.py"
+    codex_partial_prefix = _write_fake_codex_script(
+        codex_partial_script,
+        (
+            "import json, pathlib, sys\n"
+            "args = sys.argv[1:]\n"
+            "out_path = pathlib.Path(args[args.index('-o') + 1])\n"
+            "_ = sys.stdin.read()\n"
+            "if out_path.name == 'pass1.json':\n"
+            f"    payload = {{'revision_sha': {head_sha!r}, 'lens': 'correctness_and_tests', "
+            "'verdict': 'CHANGES_REQUESTED', 'summary': 'found blocking bug', "
+            "'findings': [{'id': 'C-1', 'severity': 'high', 'category': 'bug', 'file': 'backend/app/main.py', "
+            "'line_start': 10, 'line_end': 12, 'title': 'Blocking bug from Codex pass1', "
+            "'behavior_affected': 'b', 'trigger_condition': 't', 'evidence': 'e', "
+            "'verification_method': 'v', 'plan_ref': 'F03'}], "
+            "'test_quality_issues': ['codex tqi'], 'unverified_areas': []}\n"
+            "    out_path.write_text(json.dumps(payload), encoding='utf-8')\n"
+            "    print(json.dumps({'type': 'turn.completed'}), flush=True)\n"
+            "else:\n"
+            "    sys.stderr.write('Error: usage_limit_reached - Codex CLI quota exhausted\\n')\n"
+            "    sys.exit(1)\n"
+        ),
+    )
+
+    agy_approve_script = tmp_path / "fake_agy_approve.py"
+    agy_approve_prefix = _write_fake_codex_script(
+        agy_approve_script,
+        (
+            "import json, sys\n"
+            "args = sys.argv[1:]\n"
+            "prompt = args[args.index('-p') + 1]\n"
+            "lens = 'security_and_invariants' if 'security_and_invariants' in prompt else 'correctness_and_tests'\n"
+            f"payload = {{'revision_sha': {head_sha!r}, 'lens': lens, 'verdict': 'APPROVE', "
+            "'summary': 'agy approve', 'findings': [], 'test_quality_issues': [], 'unverified_areas': []}\n"
+            "print(json.dumps({'event': 'result', 'result': {'status': 'SUCCESS', 'structured_output': payload}}), flush=True)\n"
+        ),
+    )
+
+    monkeypatch.setattr(codex_room_review, "verify_role", lambda role, root: {"ok": True, "errors": []})
+    monkeypatch.setattr(codex_room_review, "resolve_codex_command", lambda: codex_partial_prefix)
+    monkeypatch.setattr(codex_room_review, "resolve_agy_command", lambda: agy_approve_prefix)
+
+    out_dir = tmp_path / "out_partial_fallback"
+    rc = codex_room_review.main(
+        ["--commit", "HEAD", "--out-dir", str(out_dir), "--backend", "auto", "--fail-on-blocking"]
+    )
+    assert rc == 1
+    report = json.loads((out_dir / "consolidated-review.json").read_text(encoding="utf-8"))
+    assert report["review_gate_status"] == "CHANGES_REQUESTED"
+    assert report["blocking_open_count"] == 1
+    assert any(f["id"] == "C-1" and f["status"] == "OPEN" for f in report["consolidated_findings"])
+    assert "codex tqi" in report["test_quality_issues"]
