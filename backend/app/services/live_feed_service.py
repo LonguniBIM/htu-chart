@@ -9,6 +9,7 @@ import json
 import logging
 import math
 import time
+from collections import deque
 from collections.abc import Awaitable, Callable, Collection, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -68,6 +69,16 @@ SignalCallback = Callable[[AggregatedBarEvent, str | None], Awaitable[None] | No
 
 class _StaleGenerationAbort(Exception):
     """Internal control-flow signal when a newer disconnect/recovery supersedes work."""
+
+
+@dataclass
+class _LivePersistItem:
+    """Queued live persistence/broadcast item with optional in-place open-bar coalescing."""
+
+    gen: int
+    now_utc: int
+    broadcast: bool
+    bar_evt: AggregatedBarEvent
 
 
 @dataclass
@@ -164,9 +175,10 @@ class LiveFeedService:
         self._pending_recovery_ticks_count = 0
         self._recovery_task: asyncio.Task[None] | None = None
         self._live_tick_tasks: set[asyncio.Task[None]] = set()
-        self._inflight_closed_broadcast_events: dict[
-            tuple[str, bool, str], list[asyncio.Event]
-        ] = {}
+        self._live_persist_queue: deque[_LivePersistItem] = deque()
+        self._live_pending_open: dict[tuple[str, bool, str], _LivePersistItem] = {}
+        self._live_persist_busy = False
+        self._live_persist_worker_task: asyncio.Task[None] | None = None
         self._watchdog_task: asyncio.Task[None] | None = None
         self._running = False
         self._generation = 0
@@ -464,6 +476,8 @@ class LiveFeedService:
                     with contextlib.suppress(asyncio.CancelledError):
                         await task
             self._live_tick_tasks.clear()
+            self._live_persist_worker_task = None
+            self._live_persist_busy = False
             for cid, c_state in list(self._contracts.items()):
                 self._aggregator.reset_contract(cid)
                 self._contracts[cid] = ContractFeedRuntime(
@@ -519,6 +533,8 @@ class LiveFeedService:
                 with contextlib.suppress(asyncio.CancelledError):
                     await task
         self._live_tick_tasks.clear()
+        self._live_persist_worker_task = None
+        self._live_persist_busy = False
 
         if self._quarantine_worker_task is not None and not self._quarantine_worker_task.done():
             with contextlib.suppress(TimeoutError):
@@ -1025,6 +1041,13 @@ class LiveFeedService:
 
     def _bump_generation_and_cancel_live_tasks(self) -> int:
         self._generation += 1
+        self._live_persist_queue.clear()
+        self._live_pending_open.clear()
+        if (
+            self._live_persist_worker_task is not None
+            and not self._live_persist_worker_task.done()
+        ):
+            self._live_persist_worker_task.cancel()
         for task in list(self._live_tick_tasks):
             if not task.done():
                 task.cancel()
@@ -1881,6 +1904,9 @@ class LiveFeedService:
             t.cancel()
         if prior_tasks:
             await asyncio.gather(*prior_tasks, return_exceptions=True)
+        self._live_persist_queue.clear()
+        self._live_pending_open.clear()
+        self._live_persist_busy = False
 
         pending_by_contract = self._pending_by_contract
         contract_degraded: dict[str, bool] = {}
@@ -2085,6 +2111,8 @@ class LiveFeedService:
 
     def _on_live_task_done(self, task: asyncio.Task[None]) -> None:
         self._live_tick_tasks.discard(task)
+        if task is self._live_persist_worker_task:
+            self._live_persist_worker_task = None
         if not task.cancelled():
             exc = task.exception()
             if exc is not None:
@@ -2286,35 +2314,53 @@ class LiveFeedService:
         if not res.events:
             return []
         has_closed = any(evt.bar.is_closed for evt in res.events)
-        prior_barriers, registered_barriers, done_evt = self._register_closed_broadcast_barrier(
-            res.events
-        )
-        if not has_closed and not prior_barriers and self._broadcaster is not None:
-            for bar_evt in res.events:
-                self._broadcaster.publish_bar(bar_evt)
-        if has_closed or prior_barriers or self._on_bar_signal is not None:
-            broadcast_in_task = has_closed or bool(prior_barriers)
-            task = asyncio.create_task(
-                self._safe_persist_and_signal_events(
+        queue_idle = not self._live_persist_queue and not self._live_persist_busy
+        if not has_closed and queue_idle:
+            if self._broadcaster is not None:
+                for bar_evt in res.events:
+                    self._broadcaster.publish_bar(bar_evt)
+            if self._on_bar_signal is not None:
+                self._enqueue_live_persist_events(
                     res.events,
                     now_utc=eff_now,
-                    broadcast=broadcast_in_task,
+                    broadcast=False,
                     expected_gen=gen,
-                    wait_for_events=prior_barriers,
-                    registered_barriers=registered_barriers,
-                    done_evt=done_evt,
                 )
+        else:
+            self._enqueue_live_persist_events(
+                res.events,
+                now_utc=eff_now,
+                broadcast=True,
+                expected_gen=gen,
             )
-            self._live_tick_tasks.add(task)
-            task.add_done_callback(self._on_live_task_done)
         return list(res.events)
+
+    async def _flush_live_persist_worker(self) -> None:
+        while (
+            self._live_persist_queue
+            or self._live_persist_busy
+            or (
+                self._live_persist_worker_task is not None
+                and not self._live_persist_worker_task.done()
+            )
+        ):
+            if self._live_persist_queue and (
+                self._live_persist_worker_task is None
+                or self._live_persist_worker_task.done()
+            ):
+                self._ensure_live_persist_worker()
+            if self._live_persist_worker_task is not None:
+                await asyncio.gather(self._live_persist_worker_task, return_exceptions=True)
+            elif self._live_tick_tasks:
+                await asyncio.gather(*tuple(self._live_tick_tasks), return_exceptions=True)
+            else:
+                break
 
     async def flush_pending_tasks(self) -> None:
         """Await any in-flight recovery, closed-bar persistence, or quarantine tasks."""
         if self._recovery_task is not None and not self._recovery_task.done():
             await self._recovery_task
-        if self._live_tick_tasks:
-            await asyncio.gather(*tuple(self._live_tick_tasks), return_exceptions=True)
+        await self._flush_live_persist_worker()
         if not self._quarantine_queue.empty():
             self._ensure_quarantine_worker()
         if (
@@ -2374,47 +2420,99 @@ class LiveFeedService:
             reraise_abort=True,
         )
 
-    def _register_closed_broadcast_barrier(
+    def _enqueue_live_persist_events(
         self,
         events: Sequence[AggregatedBarEvent],
-    ) -> tuple[
-        list[asyncio.Event],
-        list[tuple[tuple[str, bool, str], asyncio.Event]],
-        asyncio.Event | None,
-    ]:
-        streams = list(
-            dict.fromkeys((e.contract_id, e.live_mode, e.timeframe) for e in events)
-        )
-        prior: list[asyncio.Event] = []
-        seen_ids: set[int] = set()
-        for skey in streams:
-            for ev in self._inflight_closed_broadcast_events.get(skey, ()):
-                if id(ev) not in seen_ids:
-                    seen_ids.add(id(ev))
-                    prior.append(ev)
-        if any(e.bar.is_closed for e in events):
-            done_evt = asyncio.Event()
-            registered: list[tuple[tuple[str, bool, str], asyncio.Event]] = []
-            for skey in streams:
-                self._inflight_closed_broadcast_events.setdefault(skey, []).append(done_evt)
-                registered.append((skey, done_evt))
-            return prior, registered, done_evt
-        return prior, [], None
-
-    def _release_closed_broadcast_barrier(
-        self,
-        registered: Sequence[tuple[tuple[str, bool, str], asyncio.Event]],
-        done_evt: asyncio.Event | None,
+        *,
+        now_utc: int,
+        broadcast: bool,
+        expected_gen: int,
     ) -> None:
-        for skey, ev in registered:
-            bucket = self._inflight_closed_broadcast_events.get(skey)
-            if bucket is not None:
-                with contextlib.suppress(ValueError):
-                    bucket.remove(ev)
-                if not bucket:
-                    self._inflight_closed_broadcast_events.pop(skey, None)
-        if done_evt is not None:
-            done_evt.set()
+        maxsize = max(1, self._settings.signalr_recovery_queue_maxsize)
+        for bar_evt in events:
+            skey = (bar_evt.contract_id, bar_evt.live_mode, bar_evt.timeframe)
+            if not bar_evt.bar.is_closed:
+                existing_open = self._live_pending_open.get(skey)
+                if existing_open is not None:
+                    existing_open.gen = expected_gen
+                    existing_open.now_utc = now_utc
+                    existing_open.broadcast = existing_open.broadcast or broadcast
+                    existing_open.bar_evt = bar_evt
+                    continue
+            if len(self._live_persist_queue) >= maxsize:
+                self._queue_overflow_count += 1
+                c_state = self._contracts.get(bar_evt.contract_id)
+                if c_state is not None:
+                    c_state.unresolved_gaps += 1
+                    c_state.state = "DEGRADED"
+                else:
+                    self._global_unresolved_gaps += 1
+                self._mark_overflow_bucket_gap(
+                    c_state,
+                    contract_id=bar_evt.contract_id,
+                    live_mode=bar_evt.live_mode,
+                    ts_hint=bar_evt.bar.time,
+                    eff_now=now_utc,
+                )
+                self._last_degraded_at_mono = time.monotonic()
+                self._recompute_aggregate_state()
+                self._broadcast_status()
+                if self._broadcaster is not None:
+                    self._broadcaster.publish_resync_required(
+                        "live_queue_overflow",
+                        contract_id=bar_evt.contract_id,
+                    )
+                continue
+            item = _LivePersistItem(
+                gen=expected_gen,
+                now_utc=now_utc,
+                broadcast=broadcast,
+                bar_evt=bar_evt,
+            )
+            self._live_persist_queue.append(item)
+            if bar_evt.bar.is_closed:
+                self._live_pending_open.pop(skey, None)
+            else:
+                self._live_pending_open[skey] = item
+        self._ensure_live_persist_worker()
+
+    def _ensure_live_persist_worker(self) -> None:
+        if not self._live_persist_queue:
+            return
+        if self._live_persist_worker_task is None or self._live_persist_worker_task.done():
+            task = asyncio.create_task(
+                self._live_persist_worker_loop(),
+                name="live_feed_persist_worker",
+            )
+            self._live_persist_worker_task = task
+            self._live_tick_tasks.add(task)
+            task.add_done_callback(self._on_live_task_done)
+
+    async def _live_persist_worker_loop(self) -> None:
+        try:
+            while self._live_persist_queue:
+                item = self._live_persist_queue.popleft()
+                skey = (
+                    item.bar_evt.contract_id,
+                    item.bar_evt.live_mode,
+                    item.bar_evt.timeframe,
+                )
+                if self._live_pending_open.get(skey) is item:
+                    self._live_pending_open.pop(skey, None)
+                if item.gen != self._generation:
+                    continue
+                self._live_persist_busy = True
+                try:
+                    await self._safe_persist_and_signal_events(
+                        (item.bar_evt,),
+                        now_utc=item.now_utc,
+                        broadcast=item.broadcast,
+                        expected_gen=item.gen,
+                    )
+                finally:
+                    self._live_persist_busy = False
+        except asyncio.CancelledError:
+            raise
 
     async def _safe_persist_and_signal_events(
         self,
@@ -2424,13 +2522,8 @@ class LiveFeedService:
         broadcast: bool = True,
         expected_gen: int | None = None,
         reraise_abort: bool = False,
-        wait_for_events: Sequence[asyncio.Event] = (),
-        registered_barriers: Sequence[tuple[tuple[str, bool, str], asyncio.Event]] = (),
-        done_evt: asyncio.Event | None = None,
     ) -> None:
         try:
-            if wait_for_events:
-                await asyncio.gather(*(ev.wait() for ev in wait_for_events))
             await self._persist_and_signal_events(
                 events,
                 now_utc=now_utc,
@@ -2462,9 +2555,6 @@ class LiveFeedService:
             self._recompute_aggregate_state()
             self._broadcast_status()
             logger.warning("Live persistence/signal failure: %s", redacted_err)
-        finally:
-            if done_evt is not None or registered_barriers:
-                self._release_closed_broadcast_barrier(registered_barriers, done_evt)
 
     async def _persist_and_signal_events(
         self,
@@ -2476,6 +2566,7 @@ class LiveFeedService:
     ) -> None:
         for bar_evt in events:
             self._ensure_generation(expected_gen)
+            effective_evt = bar_evt
             if bar_evt.bar.is_closed:
                 key = StorageDatasetKey(
                     "topstepx",
@@ -2492,52 +2583,79 @@ class LiveFeedService:
                     key, bar_evt.bar.time, bar_end
                 )
                 self._ensure_generation(expected_gen)
-                if already_rest_confirmed:
-                    continue
-                upsert_res = await self._parquet.upsert_bars(
-                    key,
-                    [bar_evt.bar],
-                    root_symbol=bar_evt.root_symbol,
-                    now_utc=now_utc,
-                    preserve_existing_closed=True,
-                )
-                self._ensure_generation(expected_gen)
-                preserved = getattr(upsert_res, "preserved_existing_closed_times", ())
-                if bar_evt.bar.time in preserved:
-                    continue
-                c_state = self._contracts.get(bar_evt.contract_id)
+                superseded_by_rest = already_rest_confirmed
+                if not superseded_by_rest:
+                    upsert_res = await self._parquet.upsert_bars(
+                        key,
+                        [bar_evt.bar],
+                        root_symbol=bar_evt.root_symbol,
+                        now_utc=now_utc,
+                        preserve_existing_closed=True,
+                    )
+                    self._ensure_generation(expected_gen)
+                    preserved = getattr(upsert_res, "preserved_existing_closed_times", ())
+                    if bar_evt.bar.time in preserved:
+                        superseded_by_rest = True
+                if superseded_by_rest:
+                    rest_bars = await self._parquet.read_bars(
+                        key,
+                        start_ts=bar_evt.bar.time,
+                        end_ts=bar_end,
+                        include_provisional=False,
+                    )
+                    self._ensure_generation(expected_gen)
+                    rest_bar = next(
+                        (b for b in rest_bars if b.time == bar_evt.bar.time and b.is_closed),
+                        None,
+                    )
+                    if rest_bar is None:
+                        if broadcast and self._broadcaster is not None:
+                            self._broadcaster.publish_resync_required(
+                                "rest_bar_authoritative",
+                                contract_id=bar_evt.contract_id,
+                            )
+                        continue
+                    effective_evt = AggregatedBarEvent(
+                        contract_id=bar_evt.contract_id,
+                        live_mode=bar_evt.live_mode,
+                        timeframe=bar_evt.timeframe,
+                        bar=rest_bar,
+                        is_recovered_historical=False,
+                        root_symbol=bar_evt.root_symbol,
+                    )
+                c_state = self._contracts.get(effective_evt.contract_id)
                 blocked_by_gap = False
                 if c_state is not None:
-                    gap_floor = c_state.unhealed_gap_starts.get(bar_evt.timeframe)
+                    gap_floor = c_state.unhealed_gap_starts.get(effective_evt.timeframe)
                     gap_1m = c_state.unhealed_gap_starts.get("1m")
-                    if gap_floor is not None and bar_evt.bar.time >= gap_floor:
+                    if gap_floor is not None and effective_evt.bar.time >= gap_floor:
                         blocked_by_gap = True
                     elif (
                         gap_1m is not None
-                        and bar_evt.timeframe != "1m"
+                        and effective_evt.timeframe != "1m"
                         and bucket_bounds(
-                            bar_evt.bar.time,
-                            bar_evt.timeframe,
-                            root_symbol=bar_evt.root_symbol,
+                            effective_evt.bar.time,
+                            effective_evt.timeframe,
+                            root_symbol=effective_evt.root_symbol,
                         )[1]
                         > gap_1m
                     ):
                         blocked_by_gap = True
                 if not blocked_by_gap:
-                    wm = await self._sqlite.upsert_watermark(key, bar_evt.bar.time)
+                    wm = await self._sqlite.upsert_watermark(key, effective_evt.bar.time)
                     self._ensure_generation(expected_gen)
                     if c_state is not None:
-                        c_state.watermarks[bar_evt.timeframe] = wm.last_closed_bar_time
+                        c_state.watermarks[effective_evt.timeframe] = wm.last_closed_bar_time
                 tag = (
                     None
-                    if self.is_contract_live_alerts_enabled(bar_evt.contract_id)
+                    if self.is_contract_live_alerts_enabled(effective_evt.contract_id)
                     else "SUPPRESSED"
                 )
-                await self._emit_signal(bar_evt, tag)
+                await self._emit_signal(effective_evt, tag)
 
             if broadcast and self._broadcaster is not None:
                 self._ensure_generation(expected_gen)
-                self._broadcaster.publish_bar(bar_evt)
+                self._broadcaster.publish_bar(effective_evt)
 
     async def run_watchdog_tick(self) -> None:
         """Execute one watchdog pass: bar-close flush, auth/rotation check, heartbeat, retry."""
@@ -2638,18 +2756,13 @@ class LiveFeedService:
                 live_mode=c_state.live_mode,
             )
             if flushed:
-                prior_barriers, registered_barriers, done_evt = (
-                    self._register_closed_broadcast_barrier(flushed)
-                )
-                await self._safe_persist_and_signal_events(
+                self._enqueue_live_persist_events(
                     flushed,
                     now_utc=now_ts,
                     broadcast=True,
                     expected_gen=live_gen,
-                    wait_for_events=prior_barriers,
-                    registered_barriers=registered_barriers,
-                    done_evt=done_evt,
                 )
+                await self._flush_live_persist_worker()
 
         hub_token_stale = (
             self._feed_state in {"LIVE", "DEGRADED"}
