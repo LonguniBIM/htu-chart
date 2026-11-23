@@ -9,7 +9,7 @@ import threading
 import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -29,6 +29,7 @@ from app.services.ws_broadcaster import WsBroadcaster
 from app.storage.parquet_store import ParquetStore
 from app.storage.sqlite_store import SqliteStore
 from app.topstep.auth import TopstepAuthService
+from app.topstep.errors import UpstreamHTTPError
 from app.topstep.rest_client import TopstepRestClient
 from app.topstep.signalr_hub import (
     SIGNALR_RECORD_SEPARATOR,
@@ -10285,6 +10286,79 @@ async def test_f03_signalr_sticky_overflow_error_delivered_after_lifecycle_drain
     finally:
         await hub.stop()
         assert task.done()
+
+
+@pytest.mark.asyncio
+async def test_f03_retry_login_rechecks_session_under_lock_without_overwriting_manual_login(
+    tmp_path: Path,
+) -> None:
+    """Contract: P1-001 rechecks active session under _lock in TopstepAuthService.retry_login.
+
+    Defect caught: retry_login reading stale _username/_api_key/_live before acquiring _lock
+    and calling login() unconditionally while a manual login with new credentials held _lock,
+    overwriting or revoking the new session.
+    """
+    settings = Settings(data_dir=tmp_path / "data", upstream_max_retries=0)
+    login_calls: list[tuple[str, str]] = []
+    mode = ["seed_ok"]
+    manual_entered = asyncio.Event()
+    release_manual = asyncio.Event()
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path != "/api/Auth/loginKey":
+            return httpx.Response(404)
+        payload = json.loads(request.content.decode("utf-8"))
+        user = str(payload["userName"])
+        key = str(payload["apiKey"])
+        login_calls.append((user, key))
+        if mode[0] == "seed_ok":
+            return httpx.Response(200, json={"success": True, "token": "seed-token"})
+        if mode[0] == "transient_fail":
+            return httpx.Response(503, json={"success": False, "errorMessage": "busy"})
+        if user == "new_user" and key == "new_key":
+            manual_entered.set()
+            await asyncio.wait_for(release_manual.wait(), timeout=2.0)
+            return httpx.Response(200, json={"success": True, "token": "fresh-token"})
+        return httpx.Response(401, json={"success": False, "errorMessage": "revoked old key"})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        auth = TopstepAuthService(settings, client)
+        seed_time = datetime(2026, 11, 10, 0, 0, tzinfo=UTC)
+        await auth.login("old_user", "old_key", live=False, now=seed_time)
+        assert auth.is_connected is True
+
+        # Simulate transient refresh failure clearing token while retaining old_user/old_key.
+        mode[0] = "transient_fail"
+        with pytest.raises(UpstreamHTTPError):
+            await auth.ensure_token(
+                now=seed_time + timedelta(hours=settings.jwt_refresh_hours + 1)
+            )
+        assert auth.is_connected is False
+        assert auth.can_retry_login is True
+
+        login_calls.clear()
+        mode[0] = "gated_manual"
+
+        manual_task = asyncio.create_task(auth.login("new_user", "new_key", live=True))
+        await asyncio.wait_for(manual_entered.wait(), timeout=2.0)
+        assert auth.is_connected is False
+
+        # Start retry_login while manual login holds _lock and token is still None.
+        retry_task = asyncio.create_task(auth.retry_login())
+        await asyncio.sleep(0.02)
+
+        release_manual.set()
+        try:
+            await manual_task
+            retry_result = await retry_task
+        finally:
+            release_manual.set()
+
+        assert login_calls == [("new_user", "new_key")]
+        assert auth.is_connected is True
+        assert auth.live is True
+        assert await auth.ensure_token() == "fresh-token"
+        assert retry_result == "fresh-token"
 
 
 

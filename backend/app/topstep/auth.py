@@ -108,11 +108,31 @@ class TopstepAuthService:
         """Return True when cached session credentials remain eligible for transient re-auth."""
         return bool(self._username and self._api_key)
 
-    async def retry_login(self, now: datetime | None = None) -> None:
+    async def retry_login(self, now: datetime | None = None) -> str:
         """Re-authenticate using held in-memory credentials after a transient refresh failure."""
-        if not self._username or not self._api_key:
-            raise TopstepAuthError("Cannot retry login without active session credentials")
-        await self.login(self._username, self._api_key, live=self._live, now=now)
+        try:
+            return await asyncio.wait_for(
+                self._acquire_and_retry_login(now=now),
+                timeout=self._settings.upstream_total_timeout_sec,
+            )
+        except TimeoutError as exc:
+            raise UpstreamTimeoutError("TopstepX login timed out") from exc
+
+    async def _acquire_and_retry_login(self, now: datetime | None = None) -> str:
+        async with self._lock:
+            if self._token is not None:
+                return self._token
+            if not self._username or not self._api_key:
+                raise TopstepAuthError("Cannot retry login without active session credentials")
+            await self._login_locked(
+                username=self._username,
+                api_key=self._api_key,
+                live=self._live,
+                now=now,
+            )
+            if self._token is None:
+                raise TopstepAuthError("TopstepX login did not establish a session token")
+            return self._token
 
     @property
     def token_generation(self) -> int:
