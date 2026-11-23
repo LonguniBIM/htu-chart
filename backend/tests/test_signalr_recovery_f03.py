@@ -18,7 +18,7 @@ import pytest
 from argon2 import PasswordHasher
 
 from app.config import Settings
-from app.engine.bar_aggregator import BarAggregator, NormalizedTick
+from app.engine.bar_aggregator import AggregatedBarEvent, BarAggregator, NormalizedTick
 from app.engine.instruments import StorageDatasetKey
 from app.engine.ohlcv import OHLCVBar
 from app.engine.session_calendar import first_bucket_open_at_or_after, has_open_session_in_range
@@ -10658,6 +10658,145 @@ async def test_f03_degraded_retry_not_starved_by_continuous_malformed_ticks(
                     await asyncio.wait_for(svc._recovery_task, timeout=2.0)
 
                 assert len(rest_recovery_calls) >= 1
+            finally:
+                await svc.stop()
+    finally:
+        sqlite.close()
+
+
+def test_f03_reconcile_from_1m_rejects_off_grid_minute_timestamps() -> None:
+    """Contract: P1-HTF-002 requires exact 60s grid alignment for all 1m source bars in HTF bucket.
+
+    Defect caught: full_1m_coverage only checking count == expected_1m_count and first/last
+    endpoints, letting [T, T+60, T+61, T+180, T+240] (missing T+120, off-grid T+61) close 5m bar.
+    """
+    t0 = BASE_T  # 2026-11-10 14:00:00 UTC (5m aligned)
+    agg = BarAggregator(timeframes=("1m", "5m"))
+    off_grid_1m = [
+        OHLCVBar(t0, 5950.0, 5952.0, 5949.0, 5951.0, 2.0, is_closed=True),
+        OHLCVBar(t0 + 60, 5951.0, 5953.0, 5950.0, 5952.0, 2.0, is_closed=True),
+        OHLCVBar(t0 + 61, 5952.0, 5954.0, 5951.0, 5953.0, 2.0, is_closed=True),
+        OHLCVBar(t0 + 180, 5953.0, 5955.0, 5952.0, 5954.0, 2.0, is_closed=True),
+        OHLCVBar(t0 + 240, 5954.0, 5956.0, 5953.0, 5955.0, 2.0, is_closed=True),
+    ]
+
+    recon = agg.reconcile_from_1m_bars(
+        contract_id=CID_MES,
+        live_mode=False,
+        timeframe="5m",
+        closed_1m_bars=off_grid_1m,
+        now_utc=t0 + 300,
+        covered_start_utc=t0,
+    )
+
+    assert recon.closed_bars == ()
+    assert agg.get_last_closed_time(CID_MES, False, "5m") is None
+    assert any(
+        bar_t == t0 and code == "incomplete_htf_source_bars"
+        for bar_t, code, _detail in recon.rejected_bars
+    )
+
+
+@pytest.mark.asyncio
+async def test_f03_recovery_emits_authoritative_cached_bars_omitted_by_rest(
+    tmp_path: Path,
+) -> None:
+    """Contract: P1-CACHE-001 merges COMPLETE-covered cached bars into reconcile_recovery history.
+
+    Defect caught: _recover_single_timeframe_rest only passing REST valid_bars to reconcile_recovery
+    while consulting COMPLETE cached_closed later for gap checks, omitting cached T+60 from
+    RECOVERED_HISTORICAL callbacks when REST returns [T, T+120] and omits T+60.
+    """
+    t0 = BASE_T  # 2026-11-10 14:00:00 UTC
+    now_ts = t0 + 185  # 14:03:05 UTC -> closed_end = T+180
+    settings = Settings(data_dir=tmp_path / "data", signalr_enabled=True)
+    sqlite = SqliteStore(tmp_path / "meta.db")
+    sqlite.initialize()
+    parquet = ParquetStore(settings.data_dir, sqlite_store=sqlite)
+    key_1m = StorageDatasetKey("topstepx", False, CID_MES, "1m")
+
+    cached_bars = [
+        OHLCVBar(t0, 5950.0, 5952.0, 5949.0, 5951.0, 3.0, is_closed=True),
+        OHLCVBar(t0 + 60, 5951.0, 5954.0, 5950.0, 5953.0, 4.0, is_closed=True),
+        OHLCVBar(t0 + 120, 5953.0, 5955.0, 5952.0, 5954.0, 5.0, is_closed=True),
+    ]
+    await parquet.upsert_bars(key_1m, cached_bars, now_utc=t0 + 180)
+    await sqlite.record_coverage(key_1m, t0, t0 + 180, status="COMPLETE")
+    await sqlite.upsert_watermark(key_1m, t0 + 120)
+
+    emitted_recovered: list[tuple[int, float]] = []
+
+    class _MockHub:
+        def __init__(self) -> None:
+            self.is_connected = True
+            self.last_event_monotonic: float | None = 100.0
+            self.queue_overflow_count = 0
+            self.connected_token_digest: str | None = None
+            self._on_event: Any = None
+
+        def has_pending_subscription(self, _cid: str) -> bool:
+            return False
+
+        async def update_contracts(self, _contracts: Any, *, live_mode: bool) -> None:
+            return None
+
+        async def sync_contracts(self, _contracts: Any, *, live_mode: bool) -> None:
+            return None
+
+        async def stop(self) -> None:
+            self.is_connected = False
+
+    class _PartialRest:
+        async def retrieve_bars_paginated(self, **_kw: Any) -> Any:
+            # Omit T+60 from REST response while returning T and T+120 (updated close at T+120).
+            bars = [
+                _wire_bar(t0, 5950.0, 5952.0, 5949.0, 5951.0, 3.0),
+                _wire_bar(t0 + 120, 5953.0, 5956.0, 5952.0, 5955.0, 6.0),
+            ]
+            return type("R", (), {"raw_bars": bars, "truncated": False, "provider_gap": False})()
+
+    def _auth_handler(_req: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"success": True, "errorCode": 0, "token": "jwt-cache"})
+
+    def _on_signal(evt: AggregatedBarEvent, tag: str | None) -> None:
+        if tag == "RECOVERED_HISTORICAL" and evt.timeframe == "1m":
+            emitted_recovered.append((evt.bar.time, evt.bar.close))
+
+    try:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(_auth_handler)) as client:
+            auth = TopstepAuthService(settings, client)
+            await auth.login("alice", "api-key")
+            svc = LiveFeedService(
+                settings,
+                auth,
+                _PartialRest(),
+                parquet,
+                sqlite,
+                signalr_hub=cast(Any, _MockHub()),
+                recovery_timeframes=("1m",),
+                initial_backfill_bars=3,
+                on_bar_signal=_on_signal,
+                clock=lambda: now_ts,
+            )
+            try:
+                await svc.set_active_contracts([CID_MES], live_mode=False)
+                svc._last_connected_utc = t0
+                await svc.trigger_recovery(now_utc=now_ts)
+
+                assert svc.feed_state == "LIVE"
+                assert emitted_recovered == [
+                    (t0, 5951.0),
+                    (t0 + 60, 5953.0),
+                    (t0 + 120, 5955.0),
+                ]
+                persisted = await parquet.read_bars(
+                    key_1m, start_ts=t0, end_ts=t0 + 179, include_provisional=False
+                )
+                assert [(b.time, b.close) for b in persisted] == [
+                    (t0, 5951.0),
+                    (t0 + 60, 5953.0),
+                    (t0 + 120, 5955.0),
+                ]
             finally:
                 await svc.stop()
     finally:

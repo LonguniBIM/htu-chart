@@ -1366,6 +1366,55 @@ class LiveFeedService:
             if increment_heal_seq and c_state is not None:
                 c_state.coverage_heal_seq += 1
 
+    async def _load_authoritative_cached_bars(
+        self,
+        *,
+        key: StorageDatasetKey,
+        c_state: ContractFeedRuntime,
+        tf: str,
+        backfill_start: int,
+        closed_end: int,
+        expected_gen: int,
+    ) -> list[OHLCVBar]:
+        cached_closed: Sequence[OHLCVBar] = ()
+        if closed_end > backfill_start:
+            cached_closed = await self._parquet.read_bars(
+                key,
+                start_ts=backfill_start,
+                end_ts=closed_end - 1,
+                include_provisional=False,
+            )
+            self._ensure_generation(expected_gen)
+
+        coverage_rows = await self._sqlite.get_coverage_intervals(key)
+        self._ensure_generation(expected_gen)
+        complete_ranges = [
+            (cov.start_ts, cov.end_ts)
+            for cov in coverage_rows
+            if cov.status == "COMPLETE"
+        ]
+        non_complete_ranges = [
+            (cov.start_ts, cov.end_ts)
+            for cov in coverage_rows
+            if cov.status != "COMPLETE"
+        ]
+        unhealed_tf_buckets = c_state.unhealed_gap_buckets.get(tf, set())
+        unhealed_1m_buckets = (
+            c_state.unhealed_gap_buckets.get("1m", set()) if tf != "1m" else set()
+        )
+        return [
+            b
+            for b in cached_closed
+            if b.is_closed
+            and b.time not in unhealed_tf_buckets
+            and not any(
+                b.time <= g1m < bucket_bounds(b.time, tf, root_symbol=c_state.root_symbol)[1]
+                for g1m in unhealed_1m_buckets
+            )
+            and any(c_start <= b.time < c_end for c_start, c_end in complete_ranges)
+            and not any(c_start <= b.time < c_end for c_start, c_end in non_complete_ranges)
+        ]
+
     async def _recover_single_timeframe_rest(
         self,
         *,
@@ -1565,11 +1614,23 @@ class LiveFeedService:
                 or eff_connected_utc >= open_bucket_utc_ts
                 or has_open_unhealed_gap
             )
+            auth_cached_bars = await self._load_authoritative_cached_bars(
+                key=key,
+                c_state=c_state,
+                tf=tf,
+                backfill_start=backfill_start,
+                closed_end=closed_end,
+                expected_gen=expected_gen,
+            )
+            merged_hist: dict[int, OHLCVBar] = {b.time: b for b in auth_cached_bars}
+            for b in valid_bars:
+                merged_hist[b.time] = b
+            historical_bars_for_recon = sorted(merged_hist.values(), key=lambda b: b.time)
             recon = self._aggregator.reconcile_recovery(
                 contract_id=cid,
                 live_mode=c_state.live_mode,
                 timeframe=tf,
-                historical_bars=valid_bars,
+                historical_bars=historical_bars_for_recon,
                 buffered_ticks=normalized_ticks,
                 now_utc=eff_now,
                 root_symbol=c_state.root_symbol,
@@ -1626,46 +1687,11 @@ class LiveFeedService:
             for d_time in discarded_tf_times
             if backfill_start <= d_time < closed_end
         ]
-        cached_closed: Sequence[OHLCVBar] = ()
-        if closed_end > backfill_start:
-            cached_closed = await self._parquet.read_bars(
-                key,
-                start_ts=backfill_start,
-                end_ts=closed_end - 1,
-                include_provisional=False,
-            )
-            self._ensure_generation(expected_gen)
-
-        coverage_rows = await self._sqlite.get_coverage_intervals(key)
-        self._ensure_generation(expected_gen)
-        complete_ranges = [
-            (cov.start_ts, cov.end_ts)
-            for cov in coverage_rows
-            if cov.status == "COMPLETE"
-        ]
-        non_complete_ranges = [
-            (cov.start_ts, cov.end_ts)
-            for cov in coverage_rows
-            if cov.status != "COMPLETE"
-        ]
-
         # Only REST-confirmed (COMPLETE coverage) cached bars or fresh valid REST bars heal gaps.
-        unhealed_tf_buckets = c_state.unhealed_gap_buckets.get(tf, set())
-        unhealed_1m_buckets = (
-            c_state.unhealed_gap_buckets.get("1m", set()) if tf != "1m" else set()
-        )
         valid_cached_times = {
             b.time
-            for b in cached_closed
-            if b.is_closed
-            and b.time not in unhealed_tf_buckets
-            and b.time not in discarded_tf_times
-            and not any(
-                b.time <= g1m < bucket_bounds(b.time, tf, root_symbol=c_state.root_symbol)[1]
-                for g1m in unhealed_1m_buckets
-            )
-            and any(c_start <= b.time < c_end for c_start, c_end in complete_ranges)
-            and not any(c_start <= b.time < c_end for c_start, c_end in non_complete_ranges)
+            for b in auth_cached_bars
+            if b.time not in discarded_tf_times
         }
         present_closed_times = valid_cached_times | {
             b.time for b in valid_bars if b.is_closed

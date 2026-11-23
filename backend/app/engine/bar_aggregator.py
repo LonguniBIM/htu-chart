@@ -973,8 +973,10 @@ class BarAggregator:
             full_1m_coverage = (
                 covered_ok
                 and len(members) == expected_1m_count
-                and members[0].time == htf_open
-                and members[-1].time == htf_end - 60
+                and all(
+                    b.time == htf_open + (idx * 60)
+                    for idx, b in enumerate(members)
+                )
             )
             bar_closed = all_inputs_closed and bucket_elapsed and full_1m_coverage
 
