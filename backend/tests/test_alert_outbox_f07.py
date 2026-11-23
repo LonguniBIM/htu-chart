@@ -16,7 +16,7 @@ import pytest
 from argon2 import PasswordHasher
 from pydantic import ValidationError
 
-from app.config import Settings
+from app.config import Settings, load_settings
 from app.engine.alert_engine import (
     AlertCandidate,
     AlertDirection,
@@ -33,7 +33,7 @@ from app.engine.session_calendar import (
     has_open_session_in_range,
 )
 from app.main import create_app
-from app.notify.telegram import TelegramClient, build_telegram_httpx_timeout
+from app.notify.telegram import TelegramClient
 from app.services.alert_service import AlertService, TelegramNotConfiguredError
 from app.services.live_feed_service import LiveFeedService
 from app.storage.parquet_store import ParquetStore
@@ -544,13 +544,23 @@ async def test_f07_f03_live_feed_signal_suppression_integration(tmp_path: Path) 
     """
     base_t = int(datetime(2026, 11, 10, 14, 0, 0, tzinfo=UTC).timestamp())
     clock = _MutableClock(base_t + 120)
-    settings = _make_settings(tmp_path)
+    settings = Settings(
+        data_dir=tmp_path,
+        app_password_hash=TEST_PASSWORD_HASH,
+        telegram_bot_token="123456:tg-secret-token-abcdef",
+        telegram_chat_id="-1001234567890",
+        upstream_max_retries=0,
+        signalr_recovery_timeout_sec=2.0,
+    )
     sent_texts: list[str] = []
+    rest_state = {"fail_history": True}
 
     def rest_handler(request: httpx.Request) -> httpx.Response:
         if request.url.path == "/api/Auth/loginKey":
             return httpx.Response(200, json={"success": True, "token": "jwt-f03-test"})
         if request.url.path == "/api/History/retrieveBars":
+            if rest_state["fail_history"]:
+                return httpx.Response(500, json={"errorMessage": "Temporary upstream outage"})
             payload = json.loads(request.content.decode("utf-8"))
             raw_start = str(payload["startTime"]).replace("Z", "+00:00")
             raw_end = str(payload["endTime"]).replace("Z", "+00:00")
@@ -601,6 +611,12 @@ async def test_f07_f03_live_feed_signal_suppression_integration(tmp_path: Path) 
     tg_client = TelegramClient(settings, tg_http)
     alert_service = AlertService(settings, engine, sqlite_store, tg_client, auth, clock=clock)
 
+    observed_signals: list[tuple[int, str | None]] = []
+
+    async def spy_on_bar_signal(event: AggregatedBarEvent, tag: str | None) -> None:
+        observed_signals.append((event.bar.time, tag))
+        await alert_service.handle_bar_signal(event, tag)
+
     transports: list[_MockSignalRTransport] = []
 
     async def ws_factory(*_args: Any, **_kwargs: Any) -> _MockSignalRTransport:
@@ -619,84 +635,89 @@ async def test_f07_f03_live_feed_signal_suppression_integration(tmp_path: Path) 
         signalr_hub=hub,
         recovery_timeframes=("1m",),
         initial_backfill_bars=3,
-        on_bar_signal=alert_service.handle_bar_signal,
+        degraded_retry_interval_sec=60.0,
+        on_bar_signal=spy_on_bar_signal,
         clock=clock,
     )
+
+    def _trade_frame(ts: int, price: float, volume: float) -> dict[str, Any]:
+        return {
+            "type": 1,
+            "target": "GatewayTrade",
+            "arguments": [
+                CID_MES,
+                {
+                    "symbolId": "F.US.MES",
+                    "price": price,
+                    "volume": volume,
+                    "timestamp": datetime.fromtimestamp(ts, tz=UTC)
+                    .isoformat()
+                    .replace("+00:00", "Z"),
+                },
+            ],
+        }
 
     try:
         await auth.login("user1", "api-key-123456", live=False)
         await live_feed.set_active_contracts([CID_MES], live_mode=False)
         await live_feed.start()
 
+        # 1) Failed REST backfill drives LiveFeedService into DEGRADED state
+        for _ in range(100):
+            if live_feed.feed_state == "DEGRADED":
+                break
+            await asyncio.sleep(0.02)
+        assert live_feed.feed_state == "DEGRADED"
+
+        tr = transports[-1]
+        await tr.handshake_done.wait()
+
+        # Ingest live ticks while DEGRADED -> closed bar must emit tag="SUPPRESSED" & enqueue 0
+        m1_open = base_t + 180
+        m2_open = base_t + 240
+        clock.now = m1_open + 15
+        await tr.push_frame(_trade_frame(m1_open + 15, 5951.0, 5))
+        await asyncio.sleep(0.03)
+        clock.now = m2_open + 10
+        await tr.push_frame(_trade_frame(m2_open + 10, 5951.5, 4))
+
+        for _ in range(100):
+            if any(tag == "SUPPRESSED" for _, tag in observed_signals):
+                break
+            await asyncio.sleep(0.02)
+        assert (m1_open, "SUPPRESSED") in observed_signals
+        assert engine.suppressed_signals >= 1
+        assert (await sqlite_store.get_outbox_summary())["total"] == 0
+
+        # 2) Recover to LIVE at m3_open + 2 -> REST confirms prior bars & emits RECOVERED_HISTORICAL
+        rest_state["fail_history"] = False
+        clock.now = base_t + 302
+        await live_feed.trigger_recovery()
         for _ in range(100):
             if live_feed.feed_state == "LIVE":
                 break
             await asyncio.sleep(0.02)
         assert live_feed.feed_state == "LIVE"
-
-        # Historical recovery bars must have been skipped, zero enqueued during recovery
+        assert any(tag == "RECOVERED_HISTORICAL" for _, tag in observed_signals)
         assert engine.recovered_historical_skipped >= 1
         assert (await sqlite_store.get_outbox_summary())["total"] == 0
 
-        # Emit a SUPPRESSED signal (DEGRADED state) directly via handle_bar_signal
-        suppressed_evt = _closed_bar_event(
-            live_mode=False,
-            timeframe="1m",
-            bar_time=base_t + 180,
-        )
-        sup_res = await alert_service.handle_bar_signal(suppressed_evt, tag="SUPPRESSED")
-        assert sup_res == []
-        assert engine.suppressed_signals == 1
-        assert (await sqlite_store.get_outbox_summary())["total"] == 0
+        # 3) Feed real live ticks while LIVE across complete boundary (m4_open -> m5_open)
+        m4_open = base_t + 360
+        m5_open = base_t + 420
+        clock.now = m4_open + 15
+        await tr.push_frame(_trade_frame(m4_open + 15, 5952.0, 6))
+        await asyncio.sleep(0.03)
+        clock.now = m5_open + 5
+        await tr.push_frame(_trade_frame(m5_open + 5, 5952.5, 7))
 
-        # Now feed real live ticks across a complete live minute boundary (m2_open -> m3_open)
-        tr = transports[-1]
-        await tr.handshake_done.wait()
-        m2_open = base_t + 180  # First full live 1m bucket after LIVE transition
-        m3_open = base_t + 240
-        clock.now = m2_open + 15
-        await tr.push_frame(
-            {
-                "type": 1,
-                "target": "GatewayTrade",
-                "arguments": [
-                    CID_MES,
-                    {
-                        "symbolId": "F.US.MES",
-                        "price": 5952.0,
-                        "volume": 6,
-                        "timestamp": datetime.fromtimestamp(m2_open + 15, tz=UTC)
-                        .isoformat()
-                        .replace("+00:00", "Z"),
-                    },
-                ],
-            }
-        )
-        await asyncio.sleep(0.02)
-        clock.now = m3_open + 5
-        await tr.push_frame(
-            {
-                "type": 1,
-                "target": "GatewayTrade",
-                "arguments": [
-                    CID_MES,
-                    {
-                        "symbolId": "F.US.MES",
-                        "price": 5952.5,
-                        "volume": 7,
-                        "timestamp": datetime.fromtimestamp(m3_open + 5, tz=UTC)
-                        .isoformat()
-                        .replace("+00:00", "Z"),
-                    },
-                ],
-            }
-        )
         for _ in range(100):
             summary = await sqlite_store.get_outbox_summary()
             if summary["total"] >= 1:
                 break
             await asyncio.sleep(0.02)
 
+        assert (m4_open, None) in observed_signals
         summary = await sqlite_store.get_outbox_summary()
         assert summary["total"] == 1
         assert summary["pending"] == 1
@@ -709,7 +730,7 @@ async def test_f07_f03_live_feed_signal_suppression_integration(tmp_path: Path) 
 
         # Scanner kill-switch suppresses LIVE bars too
         alert_service.set_scanner_enabled(False)
-        killed_evt = _closed_bar_event(live_mode=False, timeframe="1m", bar_time=m3_open)
+        killed_evt = _closed_bar_event(live_mode=False, timeframe="1m", bar_time=m5_open)
         assert await alert_service.handle_bar_signal(killed_evt, tag=None) == []
         assert (await sqlite_store.get_outbox_summary())["total"] == 1
     finally:
@@ -1022,7 +1043,12 @@ async def test_f07_lifespan_creates_and_closes_dedicated_telegram_client(
     app = create_app(settings=settings)
     async with app.router.lifespan_context(app):
         assert len(created_clients) == 2
-        assert captured_timeouts[1] == build_telegram_httpx_timeout(settings)
+        tg_timeout = captured_timeouts[1]
+        assert isinstance(tg_timeout, httpx.Timeout)
+        assert tg_timeout.connect == 5.0
+        assert tg_timeout.read == 10.0
+        assert tg_timeout.write == 10.0
+        assert tg_timeout.pool == 5.0
         assert created_clients[0].is_closed is False
         assert created_clients[1].is_closed is False
         assert app.state.telegram_http_client is created_clients[1]
@@ -1171,3 +1197,123 @@ async def test_f07_direct_enqueue_candidate_infers_root_symbol_and_validates(
         store.close()
         await tg.aclose()
         await up.aclose()
+
+
+def test_f07_env_alert_retry_backoff_sec_parsing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Contract: ALERT_RETRY_BACKOFF_SEC parses comma-separated and JSON env strings cleanly.
+
+    Defect caught: pydantic-settings EnvSettingsSource crashing with JSONDecodeError on '2,5,15'.
+    """
+    monkeypatch.setenv("ALERT_RETRY_BACKOFF_SEC", "2,5,15")
+    csv_settings = Settings()
+    assert csv_settings.alert_retry_backoff_sec == [2.0, 5.0, 15.0]
+
+    monkeypatch.setenv("ALERT_RETRY_BACKOFF_SEC", "[1, 3, 9]")
+    json_settings = Settings()
+    assert json_settings.alert_retry_backoff_sec == [1.0, 3.0, 9.0]
+
+    monkeypatch.delenv("ALERT_RETRY_BACKOFF_SEC", raising=False)
+    env_file = tmp_path / ".env"
+    env_file.write_text("ALERT_RETRY_BACKOFF_SEC=2,5,15\n", encoding="utf-8")
+    loaded = load_settings(env_file=env_file)
+    assert loaded.alert_retry_backoff_sec == [2.0, 5.0, 15.0]
+
+
+async def test_f07_redacts_full_error_before_truncation_with_4080_token_body(
+    tmp_path: Path,
+) -> None:
+    """Contract: Full response body is redacted BEFORE slicing to _MAX_ERROR_CHARS (512).
+
+    Defect caught: Pre-redaction 4096-byte slice cutting chat_id into '-1009' inside final error.
+    """
+    chat_id = "-1009876543210"
+    settings = _make_settings(tmp_path, chat_id=chat_id)
+    long_body = "token=" + ("X" * 4080) + " end " + chat_id
+
+    log_buf = io.StringIO()
+    handler = logging.StreamHandler(log_buf)
+    tg_logger = logging.getLogger("topstep_chart.notify.telegram")
+    prev_lvl = tg_logger.level
+    tg_logger.setLevel(logging.DEBUG)
+    tg_logger.addHandler(handler)
+    try:
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(lambda _r: httpx.Response(502, text=long_body))
+        ) as tg_http:
+            client = TelegramClient(settings, tg_http)
+            result = await client.send_message("hello")
+    finally:
+        tg_logger.removeHandler(handler)
+        tg_logger.setLevel(prev_lvl)
+
+    assert result.ok is False
+    assert result.status_code == 502
+    assert result.error is not None
+    assert len(result.error) <= 512
+    assert chat_id not in result.error
+    assert "-1009" not in result.error
+    emitted_logs = log_buf.getvalue()
+    assert chat_id not in emitted_logs
+    assert "-1009" not in emitted_logs
+
+
+async def test_f07_telegram_semaphore_concurrency_and_cancellation(tmp_path: Path) -> None:
+    """Contract: TelegramClient enforces max_concurrency semaphore and propagates CancelledError.
+
+    Defect caught: Unbounded concurrent Telegram POSTs or swallowed task cancellation.
+    """
+    settings = Settings(
+        data_dir=tmp_path,
+        app_password_hash=TEST_PASSWORD_HASH,
+        telegram_bot_token="123456:tg-secret-token-abcdef",
+        telegram_chat_id="-1001234567890",
+        telegram_max_concurrency=2,
+    )
+    in_flight = 0
+    max_observed = 0
+    started_two = asyncio.Event()
+    release_send = asyncio.Event()
+
+    async def slow_handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal in_flight, max_observed
+        in_flight += 1
+        max_observed = max(max_observed, in_flight)
+        if max_observed >= 2:
+            started_two.set()
+        try:
+            await release_send.wait()
+            return httpx.Response(200, json={"ok": True})
+        finally:
+            in_flight -= 1
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(slow_handler)) as tg_http:
+        client = TelegramClient(settings, tg_http)
+        tasks = [asyncio.create_task(client.send_message(f"msg-{i}")) for i in range(5)]
+        await asyncio.wait_for(started_two.wait(), timeout=2.0)
+        await asyncio.sleep(0.02)
+        assert max_observed == 2
+        release_send.set()
+        results = await asyncio.gather(*tasks)
+        assert all(res.ok is True for res in results)
+
+        # Cancellation propagation while blocked inside send_message
+        release_send.clear()
+        started_cancel_target = asyncio.Event()
+
+        async def blocking_handler(_request: httpx.Request) -> httpx.Response:
+            started_cancel_target.set()
+            await asyncio.Future()
+            return httpx.Response(200, json={"ok": True})
+
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(blocking_handler)
+        ) as blocking_http:
+            cancel_client = TelegramClient(settings, blocking_http)
+            cancel_task = asyncio.create_task(cancel_client.send_message("cancel-me"))
+            await asyncio.wait_for(started_cancel_target.wait(), timeout=2.0)
+            cancel_task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await cancel_task

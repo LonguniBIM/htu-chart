@@ -60,9 +60,14 @@ async def _async_client(
     *,
     client_ip: str = "127.0.0.1",
     transport: httpx.AsyncBaseTransport | None = None,
+    telegram_http_client: httpx.AsyncClient | None = None,
 ):
     upstream = httpx.AsyncClient(transport=transport or _mock_topstep_transport())
-    app = create_app(settings=settings, http_client=upstream)
+    owns_tg = telegram_http_client is None
+    tg_client = telegram_http_client or httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda _r: httpx.Response(200, json={"ok": True}))
+    )
+    app = create_app(settings=settings, http_client=upstream, telegram_http_client=tg_client)
     try:
         async with app.router.lifespan_context(app):
             asgi = httpx.ASGITransport(app=app, client=(client_ip, 54321))
@@ -72,6 +77,8 @@ async def _async_client(
             ) as client:
                 yield client, app
     finally:
+        if owns_tg:
+            await tg_client.aclose()
         await upstream.aclose()
 
 
@@ -934,7 +941,9 @@ async def test_f01_concurrent_login_rechecks_rate_limit_after_permit_acquire(
         assert call_count == 1
 
 
-async def test_f01_alert_routes_require_session_csrf_and_redact_telegram_secrets() -> None:
+async def test_f01_alert_routes_require_session_csrf_and_redact_telegram_secrets(
+    tmp_path: Path,
+) -> None:
     """Contract: /api/alerts/* enforces session/CSRF and redact_secrets masks bot URL & chat_id.
 
     Defect caught: Unauthenticated/missing-CSRF alert mutations or /bot<token> URL secret leaks.
@@ -942,42 +951,56 @@ async def test_f01_alert_routes_require_session_csrf_and_redact_telegram_secrets
     bot_token = "987654321:AAH_super_secret_bot_token_value"
     chat_id = "-1009988776655"
     settings = Settings(
+        data_dir=tmp_path,
         app_password_hash=TEST_PASSWORD_HASH,
         telegram_bot_token=bot_token,
         telegram_chat_id=chat_id,
+        topstepx_key_updated_at=None,
     )
+
+    # _TELEGRAM_BOT_URL_RE and _JSON_SECRET_RE/_KV_SECRET_RE must redact even without extra_secrets
+    raw_url_only = f"POST https://api.telegram.org/bot{bot_token}/sendMessage"
+    redacted_url_only = redact_secrets(raw_url_only)
+    assert bot_token not in redacted_url_only
+    assert redacted_url_only == "POST https://api.telegram.org/bot***REDACTED***/sendMessage"
 
     raw_url_error = (
         f"POST https://api.telegram.org/bot{bot_token}/sendMessage "
         f'payload={{"chat_id": "{chat_id}", "TELEGRAM_CHAT_ID": "{chat_id}"}}'
     )
-    redacted = redact_secrets(raw_url_error, (bot_token, chat_id))
+    redacted = redact_secrets(raw_url_error)
     assert bot_token not in redacted
     assert chat_id not in redacted
     assert "/bot***REDACTED***/sendMessage" in redacted
 
-    async with _async_client(settings) as (client, _):
-        assert (await client.get("/api/alerts/status")).status_code == 401
-        assert (await client.get("/api/alerts/history")).status_code == 401
-        scanner_unauth = await client.post("/api/alerts/scanner", json={"enabled": False})
-        assert scanner_unauth.status_code == 401
-        assert (await client.post("/api/alerts/test")).status_code == 401
+    tg_mock = httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda _r: httpx.Response(200, json={"ok": True}))
+    )
+    try:
+        async with _async_client(settings, telegram_http_client=tg_mock) as (client, _):
+            assert (await client.get("/api/alerts/status")).status_code == 401
+            assert (await client.get("/api/alerts/history")).status_code == 401
+            scanner_unauth = await client.post("/api/alerts/scanner", json={"enabled": False})
+            assert scanner_unauth.status_code == 401
+            assert (await client.post("/api/alerts/test")).status_code == 401
 
-        csrf_token = await _login_and_get_csrf(client)
-        assert (
-            await client.post("/api/alerts/scanner", json={"enabled": False})
-        ).status_code == 403
-        assert (await client.post("/api/alerts/test")).status_code == 403
+            csrf_token = await _login_and_get_csrf(client)
+            assert (
+                await client.post("/api/alerts/scanner", json={"enabled": False})
+            ).status_code == 403
+            assert (await client.post("/api/alerts/test")).status_code == 403
 
-        ok_scanner = await client.post(
-            "/api/alerts/scanner",
-            json={"enabled": False},
-            headers={"X-CSRF-Token": csrf_token},
-        )
-        assert ok_scanner.status_code == 200
-        assert ok_scanner.json()["scanner_enabled"] is False
+            ok_scanner = await client.post(
+                "/api/alerts/scanner",
+                json={"enabled": False},
+                headers={"X-CSRF-Token": csrf_token},
+            )
+            assert ok_scanner.status_code == 200
+            assert ok_scanner.json()["scanner_enabled"] is False
 
-        status_resp = await client.get("/api/alerts/status")
-        assert status_resp.status_code == 200
-        assert bot_token not in status_resp.text
-        assert chat_id not in status_resp.text
+            status_resp = await client.get("/api/alerts/status")
+            assert status_resp.status_code == 200
+            assert bot_token not in status_resp.text
+            assert chat_id not in status_resp.text
+    finally:
+        await tg_mock.aclose()

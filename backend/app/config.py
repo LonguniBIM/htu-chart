@@ -7,11 +7,11 @@ import json
 import math
 from datetime import date
 from pathlib import Path
-from typing import Literal
+from typing import Annotated, Literal
 from urllib.parse import urlparse
 
 from pydantic import Field, field_validator, model_validator
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 DEFAULT_LOOPBACK_HOSTS = ("127.0.0.1", "localhost", "[::1]", "::1")
 _LOOPBACK_URL_HOSTNAMES = frozenset({"127.0.0.1", "localhost", "::1"})
@@ -189,7 +189,9 @@ class Settings(BaseSettings):
     telegram_api_base_url: str = "https://api.telegram.org"
     alert_ttl_seconds: int = Field(default=90, ge=1, le=3600)
     alert_max_retries: int = Field(default=3, ge=0, le=10)
-    alert_retry_backoff_sec: list[float] = Field(default_factory=lambda: [2.0, 5.0, 15.0])
+    alert_retry_backoff_sec: Annotated[list[float], NoDecode] = Field(
+        default_factory=lambda: [2.0, 5.0, 15.0]
+    )
     alert_dispatch_poll_interval_sec: float = Field(default=1.0, gt=0.0, le=60.0)
     telegram_connect_timeout_sec: float = Field(default=5.0, gt=0.0)
     telegram_read_timeout_sec: float = Field(default=10.0, gt=0.0)
