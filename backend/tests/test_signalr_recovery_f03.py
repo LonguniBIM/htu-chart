@@ -875,15 +875,22 @@ async def test_f03_multi_contract_and_multi_timeframe_recovery_retains_cross_con
             # REST 1m bar (high=200.0, vol=10.0) and late buffered tick (close=180.0, vol=4.0).
             mes_1m = agg.get_open_bar(cid_a, False, "1m")
             assert mes_1m == OHLCVBar(b1, 180.0, 180.0, 180.0, 180.0, 4.0, is_closed=False)
-            for htf in ("5m", "15m", "1h", "4h", "1d"):
+            expected_htf = {
+                "5m": (b0, 14.0),
+                "15m": (b0, 14.0),
+                "1h": (b0, 14.0),
+                "4h": (b0 - 10800, 914.0),
+                "1d": (b0 - 54000, 4514.0),
+            }
+            for htf, (exp_time, exp_vol) in expected_htf.items():
                 htf_bar = agg.get_open_bar(cid_a, False, htf)
                 assert htf_bar is not None
+                assert htf_bar.time == exp_time
                 assert htf_bar.open == 100.0
                 assert htf_bar.high == 200.0
                 assert htf_bar.low == 95.0
                 assert htf_bar.close == 180.0
-                prior_mins = max(0, (b0 - htf_bar.time) // 60)
-                assert htf_bar.volume == (prior_mins * 5.0) + 14.0
+                assert htf_bar.volume == exp_vol
 
             mnq_5m = agg.get_open_bar(cid_b, False, "5m")
             assert mnq_5m is not None
@@ -8622,6 +8629,139 @@ async def test_f03_mismatched_live_mode_malformed_tick_preserves_live_state_and_
                 assert persisted[0].volume == 2.0
             finally:
                 await svc.stop()
+    finally:
+        sqlite.close()
+
+
+@pytest.mark.asyncio
+async def test_f03_restart_restores_persisted_corrupted_gap_prior_to_watermark_overlap(
+    tmp_path: Path,
+) -> None:
+    """Contract: P1-001/P2-001 restores persisted non-COMPLETE SQLite gaps across restart.
+
+    Defect caught: Restarting after a late malformed tick left CORRUPTED [14:02, 14:03) with
+    watermark at 14:09 computed backfill_start=14:07, skipping 14:02 and falsely going LIVE.
+    """
+    settings = Settings(data_dir=tmp_path / "data", signalr_enabled=True)
+    sqlite = SqliteStore(tmp_path / "meta.db")
+    sqlite.initialize()
+    parquet = ParquetStore(settings.data_dir, sqlite_store=sqlite)
+
+    t0 = BASE_T  # 14:00:00
+    t_gap = t0 + 120  # 14:02:00
+    t_wm = t0 + 540  # 14:09:00
+    now_t = t0 + 610  # 14:10:10
+
+    key_1m = StorageDatasetKey("topstepx", False, CID_MES, "1m")
+    rest_calls: list[tuple[int, int]] = []
+    rest_mode = ["fail"]  # "fail" -> "partial" -> "heal"
+
+    class _RestartRest:
+        async def retrieve_bars_paginated(self, **kw: Any) -> Any:
+            s_ts = int(kw["start_ts"])
+            e_ts = int(kw["end_ts"])
+            rest_calls.append((s_ts, e_ts))
+            if rest_mode[0] == "fail":
+                raise ConnectionError("REST down during restart")
+            cutoff = now_t - (now_t % 60)
+            bars = []
+            for ts in range(s_ts - (s_ts % 60), min(e_ts, cutoff), 60):
+                if rest_mode[0] == "partial" and ts < t0 + 420:  # < 14:07
+                    continue
+                bars.append(
+                    {"t": ts, "o": 5950.0, "h": 5952.0, "l": 5949.0, "c": 5951.0, "v": 4.0}
+                )
+            return type("R", (), {"raw_bars": bars, "truncated": False, "provider_gap": False})()
+
+    def _auth_handler(_req: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"success": True, "errorCode": 0, "token": "jwt-restart"})
+
+    try:
+        # Seed persisted state before restart: COMPLETE 14:00..14:09, watermark=14:09,
+        # then a late malformed tick at 14:02 writes CORRUPTED [14:02, 14:03).
+        await sqlite.record_coverage(key_1m, t0, t_wm + 60, status="COMPLETE")
+        await sqlite.upsert_watermark(key_1m, t_wm)
+        await sqlite.record_coverage(
+            key_1m, t_gap, t_gap + 60, status="CORRUPTED", quarantined_count=1
+        )
+        assert await sqlite.is_interval_complete(key_1m, t_gap, t_gap + 60) is False
+
+        async with httpx.AsyncClient(transport=httpx.MockTransport(_auth_handler)) as client:
+            auth = TopstepAuthService(settings, client)
+            await auth.login("alice", "api-key")
+
+            # Restarted service #1: REST fails -> MUST stay DEGRADED with unresolved_gaps > 0.
+            svc1 = LiveFeedService(
+                settings,
+                auth,
+                _RestartRest(),
+                parquet,
+                sqlite,
+                aggregator=BarAggregator(timeframes=("1m",)),
+                recovery_timeframes=("1m",),
+                initial_backfill_bars=2,
+                clock=lambda: now_t,
+            )
+            try:
+                await svc1.set_active_contracts([CID_MES], live_mode=False)
+                svc1._last_connected_utc = t0 - 30
+                await svc1.trigger_recovery(now_utc=now_t)
+                assert svc1.feed_state == "DEGRADED"
+                assert svc1.live_alerts_enabled is False
+                assert svc1.get_status_snapshot()["unresolved_gaps"] > 0
+                assert rest_calls[-1][0] <= t_gap
+            finally:
+                await svc1.stop()
+
+            # Restarted service #2: REST omits 14:02 -> MUST stay DEGRADED with unresolved_gaps > 0.
+            rest_mode[0] = "partial"
+            svc2 = LiveFeedService(
+                settings,
+                auth,
+                _RestartRest(),
+                parquet,
+                sqlite,
+                aggregator=BarAggregator(timeframes=("1m",)),
+                recovery_timeframes=("1m",),
+                initial_backfill_bars=2,
+                clock=lambda: now_t,
+            )
+            try:
+                await svc2.set_active_contracts([CID_MES], live_mode=False)
+                svc2._last_connected_utc = t0 - 30
+                await svc2.trigger_recovery(now_utc=now_t)
+                assert svc2.feed_state == "DEGRADED"
+                assert svc2.live_alerts_enabled is False
+                assert svc2.get_status_snapshot()["unresolved_gaps"] > 0
+                assert rest_calls[-1][0] <= t_gap
+                assert await sqlite.is_interval_complete(key_1m, t_gap, t_gap + 60) is False
+            finally:
+                await svc2.stop()
+
+            # Restarted service #3: REST returns repaired 14:02..14:09 -> heals to LIVE!
+            rest_mode[0] = "heal"
+            svc3 = LiveFeedService(
+                settings,
+                auth,
+                _RestartRest(),
+                parquet,
+                sqlite,
+                aggregator=BarAggregator(timeframes=("1m",)),
+                recovery_timeframes=("1m",),
+                initial_backfill_bars=2,
+                clock=lambda: now_t,
+            )
+            try:
+                await svc3.set_active_contracts([CID_MES], live_mode=False)
+                svc3._last_connected_utc = t0 - 30
+                await svc3.trigger_recovery(now_utc=now_t)
+                assert rest_calls[-1][0] <= t_gap
+                assert svc3.feed_state == "LIVE"
+                assert svc3.live_alerts_enabled is True
+                assert svc3.get_status_snapshot()["unresolved_gaps"] == 0
+                assert await sqlite.is_interval_complete(key_1m, t_gap, t_gap + 60) is True
+            finally:
+                await svc3.stop()
     finally:
         sqlite.close()
 

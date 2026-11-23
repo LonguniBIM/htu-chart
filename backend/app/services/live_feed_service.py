@@ -1237,6 +1237,30 @@ class LiveFeedService:
         if expected_gen is not None and self._generation != expected_gen:
             raise _StaleGenerationAbort
 
+    async def _restore_persisted_gap_buckets(
+        self,
+        c_state: ContractFeedRuntime,
+        tf: str,
+        *,
+        closed_end: int,
+        expected_gen: int,
+    ) -> None:
+        """Hydrate in-memory unhealed gap buckets from persisted non-COMPLETE SQLite coverage."""
+        key = StorageDatasetKey("topstepx", c_state.live_mode, c_state.contract_id, tf)
+        intervals = await self._sqlite.get_coverage_intervals(key)
+        self._ensure_generation(expected_gen)
+        for iv in intervals:
+            if iv.status == "COMPLETE":
+                continue
+            eff_end = min(iv.end_ts, closed_end) if iv.start_ts < closed_end else iv.end_ts
+            cursor = bucket_open_utc(iv.start_ts, tf)
+            self._record_gap_bucket(c_state, tf, cursor)
+            _, next_bucket = bucket_bounds(cursor, tf, root_symbol=c_state.root_symbol)
+            while next_bucket < eff_end:
+                cursor = next_bucket
+                self._record_gap_bucket(c_state, tf, cursor)
+                _, next_bucket = bucket_bounds(cursor, tf, root_symbol=c_state.root_symbol)
+
     async def _await_shielded(self, coro: Awaitable[Any]) -> Any:
         """Await a coroutine/task to completion even if the caller is cancelled."""
         task = asyncio.ensure_future(coro)
@@ -1334,8 +1358,25 @@ class LiveFeedService:
                 eff_now - (self._initial_backfill_bars * TIMEFRAME_SECONDS[tf]),
             )
 
+        closed_end = latest_closed_bucket_end_utc(eff_now, tf, root_symbol=c_state.root_symbol)
+        await self._restore_persisted_gap_buckets(
+            c_state,
+            tf,
+            closed_end=closed_end,
+            expected_gen=expected_gen,
+        )
+
         if tf == "1m" and align_for_higher_tfs:
             for htf in align_for_higher_tfs:
+                htf_closed_end = latest_closed_bucket_end_utc(
+                    eff_now, htf, root_symbol=c_state.root_symbol
+                )
+                await self._restore_persisted_gap_buckets(
+                    c_state,
+                    htf,
+                    closed_end=htf_closed_end,
+                    expected_gen=expected_gen,
+                )
                 htf_key = StorageDatasetKey("topstepx", c_state.live_mode, cid, htf)
                 wm_htf = await self._sqlite.get_watermark(htf_key)
                 self._ensure_generation(expected_gen)
@@ -1368,7 +1409,6 @@ class LiveFeedService:
                     backfill_start = min(backfill_start, missing_ranges[0][0])
 
         unhealed_start = c_state.unhealed_gap_starts.get(tf)
-        closed_end = latest_closed_bucket_end_utc(eff_now, tf, root_symbol=c_state.root_symbol)
         open_bucket_unhealed = unhealed_start is not None and unhealed_start >= closed_end
         if unhealed_start is not None and not open_bucket_unhealed:
             backfill_start = min(backfill_start, unhealed_start)
@@ -1404,10 +1444,18 @@ class LiveFeedService:
             gap_from_rest_issues = False
             if issues:
                 await self._sqlite.record_quality_issues(key, issues)
+                corrupted_end = (
+                    closed_end
+                    if closed_end > backfill_start
+                    and not any(
+                        iss.bar_time is not None and iss.bar_time >= closed_end for iss in issues
+                    )
+                    else backfill_end
+                )
                 await self._record_coverage_locked(
                     key,
                     backfill_start,
-                    backfill_end,
+                    corrupted_end,
                     status="CORRUPTED",
                     expected_gen=expected_gen,
                     quarantined_count=len(issues),
@@ -1636,6 +1684,8 @@ class LiveFeedService:
                 )
             if self._clear_healed_gap_buckets(c_state, tf, backfill_start, closed_end):
                 had_gap = True
+                if c_state.unresolved_gaps == 0:
+                    c_state.unresolved_gaps += 1
 
         for closed_evt in recon.closed_bars:
             self._ensure_generation(expected_gen)
