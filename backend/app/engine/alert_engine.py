@@ -61,11 +61,12 @@ class BarSignalEvaluator(Protocol):
         ...
 
 
-def _normalize_candidate(
+def normalize_candidate(
     candidate: AlertCandidate,
     *,
-    default_strategy_id: str,
+    default_strategy_id: str = "",
 ) -> AlertCandidate:
+    """Validate and normalize an AlertCandidate, inferring root_symbol when omitted."""
     strategy_id = (candidate.strategy_id or default_strategy_id).strip()
     if not strategy_id:
         raise ValueError("AlertCandidate.strategy_id must be non-empty")
@@ -196,7 +197,7 @@ class AlertEngine:
             emitted = fn(event)
             for item in emitted:
                 candidates.append(
-                    _normalize_candidate(item, default_strategy_id=strategy_id)
+                    normalize_candidate(item, default_strategy_id=strategy_id)
                 )
         return tuple(candidates)
 

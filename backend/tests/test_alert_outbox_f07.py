@@ -10,7 +10,6 @@ from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
-from zoneinfo import ZoneInfo
 
 import httpx
 import pytest
@@ -34,7 +33,7 @@ from app.engine.session_calendar import (
     has_open_session_in_range,
 )
 from app.main import create_app
-from app.notify.telegram import TelegramClient
+from app.notify.telegram import TelegramClient, build_telegram_httpx_timeout
 from app.services.alert_service import AlertService, TelegramNotConfiguredError
 from app.services.live_feed_service import LiveFeedService
 from app.storage.parquet_store import ParquetStore
@@ -45,7 +44,6 @@ from app.topstep.signalr_hub import SIGNALR_RECORD_SEPARATOR, SignalRMarketHub
 
 CID_MES = "CON.F.US.MES.Z26"
 CID_MNQ = "CON.F.US.MNQ.Z26"
-VN_TZ = ZoneInfo("Asia/Ho_Chi_Minh")
 TEST_PASSWORD = "correct-horse-battery-staple"
 TEST_PASSWORD_HASH = PasswordHasher().hash(TEST_PASSWORD)
 
@@ -915,7 +913,7 @@ async def test_f07_weekend_key_rotation_reminder_and_weekday_suppression(tmp_pat
 
 
 async def test_f07_terminal_state_invariants_and_pure_alert_engine(tmp_path: Path) -> None:
-    """Contract: Terminal rows are immutable; AlertEngine formats VN UTC+7 and validates config.
+    """Contract: Terminal rows are immutable; AlertEngine formats UTC+7 and validates config.
 
     Defect caught: Terminal DELIVERED/EXPIRED/FAILED rows reverting to PENDING or bad URL config.
     """
@@ -956,15 +954,12 @@ async def test_f07_terminal_state_invariants_and_pure_alert_engine(tmp_path: Pat
     finally:
         store.close()
 
-    # Pure Vietnam UTC+7 message formatting check
+    # Pure Vietnam UTC+7 message formatting check (independent UTC+7 wall-clock strings)
     candidate = _sample_candidate()
     created_utc = int(datetime(2026, 11, 10, 14, 0, 0, tzinfo=UTC).timestamp())
     formatted = format_entry_alert_message(candidate, created_utc)
-    expected_vn = datetime.fromtimestamp(created_utc, tz=UTC).astimezone(VN_TZ).strftime(
-        "%Y-%m-%d %H:%M:%S"
-    )
-    assert expected_vn in formatted
-    assert "UTC+7" in formatted
+    assert "Bar: 2025-11-10 21:00:00 ICT (UTC+7)" in formatted
+    assert "Time: 2026-11-10 21:00:00 ICT (UTC+7)" in formatted
     assert "Bullish FVG + Liquidity Sweep" in formatted
     assert "Entry: 5950.25" in formatted
     assert "SL: 5945" in formatted
@@ -1010,9 +1005,11 @@ async def test_f07_lifespan_creates_and_closes_dedicated_telegram_client(
     Defect caught: Leaked Telegram httpx connection pool or missing client initialization.
     """
     created_clients: list[httpx.AsyncClient] = []
+    captured_timeouts: list[object] = []
     orig_async_client = httpx.AsyncClient
 
     def fake_async_client(*args: object, **kwargs: object) -> httpx.AsyncClient:
+        captured_timeouts.append(kwargs.get("timeout"))
         client = orig_async_client(
             transport=httpx.MockTransport(lambda _r: httpx.Response(200, json={"ok": True}))
         )
@@ -1025,8 +1022,152 @@ async def test_f07_lifespan_creates_and_closes_dedicated_telegram_client(
     app = create_app(settings=settings)
     async with app.router.lifespan_context(app):
         assert len(created_clients) == 2
+        assert captured_timeouts[1] == build_telegram_httpx_timeout(settings)
         assert created_clients[0].is_closed is False
         assert created_clients[1].is_closed is False
         assert app.state.telegram_http_client is created_clients[1]
     assert created_clients[0].is_closed is True
     assert created_clients[1].is_closed is True
+
+
+async def test_f07_redacts_chat_id_straddling_truncation_boundary_in_502_body(
+    tmp_path: Path,
+) -> None:
+    """Contract: Non-JSON proxy error bodies are redacted before 512-char truncation.
+
+    Defect caught: Truncating before redaction leaves a raw prefix of telegram_chat_id.
+    """
+    chat_id = "-1009876543210"
+    settings = _make_settings(tmp_path, chat_id=chat_id)
+    filler = "X" * 508
+    body_text = f"{filler}{chat_id}-tail"
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda _r: httpx.Response(502, text=body_text))
+    ) as tg_http:
+        client = TelegramClient(settings, tg_http)
+        result = await client.send_message("hello")
+
+    assert result.ok is False
+    assert result.permanent_failure is False
+    assert result.status_code == 502
+    assert result.error is not None
+    assert len(result.error) == 512
+    assert result.error == f"{filler}***R"
+    # Zero prefix (first 4+ chars or full chat_id) may leak across the 512-byte boundary
+    for prefix_len in range(4, len(chat_id) + 1):
+        assert chat_id[:prefix_len] not in result.error
+
+
+async def test_f07_send_test_alert_bypasses_backlog_and_paused_dispatcher(
+    tmp_path: Path,
+) -> None:
+    """Contract: send_test_alert dispatches only TEST even with backlog & paused worker.
+
+    Defect caught: Test button starving behind backlog or flushing paused strategy alerts.
+    """
+    clock = _MutableClock(1_762_783_260)
+    settings = Settings(
+        data_dir=tmp_path,
+        app_password_hash=TEST_PASSWORD_HASH,
+        telegram_bot_token="123456:tg-secret-token-abcdef",
+        telegram_chat_id="-1001234567890",
+        alert_dispatcher_enabled=False,
+    )
+    sent_texts: list[str] = []
+
+    async def tg_handler(request: httpx.Request) -> httpx.Response:
+        sent_texts.append(json.loads(request.content.decode("utf-8"))["text"])
+        return httpx.Response(200, json={"ok": True})
+
+    store, up, tg, _, svc = _build_service_stack(
+        tmp_path, settings=settings, tg_handler=tg_handler, clock=clock
+    )
+    try:
+        backlog_ids: list[int] = []
+        for idx in range(20):
+            enq = await svc.enqueue_candidate(
+                _sample_candidate(bar_time=1_762_783_200 + idx * 300)
+            )
+            backlog_ids.append(enq.record.id)
+
+        test_record = await svc.send_test_alert()
+        assert test_record.status == "DELIVERED"
+        assert test_record.alert_kind == "TEST"
+        assert len(sent_texts) == 1
+        assert "Telegram test alert OK" in sent_texts[0]
+
+        for bid in backlog_ids:
+            row = await store.get_outbox_alert(bid)
+            assert row is not None
+            assert row.status == "PENDING"
+            assert row.attempt_count == 0
+    finally:
+        store.close()
+        await tg.aclose()
+        await up.aclose()
+
+
+async def test_f07_direct_enqueue_candidate_infers_root_symbol_and_validates(
+    tmp_path: Path,
+) -> None:
+    """Contract: Direct enqueue_candidate normalizes/validates inputs and infers root_symbol.
+
+    Defect caught: Direct callers bypassing AlertEngine validation or losing root_symbol label.
+    """
+    clock = _MutableClock(1_762_783_260)
+    settings = _make_settings(tmp_path)
+    store, up, tg, _, svc = _build_service_stack(
+        tmp_path,
+        settings=settings,
+        tg_handler=lambda _r: httpx.Response(200, json={"ok": True}),
+        clock=clock,
+    )
+    try:
+        direct = AlertCandidate(
+            strategy_id="direct_caller",
+            strategy_version="1",
+            live_mode=True,
+            contract_id="con.f.us.mes.z26",
+            root_symbol=None,
+            timeframe="5M",
+            bar_time=1_762_783_200,
+            direction="LONG",
+            reason="Direct test",
+        )
+        enq = await svc.enqueue_candidate(direct)
+        assert enq.inserted is True
+        assert enq.record.contract_id == CID_MES
+        assert enq.record.timeframe == "5m"
+        assert "MES (CON.F.US.MES.Z26)" in enq.record.payload_text
+
+        bad_tf = AlertCandidate(
+            strategy_id="direct_caller",
+            strategy_version="1",
+            live_mode=True,
+            contract_id=CID_MES,
+            root_symbol=None,
+            timeframe="99m",
+            bar_time=1_762_783_200,
+            direction="LONG",
+        )
+        with pytest.raises(ValueError, match="Unsupported timeframe"):
+            await svc.enqueue_candidate(bad_tf)
+
+        invalid_dir: Any = "SIDEWAYS"
+        bad_dir = AlertCandidate(
+            strategy_id="direct_caller",
+            strategy_version="1",
+            live_mode=True,
+            contract_id=CID_MES,
+            root_symbol=None,
+            timeframe="5m",
+            bar_time=1_762_783_200,
+            direction=invalid_dir,
+        )
+        with pytest.raises(ValueError, match="Unsupported AlertDirection"):
+            await svc.enqueue_candidate(bad_dir)
+    finally:
+        store.close()
+        await tg.aclose()
+        await up.aclose()

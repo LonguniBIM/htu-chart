@@ -20,6 +20,7 @@ from app.engine.alert_engine import (
     format_entry_alert_message,
     format_vn_timestamp,
     is_cme_weekend_window,
+    normalize_candidate,
 )
 from app.engine.bar_aggregator import AggregatedBarEvent
 from app.notify.telegram import TelegramClient
@@ -129,33 +130,34 @@ class AlertService:
             return results
 
     async def enqueue_candidate(self, candidate: AlertCandidate) -> EnqueueAlertResult:
-        """Persist an AlertCandidate transactionally into SQLite alert_outbox."""
+        """Normalize and persist an AlertCandidate transactionally into SQLite alert_outbox."""
+        normalized = normalize_candidate(candidate)
         created_at_utc = self._clock()
         ttl = (
-            candidate.ttl_seconds
-            if candidate.ttl_seconds is not None
+            normalized.ttl_seconds
+            if normalized.ttl_seconds is not None
             else self._settings.alert_ttl_seconds
         )
         effective_ttl = max(1, int(ttl))
         expires_at_utc = created_at_utc + effective_ttl
         max_attempts = 1 + self._settings.alert_max_retries
         payload_text = (
-            candidate.message_text
-            if candidate.message_text is not None
-            else format_entry_alert_message(candidate, created_at_utc)
+            normalized.message_text
+            if normalized.message_text is not None
+            else format_entry_alert_message(normalized, created_at_utc)
         )
         return await self._sqlite.enqueue_alert_outbox(
-            strategy_id=candidate.strategy_id,
-            strategy_version=candidate.strategy_version,
-            live_mode=candidate.live_mode,
-            contract_id=candidate.contract_id,
-            timeframe=candidate.timeframe,
-            bar_time=candidate.bar_time,
-            direction=candidate.direction,
+            strategy_id=normalized.strategy_id,
+            strategy_version=normalized.strategy_version,
+            live_mode=normalized.live_mode,
+            contract_id=normalized.contract_id,
+            timeframe=normalized.timeframe,
+            bar_time=normalized.bar_time,
+            direction=normalized.direction,
             payload_text=payload_text,
             created_at_utc=created_at_utc,
             expires_at_utc=expires_at_utc,
-            alert_kind=candidate.alert_kind,
+            alert_kind=normalized.alert_kind,
             max_attempts=max_attempts,
         )
 
@@ -174,6 +176,56 @@ class AlertService:
             backoff = max(backoff, float(retry_after_sec))
         return max(1, math.ceil(backoff))
 
+    async def _dispatch_record_locked(self, record: AlertOutboxRecord) -> AlertStatus:
+        """Dispatch a single PENDING outbox record under self._dispatch_lock."""
+        send_now = self._clock()
+        if send_now >= record.expires_at_utc:
+            if await self._sqlite.mark_outbox_expired(record.id, send_now):
+                return "EXPIRED"
+            current = await self._sqlite.get_outbox_alert(record.id)
+            return current.status if current is not None else "EXPIRED"
+
+        result = await self._telegram.send_message(record.payload_text)
+        done_now = self._clock()
+
+        if result.ok:
+            await self._sqlite.mark_outbox_delivered(record.id, done_now)
+            self._last_error = None
+            return "DELIVERED"
+
+        if result.permanent_failure:
+            safe_err = self._redact(
+                result.error or f"Telegram permanent failure ({result.status_code})"
+            )
+            await self._sqlite.mark_outbox_failed(
+                record.id,
+                done_now,
+                safe_err,
+                increment_attempt=True,
+            )
+            self._last_error = safe_err
+            return "FAILED"
+
+        safe_err = self._redact(
+            result.error or f"Telegram transient failure ({result.status_code})"
+        )
+        self._last_error = safe_err
+        delay_sec = self._compute_retry_delay_sec(
+            record.attempt_count,
+            result.retry_after_sec,
+        )
+        next_attempt_at_utc = done_now + delay_sec
+        new_status = await self._sqlite.mark_outbox_retry(
+            record.id,
+            done_now,
+            next_attempt_at_utc,
+            safe_err,
+        )
+        if new_status is not None:
+            return new_status
+        current = await self._sqlite.get_outbox_alert(record.id)
+        return current.status if current is not None else "FAILED"
+
     async def process_once(self, limit: int = 20) -> DispatchCycleStats:
         """Expire stale rows and deliver due PENDING outbox alerts sequentially under lock."""
         async with self._dispatch_lock:
@@ -185,53 +237,15 @@ class AlertService:
             failed = 0
 
             for record in due_alerts:
-                send_now = self._clock()
-                if send_now >= record.expires_at_utc:
-                    if await self._sqlite.mark_outbox_expired(record.id, send_now):
-                        expired_count += 1
-                    continue
-
-                result = await self._telegram.send_message(record.payload_text)
-                done_now = self._clock()
-
-                if result.ok:
-                    if await self._sqlite.mark_outbox_delivered(record.id, done_now):
-                        delivered += 1
-                    self._last_error = None
-                elif result.permanent_failure:
-                    safe_err = self._redact(
-                        result.error or f"Telegram permanent failure ({result.status_code})"
-                    )
-                    if await self._sqlite.mark_outbox_failed(
-                        record.id,
-                        done_now,
-                        safe_err,
-                        increment_attempt=True,
-                    ):
-                        failed += 1
-                    self._last_error = safe_err
-                else:
-                    safe_err = self._redact(
-                        result.error or f"Telegram transient failure ({result.status_code})"
-                    )
-                    self._last_error = safe_err
-                    delay_sec = self._compute_retry_delay_sec(
-                        record.attempt_count,
-                        result.retry_after_sec,
-                    )
-                    next_attempt_at_utc = done_now + delay_sec
-                    new_status = await self._sqlite.mark_outbox_retry(
-                        record.id,
-                        done_now,
-                        next_attempt_at_utc,
-                        safe_err,
-                    )
-                    if new_status == "EXPIRED":
-                        expired_count += 1
-                    elif new_status == "FAILED":
-                        failed += 1
-                    elif new_status == "PENDING":
-                        retried += 1
+                outcome = await self._dispatch_record_locked(record)
+                if outcome == "DELIVERED":
+                    delivered += 1
+                elif outcome == "EXPIRED":
+                    expired_count += 1
+                elif outcome == "FAILED":
+                    failed += 1
+                elif outcome == "PENDING":
+                    retried += 1
 
             return DispatchCycleStats(
                 expired=expired_count,
@@ -289,8 +303,9 @@ class AlertService:
             ),
             ttl_seconds=self._settings.alert_ttl_seconds,
         )
-        enqueued = await self.enqueue_candidate(candidate)
-        await self.process_once()
+        async with self._dispatch_lock:
+            enqueued = await self.enqueue_candidate(candidate)
+            await self._dispatch_record_locked(enqueued.record)
         updated = await self._sqlite.get_outbox_alert(enqueued.record.id)
         return updated or enqueued.record
 

@@ -175,9 +175,9 @@ class TelegramClient:
         desc = ""
         if isinstance(data, dict):
             raw_desc = data.get("description") or data.get("error") or ""
-            desc = str(raw_desc)
+            desc = str(raw_desc)[:4096]
         if not desc:
-            desc = resp.text[:_MAX_ERROR_CHARS] if resp.text else f"Telegram HTTP {status_code}"
+            desc = resp.text[:4096] if resp.text else f"Telegram HTTP {status_code}"
         safe_desc = self.redact_text(desc)[:_MAX_ERROR_CHARS]
 
         if status_code == 200:
