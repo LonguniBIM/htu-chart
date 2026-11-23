@@ -437,6 +437,7 @@ class SignalRMarketHub:
         self._event_queue = event_queue
         self._on_queue_overflow = on_queue_overflow
         self._queue_overflow_count = 0
+        self._pending_overflow_error = False
 
         self._contracts: list[str] = self._normalize_contracts(contracts)
         if live_mode is not None:
@@ -592,6 +593,15 @@ class SignalRMarketHub:
             return await self._auth_service.ensure_token()
         raise RuntimeError("SignalRMarketHub requires token_provider or auth_service")
 
+    def _make_overflow_error(self) -> SignalRErrorEvent:
+        return SignalRErrorEvent(
+            message=(
+                "SignalR event_queue overflowed "
+                f"(count={self._queue_overflow_count}); resync required"
+            ),
+            occurred_monotonic=time.monotonic(),
+        )
+
     def _surface_queue_overflow(self, dropped_event: SignalREvent) -> None:
         if self._event_queue is None:
             return
@@ -604,13 +614,7 @@ class SignalRMarketHub:
             self._event_queue.task_done()
             items.append(item)
 
-        overflow_err = SignalRErrorEvent(
-            message=(
-                "SignalR event_queue overflowed "
-                f"(count={self._queue_overflow_count}); resync required"
-            ),
-            occurred_monotonic=time.monotonic(),
-        )
+        overflow_err = self._make_overflow_error()
         if isinstance(
             dropped_event,
             (SignalRConnectedEvent, SignalRDisconnectedEvent, SignalRErrorEvent),
@@ -619,6 +623,7 @@ class SignalRMarketHub:
         else:
             tail_event = overflow_err
 
+        placed_overflow_err = False
         maxsize = self._event_queue.maxsize
         if maxsize > 0:
             # Evict oldest non-lifecycle item first (ticks before errors)
@@ -654,8 +659,17 @@ class SignalRMarketHub:
                 items.pop(0)
             if len(items) < maxsize:
                 items.append(tail_event)
+                if tail_event is overflow_err:
+                    placed_overflow_err = True
         else:
             items.append(tail_event)
+            if tail_event is overflow_err:
+                placed_overflow_err = True
+
+        if placed_overflow_err:
+            self._pending_overflow_error = False
+        elif tail_event is overflow_err:
+            self._pending_overflow_error = True
 
         for ev in items:
             with contextlib.suppress(asyncio.QueueFull):
@@ -663,6 +677,13 @@ class SignalRMarketHub:
 
     async def _emit(self, event: SignalREvent) -> None:
         if self._event_queue is not None:
+            if self._pending_overflow_error:
+                sticky_err = self._make_overflow_error()
+                try:
+                    self._event_queue.put_nowait(sticky_err)
+                    self._pending_overflow_error = False
+                except asyncio.QueueFull:
+                    pass
             try:
                 self._event_queue.put_nowait(event)
             except asyncio.QueueFull:

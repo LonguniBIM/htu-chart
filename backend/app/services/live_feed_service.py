@@ -2691,6 +2691,32 @@ class LiveFeedService:
                         if resolved_evt is None:
                             continue
                         effective_evt = resolved_evt
+                    else:
+                        # Catch REST overwrites in Parquet before SQLite records COMPLETE.
+                        stored_bars = await self._parquet.read_bars(
+                            key,
+                            start_ts=bar_evt.bar.time,
+                            end_ts=bar_end,
+                            include_provisional=False,
+                        )
+                        self._ensure_generation(expected_gen)
+                        stored_bar = next(
+                            (
+                                b
+                                for b in stored_bars
+                                if b.time == bar_evt.bar.time and b.is_closed
+                            ),
+                            None,
+                        )
+                        if stored_bar is not None and stored_bar != effective_evt.bar:
+                            effective_evt = AggregatedBarEvent(
+                                contract_id=effective_evt.contract_id,
+                                live_mode=effective_evt.live_mode,
+                                timeframe=effective_evt.timeframe,
+                                bar=stored_bar,
+                                is_recovered_historical=False,
+                                root_symbol=effective_evt.root_symbol,
+                            )
                 tag = (
                     None
                     if self.is_contract_live_alerts_enabled(effective_evt.contract_id)

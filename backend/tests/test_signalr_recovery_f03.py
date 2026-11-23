@@ -10047,5 +10047,245 @@ async def test_f03_signalr_queue_overflow_preserves_lifecycle_fifo_and_surfaces_
         assert task.done()
 
 
+@pytest.mark.asyncio
+async def test_f03_post_watermark_parquet_readback_catches_rest_before_complete_coverage(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Contract: P1-001 reads back Parquet before signaling/broadcasting even before COMPLETE row.
+
+    Defect caught: Checking only is_interval_complete() after upsert_watermark misses the window
+    where HistoryBackfillService has overwritten Parquet with REST OHLCV but has not yet written
+    the SQLite COMPLETE coverage interval.
+    """
+    settings = Settings(data_dir=tmp_path / "data", signalr_enabled=True)
+    sqlite = SqliteStore(tmp_path / "meta.db")
+    sqlite.initialize()
+    parquet = ParquetStore(settings.data_dir, sqlite_store=sqlite)
+
+    t0 = first_bucket_open_at_or_after(BASE_T, "5m")
+    clock_ref = [t0 + 10]
+    signals: list[tuple[str, int, str | None, float]] = []
+    broadcasted_closed: list[tuple[str, int, float, float]] = []
+    broadcaster = WsBroadcaster()
+    orig_publish_bar = broadcaster.publish_bar
+
+    def _spy_publish_bar(evt: Any) -> None:
+        if evt.bar.is_closed:
+            broadcasted_closed.append(
+                (evt.timeframe, evt.bar.time, evt.bar.high, evt.bar.volume)
+            )
+        orig_publish_bar(evt)
+
+    monkeypatch.setattr(broadcaster, "publish_bar", _spy_publish_bar)
+
+    wm_5m_entered = asyncio.Event()
+    release_wm_5m = asyncio.Event()
+    hold_5m_wm = [False]
+
+    cov_5m_entered = asyncio.Event()
+    release_cov_5m = asyncio.Event()
+    hold_5m_cov = [False]
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/Auth/loginKey":
+            return httpx.Response(200, json={"success": True, "token": "jwt-parquet-rb"})
+        if request.url.path == "/api/History/retrieveBars":
+            payload = json.loads(request.content.decode("utf-8"))
+            unit = int(payload["unit"])
+            unit_number = int(payload["unitNumber"])
+            if unit == 2 and unit_number == 5:
+                bars = [_wire_bar(t0, 5945.0, 5999.0, 5940.0, 5988.0, 77.0)]
+            else:
+                bars = _bars_for_history_payload(payload)
+            return httpx.Response(200, json={"success": True, "bars": bars})
+        return httpx.Response(404)
+
+    orig_upsert_wm = sqlite.upsert_watermark
+    orig_record_cov = sqlite.record_coverage
+
+    async def _gated_upsert_wm(key: StorageDatasetKey, bar_time: int) -> Any:
+        res = await orig_upsert_wm(key, bar_time)
+        if hold_5m_wm[0] and key.timeframe == "5m" and not wm_5m_entered.is_set():
+            wm_5m_entered.set()
+            await asyncio.wait_for(release_wm_5m.wait(), timeout=2.0)
+        return res
+
+    async def _gated_record_cov(
+        key: StorageDatasetKey,
+        interval_start: int,
+        interval_end: int,
+        **kwargs: Any,
+    ) -> Any:
+        if (
+            hold_5m_cov[0]
+            and key.timeframe == "5m"
+            and kwargs.get("status") == "COMPLETE"
+            and not cov_5m_entered.is_set()
+        ):
+            cov_5m_entered.set()
+            await asyncio.wait_for(release_cov_5m.wait(), timeout=2.0)
+        return await orig_record_cov(key, interval_start, interval_end, **kwargs)
+
+    monkeypatch.setattr(sqlite, "upsert_watermark", _gated_upsert_wm)
+    monkeypatch.setattr(sqlite, "record_coverage", _gated_record_cov)
+
+    try:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            auth = TopstepAuthService(settings, client)
+            await auth.login("alice", "api-key")
+            rest = TopstepRestClient(settings, auth, client)
+            history_svc = HistoryBackfillService(settings, rest, parquet, sqlite)
+            agg = BarAggregator(timeframes=("1m", "5m"))
+            svc = LiveFeedService(
+                settings,
+                auth,
+                rest,
+                parquet,
+                sqlite,
+                aggregator=agg,
+                broadcaster=broadcaster,
+                recovery_timeframes=("1m", "5m"),
+                initial_backfill_bars=1,
+                on_bar_signal=lambda evt, tag: signals.append(
+                    (evt.timeframe, evt.bar.time, tag, evt.bar.volume)
+                ),
+                clock=lambda: clock_ref[0],
+            )
+            hist_task: asyncio.Task[Any] | None = None
+            try:
+                await svc.set_active_contracts([CID_MES], live_mode=False)
+                svc._last_connected_utc = t0 - 30
+                await svc.trigger_recovery(now_utc=clock_ref[0])
+                assert svc.feed_state == "LIVE"
+                signals.clear()
+                broadcasted_closed.clear()
+
+                svc.handle_hub_event(
+                    SignalRTickEvent(CID_MES, False, t0 + 250, 5952.0, 2.0, "GatewayTrade", 1.0)
+                )
+                await svc.flush_pending_tasks()
+
+                # Close 5m bar t0 and pause right after upsert_watermark.
+                hold_5m_wm[0] = True
+                clock_ref[0] = t0 + 305
+                svc.handle_hub_event(
+                    SignalRTickEvent(CID_MES, False, t0 + 305, 5955.0, 1.0, "GatewayTrade", 2.0)
+                )
+                await asyncio.wait_for(wm_5m_entered.wait(), timeout=2.0)
+
+                # HistoryBackfillService writes Parquet REST OHLCV and pauses BEFORE COMPLETE row.
+                hold_5m_cov[0] = True
+                hist_task = asyncio.create_task(
+                    history_svc.sync_and_read_bars(
+                        contract_id=CID_MES,
+                        live=False,
+                        timeframe="5m",
+                        start_ts=t0,
+                        end_ts=t0 + 299,
+                        now_utc=clock_ref[0],
+                    )
+                )
+                await asyncio.wait_for(cov_5m_entered.wait(), timeout=2.0)
+                key_5m = StorageDatasetKey("topstepx", False, CID_MES, "5m")
+                assert await sqlite.is_interval_complete(key_5m, t0, t0 + 300) is False
+
+                release_wm_5m.set()
+                await svc.flush_pending_tasks()
+
+                assert not any(
+                    tf == "5m" and bt == t0 and vol != 77.0 for tf, bt, _tag, vol in signals
+                )
+                assert ("5m", t0, None, 77.0) in signals
+                assert not any(
+                    tf == "5m" and bt == t0 and vol != 77.0
+                    for tf, bt, _h, vol in broadcasted_closed
+                )
+                assert ("5m", t0, 5999.0, 77.0) in broadcasted_closed
+            finally:
+                release_wm_5m.set()
+                release_cov_5m.set()
+                if hist_task is not None:
+                    await asyncio.gather(hist_task, return_exceptions=True)
+                await svc.stop()
+    finally:
+        sqlite.close()
+
+
+@pytest.mark.asyncio
+async def test_f03_signalr_sticky_overflow_error_delivered_after_lifecycle_drain(
+    tmp_path: Path,
+) -> None:
+    """Contract: P1-002 surfaces a sticky overflow SignalRErrorEvent after lifecycle drain.
+
+    Defect caught: When queue(maxsize=1) is full with SignalRConnectedEvent and a tick
+    overflows, preserving Connected left no room for overflow_err and later draining + tick2
+    never informed the consumer that ticks were dropped.
+    """
+    settings = Settings(data_dir=tmp_path / "data", signalr_enabled=True)
+    event_queue: asyncio.Queue[Any] = asyncio.Queue(maxsize=1)
+    transports: list[_MockSignalRTransport] = []
+
+    async def fake_ws_factory(_url: str, _headers: dict[str, str]) -> _MockSignalRTransport:
+        tr = _MockSignalRTransport()
+        transports.append(tr)
+        return tr
+
+    hub = SignalRMarketHub(
+        settings,
+        token_provider=lambda: asyncio.sleep(0, result="test-jwt"),
+        ws_factory=fake_ws_factory,
+        event_queue=event_queue,
+        contracts=[CID_MES],
+        reconnect_initial_delay_sec=0.5,
+        reconnect_max_delay_sec=1.0,
+    )
+    task = hub.start()
+    try:
+        for _ in range(50):
+            if transports and hub.is_connected and event_queue.qsize() == 1:
+                break
+            await asyncio.sleep(0.01)
+        assert hub.is_connected is True
+        assert event_queue.full() is True
+
+        # Emit tick1 BEFORE draining SignalRConnectedEvent -> overflow while only Connected queued.
+        tr0 = transports[0]
+        await tr0.push_frame(_quote_frame(CID_MES, BASE_T + 1, 5950.0, 1.0))
+        for _ in range(50):
+            if hub.queue_overflow_count >= 1:
+                break
+            await asyncio.sleep(0.01)
+        assert hub.queue_overflow_count >= 1
+
+        # Drain item 1: must preserve SignalRConnectedEvent!
+        first = event_queue.get_nowait()
+        event_queue.task_done()
+        assert isinstance(first, SignalRConnectedEvent)
+
+        # Emit tick2 now that space exists; consumer must receive overflow SignalRErrorEvent.
+        await tr0.push_frame(_quote_frame(CID_MES, BASE_T + 2, 5951.0, 2.0))
+        for _ in range(50):
+            if not event_queue.empty():
+                break
+            await asyncio.sleep(0.01)
+
+        drained_after: list[Any] = []
+        while not event_queue.empty():
+            drained_after.append(event_queue.get_nowait())
+            event_queue.task_done()
+
+        assert any(
+            isinstance(ev, SignalRErrorEvent)
+            and "overflowed" in ev.message
+            and "resync required" in ev.message
+            for ev in drained_after
+        )
+        await asyncio.wait_for(event_queue.join(), timeout=0.2)
+    finally:
+        await hub.stop()
+        assert task.done()
+
+
 
 
