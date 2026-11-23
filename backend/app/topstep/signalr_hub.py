@@ -262,8 +262,34 @@ def parse_market_invocation_events(
                 )
             )
             continue
-        # Require explicit contractId or callback contract; never fall back to root symbolId.
-        raw_cid = item.get("contractId") or default_contract
+        # Require explicit contractId or callback contract; reject conflicting values.
+        raw_item_cid = item.get("contractId")
+        item_cid_norm = (
+            raw_item_cid.strip().upper()
+            if isinstance(raw_item_cid, str) and raw_item_cid.strip()
+            else None
+        )
+        if (
+            item_cid_norm is not None
+            and default_contract is not None
+            and item_cid_norm != default_contract
+        ):
+            events.append(
+                SignalRMalformedTickEvent(
+                    contract_id=default_contract,
+                    live_mode=live_mode,
+                    reason=(
+                        f"Conflicting SignalR contractId {item_cid_norm!r} "
+                        f"vs callback {default_contract!r}"
+                    ),
+                    issue_code="conflicting_contract_id",
+                    raw_summary=raw_summary,
+                    bar_time=_extract_item_timestamp(item),
+                    received_monotonic=received_monotonic,
+                )
+            )
+            continue
+        raw_cid = item_cid_norm or default_contract
         if not isinstance(raw_cid, str) or not raw_cid.strip():
             events.append(
                 SignalRMalformedTickEvent(
@@ -1163,15 +1189,17 @@ class SignalRMarketHub:
             self._ws = None
             self._clear_pending_subscriptions(ConnectionError(disconnect_reason))
             self._subscribed_contracts.clear()
-            await self._close_ws(ws)
-            if was_connected:
-                await self._emit(
-                    SignalRDisconnectedEvent(
-                        reason=disconnect_reason,
-                        will_reconnect=not self._stopping,
-                        disconnected_monotonic=time.monotonic(),
+            try:
+                if was_connected:
+                    await self._emit(
+                        SignalRDisconnectedEvent(
+                            reason=disconnect_reason,
+                            will_reconnect=not self._stopping,
+                            disconnected_monotonic=time.monotonic(),
+                        )
                     )
-                )
+            finally:
+                await self._close_ws(ws)
 
     async def run(self) -> None:
         """Connect and maintain the SignalR Market Hub session with exponential backoff."""
