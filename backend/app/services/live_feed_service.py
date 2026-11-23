@@ -181,6 +181,7 @@ class LiveFeedService:
         self._live_persist_worker_task: asyncio.Task[None] | None = None
         self._watchdog_task: asyncio.Task[None] | None = None
         self._running = False
+        self._stopping = False
         self._generation = 0
         self._last_connected_utc: int | None = None
         self._last_degraded_at_mono: float | None = None
@@ -439,6 +440,7 @@ class LiveFeedService:
         """Start background watchdog and SignalR connection (if enabled & auth+contracts ready)."""
         if self._running:
             return
+        self._stopping = False
         self._running = True
         if self._watchdog_task is None or self._watchdog_task.done():
             self._watchdog_task = asyncio.create_task(
@@ -512,6 +514,7 @@ class LiveFeedService:
 
     async def stop(self) -> None:
         """Stop SignalR, recovery tasks, and watchdog cleanly on shutdown or disconnect."""
+        self._stopping = True
         self._running = False
         self._auth_retry_pending = False
         self._bump_generation_and_cancel_live_tasks()
@@ -526,6 +529,13 @@ class LiveFeedService:
             with contextlib.suppress(asyncio.CancelledError):
                 await self._recovery_task
         self._recovery_task = None
+
+        async with self._hub_lifecycle_lock:
+            self._last_connected_utc = None
+            for c_state in self._contracts.values():
+                c_state.subscribed_at_utc = None
+            self._transition_all_contracts("DISCONNECTED")
+            await self._hub.stop()
 
         for task in list(self._live_tick_tasks):
             if not task.done():
@@ -549,15 +559,10 @@ class LiveFeedService:
                 self._quarantine_queue.get_nowait()
                 self._quarantine_queue.task_done()
 
-        async with self._hub_lifecycle_lock:
-            await self._hub.stop()
-            self._last_connected_utc = None
-            for c_state in self._contracts.values():
-                c_state.subscribed_at_utc = None
-            self._transition_all_contracts("DISCONNECTED")
-
     def handle_hub_event(self, event: SignalREvent) -> None:
         """Handle lifecycle and tick events from SignalRMarketHub without blocking recv."""
+        if self._stopping:
+            return
         if isinstance(event, SignalRConnectedEvent):
             self._last_event_monotonic = event.connected_monotonic
             self._last_connected_utc = self._clock()
@@ -826,6 +831,8 @@ class LiveFeedService:
         )
 
     def _handle_malformed_signalr_tick(self, event: SignalRMalformedTickEvent) -> None:
+        if self._stopping:
+            return
         raw_cid = (
             event.contract_id.strip().upper()
             if isinstance(event.contract_id, str) and event.contract_id.strip()
@@ -2275,6 +2282,8 @@ class LiveFeedService:
         *,
         now_utc: int | None = None,
     ) -> list[AggregatedBarEvent]:
+        if self._stopping:
+            return []
         c_state = self._validate_tracked_tick_identity(event)
         if c_state is None:
             return []
@@ -2556,6 +2565,42 @@ class LiveFeedService:
             self._broadcast_status()
             logger.warning("Live persistence/signal failure: %s", redacted_err)
 
+    async def _resolve_rest_authoritative_event(
+        self,
+        *,
+        key: StorageDatasetKey,
+        bar_evt: AggregatedBarEvent,
+        bar_end: int,
+        broadcast: bool,
+        expected_gen: int | None,
+    ) -> AggregatedBarEvent | None:
+        rest_bars = await self._parquet.read_bars(
+            key,
+            start_ts=bar_evt.bar.time,
+            end_ts=bar_end,
+            include_provisional=False,
+        )
+        self._ensure_generation(expected_gen)
+        rest_bar = next(
+            (b for b in rest_bars if b.time == bar_evt.bar.time and b.is_closed),
+            None,
+        )
+        if rest_bar is None:
+            if broadcast and self._broadcaster is not None:
+                self._broadcaster.publish_resync_required(
+                    "rest_bar_authoritative",
+                    contract_id=bar_evt.contract_id,
+                )
+            return None
+        return AggregatedBarEvent(
+            contract_id=bar_evt.contract_id,
+            live_mode=bar_evt.live_mode,
+            timeframe=bar_evt.timeframe,
+            bar=rest_bar,
+            is_recovered_historical=False,
+            root_symbol=bar_evt.root_symbol,
+        )
+
     async def _persist_and_signal_events(
         self,
         events: Sequence[AggregatedBarEvent],
@@ -2597,32 +2642,16 @@ class LiveFeedService:
                     if bar_evt.bar.time in preserved:
                         superseded_by_rest = True
                 if superseded_by_rest:
-                    rest_bars = await self._parquet.read_bars(
-                        key,
-                        start_ts=bar_evt.bar.time,
-                        end_ts=bar_end,
-                        include_provisional=False,
+                    resolved_evt = await self._resolve_rest_authoritative_event(
+                        key=key,
+                        bar_evt=bar_evt,
+                        bar_end=bar_end,
+                        broadcast=broadcast,
+                        expected_gen=expected_gen,
                     )
-                    self._ensure_generation(expected_gen)
-                    rest_bar = next(
-                        (b for b in rest_bars if b.time == bar_evt.bar.time and b.is_closed),
-                        None,
-                    )
-                    if rest_bar is None:
-                        if broadcast and self._broadcaster is not None:
-                            self._broadcaster.publish_resync_required(
-                                "rest_bar_authoritative",
-                                contract_id=bar_evt.contract_id,
-                            )
+                    if resolved_evt is None:
                         continue
-                    effective_evt = AggregatedBarEvent(
-                        contract_id=bar_evt.contract_id,
-                        live_mode=bar_evt.live_mode,
-                        timeframe=bar_evt.timeframe,
-                        bar=rest_bar,
-                        is_recovered_historical=False,
-                        root_symbol=bar_evt.root_symbol,
-                    )
+                    effective_evt = resolved_evt
                 c_state = self._contracts.get(effective_evt.contract_id)
                 blocked_by_gap = False
                 if c_state is not None:
@@ -2646,6 +2675,22 @@ class LiveFeedService:
                     self._ensure_generation(expected_gen)
                     if c_state is not None:
                         c_state.watermarks[effective_evt.timeframe] = wm.last_closed_bar_time
+                if not superseded_by_rest:
+                    post_wm_complete = await self._sqlite.is_interval_complete(
+                        key, bar_evt.bar.time, bar_end
+                    )
+                    self._ensure_generation(expected_gen)
+                    if post_wm_complete:
+                        resolved_evt = await self._resolve_rest_authoritative_event(
+                            key=key,
+                            bar_evt=bar_evt,
+                            bar_end=bar_end,
+                            broadcast=broadcast,
+                            expected_gen=expected_gen,
+                        )
+                        if resolved_evt is None:
+                            continue
+                        effective_evt = resolved_evt
                 tag = (
                     None
                     if self.is_contract_live_alerts_enabled(effective_evt.contract_id)

@@ -9555,6 +9555,258 @@ async def test_f03_bounded_live_queue_coalesces_open_bars_and_preserves_order(
         sqlite.close()
 
 
+@pytest.mark.asyncio
+async def test_f03_post_watermark_rest_backfill_rechecked_before_signal_and_broadcast(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Contract: P1-001 rechecks SQLite COMPLETE after upsert_watermark before signal/broadcast.
+
+    Defect caught: Emitting stale local OHLCV signal/broadcast when HistoryBackfillService writes
+    authoritative REST bar + COMPLETE while _persist_and_signal_events awaits upsert_watermark.
+    """
+    settings = Settings(data_dir=tmp_path / "data", signalr_enabled=True)
+    sqlite = SqliteStore(tmp_path / "meta.db")
+    sqlite.initialize()
+    parquet = ParquetStore(settings.data_dir, sqlite_store=sqlite)
+
+    t0 = first_bucket_open_at_or_after(BASE_T, "5m")
+    clock_ref = [t0 + 10]
+    signals: list[tuple[str, int, str | None, float]] = []
+    broadcasted_closed: list[tuple[str, int, float, float]] = []
+    broadcaster = WsBroadcaster()
+    orig_publish_bar = broadcaster.publish_bar
+
+    def _spy_publish_bar(evt: Any) -> None:
+        if evt.bar.is_closed:
+            broadcasted_closed.append(
+                (evt.timeframe, evt.bar.time, evt.bar.high, evt.bar.volume)
+            )
+        orig_publish_bar(evt)
+
+    monkeypatch.setattr(broadcaster, "publish_bar", _spy_publish_bar)
+
+    wm_5m_entered = asyncio.Event()
+    release_wm_5m = asyncio.Event()
+    hold_5m_wm = [False]
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/Auth/loginKey":
+            return httpx.Response(200, json={"success": True, "token": "jwt-postwm"})
+        if request.url.path == "/api/History/retrieveBars":
+            payload = json.loads(request.content.decode("utf-8"))
+            unit = int(payload["unit"])
+            unit_number = int(payload["unitNumber"])
+            if unit == 2 and unit_number == 5:
+                bars = [_wire_bar(t0, 5945.0, 5999.0, 5940.0, 5988.0, 77.0)]
+            else:
+                bars = _bars_for_history_payload(payload)
+            return httpx.Response(200, json={"success": True, "bars": bars})
+        return httpx.Response(404)
+
+    orig_upsert_wm = sqlite.upsert_watermark
+
+    async def _gated_upsert_wm(key: StorageDatasetKey, bar_time: int) -> Any:
+        res = await orig_upsert_wm(key, bar_time)
+        if hold_5m_wm[0] and key.timeframe == "5m" and not wm_5m_entered.is_set():
+            wm_5m_entered.set()
+            await asyncio.wait_for(release_wm_5m.wait(), timeout=2.0)
+        return res
+
+    monkeypatch.setattr(sqlite, "upsert_watermark", _gated_upsert_wm)
+
+    try:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            auth = TopstepAuthService(settings, client)
+            await auth.login("alice", "api-key")
+            rest = TopstepRestClient(settings, auth, client)
+            history_svc = HistoryBackfillService(settings, rest, parquet, sqlite)
+            agg = BarAggregator(timeframes=("1m", "5m"))
+            svc = LiveFeedService(
+                settings,
+                auth,
+                rest,
+                parquet,
+                sqlite,
+                aggregator=agg,
+                broadcaster=broadcaster,
+                recovery_timeframes=("1m", "5m"),
+                initial_backfill_bars=1,
+                on_bar_signal=lambda evt, tag: signals.append(
+                    (evt.timeframe, evt.bar.time, tag, evt.bar.volume)
+                ),
+                clock=lambda: clock_ref[0],
+            )
+            try:
+                await svc.set_active_contracts([CID_MES], live_mode=False)
+                svc._last_connected_utc = t0 - 30
+                await svc.trigger_recovery(now_utc=clock_ref[0])
+                assert svc.feed_state == "LIVE"
+                signals.clear()
+                broadcasted_closed.clear()
+
+                svc.handle_hub_event(
+                    SignalRTickEvent(CID_MES, False, t0 + 250, 5952.0, 2.0, "GatewayTrade", 1.0)
+                )
+                await svc.flush_pending_tasks()
+
+                # Close 5m bar t0, letting live upsert_bars finish, then pause at 5m watermark.
+                hold_5m_wm[0] = True
+                clock_ref[0] = t0 + 305
+                svc.handle_hub_event(
+                    SignalRTickEvent(CID_MES, False, t0 + 305, 5955.0, 1.0, "GatewayTrade", 2.0)
+                )
+                await asyncio.wait_for(wm_5m_entered.wait(), timeout=2.0)
+
+                # HistoryBackfillService overwrites Parquet with REST bar + COMPLETE coverage.
+                hist_res = await history_svc.sync_and_read_bars(
+                    contract_id=CID_MES,
+                    live=False,
+                    timeframe="5m",
+                    start_ts=t0,
+                    end_ts=t0 + 299,
+                    now_utc=clock_ref[0],
+                )
+                assert hist_res.is_complete is True
+
+                release_wm_5m.set()
+                await svc.flush_pending_tasks()
+
+                assert not any(
+                    tf == "5m" and bt == t0 and vol != 77.0 for tf, bt, _tag, vol in signals
+                )
+                assert ("5m", t0, None, 77.0) in signals
+                assert not any(
+                    tf == "5m" and bt == t0 and vol != 77.0
+                    for tf, bt, _h, vol in broadcasted_closed
+                )
+                assert ("5m", t0, 5999.0, 77.0) in broadcasted_closed
+            finally:
+                release_wm_5m.set()
+                await svc.stop()
+    finally:
+        sqlite.close()
+
+
+@pytest.mark.asyncio
+async def test_f03_stop_fences_hub_ingress_before_draining_workers(
+    tmp_path: Path,
+) -> None:
+    """Contract: P2-001 sets _stopping and halts SignalR hub before draining live/quarantine tasks.
+
+    Defect caught: stop() draining workers before awaiting _hub.stop(), allowing in-flight
+    events during transport.close() to spawn orphaned live/quarantine tasks or emit signals.
+    """
+    settings = Settings(data_dir=tmp_path / "data", signalr_enabled=True)
+    sqlite = SqliteStore(tmp_path / "meta.db")
+    sqlite.initialize()
+    parquet = ParquetStore(settings.data_dir, sqlite_store=sqlite)
+
+    t0 = BASE_T
+    clock_ref = [t0 + 10]
+    signals: list[tuple[str, int, str | None]] = []
+    close_entered = asyncio.Event()
+    release_close = asyncio.Event()
+
+    class _GatedCloseTransport(_MockSignalRTransport):
+        async def close(self) -> None:
+            close_entered.set()
+            await asyncio.wait_for(release_close.wait(), timeout=2.0)
+            await super().close()
+
+    transports: list[_GatedCloseTransport] = []
+
+    async def ws_factory(_url: str, _headers: dict[str, str]) -> _GatedCloseTransport:
+        tr = _GatedCloseTransport()
+        transports.append(tr)
+        return tr
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/Auth/loginKey":
+            return httpx.Response(200, json={"success": True, "token": "jwt-stop-fence"})
+        if request.url.path == "/api/History/retrieveBars":
+            payload = json.loads(request.content.decode("utf-8"))
+            return httpx.Response(
+                200, json={"success": True, "bars": _bars_for_history_payload(payload)}
+            )
+        return httpx.Response(404)
+
+    try:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            auth = TopstepAuthService(settings, client)
+            await auth.login("alice", "api-key")
+            rest = TopstepRestClient(settings, auth, client)
+            hub = SignalRMarketHub(
+                settings,
+                auth_service=auth,
+                ws_factory=ws_factory,
+                contracts=[CID_MES],
+            )
+            svc = LiveFeedService(
+                settings,
+                auth,
+                rest,
+                parquet,
+                sqlite,
+                signalr_hub=hub,
+                recovery_timeframes=("1m",),
+                on_bar_signal=lambda evt, tag: signals.append((evt.timeframe, evt.bar.time, tag)),
+                clock=lambda: clock_ref[0],
+            )
+            try:
+                await svc.set_active_contracts([CID_MES], live_mode=False)
+                await svc.start()
+                for _ in range(100):
+                    if svc.feed_state == "LIVE":
+                        break
+                    await asyncio.sleep(0.01)
+                assert svc.feed_state == "LIVE"
+                signals.clear()
+
+                # Open bar t0 so a closing tick during stop() would otherwise emit a signal.
+                now_mono = time.monotonic()
+                svc.handle_hub_event(
+                    SignalRTickEvent(CID_MES, False, t0 + 10, 5950.0, 1.0, "GatewayTrade", now_mono)
+                )
+                await svc.flush_pending_tasks()
+                signals.clear()
+
+                stop_task = asyncio.create_task(svc.stop())
+                await asyncio.wait_for(close_entered.wait(), timeout=2.0)
+
+                # Deliver live closing tick + malformed tick while stop() awaits transport.close().
+                clock_ref[0] = t0 + 65
+                svc.handle_hub_event(
+                    SignalRTickEvent(
+                        CID_MES, False, t0 + 65, 5955.0, 2.0, "GatewayTrade", now_mono + 1.0
+                    )
+                )
+                svc.handle_hub_event(
+                    SignalRMalformedTickEvent(
+                        contract_id=CID_MES,
+                        live_mode=False,
+                        reason="late malformed during close",
+                        issue_code="invalid_price",
+                        raw_summary="{'price': -1}",
+                        bar_time=t0 + 66,
+                        received_monotonic=now_mono + 1.1,
+                    )
+                )
+
+                release_close.set()
+                await asyncio.wait_for(stop_task, timeout=2.0)
+
+                assert svc._live_persist_worker_task is None or svc._live_persist_worker_task.done()
+                assert len(svc._live_tick_tasks) == 0
+                assert svc._quarantine_worker_task is None or svc._quarantine_worker_task.done()
+                assert signals == []
+            finally:
+                release_close.set()
+                await svc.stop()
+    finally:
+        sqlite.close()
+
+
 def test_f03_reconcile_from_1m_empty_propagates_1m_incomplete_marker_to_htf() -> None:
     """Contract: C1-002 propagates 1m incomplete markers to HTF even when 1m history is empty.
 
