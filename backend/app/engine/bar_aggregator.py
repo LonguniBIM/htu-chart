@@ -834,6 +834,7 @@ class BarAggregator:
             dedup_1m[open_1m_bar.time] = open_1m_bar
 
         if not dedup_1m:
+            current_htf_open = bucket_open_utc(eff_now, tf)
             key_1m = (cid, eff_live, "1m")
             open_1m_cur = self._open_bars.get(key_1m)
             htf_incomplete_buckets: set[int] = {
@@ -843,12 +844,31 @@ class BarAggregator:
             if key_1m in self._incomplete_open_bars and open_1m_cur is not None:
                 htf_incomplete_buckets.add(bucket_open_utc(open_1m_cur.time, tf))
             if mark_open_incomplete:
-                htf_incomplete_buckets.add(bucket_open_utc(eff_now, tf))
+                htf_incomplete_buckets.add(current_htf_open)
             for htf_bucket in htf_incomplete_buckets:
-                if pre_open is not None and pre_open.time == htf_bucket:
+                if (
+                    pre_open is not None
+                    and pre_open.time == htf_bucket
+                    and pre_open.time >= current_htf_open
+                ):
                     self._incomplete_open_bars.add(stream_key)
                 else:
                     self._incomplete_open_buckets.setdefault(stream_key, set()).add(htf_bucket)
+
+            if pre_open is not None and pre_open.time < current_htf_open:
+                self._open_bars.pop(stream_key, None)
+                self._open_bar_ts_bounds.pop(stream_key, None)
+                self._incomplete_open_bars.discard(stream_key)
+                if prev_closed is None or pre_open.time > prev_closed:
+                    self._discarded_incomplete_bars.append((cid, eff_live, tf, pre_open.time))
+                return ReconciliationResult(
+                    contract_id=cid,
+                    live_mode=eff_live,
+                    timeframe=tf,
+                    closed_bars=(),
+                    open_bar=None,
+                    last_closed_bar_time=prev_closed,
+                )
 
             if pre_open is not None and (prev_closed is None or pre_open.time > prev_closed):
                 open_event = AggregatedBarEvent(

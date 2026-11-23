@@ -9850,4 +9850,129 @@ def test_f03_reconcile_from_1m_empty_propagates_1m_incomplete_marker_to_htf() ->
     assert (CID_MES, False, "5m", t0) in discarded
 
 
+@pytest.mark.asyncio
+async def test_f03_expired_unconfirmed_htf_pre_open_discarded_when_1m_recovery_empty(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Contract: P1-001 discards expired unconfirmed HTF pre_open bars when 1m recovery is empty.
+
+    Defect caught: reconcile_from_1m_bars early return when dedup_1m is empty left an expired
+    pre_open 5m bar active, allowing the next tick in a later 5m bucket to finalize and persist
+    an unconfirmed interrupted 5m bar while the feed was DEGRADED.
+    """
+    t0 = 1794351600  # 2026-11-10 23:00 UTC session open
+    clock_ref = [t0 + 5]
+    settings = Settings(
+        data_dir=tmp_path / "data",
+        signalr_enabled=True,
+        signalr_recovery_queue_maxsize=20,
+    )
+    sqlite = SqliteStore(tmp_path / "meta.db")
+    sqlite.initialize()
+    parquet = ParquetStore(settings.data_dir, sqlite_store=sqlite)
+    broadcaster = WsBroadcaster()
+    published: list[Any] = []
+    signals: list[tuple[str, int, str]] = []
+
+    def _spy_publish_bar(evt: Any) -> None:
+        published.append(evt)
+
+    monkeypatch.setattr(broadcaster, "publish_bar", _spy_publish_bar)
+
+    return_empty_rest = [False]
+
+    class _SwitchableRest:
+        async def retrieve_bars_paginated(self, **kw: Any) -> Any:
+            if return_empty_rest[0]:
+                return type("R", (), {"raw_bars": [], "truncated": False, "provider_gap": False})()
+            s_ts = int(kw["start_ts"])
+            e_ts = int(kw["end_ts"])
+            cutoff = clock_ref[0] - (clock_ref[0] % 60)
+            bars = [
+                {"t": ts, "o": 100.0, "h": 100.0, "l": 100.0, "c": 100.0, "v": 1.0}
+                for ts in range(s_ts - (s_ts % 60), min(e_ts, cutoff), 60)
+                if has_open_session_in_range(ts, ts + 60)
+            ]
+            return type("R", (), {"raw_bars": bars, "truncated": False, "provider_gap": False})()
+
+    def _auth_handler(_req: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"success": True, "errorCode": 0, "token": "jwt-htf-empty"})
+
+    try:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(_auth_handler)) as client:
+            auth = TopstepAuthService(settings, client)
+            await auth.login("alice", "api-key")
+            agg = BarAggregator(timeframes=("1m", "5m"))
+            svc = LiveFeedService(
+                settings,
+                auth,
+                _SwitchableRest(),
+                parquet,
+                sqlite,
+                aggregator=agg,
+                broadcaster=broadcaster,
+                recovery_timeframes=("1m", "5m"),
+                initial_backfill_bars=1,
+                on_bar_signal=lambda evt, tag: signals.append((evt.timeframe, evt.bar.time, tag)),
+                clock=lambda: clock_ref[0],
+            )
+            try:
+                await svc.set_active_contracts([CID_MES], live_mode=False)
+                svc._last_connected_utc = t0 - 30
+                await svc.trigger_recovery(now_utc=clock_ref[0])
+                assert svc.feed_state == "LIVE"
+
+                # Live tick at +10s opens 5m bar 1794351600.
+                clock_ref[0] = t0 + 10
+                svc.handle_hub_event(
+                    SignalRTickEvent(CID_MES, False, t0 + 10, 100.0, 2.0, "GatewayTrade", 1.0)
+                )
+                await svc.flush_pending_tasks()
+
+                # Disconnect and reconnect at +310s (new 5m bucket 1794351900) with empty REST 1m.
+                svc.handle_hub_event(
+                    SignalRDisconnectedEvent(
+                        reason="disconnect",
+                        will_reconnect=True,
+                        disconnected_monotonic=1.5,
+                    )
+                )
+                return_empty_rest[0] = True
+                clock_ref[0] = t0 + 310
+                await svc.trigger_recovery(now_utc=clock_ref[0])
+                assert svc.feed_state == "DEGRADED"
+
+                published.clear()
+                signals.clear()
+
+                # Live tick at +315s in 1794351900 must NOT finalize/broadcast/persist 5m bar t0.
+                clock_ref[0] = t0 + 315
+                svc.handle_hub_event(
+                    SignalRTickEvent(CID_MES, False, t0 + 315, 105.0, 3.0, "GatewayTrade", 2.0)
+                )
+                await svc.flush_pending_tasks()
+
+                assert not any(
+                    tf == "5m" and bt == t0 for tf, bt, _tag in signals
+                ), f"Unexpected signal for expired unconfirmed 5m bar {t0}: {signals}"
+                assert not any(
+                    evt.timeframe == "5m" and evt.bar.time == t0 and evt.bar.is_closed
+                    for evt in published
+                ), f"Unexpected closed 5m bar broadcast for {t0}: {published}"
+                key_5m = StorageDatasetKey("topstepx", False, CID_MES, "5m")
+                persisted_5m = await parquet.read_bars(
+                    key_5m,
+                    start_ts=t0,
+                    end_ts=t0,
+                    include_provisional=True,
+                )
+                assert persisted_5m == []
+            finally:
+                await svc.stop()
+    finally:
+        sqlite.close()
+
+
+
 
