@@ -119,6 +119,7 @@ class LiveFeedService:
         degraded_retry_interval_sec: float = 15.0,
         on_bar_signal: SignalCallback | None = None,
         clock: Callable[[], int] | None = None,
+        monotonic_clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self._settings = settings
         self._auth = auth_service
@@ -141,6 +142,7 @@ class LiveFeedService:
         self._degraded_retry_interval_sec = max(0.1, float(degraded_retry_interval_sec))
         self._on_bar_signal = on_bar_signal
         self._clock = clock or (lambda: int(datetime.now(UTC).timestamp()))
+        self._mono_clock = monotonic_clock
 
         self._hub: SignalRMarketHub = signalr_hub or SignalRMarketHub(
             settings,
@@ -255,12 +257,24 @@ class LiveFeedService:
         if self._broadcaster is not None:
             self._broadcaster.publish_feed_status(self.get_status_snapshot())
 
+    def _mark_degraded_timestamp(
+        self,
+        prev_feed_state: FeedState | None = None,
+        *,
+        force: bool = False,
+    ) -> None:
+        if self._feed_state != "DEGRADED":
+            return
+        if force or prev_feed_state != "DEGRADED" or self._last_degraded_at_mono is None:
+            self._last_degraded_at_mono = self._mono_clock()
+
     def _transition_all_contracts(self, new_state: FeedState) -> None:
+        prev_feed_state = self._feed_state
         for c in self._contracts.values():
             c.state = new_state
         self._feed_state = new_state
         if new_state == "DEGRADED":
-            self._last_degraded_at_mono = time.monotonic()
+            self._mark_degraded_timestamp(prev_feed_state)
         self._broadcast_status()
 
     async def set_active_contracts(
@@ -877,6 +891,7 @@ class LiveFeedService:
             self._ensure_quarantine_worker()
             return
 
+        prev_feed_state = self._feed_state
         self._last_event_monotonic = event.received_monotonic
         self._last_error = redacted_reason
         live_mode = c_state.live_mode if c_state is not None else event.live_mode
@@ -919,8 +934,8 @@ class LiveFeedService:
                     self._global_unresolved_gaps += 1
             self._ensure_quarantine_worker()
 
-        self._last_degraded_at_mono = time.monotonic()
         self._recompute_aggregate_state()
+        self._mark_degraded_timestamp(prev_feed_state)
         self._broadcast_status()
 
     def _ensure_quarantine_worker(self) -> None:
@@ -1591,7 +1606,7 @@ class LiveFeedService:
                     price=rej_tick.price,
                     volume=rej_tick.volume,
                     source_target=matched_target,
-                    received_monotonic=time.monotonic(),
+                    received_monotonic=self._mono_clock(),
                 ),
                 reason=rej_reason,
             )
@@ -1901,7 +1916,7 @@ class LiveFeedService:
         return recovered_any_closed
 
     async def _run_recovery(self, *, now_utc: int | None = None) -> None:
-        started_mono = time.monotonic()
+        started_mono = self._mono_clock()
         eff_now = now_utc if now_utc is not None else self._clock()
         if self._last_connected_utc is None:
             self._last_connected_utc = eff_now
@@ -2014,10 +2029,10 @@ class LiveFeedService:
                 contract_degraded[cid] = contract_had_gap
                 if contract_had_gap:
                     c_state.state = "DEGRADED"
-                    self._last_degraded_at_mono = time.monotonic()
+                    self._last_degraded_at_mono = self._mono_clock()
                 else:
                     c_state.last_error = None
-                c_state.recovery_duration_ms = int((time.monotonic() - started_mono) * 1000)
+                c_state.recovery_duration_ms = int((self._mono_clock() - started_mono) * 1000)
 
             # Drain remaining/late ticks before leaving RECOVERING without discarding
             # unprocessed ticks or _replayed_tick_tfs if this recovery is superseded.
@@ -2042,7 +2057,7 @@ class LiveFeedService:
                         seq += 1
 
                 if not remaining_tagged:
-                    self._recovery_duration_ms = int((time.monotonic() - started_mono) * 1000)
+                    self._recovery_duration_ms = int((self._mono_clock() - started_mono) * 1000)
                     for cid, c_state in self._contracts.items():
                         if self._hub.has_pending_subscription(cid):
                             c_state.state = "DISCONNECTED"
@@ -2052,14 +2067,14 @@ class LiveFeedService:
                             or c_state.unhealed_gap_starts
                         ):
                             c_state.state = "DEGRADED"
-                            self._last_degraded_at_mono = time.monotonic()
+                            self._last_degraded_at_mono = self._mono_clock()
                         else:
                             c_state.state = "LIVE"
                             c_state.unresolved_gaps = 0
                             c_state.last_error = None
                     if self._recovery_overflowed:
                         self._feed_state = "DEGRADED"
-                        self._last_degraded_at_mono = time.monotonic()
+                        self._last_degraded_at_mono = self._mono_clock()
                     else:
                         self._recompute_aggregate_state()
                         if not self._contracts:
@@ -2110,7 +2125,7 @@ class LiveFeedService:
                 return
             self._global_unresolved_gaps += 1
             self._last_error = self._redact(str(exc) or type(exc).__name__)
-            self._recovery_duration_ms = int((time.monotonic() - started_mono) * 1000)
+            self._recovery_duration_ms = int((self._mono_clock() - started_mono) * 1000)
             self._transition_all_contracts("DEGRADED")
             logger.warning("Recovery coordinator error: %s", self._last_error)
         finally:
@@ -2137,6 +2152,7 @@ class LiveFeedService:
         )
         if not discarded:
             return False
+        prev_feed_state = self._feed_state
         for cid, _lmode, tf, bar_time in discarded:
             c_state = self._contracts.get(cid)
             if c_state is not None:
@@ -2144,8 +2160,8 @@ class LiveFeedService:
                 self._record_gap_bucket(c_state, tf, bar_time)
                 c_state.last_error = f"Unconfirmed interrupted {tf} bar at {bar_time}"
                 c_state.state = "DEGRADED"
-        self._last_degraded_at_mono = time.monotonic()
         self._recompute_aggregate_state()
+        self._mark_degraded_timestamp(prev_feed_state)
         self._broadcast_status()
         return True
 
@@ -2159,6 +2175,7 @@ class LiveFeedService:
         c_state = self._contracts.get(contract_id)
         if c_state is None:
             return
+        prev_feed_state = self._feed_state
         stale_tfs_and_ts: list[tuple[str, int]] = []
         for gap_tf, gap_ts in stale_buckets:
             if gap_tf in self._recovery_timeframes:
@@ -2167,7 +2184,6 @@ class LiveFeedService:
         c_state.unresolved_gaps += 1
         c_state.last_error = "Late trade arrived after local bar close; reconciliation required"
         self._last_error = c_state.last_error
-        self._last_degraded_at_mono = time.monotonic()
         if (
             trigger_reconcile
             and self._running
@@ -2183,6 +2199,7 @@ class LiveFeedService:
             if c_state.state != "RECOVERING":
                 c_state.state = "DEGRADED"
             self._recompute_aggregate_state()
+            self._mark_degraded_timestamp(prev_feed_state)
             self._broadcast_status()
 
         queued_gen = self._generation
@@ -2449,6 +2466,7 @@ class LiveFeedService:
                     existing_open.bar_evt = bar_evt
                     continue
             if len(self._live_persist_queue) >= maxsize:
+                prev_feed_state = self._feed_state
                 self._queue_overflow_count += 1
                 c_state = self._contracts.get(bar_evt.contract_id)
                 if c_state is not None:
@@ -2463,8 +2481,8 @@ class LiveFeedService:
                     ts_hint=bar_evt.bar.time,
                     eff_now=now_utc,
                 )
-                self._last_degraded_at_mono = time.monotonic()
                 self._recompute_aggregate_state()
+                self._mark_degraded_timestamp(prev_feed_state)
                 self._broadcast_status()
                 if self._broadcaster is not None:
                     self._broadcaster.publish_resync_required(
@@ -2546,6 +2564,7 @@ class LiveFeedService:
         except Exception as exc:
             if expected_gen is not None and self._generation != expected_gen:
                 return
+            prev_feed_state = self._feed_state
             redacted_err = self._redact(str(exc) or type(exc).__name__)
             self._last_error = redacted_err
             marked_any = False
@@ -2560,8 +2579,8 @@ class LiveFeedService:
                         self._record_gap_bucket(c_state, bar_evt.timeframe, bar_evt.bar.time)
             if not marked_any:
                 self._global_unresolved_gaps += 1
-            self._last_degraded_at_mono = time.monotonic()
             self._recompute_aggregate_state()
+            self._mark_degraded_timestamp(prev_feed_state)
             self._broadcast_status()
             logger.warning("Live persistence/signal failure: %s", redacted_err)
 
@@ -2730,7 +2749,7 @@ class LiveFeedService:
 
     async def run_watchdog_tick(self) -> None:
         """Execute one watchdog pass: bar-close flush, auth/rotation check, heartbeat, retry."""
-        now_mono = time.monotonic()
+        now_mono = self._mono_clock()
         now_ts = self._clock()
 
         rotation = self._auth.compute_key_rotation()
@@ -2896,13 +2915,14 @@ class LiveFeedService:
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
+                prev_feed_state = self._feed_state
                 self._global_unresolved_gaps += 1
                 self._last_error = self._redact(str(exc) or type(exc).__name__)
                 for c_state in self._contracts.values():
                     if c_state.state != "DISCONNECTED":
                         c_state.state = "DEGRADED"
-                self._last_degraded_at_mono = time.monotonic()
                 self._recompute_aggregate_state()
+                self._mark_degraded_timestamp(prev_feed_state)
                 self._broadcast_status()
                 logger.warning("Watchdog tick failed: %s", self._last_error)
 
@@ -2911,7 +2931,7 @@ class LiveFeedService:
         last_age: float | None = None
         effective_last = self._effective_last_activity_monotonic()
         if effective_last is not None:
-            last_age = round(max(0.0, time.monotonic() - effective_last), 3)
+            last_age = round(max(0.0, self._mono_clock() - effective_last), 3)
 
         unresolved_gaps = self._global_unresolved_gaps + sum(
             c.unresolved_gaps for c in self._contracts.values()

@@ -11,7 +11,7 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import httpx
 import pytest
@@ -10447,6 +10447,217 @@ async def test_f03_cold_start_covered_htf_bucket_missing_1m_bar_stays_degraded(
                 assert status["live_alerts_enabled"] is False
                 assert status["unresolved_gaps"] > 0
                 assert status["contracts"][CID_MES]["unresolved_gaps"] > 0
+            finally:
+                await svc.stop()
+    finally:
+        sqlite.close()
+
+
+@pytest.mark.asyncio
+async def test_f03_cold_start_fully_empty_elapsed_htf_buckets_stay_degraded(
+    tmp_path: Path,
+) -> None:
+    """Contract: P1-001/SECINV-001 rejects fully empty elapsed HTF buckets in covered range.
+
+    Defect caught: reconcile_from_1m_bars only iterating sorted(grouped), missing elapsed 5m/15m
+    buckets in [14:00, 14:15) that had 0 cached 1m bars even though 1m coverage was COMPLETE.
+    """
+    t0 = BASE_T  # 2026-11-10 14:00:00 UTC
+    now_ts = t0 + 1695  # 14:28:15 UTC
+    gap_start = t0  # 14:00:00 UTC
+    gap_end = t0 + 900  # 14:15:00 UTC (entire 15m / three 5m buckets empty)
+    seed_start = t0 - 300  # 13:55:00 UTC so HistoryBackfillService covers [13:55, 14:28)
+    settings = Settings(data_dir=tmp_path / "data", signalr_enabled=True)
+    sqlite = SqliteStore(tmp_path / "meta.db")
+    sqlite.initialize()
+    parquet = ParquetStore(settings.data_dir, sqlite_store=sqlite)
+    rest_calls: list[tuple[int, int]] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/Auth/loginKey":
+            return httpx.Response(200, json={"success": True, "token": "jwt-empty-htf"})
+        if request.url.path == "/api/History/retrieveBars":
+            payload = json.loads(request.content.decode("utf-8"))
+            start_dt = datetime.fromisoformat(payload["startTime"].replace("Z", "+00:00"))
+            end_dt = datetime.fromisoformat(payload["endTime"].replace("Z", "+00:00"))
+            s_ts = int(start_dt.timestamp())
+            e_ts = int(end_dt.timestamp())
+            rest_calls.append((s_ts, e_ts))
+            bars = [
+                _wire_bar(ts, 5950.0, 5952.0, 5949.0, 5951.0, 3.0)
+                for ts in range(s_ts - (s_ts % 60), min(e_ts, t0 + 1680), 60)
+                if not (gap_start <= ts < gap_end) and has_open_session_in_range(ts, ts + 60)
+            ]
+            return httpx.Response(200, json={"success": True, "bars": bars})
+        return httpx.Response(404)
+
+    try:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            auth = TopstepAuthService(settings, client)
+            await auth.login("alice", "api-key")
+            rest = TopstepRestClient(settings, auth, client)
+
+            history_svc = HistoryBackfillService(settings, rest, parquet, sqlite)
+            hist_res = await history_svc.sync_and_read_bars(
+                contract_id=CID_MES,
+                live=False,
+                timeframe="1m",
+                start_ts=seed_start,
+                end_ts=t0 + 1679,
+                now_utc=now_ts,
+            )
+            assert hist_res.is_complete is True
+            assert not any(gap_start <= b.time < gap_end for b in hist_res.bars)
+
+            rest_calls.clear()
+            agg = BarAggregator(timeframes=("1m", "5m", "15m", "1h"))
+            svc = LiveFeedService(
+                settings,
+                auth,
+                rest,
+                parquet,
+                sqlite,
+                aggregator=agg,
+                recovery_timeframes=("1m", "5m", "15m", "1h"),
+                initial_backfill_bars=10,
+                clock=lambda: now_ts,
+            )
+            try:
+                await svc.set_active_contracts([CID_MES], live_mode=False)
+                svc._last_connected_utc = now_ts - 600
+                await svc.trigger_recovery(now_utc=now_ts)
+
+                # Confirm REST only reloaded recent ~10m window, not [14:00, 14:15).
+                assert rest_calls
+                assert all(s > gap_end for s, _e in rest_calls)
+
+                assert svc.feed_state == "DEGRADED"
+                assert svc.live_alerts_enabled is False
+                key_5m = StorageDatasetKey("topstepx", False, CID_MES, "5m")
+                key_15m = StorageDatasetKey("topstepx", False, CID_MES, "15m")
+                assert await sqlite.is_interval_complete(key_5m, gap_start, gap_end) is False
+                assert await sqlite.is_interval_complete(key_15m, gap_start, gap_end) is False
+            finally:
+                await svc.stop()
+    finally:
+        sqlite.close()
+
+
+@pytest.mark.asyncio
+async def test_f03_degraded_retry_not_starved_by_continuous_malformed_ticks(
+    tmp_path: Path,
+) -> None:
+    """Contract: P1-002 ensures continuous malformed ticks in DEGRADED never starve retry timer.
+
+    Defect caught: _handle_malformed_signalr_tick unconditionally resetting _last_degraded_at_mono
+    on every malformed tick while already DEGRADED, keeping (now_mono - _last_degraded_at_mono)
+    < 15s indefinitely when malformed ticks arrive every 1s.
+    """
+    mono_now = [100.0]
+
+    t0 = BASE_T
+    settings = Settings(data_dir=tmp_path / "data", signalr_enabled=True)
+    sqlite = SqliteStore(tmp_path / "meta.db")
+    sqlite.initialize()
+    parquet = ParquetStore(settings.data_dir, sqlite_store=sqlite)
+    rest_recovery_calls: list[int] = []
+
+    class _MockHub:
+        def __init__(self) -> None:
+            self.is_connected = True
+            self.last_event_monotonic: float | None = 100.0
+            self.queue_overflow_count = 0
+            self.connected_token_digest: str | None = None
+            self._on_event: Any = None
+
+        def has_pending_subscription(self, _cid: str) -> bool:
+            return False
+
+        async def update_contracts(self, _contracts: Any, *, live_mode: bool) -> None:
+            return None
+
+        async def sync_contracts(self, _contracts: Any, *, live_mode: bool) -> None:
+            return None
+
+        async def stop(self) -> None:
+            self.is_connected = False
+
+    class _CountingRest:
+        async def retrieve_bars_paginated(self, **kw: Any) -> Any:
+            rest_recovery_calls.append(int(kw["start_ts"]))
+            s_ts = int(kw["start_ts"])
+            e_ts = int(kw["end_ts"])
+            cutoff = t0 + 300
+            bars = [
+                _wire_bar(ts, 5950.0, 5952.0, 5949.0, 5951.0, 2.0)
+                for ts in range(s_ts - (s_ts % 60), min(e_ts, cutoff), 60)
+                if has_open_session_in_range(ts, ts + 60)
+            ]
+            return type("R", (), {"raw_bars": bars, "truncated": False, "provider_gap": False})()
+
+    def _auth_handler(_req: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"success": True, "errorCode": 0, "token": "jwt-retry"})
+
+    try:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(_auth_handler)) as client:
+            auth = TopstepAuthService(settings, client)
+            await auth.login("alice", "api-key")
+            svc = LiveFeedService(
+                settings,
+                auth,
+                _CountingRest(),
+                parquet,
+                sqlite,
+                signalr_hub=cast(Any, _MockHub()),
+                recovery_timeframes=("1m",),
+                initial_backfill_bars=1,
+                degraded_retry_interval_sec=15.0,
+                clock=lambda: t0 + 310,
+                monotonic_clock=lambda: mono_now[0],
+            )
+            try:
+                await svc.set_active_contracts([CID_MES], live_mode=False)
+                svc._last_connected_utc = t0 + 240
+                await svc.trigger_recovery(now_utc=t0 + 310)
+                assert svc.feed_state == "LIVE"
+
+                # First malformed tick transitions LIVE -> DEGRADED at mono_now=100.0.
+                svc.handle_hub_event(
+                    SignalRMalformedTickEvent(
+                        contract_id=CID_MES,
+                        live_mode=False,
+                        reason="bad price",
+                        issue_code="invalid_price",
+                        raw_summary="{'price': -1}",
+                        bar_time=t0 + 305,
+                        received_monotonic=mono_now[0],
+                    )
+                )
+                assert svc.feed_state == "DEGRADED"
+                rest_recovery_calls.clear()
+
+                # Deliver malformed tick every 1s for 20s (> degraded_retry_interval_sec=15s).
+                for step in range(1, 21):
+                    mono_now[0] = 100.0 + float(step)
+                    svc._hub.last_event_monotonic = mono_now[0]
+                    svc.handle_hub_event(
+                        SignalRMalformedTickEvent(
+                            contract_id=CID_MES,
+                            live_mode=False,
+                            reason="bad price",
+                            issue_code="invalid_price",
+                            raw_summary="{'price': -1}",
+                            bar_time=t0 + 305,
+                            received_monotonic=mono_now[0],
+                        )
+                    )
+                    await svc.run_watchdog_tick()
+                    await asyncio.sleep(0.01)
+
+                if svc._recovery_task is not None:
+                    await asyncio.wait_for(svc._recovery_task, timeout=2.0)
+
+                assert len(rest_recovery_calls) >= 1
             finally:
                 await svc.stop()
     finally:

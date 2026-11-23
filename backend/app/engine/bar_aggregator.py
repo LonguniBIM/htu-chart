@@ -17,6 +17,8 @@ from app.engine.ohlcv import (
 from app.engine.session_calendar import (
     bucket_bounds,
     bucket_open_utc,
+    first_bucket_open_at_or_after,
+    has_open_session_in_range,
     is_bar_closed,
     latest_closed_bucket_end_utc,
     normalize_timeframe,
@@ -80,6 +82,42 @@ def _normalize_contract_id(contract_id: str) -> str:
     if not isinstance(contract_id, str) or not contract_id.strip():
         raise ValueError("contract_id must be a non-empty string")
     return contract_id.strip().upper()
+
+
+def _collect_empty_elapsed_htf_buckets(
+    *,
+    covered_start_utc: int | None,
+    timeframe: str,
+    eff_now: int,
+    root_symbol: str | None,
+    present_buckets: Collection[int],
+) -> list[tuple[int, str, str]]:
+    """Reject elapsed open-session HTF buckets in covered range that have zero 1m bars."""
+    if covered_start_utc is None:
+        return []
+    missing: list[tuple[int, str, str]] = []
+    cur_open = first_bucket_open_at_or_after(covered_start_utc, timeframe)
+    while is_bar_closed(cur_open, timeframe, eff_now, root_symbol=root_symbol):
+        _, cur_end = bucket_bounds(cur_open, timeframe, root_symbol=root_symbol)
+        if cur_open not in present_buckets and has_open_session_in_range(
+            cur_open, cur_end, root_symbol=root_symbol
+        ):
+            expected_1m_count = max(1, (cur_end - cur_open) // 60)
+            missing.append(
+                (
+                    cur_open,
+                    "incomplete_htf_source_bars",
+                    (
+                        f"Missing all 1m source bars for elapsed {timeframe} bucket "
+                        f"{cur_open} (have 0/{expected_1m_count})"
+                    ),
+                )
+            )
+        next_open = first_bucket_open_at_or_after(cur_end, timeframe)
+        if next_open <= cur_open:
+            break
+        cur_open = next_open
+    return missing
 
 
 def _validate_tick(
@@ -834,6 +872,13 @@ class BarAggregator:
             dedup_1m[open_1m_bar.time] = open_1m_bar
 
         if not dedup_1m:
+            empty_rejected = _collect_empty_elapsed_htf_buckets(
+                covered_start_utc=covered_start_utc,
+                timeframe=tf,
+                eff_now=eff_now,
+                root_symbol=eff_root,
+                present_buckets=(),
+            )
             current_htf_open = bucket_open_utc(eff_now, tf)
             key_1m = (cid, eff_live, "1m")
             open_1m_cur = self._open_bars.get(key_1m)
@@ -868,6 +913,7 @@ class BarAggregator:
                     closed_bars=(),
                     open_bar=None,
                     last_closed_bar_time=prev_closed,
+                    rejected_bars=tuple(empty_rejected),
                 )
 
             if pre_open is not None and (prev_closed is None or pre_open.time > prev_closed):
@@ -886,6 +932,7 @@ class BarAggregator:
                     closed_bars=(),
                     open_bar=open_event,
                     last_closed_bar_time=prev_closed,
+                    rejected_bars=tuple(empty_rejected),
                 )
             return ReconciliationResult(
                 contract_id=cid,
@@ -894,6 +941,7 @@ class BarAggregator:
                 closed_bars=(),
                 open_bar=None,
                 last_closed_bar_time=prev_closed,
+                rejected_bars=tuple(empty_rejected),
             )
 
         grouped: dict[int, list[OHLCVBar]] = {}
@@ -905,7 +953,13 @@ class BarAggregator:
         current_htf_open = bucket_open_utc(eff_now, tf)
         closed_1m_end = latest_closed_bucket_end_utc(eff_now, "1m", root_symbol=eff_root)
         closed_events: list[AggregatedBarEvent] = []
-        rejected_bars: list[tuple[int, str, str]] = []
+        rejected_bars: list[tuple[int, str, str]] = _collect_empty_elapsed_htf_buckets(
+            covered_start_utc=covered_start_utc,
+            timeframe=tf,
+            eff_now=eff_now,
+            root_symbol=eff_root,
+            present_buckets=grouped,
+        )
         latest_open_bar: OHLCVBar | None = None
         latest_open_incomplete = False
 
@@ -1046,6 +1100,7 @@ class BarAggregator:
             if any(current_htf_start <= p < current_htf_end for p in m1_pending):
                 self._incomplete_open_buckets.setdefault(stream_key, set()).add(current_htf_open)
 
+        rejected_bars.sort(key=lambda item: item[0])
         earliest_rejected = min((r[0] for r in rejected_bars), default=None)
         contiguous_closed = [
             e.bar.time
