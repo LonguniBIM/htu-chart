@@ -1734,11 +1734,14 @@ class LiveFeedService:
             self._record_gap_bucket(c_state, tf, earliest_post)
 
         self._ensure_generation(expected_gen)
-        closed_bars = [evt.bar for evt in recon.closed_bars]
-        if closed_bars:
+        rest_bar_times = {b.time for b in valid_bars}
+        closed_to_persist = [
+            evt.bar for evt in recon.closed_bars if evt.bar.time in rest_bar_times
+        ]
+        if closed_to_persist:
             await self._parquet.upsert_bars(
                 key,
-                closed_bars,
+                closed_to_persist,
                 root_symbol=c_state.root_symbol,
                 now_utc=eff_now,
             )

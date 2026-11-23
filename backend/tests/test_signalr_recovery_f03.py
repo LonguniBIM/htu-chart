@@ -11380,5 +11380,125 @@ async def test_f03_mixed_contract_states_suppress_signals_when_aggregate_degrade
         sqlite.close()
 
 
+@pytest.mark.asyncio
+async def test_f03_recovery_does_not_overwrite_concurrent_parquet_update_with_stale_cache(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Contract: PASS2-001 skips re-upserting cache-only bars omitted by REST during recovery.
+
+    Defect caught: _recover_single_timeframe_rest passing cache-only bars from recon.closed_bars
+    into parquet.upsert_bars, overwriting a newer concurrent REST/HistoryBackfillService bar T=B
+    with the stale cached snapshot T=A read earlier by _load_authoritative_cached_bars.
+    """
+    t0 = BASE_T  # 2026-11-10 14:00:00 UTC
+    t_mid = t0 + 60
+    now_ts = t0 + 185
+    settings = Settings(data_dir=tmp_path / "data", signalr_enabled=True)
+    sqlite = SqliteStore(tmp_path / "meta.db")
+    sqlite.initialize()
+    parquet = ParquetStore(settings.data_dir, sqlite_store=sqlite)
+    key_1m = StorageDatasetKey("topstepx", False, CID_MES, "1m")
+
+    bar_a = OHLCVBar(t_mid, 5951.0, 5952.0, 5950.0, 5951.5, 2.0, is_closed=True)
+    bar_b = OHLCVBar(t_mid, 5951.0, 5999.0, 5950.0, 5998.0, 88.0, is_closed=True)
+    await parquet.upsert_bars(
+        key_1m,
+        [
+            OHLCVBar(t0, 5950.0, 5952.0, 5949.0, 5951.0, 3.0, is_closed=True),
+            bar_a,
+            OHLCVBar(t0 + 120, 5953.0, 5955.0, 5952.0, 5954.0, 5.0, is_closed=True),
+        ],
+        now_utc=t0 + 180,
+    )
+    await sqlite.record_coverage(key_1m, t0, t0 + 180, status="COMPLETE")
+    await sqlite.upsert_watermark(key_1m, t0 + 120)
+
+    after_cache_read = asyncio.Event()
+    release_after_cache_read = asyncio.Event()
+    orig_read_bars = parquet.read_bars
+    pause_first_read = [True]
+
+    async def pause_after_cache_read(*args: Any, **kwargs: Any) -> Any:
+        result = await orig_read_bars(*args, **kwargs)
+        if pause_first_read[0]:
+            pause_first_read[0] = False
+            after_cache_read.set()
+            await release_after_cache_read.wait()
+        return result
+
+    monkeypatch.setattr(parquet, "read_bars", pause_after_cache_read)
+
+    class _MockHub:
+        def __init__(self) -> None:
+            self.is_connected = True
+            self.last_event_monotonic: float | None = 100.0
+            self.queue_overflow_count = 0
+            self.connected_token_digest: str | None = None
+            self._on_event: Any = None
+
+        def has_pending_subscription(self, _cid: str) -> bool:
+            return False
+
+        async def update_contracts(self, _contracts: Any, *, live_mode: bool) -> None:
+            return None
+
+        async def sync_contracts(self, _contracts: Any, *, live_mode: bool) -> None:
+            return None
+
+        async def stop(self) -> None:
+            self.is_connected = False
+
+    class _PartialRest:
+        async def retrieve_bars_paginated(self, **_kw: Any) -> Any:
+            bars = [
+                _wire_bar(t0, 5950.0, 5952.0, 5949.0, 5951.0, 3.0),
+                _wire_bar(t0 + 120, 5953.0, 5955.0, 5952.0, 5954.0, 5.0),
+            ]
+            return type("R", (), {"raw_bars": bars, "truncated": False, "provider_gap": False})()
+
+    def _auth_handler(_req: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"success": True, "errorCode": 0, "token": "jwt-pass2"})
+
+    try:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(_auth_handler)) as client:
+            auth = TopstepAuthService(settings, client)
+            await auth.login("alice", "api-key")
+            svc = LiveFeedService(
+                settings,
+                auth,
+                _PartialRest(),
+                parquet,
+                sqlite,
+                signalr_hub=cast(Any, _MockHub()),
+                recovery_timeframes=("1m",),
+                initial_backfill_bars=3,
+                clock=lambda: now_ts,
+            )
+            try:
+                await svc.set_active_contracts([CID_MES], live_mode=False)
+                svc._last_connected_utc = t0
+                recovery_task = asyncio.create_task(svc.trigger_recovery(now_utc=now_ts))
+                await asyncio.wait_for(after_cache_read.wait(), timeout=2.0)
+
+                # Concurrently write newer bar_b (high=5999.0, volume=88.0) before upsert_bars.
+                await parquet.upsert_bars(key_1m, [bar_b], now_utc=now_ts)
+                release_after_cache_read.set()
+                await asyncio.wait_for(recovery_task, timeout=2.0)
+
+                assert svc.feed_state == "LIVE"
+                stored = await orig_read_bars(
+                    key_1m, start_ts=t0, end_ts=t0 + 179, include_provisional=False
+                )
+                mid_bar = next(b for b in stored if b.time == t_mid)
+                assert mid_bar.high == 5999.0
+                assert mid_bar.volume == 88.0
+            finally:
+                release_after_cache_read.set()
+                await svc.stop()
+    finally:
+        sqlite.close()
+
+
 
 
