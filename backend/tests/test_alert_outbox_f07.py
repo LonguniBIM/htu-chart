@@ -1492,7 +1492,7 @@ async def test_f07_hanging_transport_triggers_total_timeout_deadline(tmp_path: P
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(hanging_handler)) as tg_http:
         client = TelegramClient(settings, tg_http)
-        result = await client.send_message("deadline-test")
+        result = await asyncio.wait_for(client.send_message("deadline-test"), timeout=0.5)
 
     assert result.ok is False
     assert result.permanent_failure is False
@@ -1748,7 +1748,7 @@ async def test_f07_concurrent_process_once_claims_no_duplicates(tmp_path: Path) 
         assert s1.delivered + s2.delivered == 8
         assert len(sent_texts) == 8
         assert len(set(sent_texts)) == 8
-        assert svc._in_flight_ids == set()
+        assert svc._in_flight_owners == {}
 
         for bid in batch_ids:
             row = await store.get_outbox_alert(bid)
@@ -1757,6 +1757,118 @@ async def test_f07_concurrent_process_once_claims_no_duplicates(tmp_path: Path) 
             assert row.attempt_count == 1
     finally:
         release_first.set()
+        store.close()
+        await tg.aclose()
+        await up.aclose()
+
+
+async def test_f07_three_way_aba_in_flight_ownership_prevents_double_delivery(
+    tmp_path: Path,
+) -> None:
+    """Contract: Batch-token ownership prevents 3-way overlapping ABA re-claim/double-send.
+
+    Defect caught: Batch 1 finally wiping A after Batch 2 re-claimed A, letting Batch 3 re-send.
+    """
+    t0 = 1_762_783_260
+    clock = _MutableClock(t0)
+    settings = _make_settings(
+        tmp_path,
+        alert_ttl_seconds=300,
+        alert_max_retries=2,
+        backoff=[2.0],
+    )
+
+    call_log: list[tuple[str, int]] = []
+    b_paused = asyncio.Event()
+    release_b = asyncio.Event()
+    x_paused = asyncio.Event()
+    release_x = asyncio.Event()
+    a_count = 0
+
+    async def tg_handler(request: httpx.Request) -> httpx.Response:
+        nonlocal a_count
+        text = json.loads(request.content.decode("utf-8"))["text"]
+        if "strat_A" in text:
+            a_count += 1
+            if a_count == 1:
+                call_log.append(("A", 503))
+                return httpx.Response(503, json={"ok": False, "description": "Retry"})
+            call_log.append(("A", 200))
+            return httpx.Response(200, json={"ok": True})
+        if "strat_B" in text:
+            call_log.append(("B", 200))
+            b_paused.set()
+            await release_b.wait()
+            return httpx.Response(200, json={"ok": True})
+        if "strat_C" in text:
+            call_log.append(("C", 200))
+            return httpx.Response(200, json={"ok": True})
+        call_log.append(("X", 200))
+        x_paused.set()
+        await release_x.wait()
+        return httpx.Response(200, json={"ok": True})
+
+    store, up, tg, _, svc = _build_service_stack(
+        tmp_path, settings=settings, tg_handler=tg_handler, clock=clock
+    )
+    try:
+        enq_a = await svc.enqueue_candidate(_sample_candidate(strategy_id="strat_A", bar_time=t0))
+        enq_b = await svc.enqueue_candidate(
+            _sample_candidate(strategy_id="strat_B", bar_time=t0 + 60)
+        )
+        enq_c = await svc.enqueue_candidate(
+            _sample_candidate(strategy_id="strat_C", bar_time=t0 + 120)
+        )
+
+        # Batch 1 claims [A, B, C], gets 503 on A (schedules retry at t0 + 2), pauses on B
+        batch1 = asyncio.create_task(svc.process_once(limit=20))
+        await asyncio.wait_for(b_paused.wait(), timeout=2.0)
+
+        # Enqueue X at t0 + 1 (due before A's t0 + 2), then advance clock to t0 + 2
+        clock.now = t0 + 1
+        enq_x = await svc.enqueue_candidate(
+            _sample_candidate(strategy_id="strat_X", bar_time=t0 + 180)
+        )
+        clock.now = t0 + 2
+
+        # Queue Batch 2 behind B, then release B -> Batch 2 claims [X, A],
+        # Batch 1 finishes C and runs its finally: while Batch 2 still owns A!
+        batch2 = asyncio.create_task(svc.process_once(limit=20))
+        await asyncio.sleep(0.02)
+        release_b.set()
+
+        await asyncio.wait_for(x_paused.wait(), timeout=2.0)
+        await asyncio.wait_for(batch1, timeout=2.0)
+
+        # Queue Batch 3 while Batch 2 is paused on X (and still holds A in _in_flight_owners)
+        batch3 = asyncio.create_task(svc.process_once(limit=20))
+        await asyncio.sleep(0.02)
+        release_x.set()
+
+        s1, s2, s3 = await asyncio.gather(batch1, batch2, batch3)
+        assert s1.retried == 1 and s1.delivered == 2
+        assert s2.delivered == 2
+        assert s3.claimed == 0
+        assert call_log == [
+            ("A", 503),
+            ("B", 200),
+            ("C", 200),
+            ("X", 200),
+            ("A", 200),
+        ]
+
+        row_a = await store.get_outbox_alert(enq_a.record.id)
+        row_b = await store.get_outbox_alert(enq_b.record.id)
+        row_c = await store.get_outbox_alert(enq_c.record.id)
+        row_x = await store.get_outbox_alert(enq_x.record.id)
+        assert row_a is not None and row_a.status == "DELIVERED" and row_a.attempt_count == 2
+        assert row_b is not None and row_b.status == "DELIVERED" and row_b.attempt_count == 1
+        assert row_c is not None and row_c.status == "DELIVERED" and row_c.attempt_count == 1
+        assert row_x is not None and row_x.status == "DELIVERED" and row_x.attempt_count == 1
+        assert svc._in_flight_owners == {}
+    finally:
+        release_b.set()
+        release_x.set()
         store.close()
         await tg.aclose()
         await up.aclose()

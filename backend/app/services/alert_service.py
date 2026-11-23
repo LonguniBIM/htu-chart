@@ -71,7 +71,7 @@ class AlertService:
         self._auth = topstep_auth
         self._clock = clock or (lambda: int(datetime.now(UTC).timestamp()))
         self._dispatch_lock = asyncio.Lock()
-        self._in_flight_ids: set[int] = set()
+        self._in_flight_owners: dict[int, object] = {}
         self._wakeup = asyncio.Event()
         self._worker_task: asyncio.Task[None] | None = None
         self._running = False
@@ -188,20 +188,24 @@ class AlertService:
             backoff = max(backoff, float(retry_after_sec))
         return max(1, math.ceil(backoff))
 
-    async def _dispatch_record_locked(self, record: AlertOutboxRecord) -> AlertStatus:
+    async def _dispatch_record_locked(self, record: AlertOutboxRecord) -> AlertStatus | None:
         """Dispatch a single PENDING outbox record under self._dispatch_lock."""
+        fresh = await self._sqlite.get_outbox_alert(record.id)
+        if fresh is None or fresh.status != "PENDING":
+            return None
+
         send_now = self._clock()
-        if send_now >= record.expires_at_utc:
-            if await self._sqlite.mark_outbox_expired(record.id, send_now):
+        if send_now >= fresh.expires_at_utc:
+            if await self._sqlite.mark_outbox_expired(fresh.id, send_now):
                 return "EXPIRED"
-            current = await self._sqlite.get_outbox_alert(record.id)
+            current = await self._sqlite.get_outbox_alert(fresh.id)
             return current.status if current is not None else "EXPIRED"
 
-        result = await self._telegram.send_message(record.payload_text)
+        result = await self._telegram.send_message(fresh.payload_text)
         done_now = self._clock()
 
         if result.ok:
-            await self._sqlite.mark_outbox_delivered(record.id, done_now)
+            await self._sqlite.mark_outbox_delivered(fresh.id, done_now)
             self._last_error = None
             return "DELIVERED"
 
@@ -210,7 +214,7 @@ class AlertService:
                 result.error or f"Telegram permanent failure ({result.status_code})"
             )
             await self._sqlite.mark_outbox_failed(
-                record.id,
+                fresh.id,
                 done_now,
                 safe_err,
                 increment_attempt=True,
@@ -223,34 +227,36 @@ class AlertService:
         )
         self._last_error = safe_err
         delay_sec = self._compute_retry_delay_sec(
-            record.attempt_count,
+            fresh.attempt_count,
             result.retry_after_sec,
         )
-        remaining = max(0, record.expires_at_utc - done_now)
+        remaining = max(0, fresh.expires_at_utc - done_now)
         next_attempt_at_utc = done_now + min(delay_sec, remaining)
         new_status = await self._sqlite.mark_outbox_retry(
-            record.id,
+            fresh.id,
             done_now,
             next_attempt_at_utc,
             safe_err,
         )
         if new_status is not None:
             return new_status
-        current = await self._sqlite.get_outbox_alert(record.id)
+        current = await self._sqlite.get_outbox_alert(fresh.id)
         return current.status if current is not None else "FAILED"
 
     async def process_once(self, limit: int = 20) -> DispatchCycleStats:
         """Expire stale rows and deliver due PENDING outbox alerts without holding batch lock."""
+        batch_token = object()
         async with self._dispatch_lock:
             now_utc = self._clock()
             expired_count = await self._sqlite.expire_stale_outbox_alerts(now_utc)
             due_alerts = await self._sqlite.claim_due_outbox_alerts(
                 now_utc,
                 limit=limit,
-                exclude_ids=self._in_flight_ids,
+                exclude_ids=self._in_flight_owners.keys(),
             )
             claimed_ids = [record.id for record in due_alerts]
-            self._in_flight_ids.update(claimed_ids)
+            for cid in claimed_ids:
+                self._in_flight_owners[cid] = batch_token
 
         delivered = 0
         retried = 0
@@ -261,7 +267,8 @@ class AlertService:
                     try:
                         outcome = await self._dispatch_record_locked(record)
                     finally:
-                        self._in_flight_ids.discard(record.id)
+                        if self._in_flight_owners.get(record.id) is batch_token:
+                            self._in_flight_owners.pop(record.id, None)
                 if outcome == "DELIVERED":
                     delivered += 1
                 elif outcome == "EXPIRED":
@@ -272,7 +279,8 @@ class AlertService:
                     retried += 1
         finally:
             for cid in claimed_ids:
-                self._in_flight_ids.discard(cid)
+                if self._in_flight_owners.get(cid) is batch_token:
+                    self._in_flight_owners.pop(cid, None)
 
         return DispatchCycleStats(
             expired=expired_count,
