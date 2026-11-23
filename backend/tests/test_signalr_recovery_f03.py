@@ -10361,5 +10361,97 @@ async def test_f03_retry_login_rechecks_session_under_lock_without_overwriting_m
         assert retry_result == "fresh-token"
 
 
+@pytest.mark.asyncio
+async def test_f03_cold_start_covered_htf_bucket_missing_1m_bar_stays_degraded(
+    tmp_path: Path,
+) -> None:
+    """Contract: P1-001 rejects elapsed covered HTF buckets missing 1m bars and stays DEGRADED.
+
+    Defect caught: reconcile_from_1m_bars silently continuing on elapsed covered buckets with
+    missing 1m bars (e.g., 14:02 omitted in HistoryBackfillService 1m cache), causing cold-start
+    LiveFeedService to mark 5m coverage COMPLETE and transition to LIVE with alerts enabled.
+    """
+    t0 = BASE_T  # 2026-11-10 14:00:00 UTC
+    now_ts = t0 + 1215  # 14:20:15 UTC
+    missing_min = t0 + 120  # 14:02:00 UTC
+    settings = Settings(data_dir=tmp_path / "data", signalr_enabled=True)
+    sqlite = SqliteStore(tmp_path / "meta.db")
+    sqlite.initialize()
+    parquet = ParquetStore(settings.data_dir, sqlite_store=sqlite)
+    rest_calls: list[tuple[int, int]] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/Auth/loginKey":
+            return httpx.Response(200, json={"success": True, "token": "jwt-htf-gap"})
+        if request.url.path == "/api/History/retrieveBars":
+            payload = json.loads(request.content.decode("utf-8"))
+            start_dt = datetime.fromisoformat(payload["startTime"].replace("Z", "+00:00"))
+            end_dt = datetime.fromisoformat(payload["endTime"].replace("Z", "+00:00"))
+            s_ts = int(start_dt.timestamp())
+            e_ts = int(end_dt.timestamp())
+            rest_calls.append((s_ts, e_ts))
+            bars = [
+                _wire_bar(ts, 5950.0, 5952.0, 5949.0, 5951.0, 3.0)
+                for ts in range(s_ts - (s_ts % 60), min(e_ts, t0 + 1200), 60)
+                if ts != missing_min and has_open_session_in_range(ts, ts + 60)
+            ]
+            return httpx.Response(200, json={"success": True, "bars": bars})
+        return httpx.Response(404)
+
+    try:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            auth = TopstepAuthService(settings, client)
+            await auth.login("alice", "api-key")
+            rest = TopstepRestClient(settings, auth, client)
+
+            # Pre-seed 1m cache [14:00, 14:20) via HistoryBackfillService with 14:02 omitted.
+            history_svc = HistoryBackfillService(settings, rest, parquet, sqlite)
+            hist_res = await history_svc.sync_and_read_bars(
+                contract_id=CID_MES,
+                live=False,
+                timeframe="1m",
+                start_ts=t0,
+                end_ts=t0 + 1199,
+                now_utc=now_ts,
+            )
+            assert hist_res.is_complete is True
+            assert all(b.time != missing_min for b in hist_res.bars)
+
+            rest_calls.clear()
+            agg = BarAggregator(timeframes=("1m", "5m", "15m"))
+            svc = LiveFeedService(
+                settings,
+                auth,
+                rest,
+                parquet,
+                sqlite,
+                aggregator=agg,
+                recovery_timeframes=("1m", "5m", "15m"),
+                initial_backfill_bars=10,
+                clock=lambda: now_ts,
+            )
+            try:
+                await svc.set_active_contracts([CID_MES], live_mode=False)
+                svc._last_connected_utc = now_ts - 600
+                await svc.trigger_recovery(now_utc=now_ts)
+
+                # Confirm REST only reloaded recent ~10m window, while 14:00..14:05 came from cache.
+                assert rest_calls
+                assert all(s > t0 for s, _e in rest_calls)
+
+                assert svc.feed_state == "DEGRADED"
+                assert svc.is_contract_live_alerts_enabled(CID_MES) is False
+                key_5m = StorageDatasetKey("topstepx", False, CID_MES, "5m")
+                assert await sqlite.is_interval_complete(key_5m, t0, t0 + 300) is False
+                status = svc.get_status_snapshot()
+                assert status["live_alerts_enabled"] is False
+                assert status["unresolved_gaps"] > 0
+                assert status["contracts"][CID_MES]["unresolved_gaps"] > 0
+            finally:
+                await svc.stop()
+    finally:
+        sqlite.close()
+
+
 
 

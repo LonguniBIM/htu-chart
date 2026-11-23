@@ -926,6 +926,17 @@ class BarAggregator:
 
             # Never finalize or publish an elapsed bucket with incomplete 1m source bars.
             if bucket_elapsed and not bar_closed:
+                if covered_ok:
+                    rejected_bars.append(
+                        (
+                            htf_open,
+                            "incomplete_htf_source_bars",
+                            (
+                                f"Missing 1m source bars for elapsed {tf} bucket "
+                                f"{htf_open} (have {len(members)}/{expected_1m_count})"
+                            ),
+                        )
+                    )
                 continue
 
             candidate = {
