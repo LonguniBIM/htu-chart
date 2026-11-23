@@ -707,3 +707,220 @@ async def test_r06_large_historical_recovery_does_not_overflow_healthy_ws_client
             await live_feed.stop()
     finally:
         sqlite_store.close()
+
+
+def test_r06_ws_subscribe_rejects_bogus_and_unsafe_contract_ids_without_disrupting_live_feed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Contract: P1-001/SEC-WS-001 rejects unsupported or unsafe contract_ids on /ws/market.
+
+    Defect caught: /ws/market accepting CON.F.US.BOGUS.Z99 or 'A B' and passing them into
+    LiveFeedService.subscribe_ws_contract, calling hub.update_contracts and breaking LIVE state.
+    """
+    clock_now = BASE_T + 15
+    transports: list[_MockSignalRTransport] = []
+
+    async def ws_factory(_url: str, _headers: dict[str, str]) -> _MockSignalRTransport:
+        t = _MockSignalRTransport()
+        transports.append(t)
+        return t
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/Auth/loginKey":
+            return httpx.Response(200, json={"success": True, "token": "jwt-ws-val"})
+        if request.url.path == "/api/History/retrieveBars":
+            req_payload = json.loads(request.content.decode("utf-8"))
+            bars = _bars_for_history_payload(req_payload)
+            return httpx.Response(200, json={"success": True, "bars": bars})
+        return httpx.Response(404)
+
+    settings = Settings(
+        app_env="development",
+        app_password_hash=TEST_PASSWORD_HASH,
+        data_dir=tmp_path / "data",
+    )
+    upstream = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    app = create_app(
+        settings=settings,
+        http_client=upstream,
+        signalr_ws_factory=ws_factory,
+        clock=lambda: clock_now,
+    )
+
+    try:
+        with TestClient(
+            app,
+            client=("127.0.0.1", 50000),
+            base_url="http://127.0.0.1:8000",
+        ) as client:
+            login_resp = client.post("/api/auth/login", json={"password": TEST_PASSWORD})
+            assert login_resp.status_code == 200
+            csrf = login_resp.json()["csrf_token"]
+            session_cookie = login_resp.cookies["topstep_session"]
+
+            conn = client.post(
+                "/api/connect",
+                json={"userName": "alice", "apiKey": "key-ws-val"},
+                headers={"X-CSRF-Token": csrf},
+            )
+            assert conn.status_code == 200
+
+            with client.websocket_connect(
+                "/ws/market",
+                headers={
+                    "Host": "127.0.0.1:8000",
+                    "Origin": "http://127.0.0.1:8000",
+                    "Cookie": f"topstep_session={session_cookie}",
+                },
+            ) as ws:
+                assert ws.receive_json()["type"] == "feed_status"
+                ws.send_json(
+                    {"type": "subscribe", "contract_id": "CON.F.US.MES.Z26", "timeframe": "1m"}
+                )
+                assert ws.receive_json()["type"] == "subscribed"
+
+                deadline = time.monotonic() + 2.0
+                while time.monotonic() < deadline:
+                    if transports and app.state.live_feed_service.feed_state == "LIVE":
+                        break
+                    time.sleep(0.02)
+                assert app.state.live_feed_service.feed_state == "LIVE"
+
+                update_calls: list[list[str]] = []
+                orig_update = app.state.live_feed_service.hub.update_contracts
+
+                async def spy_update(contracts: Any, *, live_mode: bool) -> None:
+                    update_calls.append(list(contracts))
+                    await orig_update(contracts, live_mode=live_mode)
+
+                monkeypatch.setattr(
+                    app.state.live_feed_service.hub, "update_contracts", spy_update
+                )
+
+                for bad_cid in ("CON.F.US.BOGUS.Z99", "A B"):
+                    ws.send_json({"type": "subscribe", "contract_id": bad_cid, "timeframe": "1m"})
+                    resp = ws.receive_json()
+                    while resp.get("type") in {"feed_status", "resync_required"}:
+                        resp = ws.receive_json()
+                    assert resp["type"] == "error", f"Expected error for {bad_cid!r}, got {resp!r}"
+
+                assert update_calls == []
+                assert app.state.live_feed_service.feed_state == "LIVE"
+                assert app.state.live_feed_service.live_alerts_enabled is True
+                assert app.state.live_feed_service.active_contracts == ("CON.F.US.MES.Z26",)
+    finally:
+        asyncio.run(upstream.aclose())
+
+
+async def test_r06_ws_subscribe_enforces_per_client_and_total_ws_contract_caps(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Contract: P1-001/SEC-WS-001 enforces per-client and total WS contract subscription caps.
+
+    Defect caught: Unbounded subscribe_ws_contract / WsBroadcaster.subscribe allowing arbitrary
+    fan-out of subscriptions and SignalR contract churn.
+    """
+    broadcaster = WsBroadcaster(max_subscriptions_per_client=2)
+    ws_client = _FakeWsClient()
+    session = broadcaster.register(ws_client, client_id="capped-client")
+    try:
+        broadcaster.subscribe("capped-client", "CON.F.US.MES.Z26", "1m")
+        broadcaster.subscribe("capped-client", "CON.F.US.MES.Z26", "5m")
+        # Idempotent re-subscribe at cap succeeds.
+        broadcaster.subscribe("capped-client", "CON.F.US.MES.Z26", "1m")
+        with pytest.raises(ValueError, match=r"(?i)limit|cap|maximum"):
+            broadcaster.subscribe("capped-client", "CON.F.US.MNQ.Z26", "1m")
+        assert len(session.subscriptions) == 2
+    finally:
+        await broadcaster.close_all()
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/Auth/loginKey":
+            return httpx.Response(200, json={"success": True, "token": "jwt-cap"})
+        if request.url.path == "/api/History/retrieveBars":
+            req_payload = json.loads(request.content.decode("utf-8"))
+            return httpx.Response(
+                200,
+                json={"success": True, "bars": _bars_for_history_payload(req_payload)},
+            )
+        return httpx.Response(404)
+
+    settings = Settings(data_dir=tmp_path / "data")
+    sqlite_store = SqliteStore(tmp_path / "meta.db")
+    sqlite_store.initialize()
+    try:
+        parquet_store = ParquetStore(settings.data_dir, sqlite_store=sqlite_store)
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            auth = TopstepAuthService(settings, client)
+            await auth.login("alice", "key-cap")
+            rest = TopstepRestClient(settings, auth, client)
+            live_feed = LiveFeedService(
+                settings,
+                auth,
+                rest,
+                parquet_store,
+                sqlite_store,
+                recovery_timeframes=("1m",),
+                initial_backfill_bars=2,
+                max_ws_contracts=2,
+                clock=lambda: BASE_T + 15,
+            )
+            try:
+                await live_feed.subscribe_ws_contract("CON.F.US.MES.Z26")
+                await live_feed.subscribe_ws_contract("CON.F.US.MNQ.Z26")
+                # Re-subscribing an existing WS contract succeeds at cap.
+                await live_feed.subscribe_ws_contract("CON.F.US.MES.Z26")
+
+                update_calls: list[list[str]] = []
+                orig_update = live_feed.hub.update_contracts
+
+                async def spy_update(contracts: Any, *, live_mode: bool) -> None:
+                    update_calls.append(list(contracts))
+                    await orig_update(contracts, live_mode=live_mode)
+
+                monkeypatch.setattr(live_feed.hub, "update_contracts", spy_update)
+
+                with pytest.raises(ValueError, match=r"(?i)limit|cap|maximum"):
+                    await live_feed.subscribe_ws_contract("CON.F.US.MYM.Z26")
+                assert update_calls == []
+                assert set(live_feed.active_contracts) == {
+                    "CON.F.US.MES.Z26",
+                    "CON.F.US.MNQ.Z26",
+                }
+            finally:
+                await live_feed.stop()
+    finally:
+        sqlite_store.close()
+
+
+def test_r06_ws_binary_frame_returns_structured_error_without_crash(tmp_path: Path) -> None:
+    """Contract: SEC-WS-002 handles binary WS frames cleanly with a structured JSON error.
+
+    Defect caught: websocket.receive_json() raising unhandled KeyError on binary WS send_bytes.
+    """
+    settings = Settings(app_password_hash=TEST_PASSWORD_HASH, data_dir=tmp_path / "data")
+    app = create_app(settings=settings)
+
+    with TestClient(app, base_url="http://127.0.0.1:8000") as client:
+        login_resp = client.post("/api/auth/login", json={"password": TEST_PASSWORD})
+        assert login_resp.status_code == 200
+        session_cookie = login_resp.cookies["topstep_session"]
+
+        with client.websocket_connect(
+            "/ws/market",
+            headers={
+                "Host": "127.0.0.1:8000",
+                "Origin": "http://127.0.0.1:8000",
+                "Cookie": f"topstep_session={session_cookie}",
+            },
+        ) as ws:
+            assert ws.receive_json()["type"] == "feed_status"
+            ws.send_bytes(b"x")
+            err = ws.receive_json()
+            assert err["type"] == "error"
+            assert "Invalid WebSocket JSON payload" in err["detail"]
+
+            ws.send_json({"type": "ping"})
+            assert ws.receive_json() == {"type": "pong"}

@@ -18,6 +18,7 @@ from fastapi import (
     status,
 )
 
+from app.engine.instruments import INSTRUMENTS, StorageDatasetKey, infer_root_symbol
 from app.engine.ohlcv import validate_query_timestamp
 from app.engine.session_calendar import normalize_timeframe, timeframe_from_topstep_unit
 from app.security import SessionData, redact_secrets, require_session, validate_ws_handshake
@@ -317,10 +318,15 @@ async def market_websocket(websocket: WebSocket) -> None:
                 msg = recv_task.result()
             except (WebSocketDisconnect, RuntimeError):
                 break
-            except ValueError as exc:
+            except (ValueError, KeyError) as exc:
+                detail = (
+                    "Invalid WebSocket JSON payload"
+                    if isinstance(exc, KeyError)
+                    else redact_secrets(str(exc))
+                )
                 broadcaster.send_to_client(
                     ws_session.client_id,
-                    {"type": "error", "detail": redact_secrets(str(exc))},
+                    {"type": "error", "detail": detail},
                 )
                 continue
 
@@ -347,6 +353,15 @@ async def market_websocket(websocket: WebSocket) -> None:
                 raw_cid = str(msg.get("contract_id") or msg.get("contractId") or "")
                 raw_tf = str(msg.get("timeframe") or "1m")
                 try:
+                    cid = raw_cid.strip().upper()
+                    StorageDatasetKey("topstepx", False, cid, "1m")
+                    root = infer_root_symbol(cid)
+                    if root is None or root not in INSTRUMENTS:
+                        supported_roots = ", ".join(sorted(INSTRUMENTS))
+                        raise ValueError(
+                            f"Unsupported contract_id {cid!r}; "
+                            f"supported instruments: {supported_roots}"
+                        )
                     norm_tf = normalize_timeframe(raw_tf)
                     aggregator = getattr(websocket.app.state, "bar_aggregator", None)
                     if aggregator is not None and norm_tf not in aggregator.timeframes:
@@ -355,12 +370,19 @@ async def market_websocket(websocket: WebSocket) -> None:
                             f"Timeframe {norm_tf!r} is not enabled in BarAggregator "
                             f"(supported: {supported_str})"
                         )
-                    cid, tf = broadcaster.subscribe(ws_session.client_id, raw_cid, norm_tf)
+                    check_fn = getattr(live_feed, "check_ws_subscription_allowed", None)
+                    if callable(check_fn):
+                        cid = check_fn(cid)
+                    cid, tf = broadcaster.subscribe(ws_session.client_id, cid, norm_tf)
                     broadcaster.send_to_client(
                         ws_session.client_id,
                         {"type": "subscribed", "contract_id": cid, "timeframe": tf},
                     )
-                    await live_feed.subscribe_ws_contract(cid)
+                    try:
+                        await live_feed.subscribe_ws_contract(cid)
+                    except ValueError:
+                        broadcaster.unsubscribe(ws_session.client_id, cid, tf)
+                        raise
                 except ValueError as exc:
                     broadcaster.send_to_client(
                         ws_session.client_id,

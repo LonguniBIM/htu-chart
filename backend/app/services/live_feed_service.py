@@ -21,7 +21,7 @@ from app.engine.bar_aggregator import (
     BarAggregator,
     NormalizedTick,
 )
-from app.engine.instruments import StorageDatasetKey, infer_root_symbol
+from app.engine.instruments import INSTRUMENTS, StorageDatasetKey, infer_root_symbol
 from app.engine.ohlcv import (
     DEFAULT_MAX_FUTURE_SKEW_SEC,
     DEFAULT_MIN_BAR_TIMESTAMP,
@@ -120,6 +120,7 @@ class LiveFeedService:
         on_bar_signal: SignalCallback | None = None,
         clock: Callable[[], int] | None = None,
         monotonic_clock: Callable[[], float] = time.monotonic,
+        max_ws_contracts: int = 16,
     ) -> None:
         self._settings = settings
         self._auth = auth_service
@@ -138,8 +139,11 @@ class LiveFeedService:
         )
         if not self._recovery_timeframes:
             raise ValueError("LiveFeedService requires at least one recovery timeframe")
+        if max_ws_contracts < 1:
+            raise ValueError("max_ws_contracts must be >= 1")
         self._initial_backfill_bars = max(2, int(initial_backfill_bars))
         self._degraded_retry_interval_sec = max(0.1, float(degraded_retry_interval_sec))
+        self._max_ws_contracts = int(max_ws_contracts)
         self._on_bar_signal = on_bar_signal
         self._clock = clock or (lambda: int(datetime.now(UTC).timestamp()))
         self._mono_clock = monotonic_clock
@@ -355,6 +359,28 @@ class LiveFeedService:
             self._recompute_aggregate_state()
             self._broadcast_status()
 
+    @staticmethod
+    def _validate_ws_contract_id(contract_id: str) -> str:
+        cid = contract_id.strip().upper()
+        StorageDatasetKey("topstepx", False, cid, "1m")
+        root = infer_root_symbol(cid)
+        if root is None or root not in INSTRUMENTS:
+            supported_roots = ", ".join(sorted(INSTRUMENTS))
+            raise ValueError(
+                f"Unsupported contract_id {cid!r}; supported instruments: {supported_roots}"
+            )
+        return cid
+
+    def check_ws_subscription_allowed(self, contract_id: str) -> str:
+        """Validate WS contract_id and verify the total WS contract cap is not exceeded."""
+        cid = self._validate_ws_contract_id(contract_id)
+        if cid not in self._ws_contracts and len(self._ws_contracts) >= self._max_ws_contracts:
+            raise ValueError(
+                f"Maximum concurrent WS contract subscriptions ({self._max_ws_contracts}) "
+                "exceeded"
+            )
+        return cid
+
     async def subscribe_ws_contract(
         self,
         contract_id: str,
@@ -362,10 +388,16 @@ class LiveFeedService:
         live_mode: bool | None = None,
     ) -> None:
         """Register a contract subscribed via /ws/market and start/update upstream SignalR."""
-        cid = contract_id.strip().upper()
-        if not cid:
-            raise ValueError("contract_id cannot be empty")
+        cid = self._validate_ws_contract_id(contract_id)
         async with self._hub_lifecycle_lock:
+            if (
+                cid not in self._ws_contracts
+                and len(self._ws_contracts) >= self._max_ws_contracts
+            ):
+                raise ValueError(
+                    f"Maximum concurrent WS contract subscriptions ({self._max_ws_contracts}) "
+                    "exceeded"
+                )
             eff_live = self._auth.live if live_mode is None else bool(live_mode)
             self._ws_contracts.add(cid)
             existing = self._contracts.get(cid)

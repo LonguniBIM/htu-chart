@@ -2941,7 +2941,7 @@ async def test_f03_dynamic_subscribe_missing_or_error_ack_never_live_and_reconne
     Defect caught: Marking dynamically added /ws/market contracts LIVE immediately when upstream
     type=3 subscribe ACK is missing (even with type=6 pings) or returns an error.
     """
-    cid_nq = "CON.F.US.NQ.Z26"
+    cid_nq = "CON.F.US.MNQ.Z26"
     clock_ref = [BASE_T + 15]
 
     class _DynamicAckMockTransport(_MockSignalRTransport):
@@ -3378,7 +3378,7 @@ async def test_f03_dynamic_subscribe_non_live_and_buffered_while_ack_pending(
     """
     from app.topstep.signalr_hub import SignalRTickEvent
 
-    cid_nq = "CON.F.US.NQ.Z26"
+    cid_nq = "CON.F.US.MNQ.Z26"
     clock_ref = [BASE_T + 15]
     nq_ack_gate = asyncio.Event()
     nq_ack_sent = asyncio.Event()
@@ -3711,7 +3711,7 @@ async def test_f03_live_contract_ticks_preserved_while_new_contract_awaits_ack(
     """
     from app.topstep.signalr_hub import SignalRTickEvent
 
-    cid_nq = "CON.F.US.NQ.Z26"
+    cid_nq = "CON.F.US.MNQ.Z26"
     clock_ref = [BASE_T + 15]
     nq_ack_gate = asyncio.Event()
     nq_ack_sent = asyncio.Event()

@@ -12,6 +12,7 @@ from dataclasses import dataclass, field
 from typing import Any, Protocol
 
 from app.engine.bar_aggregator import DEFAULT_AGGREGATION_TIMEFRAMES, AggregatedBarEvent
+from app.engine.instruments import INSTRUMENTS, StorageDatasetKey, infer_root_symbol
 from app.engine.session_calendar import normalize_timeframe
 
 logger = logging.getLogger("topstep_chart.ws")
@@ -147,17 +148,21 @@ class WsBroadcaster:
         client_queue_maxsize: int = 64,
         send_timeout_sec: float = 5.0,
         supported_timeframes: Sequence[str] = DEFAULT_AGGREGATION_TIMEFRAMES,
+        max_subscriptions_per_client: int = 16,
     ) -> None:
         if client_queue_maxsize < 1:
             raise ValueError("client_queue_maxsize must be >= 1")
         if send_timeout_sec <= 0:
             raise ValueError("send_timeout_sec must be > 0")
+        if max_subscriptions_per_client < 1:
+            raise ValueError("max_subscriptions_per_client must be >= 1")
         canon_tfs = tuple(dict.fromkeys(normalize_timeframe(tf) for tf in supported_timeframes))
         if not canon_tfs:
             raise ValueError("supported_timeframes must contain at least one timeframe")
         self._queue_maxsize = client_queue_maxsize
         self._send_timeout_sec = send_timeout_sec
         self._supported_timeframes: tuple[str, ...] = canon_tfs
+        self._max_subscriptions_per_client = int(max_subscriptions_per_client)
         self._clients: dict[str, WsClientSession] = {}
         self._teardown_tasks: set[asyncio.Task[None]] = set()
         self._slow_disconnect_count = 0
@@ -210,8 +215,13 @@ class WsBroadcaster:
     def subscribe(self, client_id: str, contract_id: str, timeframe: str) -> tuple[str, str]:
         """Subscribe a registered client to (contract_id, timeframe)."""
         cid = contract_id.strip().upper()
-        if not cid:
-            raise ValueError("contract_id cannot be empty")
+        StorageDatasetKey("topstepx", False, cid, "1m")
+        root = infer_root_symbol(cid)
+        if root is None or root not in INSTRUMENTS:
+            supported_roots = ", ".join(sorted(INSTRUMENTS))
+            raise ValueError(
+                f"Unsupported contract_id {cid!r}; supported instruments: {supported_roots}"
+            )
         tf = normalize_timeframe(timeframe)
         if tf not in self._supported_timeframes:
             supported_str = ", ".join(self._supported_timeframes)
@@ -221,6 +231,14 @@ class WsBroadcaster:
             )
         session = self._clients.get(client_id)
         if session is not None:
+            if (
+                (cid, tf) not in session.subscriptions
+                and len(session.subscriptions) >= self._max_subscriptions_per_client
+            ):
+                raise ValueError(
+                    f"Subscription limit exceeded (maximum {self._max_subscriptions_per_client} "
+                    "per client)"
+                )
             session.subscriptions.add((cid, tf))
         return cid, tf
 
