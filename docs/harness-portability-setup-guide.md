@@ -1204,3 +1204,59 @@ When the setup agent finishes applying this guide in a target repository, it **m
 3. **Cross-Runtime Adapter Local Execution Scope:** Antigravity (`agy 1.5.16`) and OpenAI Codex CLI (`0.172.0`) commands were executed directly on the Windows source host; Claude Code and standalone Gemini CLI adapters in this guide are verified against official vendor schemas/documentation (`2026-11-24`) and must be smoke-tested (`Section 10.2`) on the destination host before being marked `tested`.
 4. **Single-Host File Locking:** `task_runner.py` uses OS kernel file locks (`msvcrt` on Windows, `fcntl` on POSIX) designed for single-machine multi-process coordination; distributed CI workers sharing network filesystems (NFS/SMB) require an external atomic store or per-job isolated ledgers.
 5. **Guide != Destination Certification:** Creating this guide certifies only the source reference extraction and portable specification. Every destination repository starts at `unconfigured` until an executor completes intake, runs the setup/migration waves, and records actual test outputs in the Section 10.5 Completion Report.
+
+
+## Define agent–user interaction boundaries
+
+The generated guide must include an explicit interaction contract defining who may decide, act, authorize, pause and resume. Apply it separately to guide authoring and to each destination-project setup.
+
+### 1. Decision rights
+
+| Actor | Owns | Boundary |
+| --- | --- | --- |
+| User | Intended outcome, primary runtime, material cost/quality preferences, budget limits, and changes to agreed scope or operating policy. | Existing choices and authorizations remain valid within their original target and scope. Routine implementation details need not be escalated. |
+| Setup Agent / Coordinator | Evidence gathering, recommendations, adaptation design, briefs, delegation, integration, progress and consolidated reporting. | Acts autonomously within the authorized scope; cannot grant itself additional access, spending or authority. |
+| Peer | Implementation and evidence within its assigned task packet. | Escalates contract conflicts and missing dependencies to Coordinator; delegation does not expand permissions or budget. |
+| Independent Reviewer | Findings and evidence from the frozen candidate under its review contract. | Cannot edit product code, waive mandatory checks or approve its own implementation as independent review. |
+| Runner | Dispatch eligibility, permissions, counters, deadlines, validation and evidence-derived status. | Enforces the active policy; model statements or user silence cannot substitute for required evidence. |
+
+User preferences govern supported model/effort choices. If a preference conflicts with actual capabilities or an existing requirement, explain the specific conflict and present the smallest viable alternatives. Do not silently substitute a different model or weaken a gate.
+
+### 2. Authorized autonomy
+
+During guide authoring, inspect the source and produce the requested document. During destination setup, determine whether the user's existing request authorizes assessment, planning, implementation or rollout; do not ask again when that scope is already clear.
+
+Within that scope, the agent may inspect, investigate, choose routine implementation details, prepare plans and diffs, make reversible authorized changes, and run relevant verification within agreed resource limits. Prefer a recoverable, documented assumption over an unnecessary question when it does not materially change the result.
+
+Authorization may be explicit or reasonably implied by the request. Preserve it across turns, handoffs and resumed sessions for the same target and scope. Approval of one project or action does not automatically authorize a different project, additional spending, deployment or external communication.
+
+### 3. When to involve the user
+
+Ask only when:
+
+- A missing preference or unresolved ambiguity materially changes the result.
+- A proposed action exceeds the authorized scope, access or resource limits.
+- A material trade-off changes the agreed runtime, topology, review contract or shared environment.
+- A genuine capability, authentication or permission blocker requires user action.
+
+Before requesting additional authorization, finish the authorized preparation. Present the exact proposed action, affected files/settings, a reviewable diff or configuration, relevant checks, material impact, recovery approach and recommended choice. Explain why a decision is needed and identify the concrete constraint or rule.
+
+Do not impose a blanket approval gate on every edit, command, retry or subtask. Continue unrelated authorized work while one decision is pending. Never interpret silence as permission for a new consequential action.
+
+### 4. Escalation, fallback and stopping
+
+Normally consolidate Peer and reviewer questions through Coordinator. A valid `BLOCKED`, `REOPEN` or dependency request is a signal to resolve the prerequisite or contract; it is not permission to pressure the agent into continuing.
+
+Use already authorized, qualified fallbacks autonomously within their retry, cost, access and independence limits. Ask for a new choice only when all compliant options are exhausted or a material deviation is required.
+
+A failed mandatory check remains failed until its cause is corrected or a valid evidence-backed disposition applies. Do not seek a user rubber stamp for an invalid `VERIFIED` result. A user-authorized policy revision must be recorded separately and revalidated; it does not retroactively make stale evidence pass.
+
+When access, evidence or a required decision is missing, pause the affected action, preserve resumable state, and report the smallest next step. Respect explicit stop or cancellation immediately and clean up active work safely.
+
+### 5. Authentication and communication
+
+Use supported login or secret-management flows. Never request secrets in chat or place them in the guide, task packets or logs. If authentication requires user action, complete the remaining preparation first and provide a minimal handoff.
+
+Discuss progress, choices and blockers in Vietnamese. Keep persistent plans, task packets, decision records, evidence and handoffs in English. Report meaningful milestones and emerging blockers without narrating every routine command.
+
+Maintain a lightweight decision/authorization record: target, scope, user preference or request reference, approved limits, assumptions, pending decisions, and the event that would require reconsideration. Distinguish proposed, attempted, completed and verified work in the final report.
