@@ -199,7 +199,12 @@ def test_mod001_detects_active_excluded_models_and_allows_prohibition_prose(tmp_
     _write(
         tmp_path,
         ".agents/skills/display-skill/SKILL.md",
-        "- Coordinator: Gemini 4 Argon Medium\n- Alt: Orchestrator (Argon)\n",
+        "- Coordinator: Gemini 4 Argon Medium\n",
+    )
+    _write(
+        tmp_path,
+        ".agents/skills/orchestrator-argon-skill/SKILL.md",
+        "- Mode: Orchestrator (Argon)\n- Inline: `Orchestrator (Argon)`\n",
     )
     _write(
         tmp_path,
@@ -213,13 +218,37 @@ def test_mod001_detects_active_excluded_models_and_allows_prohibition_prose(tmp_
     )
     res = run_checks(tmp_path, use_baseline=False, today=FIXED_TODAY)
     mod001 = [v for v in res["violations"] if v["rule_id"] == "MOD-001"]
-    flagged_files = {v["file"] for v in mod001}
-    assert ".agents/skills/slp-orchestrator/SKILL.md" in flagged_files
-    assert ".agents/skills/other-skill/SKILL.md" in flagged_files
-    assert ".agents/skills/display-skill/SKILL.md" in flagged_files
-    assert "harness/README.md" in flagged_files
-    assert "AGENTS.md" not in flagged_files
-    assert "harness/model-policy.json" not in flagged_files
+    flagged_pairs = {(v["file"], v["line"]) for v in mod001}
+    assert (".agents/skills/slp-orchestrator/SKILL.md", 2) in flagged_pairs
+    assert (".agents/skills/other-skill/SKILL.md", 1) in flagged_pairs
+    assert (".agents/skills/display-skill/SKILL.md", 1) in flagged_pairs
+    assert (".agents/skills/orchestrator-argon-skill/SKILL.md", 1) in flagged_pairs
+    assert (".agents/skills/orchestrator-argon-skill/SKILL.md", 2) in flagged_pairs
+    assert ("harness/README.md", 1) in flagged_pairs
+    assert all(v["file"] not in {"AGENTS.md", "harness/model-policy.json"} for v in mod001)
+
+
+def test_mod001_ast_denylist_skip_does_not_leak_after_escaped_paren_regex(tmp_path: Path) -> None:
+    """Contract: Escaped regex parens in MOD001_* constants do not disable MOD-001 below them.
+
+    Defect caught: P1-002 raw paren counter leaking skip state across the rest of a Python file.
+    """
+    _write_valid_policy(tmp_path)
+    _write(
+        tmp_path,
+        "harness/scripts/sample.py",
+        "\n".join(
+            [
+                "import re",
+                'MOD001_SAMPLE_RE = re.compile(r"foo\\(")',
+                'ACTIVE = "gemini-3.8-flash-high"',
+            ]
+        )
+        + "\n",
+    )
+    res = run_checks(tmp_path, use_baseline=False, today=FIXED_TODAY)
+    mod001 = [(v["file"], v["line"]) for v in res["violations"] if v["rule_id"] == "MOD-001"]
+    assert ("harness/scripts/sample.py", 3) in mod001
 
 
 def test_mod001_flags_excluded_model_in_active_policy_roles_or_routes(tmp_path: Path) -> None:
@@ -237,6 +266,7 @@ def test_mod001_flags_excluded_model_in_active_policy_roles_or_routes(tmp_path: 
             "gemini-2.5-pro",
         ],
         "roles": {
+            "app_coordinator": {"selected_mode": "Orchestrator (Argon)"},
             "peer_default": {"selected_model": "gemini-3.8-flash-high"},
             "independent_reviewer_fallbacks": {
                 "qualified_routes": [{"model": "Gemini 4 Argon Medium"}]
@@ -246,7 +276,7 @@ def test_mod001_flags_excluded_model_in_active_policy_roles_or_routes(tmp_path: 
     _write(tmp_path, "harness/model-policy.json", json.dumps(bad_policy, indent=2) + "\n")
     res = run_checks(tmp_path, use_baseline=False, today=FIXED_TODAY)
     mod001 = [v for v in res["violations"] if v["rule_id"] == "MOD-001"]
-    assert len(mod001) == 2
+    assert len(mod001) == 3
     assert all(v["file"] == "harness/model-policy.json" for v in mod001)
 
 

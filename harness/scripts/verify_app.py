@@ -108,6 +108,7 @@ def _check_model_policy(root: Path) -> dict[str, Any]:
                     continue
                 for field in (
                     "selected_model",
+                    "selected_mode",
                     "fallback_model",
                     "planner_label",
                     "internal_executor_label",
@@ -119,7 +120,11 @@ def _check_model_policy(root: Path) -> dict[str, Any]:
                         )
                 if role_key == "independent_reviewer_fallbacks":
                     routes = role_val.get("qualified_routes", [])
-                    if isinstance(routes, list):
+                    if not isinstance(routes, list):
+                        errors.append(
+                            "independent_reviewer_fallbacks.qualified_routes must be a list."
+                        )
+                    else:
                         for item in routes:
                             m_val = item.get("model") if isinstance(item, dict) else item
                             if isinstance(m_val, str) and is_excluded_model(
@@ -205,6 +210,12 @@ def _check_hooks(root: Path) -> dict[str, Any]:
 
     if isinstance(cfg, dict):
         guard = cfg.get("topstep-safety-guard")
+        if isinstance(guard, dict) and "enabled" in guard:
+            enabled_val = guard.get("enabled")
+            if not isinstance(enabled_val, bool) or enabled_val is not True:
+                errors.append(
+                    ".agents/hooks.json topstep-safety-guard.enabled must be boolean true."
+                )
         pre_groups = guard.get("PreToolUse") if isinstance(guard, dict) else None
         if not isinstance(pre_groups, list) or not pre_groups:
             errors.append(".agents/hooks.json missing topstep-safety-guard.PreToolUse array.")
@@ -255,35 +266,45 @@ def _check_hooks(root: Path) -> dict[str, Any]:
         errors.append(".agents/hooks.json root must be a JSON object.")
 
     if cmd_str:
-        argv = shlex.split(cmd_str, posix=(os.name != "nt"))
-        if argv and Path(argv[0]).name.lower() in {"python", "python3", "python.exe"}:
-            argv[0] = sys.executable
+        argv: list[str] = []
+        try:
+            raw_argv = shlex.split(cmd_str, posix=(os.name != "nt"))
+        except ValueError as exc:
+            errors.append(f".agents/hooks.json invalid command syntax: {exc}")
+        else:
+            argv = [
+                tok[1:-1] if len(tok) >= 2 and tok[0] == tok[-1] and tok[0] in {'"', "'"} else tok
+                for tok in raw_argv
+            ]
+            if argv and Path(argv[0]).name.lower() in {"python", "python3", "python.exe"}:
+                argv[0] = sys.executable
 
-        deny_decision, deny_err = _run_hook_probe(
-            argv,
-            agents_dir,
-            root,
-            "doctor_deny",
-            "backend/app/x.py",
-            'await client.post("/api/Order/place")',
-        )
-        if deny_err:
-            errors.append(f"deny_probe: {deny_err}")
-        elif deny_decision != "deny":
-            errors.append(f"deny_probe expected 'deny', got {deny_decision!r}.")
+        if argv:
+            deny_decision, deny_err = _run_hook_probe(
+                argv,
+                agents_dir,
+                root,
+                "doctor_deny",
+                "backend/app/x.py",
+                'await client.post("/api/Order/place")',
+            )
+            if deny_err:
+                errors.append(f"deny_probe: {deny_err}")
+            elif deny_decision != "deny":
+                errors.append(f"deny_probe expected 'deny', got {deny_decision!r}.")
 
-        allow_decision, allow_err = _run_hook_probe(
-            argv,
-            agents_dir,
-            root,
-            "doctor_allow",
-            "backend/app/engine/instruments.py",
-            "MES_TICK_SIZE = 0.25\n",
-        )
-        if allow_err:
-            errors.append(f"allow_probe: {allow_err}")
-        elif allow_decision != "allow":
-            errors.append(f"allow_probe expected 'allow', got {allow_decision!r}.")
+            allow_decision, allow_err = _run_hook_probe(
+                argv,
+                agents_dir,
+                root,
+                "doctor_allow",
+                "backend/app/engine/instruments.py",
+                "MES_TICK_SIZE = 0.25\n",
+            )
+            if allow_err:
+                errors.append(f"allow_probe: {allow_err}")
+            elif allow_decision != "allow":
+                errors.append(f"allow_probe expected 'allow', got {allow_decision!r}.")
 
     return {
         "ok": not errors,

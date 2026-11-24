@@ -618,12 +618,23 @@ def _validate_model_policy_file(
         )
 
     roles = data.get("roles", {})
-    if isinstance(roles, dict):
+    if not isinstance(roles, dict):
+        violations.append(
+            Violation(
+                rule_id="MOD-001",
+                file=rel,
+                line=1,
+                message="harness/model-policy.json 'roles' must be a JSON object.",
+                fix=fix,
+            )
+        )
+    else:
         for role_key, role_val in roles.items():
             if not isinstance(role_val, dict):
                 continue
             for field in (
                 "selected_model",
+                "selected_mode",
                 "fallback_model",
                 "planner_label",
                 "internal_executor_label",
@@ -644,7 +655,20 @@ def _validate_model_policy_file(
                     )
             if role_key == "independent_reviewer_fallbacks":
                 routes = role_val.get("qualified_routes", [])
-                if isinstance(routes, list):
+                if not isinstance(routes, list):
+                    violations.append(
+                        Violation(
+                            rule_id="MOD-001",
+                            file=rel,
+                            line=1,
+                            message=(
+                                "independent_reviewer_fallbacks.qualified_routes "
+                                "must be a list."
+                            ),
+                            fix=fix,
+                        )
+                    )
+                else:
                     for item in routes:
                         m_val = item.get("model") if isinstance(item, dict) else item
                         if isinstance(m_val, str) and _is_excluded_model(m_val, merged):
@@ -680,13 +704,31 @@ def _collect_mod001_targets(root: Path) -> list[Path]:
     return targets
 
 
+def _py_denylist_line_ranges(text: str) -> set[int]:
+    try:
+        tree = ast.parse(text)
+    except SyntaxError:
+        return set()
+    skip_lines: set[int] = set()
+    for node in ast.walk(tree):
+        target_names: list[str] = []
+        if isinstance(node, ast.Assign):
+            target_names = [t.id for t in node.targets if isinstance(t, ast.Name)]
+        elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+            target_names = [node.target.id]
+        if any(MOD001_PY_DENYLIST_BLOCK_RE.match(name) for name in target_names):
+            end_line = node.end_lineno or node.lineno
+            skip_lines.update(range(node.lineno, end_line + 1))
+    return skip_lines
+
+
 def _scan_model_policy_compliance(root: Path, today: date) -> list[Violation]:
     prefixes, violations = _validate_model_policy_file(root)
     flex_parts = [re.escape(p).replace(r"\-", r"[-\s_]+") for p in prefixes]
     flex_parts.append(r"orchestrator\s*\(\s*argon\s*\)")
     escaped = "|".join(flex_parts)
     excl_re = re.compile(
-        rf"\b(?:{escaped})(?:[-\s_()]+[a-z0-9._-]+)?\b",
+        rf"\b(?:{escaped})(?:[-\s_()]+[a-z0-9._-]+\b|(?![a-z0-9_]))",
         re.IGNORECASE,
     )
     fix_msg = (
@@ -697,26 +739,12 @@ def _scan_model_policy_compliance(root: Path, today: date) -> list[Violation]:
     for path in _collect_mod001_targets(root):
         rel = _rel_posix(path, root)
         is_py = path.suffix.lower() == ".py"
-        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
-        in_py_denylist = False
-        paren_depth = 0
+        text = path.read_text(encoding="utf-8", errors="replace")
+        lines = text.splitlines()
+        skip_lines = _py_denylist_line_ranges(text) if is_py else set()
         for idx, line in enumerate(lines, start=1):
-            if is_py:
-                if MOD001_PY_DENYLIST_BLOCK_RE.match(line):
-                    in_py_denylist = True
-                    paren_depth = (
-                        line.count("(") + line.count("[") - line.count(")") - line.count("]")
-                    )
-                    if paren_depth <= 0:
-                        in_py_denylist = False
-                    continue
-                if in_py_denylist:
-                    paren_depth += (
-                        line.count("(") + line.count("[") - line.count(")") - line.count("]")
-                    )
-                    if paren_depth <= 0:
-                        in_py_denylist = False
-                    continue
+            if idx in skip_lines:
+                continue
 
             has_excl = bool(excl_re.search(line))
             has_legacy_peer = bool(MOD001_SUBAGENT_PEER_RE.search(line))

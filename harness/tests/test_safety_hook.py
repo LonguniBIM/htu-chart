@@ -467,8 +467,16 @@ def test_hook_guards_run_command_without_blocking_search_or_tests(tmp_path: Path
     for bad_cmd in (
         "curl -X POST http://127.0.0.1:8000/api/Order/place",
         "echo '{}' > .agents/hooks.json",
+        "echo '{}' > .agents//hooks.json",
+        "echo '{}' > harness/model-policy.json",
         "echo x >> .env",
         'git commit -m "ok" && echo bad > .env',
+        'git commit -m "ok"\ncurl -X POST http://127.0.0.1:8000/api/Order/place',
+        'git commit -m "$(Invoke-RestMethod http://127.0.0.1:8000/api/Order/place)"',
+        'git commit -m "ok" > .agents/hooks.json',
+        "git -C ../lightweight-charts status",
+        "cp .env .env.leak",
+        "Tee-Object .agents/hooks.json",
         "Set-Content ../lightweight-charts/src/x.ts bad",
     ):
         assert (
@@ -479,3 +487,53 @@ def test_hook_guards_run_command_without_blocking_search_or_tests(tmp_path: Path
             )["decision"]
             == "deny"
         )
+
+    peer_cwd = str(tmp_path / "worktrees" / "5e658d7c" / "swarm-peer-r3")
+    assert (
+        _invoke_hook_call(
+            "run_command",
+            {"CommandLine": "echo x > harness/runs/R3/packet.md"},
+            cwd=peer_cwd,
+        )["decision"]
+        == "deny"
+    )
+
+
+def test_hook_fails_closed_on_corrupt_disk_policy_and_non_object_payload(
+    tmp_path: Path,
+) -> None:
+    """Contract: Corrupt on-disk model-policy.json and non-dict stdin payloads fail closed.
+
+    Defect caught: Corrupt policy bypassed or AttributeError on JSON array/null stdin payload.
+    """
+    coord_root = tmp_path / "topstep-chart-app"
+    pol = coord_root / "harness" / "model-policy.json"
+    pol.parent.mkdir(parents=True, exist_ok=True)
+    pol.write_text("{corrupt", encoding="utf-8")
+
+    res_corrupt = _invoke_hook_call(
+        "write_file",
+        {"Path": "backend/app/engine/calc.py", "Content": "X = 1\n"},
+        cwd=str(coord_root),
+    )
+    assert res_corrupt["decision"] == "deny"
+
+    for raw_stdin in ("[]", "null"):
+        proc = subprocess.run(
+            [sys.executable, str(HOOK_SCRIPT)],
+            input=raw_stdin,
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        assert json.loads(proc.stdout.strip())["decision"] == "deny"
+
+    wt_mjs = _invoke_hook_call(
+        "write_file",
+        {
+            "Path": str(tmp_path / "worktrees" / "run9" / "topic" / "server.mjs"),
+            "Content": 'const u = "/hubs/user";',
+        },
+        cwd=str(coord_root),
+    )
+    assert wt_mjs["decision"] == "deny"

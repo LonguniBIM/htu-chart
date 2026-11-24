@@ -36,11 +36,19 @@ NET_CLIENT_RE = re.compile(
 )
 SHELL_WRITE_OP_RE = re.compile(
     r"(?<![-=>&])>>?(?![=&>])|\b(?:Out-File|Set-Content|Add-Content|"
-    r"Copy-Item|Move-Item|Remove-Item|rm|del)\b",
+    r"Copy-Item|Move-Item|Remove-Item|New-Item|Clear-Content|Tee-Object|"
+    r"rm|del|cp|mv)\b",
     re.IGNORECASE,
 )
 ENV_TARGET_RE = re.compile(r"(?<![A-Za-z0-9_])\.env(?:\.[A-Za-z0-9_-]+)?", re.IGNORECASE)
 GIT_COMMIT_HEAD_RE = re.compile(r"^\s*git\b(?:\s+-C\s+\S+)?\s+commit\b", re.IGNORECASE)
+SAFE_COMMIT_MSG_RE = re.compile(
+    r"(?:^|\s)(?:-m|--message)(?:\s+|=)(?:'[^'\r\n]*'|\"[^\"$`\r\n]*\")"
+)
+GIT_LWC_DIR_RE = re.compile(
+    r"\bgit\b[^\r\n]*\s-C\s+['\"]?[^\s'\"]*lightweight-charts",
+    re.IGNORECASE,
+)
 
 
 def _deny(reason: str) -> dict[str, str]:
@@ -140,6 +148,7 @@ def _validate_policy_obj(data: Any) -> str | None:
             continue
         for field in (
             "selected_model",
+            "selected_mode",
             "fallback_model",
             "planner_label",
             "internal_executor_label",
@@ -255,6 +264,8 @@ def _is_protected_app_code(rel_posix: str, norm_resolved: str) -> bool:
     if re.search(r"/topstep-chart-app/[^/]+\.(mjs|js|html)$", norm_resolved):
         return True
     if re.search(r"/swarm-peer-[^/]+/[^/]+\.(mjs|js|html)$", norm_resolved):
+        return True
+    if re.search(r"/worktrees/[^/]+/[^/]+/[^/]+\.(mjs|js|html)$", norm_resolved):
         return True
     return False
 
@@ -382,59 +393,54 @@ def _evaluate_invoke_subagent_tool(
     return _allow()
 
 
-def _has_unquoted_shell_chain(cmd: str) -> bool:
-    quote: str | None = None
-    i = 0
-    n = len(cmd)
-    while i < n:
-        ch = cmd[i]
-        if quote is not None:
-            if quote == '"' and ch == "\\" and i + 1 < n:
-                i += 2
-                continue
-            if ch == quote:
-                quote = None
-            i += 1
-            continue
-        if ch in ('"', "'"):
-            quote = ch
-            i += 1
-            continue
-        if ch in (";", "|") or cmd.startswith("&&", i):
-            return True
-        i += 1
-    return False
+def _normalize_shell_paths(cmd: str) -> str:
+    slashed = cmd.replace("\\", "/")
+    collapsed = re.sub(r"(?<!:)/{2,}", "/", slashed)
+    return re.sub(r"/(?:\./)+", "/", collapsed).lower()
 
 
-def _evaluate_run_command_tool(args: dict[str, Any]) -> dict[str, str]:
+def _evaluate_run_command_tool(args: dict[str, Any], is_peer: bool) -> dict[str, str]:
     cmd = str(args.get("CommandLine") or args.get("command") or args.get("Command") or "").strip()
     if not cmd:
         return _allow()
 
-    if GIT_COMMIT_HEAD_RE.match(cmd) and not _has_unquoted_shell_chain(cmd):
-        return _allow()
+    if GIT_LWC_DIR_RE.search(_normalize_shell_paths(cmd)):
+        return _deny("git -C targeting lightweight-charts/ is denied.")
 
-    if NET_CLIENT_RE.search(cmd) and FORBIDDEN_READONLY_URL_RE.search(cmd):
+    scrubbed_cmd = cmd
+    if GIT_COMMIT_HEAD_RE.match(cmd):
+        scrubbed_cmd = SAFE_COMMIT_MSG_RE.sub(' -m ""', cmd)
+
+    if NET_CLIENT_RE.search(scrubbed_cmd) and FORBIDDEN_READONLY_URL_RE.search(scrubbed_cmd):
         return _deny(
             "Prop Firm Hard Read-Only Violation: network call targeting forbidden TopstepX "
             "order/position/user-hub endpoint."
         )
 
-    if SHELL_WRITE_OP_RE.search(cmd):
-        lowered = cmd.replace("\\", "/").lower()
-        if "lightweight-charts" in lowered or ".agents/hooks.json" in lowered:
+    if SHELL_WRITE_OP_RE.search(scrubbed_cmd):
+        lowered = _normalize_shell_paths(scrubbed_cmd)
+        if (
+            "lightweight-charts" in lowered
+            or ".agents/hooks.json" in lowered
+            or "harness/model-policy.json" in lowered
+        ):
             return _deny(
-                "Shell modification of lightweight-charts or .agents/hooks.json is denied."
+                "Shell modification of lightweight-charts, .agents/hooks.json, "
+                "or harness/model-policy.json is denied."
             )
-        for match in ENV_TARGET_RE.finditer(cmd):
+        if is_peer and "harness/runs" in lowered:
+            return _deny("Peer shell modification of harness/runs/ is denied.")
+        for match in ENV_TARGET_RE.finditer(scrubbed_cmd):
             if match.group(0).lower() != ".env.example":
                 return _deny("Shell modification or removal of .env secret files is denied.")
 
     return _allow()
 
 
-def evaluate_hook_payload(payload: dict[str, Any]) -> dict[str, str]:
+def evaluate_hook_payload(payload: Any) -> dict[str, str]:
     """Evaluate a PreToolUse hook payload and return allow/ask/deny decision."""
+    if not isinstance(payload, dict):
+        return _deny("Hook payload must be a JSON object.")
     raw_cwd = payload.get("cwd")
     cwd_str = raw_cwd.strip() if isinstance(raw_cwd, str) else ""
     if cwd_str:
@@ -463,7 +469,7 @@ def evaluate_hook_payload(payload: dict[str, Any]) -> dict[str, str]:
     if tool_name == "invoke_subagent":
         return _evaluate_invoke_subagent_tool(args, is_peer, excluded_prefixes)
     if tool_name == "run_command":
-        return _evaluate_run_command_tool(args)
+        return _evaluate_run_command_tool(args, is_peer)
 
     return _evaluate_file_tool(tool_name, args, base_cwd, is_peer)
 
@@ -477,6 +483,9 @@ def main() -> int:
         payload = json.loads(raw)
     except json.JSONDecodeError:
         print(json.dumps(_deny("Invalid hook payload JSON; failing closed.")))
+        return 0
+    if not isinstance(payload, dict):
+        print(json.dumps(_deny("Hook payload must be a JSON object.")))
         return 0
 
     decision = evaluate_hook_payload(payload)

@@ -279,7 +279,7 @@ def test_doctor_validates_hooks_and_model_policy_fail_closed(
     assert rep_ok["model_policy"]["ok"] is True
     assert rep_ok["ok"] is True
 
-    # P1-004: display-name excluded model in active role fails model_policy check
+    # P1-004 & P1-005: display-name excluded model in active role or selected_mode fails
     bad_display_pol = _valid_model_policy_dict()
     bad_display_pol["roles"]["peer_default"]["selected_model"] = "Gemini 4 Argon Medium"
     (app_ok / "harness" / "model-policy.json").write_text(
@@ -290,17 +290,65 @@ def test_doctor_validates_hooks_and_model_policy_fail_closed(
     assert rep_disp["model_policy"]["ok"] is False
     assert rep_disp["ok"] is False
 
+    bad_mode_pol = _valid_model_policy_dict()
+    bad_mode_pol["roles"]["app_coordinator"] = {"selected_mode": "Orchestrator (Argon)"}
+    (app_ok / "harness" / "model-policy.json").write_text(
+        json.dumps(bad_mode_pol, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    rep_mode = verify_app.run_doctor(app_ok, tmp_path / "rt2")
+    assert rep_mode["model_policy"]["ok"] is False
+    assert rep_mode["ok"] is False
+
     (app_ok / "harness" / "model-policy.json").write_text("{bad json", encoding="utf-8")
     rep_bad_policy = verify_app.run_doctor(app_ok, tmp_path / "rt2")
     assert rep_bad_policy["model_policy"]["ok"] is False
     assert rep_bad_policy["ok"] is False
 
-    # Restore valid policy, narrow matcher regex (P1-006)
+    # Restore valid policy, test enabled=false, quoted command, unmatched quote, narrow matcher
     (app_ok / "harness" / "model-policy.json").write_text(
         json.dumps(_valid_model_policy_dict(), indent=2) + "\n",
         encoding="utf-8",
     )
+    hooks_disabled = json.loads((app_ok / ".agents" / "hooks.json").read_text(encoding="utf-8"))
+    hooks_disabled["topstep-safety-guard"]["enabled"] = False
+    (app_ok / ".agents" / "hooks.json").write_text(
+        json.dumps(hooks_disabled, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    rep_disabled = verify_app.run_doctor(app_ok, tmp_path / "rt2")
+    assert rep_disabled["hooks"]["ok"] is False
+    assert rep_disabled["ok"] is False
+
+    hooks_quoted = json.loads((app_ok / ".agents" / "hooks.json").read_text(encoding="utf-8"))
+    hooks_quoted["topstep-safety-guard"]["enabled"] = True
+    hooks_quoted["topstep-safety-guard"]["PreToolUse"][0]["hooks"][0]["command"] = (
+        'python "../harness/scripts/safety_hook.py"'
+    )
+    (app_ok / ".agents" / "hooks.json").write_text(
+        json.dumps(hooks_quoted, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    rep_quoted = verify_app.run_doctor(app_ok, tmp_path / "rt2")
+    assert rep_quoted["hooks"]["ok"] is True
+    assert rep_quoted["ok"] is True
+
+    hooks_unmatched = json.loads((app_ok / ".agents" / "hooks.json").read_text(encoding="utf-8"))
+    hooks_unmatched["topstep-safety-guard"]["PreToolUse"][0]["hooks"][0]["command"] = (
+        'python "../harness/scripts/safety_hook.py'
+    )
+    (app_ok / ".agents" / "hooks.json").write_text(
+        json.dumps(hooks_unmatched, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    rep_unmatched = verify_app.run_doctor(app_ok, tmp_path / "rt2")
+    assert rep_unmatched["hooks"]["ok"] is False
+    assert rep_unmatched["ok"] is False
+
     hooks_narrow = json.loads((app_ok / ".agents" / "hooks.json").read_text(encoding="utf-8"))
+    hooks_narrow["topstep-safety-guard"]["PreToolUse"][0]["hooks"][0]["command"] = (
+        "python ../harness/scripts/safety_hook.py"
+    )
     hooks_narrow["topstep-safety-guard"]["PreToolUse"][0]["matcher"] = "write_file"
     (app_ok / ".agents" / "hooks.json").write_text(
         json.dumps(hooks_narrow, indent=2) + "\n",
