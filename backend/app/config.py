@@ -183,6 +183,7 @@ class Settings(BaseSettings):
 
     ws_client_queue_maxsize: int = Field(default=64, ge=1, le=4096)
     ws_send_timeout_sec: float = Field(default=5.0, gt=0.0)
+    ws_max_clients: int = Field(default=32, ge=1, le=256)
 
     telegram_bot_token: str = ""
     telegram_chat_id: str = ""

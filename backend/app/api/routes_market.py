@@ -18,13 +18,16 @@ from fastapi import (
     status,
 )
 
-from app.engine.instruments import INSTRUMENTS, StorageDatasetKey, infer_root_symbol
 from app.engine.ohlcv import validate_query_timestamp
 from app.engine.session_calendar import normalize_timeframe, timeframe_from_topstep_unit
 from app.security import SessionData, redact_secrets, require_session, validate_ws_handshake
 from app.services.history_service import HistoryBackfillService
 from app.services.live_feed_service import LiveFeedService
-from app.services.ws_broadcaster import WsBroadcaster
+from app.services.ws_broadcaster import (
+    WS_CLOSE_TRY_AGAIN_LATER,
+    WsBroadcaster,
+    WsCapacityExceededError,
+)
 from app.topstep.auth import TopstepAuthService
 from app.topstep.errors import (
     AmbiguousContractError,
@@ -277,19 +280,39 @@ async def market_websocket(websocket: WebSocket) -> None:
     if session is None:
         return
 
-    await websocket.accept()
     broadcaster: WsBroadcaster = websocket.app.state.ws_broadcaster
     live_feed: LiveFeedService = websocket.app.state.live_feed_service
-    ws_session = broadcaster.register(
-        websocket,
-        session_validator=lambda: session_manager.get_session(session.session_id) is not None,
-    )
-    broadcaster.send_to_client(
-        ws_session.client_id,
-        {"type": "feed_status", **live_feed.get_status_snapshot()},
-    )
+    try:
+        ws_session = broadcaster.register(
+            websocket,
+            session_validator=lambda: session_manager.get_session(session.session_id) is not None,
+            defer_sender_start=True,
+        )
+    except WsCapacityExceededError:
+        await websocket.close(
+            code=WS_CLOSE_TRY_AGAIN_LATER,
+            reason="WebSocket client limit reached",
+        )
+        return
+
+    def _active_redaction_secrets() -> tuple[str, ...]:
+        topstep_auth = getattr(websocket.app.state, "topstep_auth", None)
+        dynamic = topstep_auth.active_redaction_secrets() if topstep_auth is not None else ()
+        return (
+            *dynamic,
+            settings.topstepx_api_key,
+            settings.app_password_hash,
+            settings.app_session_secret,
+            settings.telegram_bot_token,
+        )
 
     try:
+        await websocket.accept()
+        broadcaster.start_sender(ws_session.client_id)
+        broadcaster.send_to_client(
+            ws_session.client_id,
+            {"type": "feed_status", **live_feed.get_status_snapshot()},
+        )
         while not ws_session.closed_event.is_set():
             recv_task = asyncio.create_task(websocket.receive_json())
             closed_task = asyncio.create_task(ws_session.closed_event.wait())
@@ -322,7 +345,7 @@ async def market_websocket(websocket: WebSocket) -> None:
                 detail = (
                     "Invalid WebSocket JSON payload"
                     if isinstance(exc, KeyError)
-                    else redact_secrets(str(exc))
+                    else redact_secrets(str(exc), _active_redaction_secrets())
                 )
                 broadcaster.send_to_client(
                     ws_session.client_id,
@@ -353,16 +376,12 @@ async def market_websocket(websocket: WebSocket) -> None:
                 raw_cid = str(msg.get("contract_id") or msg.get("contractId") or "")
                 raw_tf = str(msg.get("timeframe") or "1m")
                 try:
-                    cid = raw_cid.strip().upper()
-                    StorageDatasetKey("topstepx", False, cid, "1m")
-                    root = infer_root_symbol(cid)
-                    if root is None or root not in INSTRUMENTS:
-                        supported_roots = ", ".join(sorted(INSTRUMENTS))
-                        raise ValueError(
-                            f"Unsupported contract_id {cid!r}; "
-                            f"supported instruments: {supported_roots}"
-                        )
-                    norm_tf = normalize_timeframe(raw_tf)
+                    cid, norm_tf = broadcaster.check_can_subscribe(
+                        ws_session.client_id,
+                        raw_cid,
+                        raw_tf,
+                        require_registered=True,
+                    )
                     aggregator = getattr(websocket.app.state, "bar_aggregator", None)
                     if aggregator is not None and norm_tf not in aggregator.timeframes:
                         supported_str = ", ".join(aggregator.timeframes)
@@ -370,24 +389,50 @@ async def market_websocket(websocket: WebSocket) -> None:
                             f"Timeframe {norm_tf!r} is not enabled in BarAggregator "
                             f"(supported: {supported_str})"
                         )
-                    check_fn = getattr(live_feed, "check_ws_subscription_allowed", None)
-                    if callable(check_fn):
-                        cid = check_fn(cid)
+                    await live_feed.subscribe_ws_contract(cid, broadcast_status=False)
+                except Exception as exc:
+                    broadcaster.send_to_client(
+                        ws_session.client_id,
+                        {
+                            "type": "error",
+                            "detail": redact_secrets(str(exc), _active_redaction_secrets()),
+                        },
+                    )
+                    continue
+
+                if ws_session.closed_event.is_set() or not broadcaster.is_registered(
+                    ws_session.client_id
+                ):
+                    await live_feed.sync_ws_contracts(broadcaster.active_contract_ids())
+                    break
+                if session_manager.get_session(session.session_id) is None:
+                    await broadcaster.unregister(
+                        ws_session.client_id,
+                        close_transport=True,
+                        code=status.WS_1008_POLICY_VIOLATION,
+                        reason="Session expired",
+                    )
+                    await live_feed.sync_ws_contracts(broadcaster.active_contract_ids())
+                    break
+
+                try:
                     cid, tf = broadcaster.subscribe(ws_session.client_id, cid, norm_tf)
-                    broadcaster.send_to_client(
-                        ws_session.client_id,
-                        {"type": "subscribed", "contract_id": cid, "timeframe": tf},
-                    )
-                    try:
-                        await live_feed.subscribe_ws_contract(cid)
-                    except ValueError:
-                        broadcaster.unsubscribe(ws_session.client_id, cid, tf)
-                        raise
                 except ValueError as exc:
+                    await live_feed.sync_ws_contracts(broadcaster.active_contract_ids())
                     broadcaster.send_to_client(
                         ws_session.client_id,
-                        {"type": "error", "detail": redact_secrets(str(exc))},
+                        {
+                            "type": "error",
+                            "detail": redact_secrets(str(exc), _active_redaction_secrets()),
+                        },
                     )
+                    continue
+
+                broadcaster.send_to_client(
+                    ws_session.client_id,
+                    {"type": "subscribed", "contract_id": cid, "timeframe": tf},
+                )
+                live_feed.emit_status_snapshot()
             elif op == "unsubscribe":
                 raw_cid = str(msg.get("contract_id") or msg.get("contractId") or "")
                 raw_tf = str(msg.get("timeframe") or "1m")
@@ -405,7 +450,10 @@ async def market_websocket(websocket: WebSocket) -> None:
                 except ValueError as exc:
                     broadcaster.send_to_client(
                         ws_session.client_id,
-                        {"type": "error", "detail": redact_secrets(str(exc))},
+                        {
+                            "type": "error",
+                            "detail": redact_secrets(str(exc), _active_redaction_secrets()),
+                        },
                     )
             else:
                 broadcaster.send_to_client(

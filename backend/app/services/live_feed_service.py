@@ -261,6 +261,10 @@ class LiveFeedService:
         if self._broadcaster is not None:
             self._broadcaster.publish_feed_status(self.get_status_snapshot())
 
+    def emit_status_snapshot(self) -> None:
+        """Broadcast current live-feed telemetry snapshot to connected WS clients."""
+        self._broadcast_status()
+
     def _mark_degraded_timestamp(
         self,
         prev_feed_state: FeedState | None = None,
@@ -272,14 +276,20 @@ class LiveFeedService:
         if force or prev_feed_state != "DEGRADED" or self._last_degraded_at_mono is None:
             self._last_degraded_at_mono = self._mono_clock()
 
-    def _transition_all_contracts(self, new_state: FeedState) -> None:
+    def _transition_all_contracts(
+        self,
+        new_state: FeedState,
+        *,
+        broadcast: bool = True,
+    ) -> None:
         prev_feed_state = self._feed_state
         for c in self._contracts.values():
             c.state = new_state
         self._feed_state = new_state
         if new_state == "DEGRADED":
             self._mark_degraded_timestamp(prev_feed_state)
-        self._broadcast_status()
+        if broadcast:
+            self._broadcast_status()
 
     async def set_active_contracts(
         self,
@@ -386,6 +396,7 @@ class LiveFeedService:
         contract_id: str,
         *,
         live_mode: bool | None = None,
+        broadcast_status: bool = True,
     ) -> None:
         """Register a contract subscribed via /ws/market and start/update upstream SignalR."""
         cid = self._validate_ws_contract_id(contract_id)
@@ -399,26 +410,51 @@ class LiveFeedService:
                     "exceeded"
                 )
             eff_live = self._auth.live if live_mode is None else bool(live_mode)
-            self._ws_contracts.add(cid)
-            existing = self._contracts.get(cid)
-            newly_added = existing is None or existing.live_mode != eff_live
-            c_state = self.register_contract(cid, live_mode=eff_live)
-            if newly_added:
-                self._recompute_aggregate_state()
-                self._broadcast_status()
-            await self._hub.update_contracts(list(self._contracts.keys()), live_mode=eff_live)
-            if newly_added and (self._hub.is_connected or self._last_connected_utc is not None):
-                c_state.subscribed_at_utc = self._clock()
+            was_in_ws = cid in self._ws_contracts
+            prev_runtime = self._contracts.get(cid)
+            had_same_runtime = prev_runtime is not None and prev_runtime.live_mode == eff_live
+            prev_feed_state = self._feed_state
+            prev_degraded_mono = self._last_degraded_at_mono
 
-            if self._running and self._settings.signalr_enabled and self._auth.is_connected:
-                if not self._hub.is_connected:
-                    self._hub.start()
-                elif newly_added and not self._hub.has_pending_subscription(cid):
-                    self._bump_generation_and_cancel_live_tasks()
-                    self._transition_all_contracts("RECOVERING")
-                    self._start_recovery_task()
+            try:
+                self._ws_contracts.add(cid)
+                newly_added = not had_same_runtime
+                c_state = self.register_contract(cid, live_mode=eff_live)
+                if newly_added:
+                    self._recompute_aggregate_state()
+                await self._hub.update_contracts(list(self._contracts.keys()), live_mode=eff_live)
+                if newly_added and (
+                    self._hub.is_connected or self._last_connected_utc is not None
+                ):
+                    c_state.subscribed_at_utc = self._clock()
+
+                if self._running and self._settings.signalr_enabled and self._auth.is_connected:
+                    if not self._hub.is_connected:
+                        self._hub.start()
+                    elif newly_added and not self._hub.has_pending_subscription(cid):
+                        self._bump_generation_and_cancel_live_tasks()
+                        self._transition_all_contracts("RECOVERING", broadcast=broadcast_status)
+                        self._start_recovery_task()
+            except BaseException:
+                if not was_in_ws:
+                    self._ws_contracts.discard(cid)
+                still_retained = (cid in self._explicit_contracts) or was_in_ws
+                if not still_retained and prev_runtime is None:
+                    self._contracts.pop(cid, None)
+                    self._consume_pending_contract_ticks(cid)
+                    self._aggregator.reset_contract(cid)
+                elif not had_same_runtime and prev_runtime is not None:
+                    self._contracts[cid] = prev_runtime
+                self._last_degraded_at_mono = prev_degraded_mono
+                if not self._contracts:
+                    self._feed_state = prev_feed_state
+                else:
+                    self._recompute_aggregate_state()
+                raise
+
             self._recompute_aggregate_state()
-            self._broadcast_status()
+            if broadcast_status:
+                self._broadcast_status()
 
     async def sync_ws_contracts(self, active_ws_contracts: set[str]) -> None:
         """Prune WS-only contracts when all WebSocket subscribers leave."""

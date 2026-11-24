@@ -22,7 +22,12 @@ from app.engine.ohlcv import OHLCVBar
 from app.engine.session_calendar import first_bucket_open_at_or_after, has_open_session_in_range
 from app.main import create_app
 from app.services.live_feed_service import LiveFeedService
-from app.services.ws_broadcaster import WS_CLOSE_SLOW_CONSUMER, WsBroadcaster
+from app.services.ws_broadcaster import (
+    WS_CLOSE_SLOW_CONSUMER,
+    WS_CLOSE_TRY_AGAIN_LATER,
+    WsBroadcaster,
+    WsCapacityExceededError,
+)
 from app.storage.parquet_store import ParquetStore
 from app.storage.sqlite_store import SqliteStore
 from app.topstep.auth import TopstepAuthService
@@ -924,3 +929,485 @@ def test_r06_ws_binary_frame_returns_structured_error_without_crash(tmp_path: Pa
 
             ws.send_json({"type": "ping"})
             assert ws.receive_json() == {"type": "pong"}
+
+
+def _ws_headers(session_cookie: str) -> dict[str, str]:
+    return {
+        "Host": "127.0.0.1:8000",
+        "Origin": "http://127.0.0.1:8000",
+        "Cookie": f"topstep_session={session_cookie}",
+    }
+
+
+def test_r06_subscribe_ack_not_emitted_before_upstream_admission_on_rejection(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Contract (NC-12): Rejected /ws/market subscribe emits only 'error', never 'subscribed'.
+
+    Defect caught: Emitting {'type': 'subscribed'} before live_feed.subscribe_ws_contract
+    completes and leaking contract_id when hub.update_contracts raises RuntimeError/ValueError.
+    """
+    settings = Settings(
+        app_env="development",
+        app_password_hash=TEST_PASSWORD_HASH,
+        data_dir=tmp_path / "data",
+        signalr_enabled=False,
+    )
+    app = create_app(settings=settings)
+
+    with TestClient(app, base_url="http://127.0.0.1:8000") as client:
+        login_resp = client.post("/api/auth/login", json={"password": TEST_PASSWORD})
+        assert login_resp.status_code == 200
+        session_cookie = login_resp.cookies["topstep_session"]
+
+        live_feed: LiveFeedService = app.state.live_feed_service
+        live_feed._max_ws_contracts = 1
+
+        async def reject_runtime(contracts: Any, *, live_mode: bool) -> None:
+            if contracts:
+                raise RuntimeError("hub update failed with apiKey=super-secret-value")
+
+        monkeypatch.setattr(live_feed.hub, "update_contracts", reject_runtime)
+
+        with client.websocket_connect("/ws/market", headers=_ws_headers(session_cookie)) as ws:
+            initial = ws.receive_json()
+            assert initial["type"] == "feed_status"
+
+            ws.send_json(
+                {"type": "subscribe", "contract_id": "CON.F.US.MES.Z26", "timeframe": "1m"}
+            )
+            ws.send_json({"type": "ping"})
+            received: list[dict[str, Any]] = []
+            while True:
+                msg = _receive_json_with_timeout(ws, 2.0)
+                if msg.get("type") == "pong":
+                    break
+                received.append(msg)
+
+            assert [m["type"] for m in received] == ["error"]
+            assert "super-secret-value" not in received[0]["detail"]
+            assert "CON.F.US.MES.Z26" not in live_feed.active_contracts
+            assert "CON.F.US.MES.Z26" not in live_feed._ws_contracts
+            assert "CON.F.US.MES.Z26" not in app.state.ws_broadcaster.active_contract_ids()
+
+
+async def test_r06_subscribe_ack_not_emitted_before_upstream_admission_rollback_preserves_shared(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Contract (NC-12): Selective rollback discards only newly added state on failure/cancel.
+
+    Defect caught: Leaking failed contract state or over-broad rollback removing shared/explicit
+    contracts on hub.update_contracts RuntimeError or asyncio.CancelledError.
+    """
+    settings = Settings(data_dir=tmp_path / "data", signalr_enabled=False)
+    sqlite_store = SqliteStore(tmp_path / "meta.db")
+    sqlite_store.initialize()
+    try:
+        parquet_store = ParquetStore(settings.data_dir, sqlite_store=sqlite_store)
+        broadcaster = WsBroadcaster(client_queue_maxsize=16, send_timeout_sec=1.0)
+        async with httpx.AsyncClient() as client:
+            auth = TopstepAuthService(settings, client)
+            rest = TopstepRestClient(settings, auth, client)
+            live_feed = LiveFeedService(
+                settings,
+                auth,
+                rest,
+                parquet_store,
+                sqlite_store,
+                broadcaster=broadcaster,
+                recovery_timeframes=("1m",),
+                max_ws_contracts=2,
+            )
+            shared_cid = "CON.F.US.MES.Z26"
+            new_cid = "CON.F.US.MNQ.Z26"
+            await live_feed.set_active_contracts([shared_cid], live_mode=False)
+
+            async def fail_runtime(_contracts: Any, *, live_mode: bool) -> None:
+                raise RuntimeError("upstream boom")
+
+            monkeypatch.setattr(live_feed.hub, "update_contracts", fail_runtime)
+            with pytest.raises(RuntimeError, match="upstream boom"):
+                await live_feed.subscribe_ws_contract(new_cid)
+            assert shared_cid in live_feed.active_contracts
+            assert new_cid not in live_feed.active_contracts
+            assert new_cid not in live_feed._ws_contracts
+
+            async def fail_cancel(_contracts: Any, *, live_mode: bool) -> None:
+                raise asyncio.CancelledError()
+
+            monkeypatch.setattr(live_feed.hub, "update_contracts", fail_cancel)
+            with pytest.raises(asyncio.CancelledError):
+                await live_feed.subscribe_ws_contract(shared_cid)
+            assert shared_cid in live_feed.active_contracts
+            assert shared_cid not in live_feed._ws_contracts
+
+            await broadcaster.close_all()
+            await live_feed.stop()
+    finally:
+        sqlite_store.close()
+
+
+def test_r06_subscribe_ack_not_emitted_before_upstream_admission_mid_await_disconnect(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Contract (NC-12): No bar_update or subscribed is sent before upstream admission completes,
+    and mid-await disconnect cleans up upstream contracts.
+
+    Defect caught: Committing broadcaster.subscribe before await live_feed.subscribe_ws_contract,
+    delivering premature bars and leaving orphaned contracts if client disconnects mid-await.
+    """
+    settings = Settings(
+        app_env="development",
+        app_password_hash=TEST_PASSWORD_HASH,
+        data_dir=tmp_path / "data",
+        signalr_enabled=False,
+    )
+    app = create_app(settings=settings)
+    entered_update = asyncio.Event()
+    release_update = asyncio.Event()
+
+    with TestClient(app, base_url="http://127.0.0.1:8000") as client:
+        login_resp = client.post("/api/auth/login", json={"password": TEST_PASSWORD})
+        assert login_resp.status_code == 200
+        session_cookie = login_resp.cookies["topstep_session"]
+
+        live_feed: LiveFeedService = app.state.live_feed_service
+        broadcaster: WsBroadcaster = app.state.ws_broadcaster
+        orig_update = live_feed.hub.update_contracts
+
+        async def gated_update(contracts: Any, *, live_mode: bool) -> None:
+            if "CON.F.US.MES.Z26" in contracts:
+                entered_update.set()
+                await asyncio.wait_for(release_update.wait(), timeout=5.0)
+            await orig_update(contracts, live_mode=live_mode)
+
+        monkeypatch.setattr(live_feed.hub, "update_contracts", gated_update)
+
+        sent_during_await: list[dict[str, Any]] = []
+        portal = client.portal
+        assert portal is not None
+
+        with client.websocket_connect("/ws/market", headers=_ws_headers(session_cookie)) as ws:
+            initial = ws.receive_json()
+            assert initial["type"] == "feed_status"
+
+            assert len(broadcaster._clients) == 1
+            ws_sess = next(iter(broadcaster._clients.values()))
+            orig_send_json = ws_sess.transport.send_json
+
+            async def spy_send_json(data: Any) -> Any:
+                sent_during_await.append(data)
+                return await orig_send_json(data)
+
+            monkeypatch.setattr(ws_sess.transport, "send_json", spy_send_json)
+
+            ws.send_json(
+                {"type": "subscribe", "contract_id": "CON.F.US.MES.Z26", "timeframe": "1m"}
+            )
+            portal.call(asyncio.wait_for, entered_update.wait(), 2.0)
+
+            # Publish a bar while subscribe_ws_contract is suspended at await update_contracts.
+            portal.call(
+                broadcaster.publish_bar,
+                AggregatedBarEvent(
+                    contract_id="CON.F.US.MES.Z26",
+                    live_mode=False,
+                    timeframe="1m",
+                    bar=OHLCVBar(BASE_T, 5950.0, 5952.0, 5949.0, 5951.0, 5.0, is_closed=True),
+                ),
+            )
+            portal.call(asyncio.sleep, 0.05)
+
+        release_update.set()
+        deadline = time.monotonic() + 2.0
+        while time.monotonic() < deadline:
+            if live_feed.active_contracts == () and broadcaster.client_count == 0:
+                break
+            time.sleep(0.02)
+
+        premature_bars = [
+            m for m in sent_during_await if m.get("type") in {"bar_update", "subscribed"}
+        ]
+        assert premature_bars == []
+        assert live_feed.active_contracts == ()
+        assert broadcaster.active_contract_ids() == set()
+
+
+def test_r06_ws_max_clients_cap_rejects_excess_and_releases_slot(tmp_path: Path) -> None:
+    """Contract (NC-13): /ws/market enforces ws_max_clients with 1013 and releases slots cleanly.
+
+    Defect caught: Unbounded concurrent WebSocket client connections exhausting queues/tasks.
+    """
+    settings = Settings(
+        app_env="development",
+        app_password_hash=TEST_PASSWORD_HASH,
+        data_dir=tmp_path / "data",
+        signalr_enabled=False,
+        ws_max_clients=2,
+    )
+    app = create_app(settings=settings)
+
+    with TestClient(app, base_url="http://127.0.0.1:8000") as client:
+        login_resp = client.post("/api/auth/login", json={"password": TEST_PASSWORD})
+        assert login_resp.status_code == 200
+        session_cookie = login_resp.cookies["topstep_session"]
+        headers = _ws_headers(session_cookie)
+
+        with client.websocket_connect("/ws/market", headers=headers) as ws1:
+            assert ws1.receive_json()["type"] == "feed_status"
+            with client.websocket_connect("/ws/market", headers=headers) as ws2:
+                assert ws2.receive_json()["type"] == "feed_status"
+
+                # Unauthenticated / invalid-origin probe at capacity still gets 1008, not 1013.
+                with pytest.raises(WebSocketDisconnect) as exc_unauth:
+                    with client.websocket_connect(
+                        "/ws/market",
+                        headers={"Host": "127.0.0.1:8000", "Origin": "http://127.0.0.1:8000"},
+                    ):
+                        pass
+                assert exc_unauth.value.code == 1008
+
+                # (N+1)th valid client must be rejected with 1013 Try Again Later.
+                with pytest.raises(WebSocketDisconnect) as exc_cap:
+                    with client.websocket_connect("/ws/market", headers=headers):
+                        pytest.fail("Expected WebSocketDisconnect(1013) for (N+1)th client")
+                assert exc_cap.value.code == 1013
+
+            # Once ws2 disconnects, slot opens and a new client can connect.
+            with client.websocket_connect("/ws/market", headers=headers) as ws3:
+                assert ws3.receive_json()["type"] == "feed_status"
+
+
+def test_r06_subscribe_ack_concurrent_slot_contention_and_ordering(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Contract (NC-12): Contending for last max_ws_contracts slot gives winner
+    ['subscribed', 'feed_status'] in order and loser ['error'] only.
+    """
+    settings = Settings(
+        app_env="development",
+        app_password_hash=TEST_PASSWORD_HASH,
+        data_dir=tmp_path / "data",
+        signalr_enabled=False,
+    )
+    app = create_app(settings=settings)
+    entered_update = asyncio.Event()
+    release_update = asyncio.Event()
+
+    with TestClient(app, base_url="http://127.0.0.1:8000") as client:
+        login_resp = client.post("/api/auth/login", json={"password": TEST_PASSWORD})
+        assert login_resp.status_code == 200
+        headers = _ws_headers(login_resp.cookies["topstep_session"])
+
+        live_feed: LiveFeedService = app.state.live_feed_service
+        live_feed._max_ws_contracts = 1
+        orig_update = live_feed.hub.update_contracts
+
+        async def gated_update(contracts: Any, *, live_mode: bool) -> None:
+            if "CON.F.US.MES.Z26" in contracts:
+                entered_update.set()
+                await asyncio.wait_for(release_update.wait(), timeout=5.0)
+            await orig_update(contracts, live_mode=live_mode)
+
+        monkeypatch.setattr(live_feed.hub, "update_contracts", gated_update)
+        portal = client.portal
+        assert portal is not None
+
+        with client.websocket_connect("/ws/market", headers=headers) as ws1:
+            assert ws1.receive_json()["type"] == "feed_status"
+            with client.websocket_connect("/ws/market", headers=headers) as ws2:
+                assert ws2.receive_json()["type"] == "feed_status"
+
+                ws1.send_json(
+                    {"type": "subscribe", "contract_id": "CON.F.US.MES.Z26", "timeframe": "1m"}
+                )
+                portal.call(asyncio.wait_for, entered_update.wait(), 2.0)
+
+                # While ws1 holds _hub_lifecycle_lock, ws2 contends for the same single slot.
+                ws2.send_json(
+                    {"type": "subscribe", "contract_id": "CON.F.US.MNQ.Z26", "timeframe": "1m"}
+                )
+                portal.call(asyncio.sleep, 0.03)
+                release_update.set()
+
+                ws1.send_json({"type": "ping"})
+                ws2.send_json({"type": "ping"})
+
+                ws1_msgs: list[dict[str, Any]] = []
+                while True:
+                    m = _receive_json_with_timeout(ws1, 2.0)
+                    if m.get("type") == "pong":
+                        break
+                    ws1_msgs.append(m)
+
+                ws2_msgs: list[dict[str, Any]] = []
+                while True:
+                    m = _receive_json_with_timeout(ws2, 2.0)
+                    if m.get("type") == "pong":
+                        break
+                    ws2_msgs.append(m)
+
+                assert [m["type"] for m in ws1_msgs] == ["subscribed", "feed_status"]
+                assert [m["type"] for m in ws2_msgs if m["type"] != "feed_status"] == ["error"]
+                assert all(m["type"] != "subscribed" for m in ws2_msgs)
+                assert live_feed.active_contracts == ("CON.F.US.MES.Z26",)
+
+
+def test_r06_subscribe_session_expired_mid_await_closes_1008_and_cleans_up(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Contract (NC-12 + F01): Session revocation mid-await closes WS 1008 and syncs upstream."""
+    settings = Settings(
+        app_env="development",
+        app_password_hash=TEST_PASSWORD_HASH,
+        data_dir=tmp_path / "data",
+        signalr_enabled=False,
+    )
+    app = create_app(settings=settings)
+    entered_update = asyncio.Event()
+    release_update = asyncio.Event()
+
+    with TestClient(app, base_url="http://127.0.0.1:8000") as client:
+        login_resp = client.post("/api/auth/login", json={"password": TEST_PASSWORD})
+        assert login_resp.status_code == 200
+        csrf = login_resp.json()["csrf_token"]
+        headers = _ws_headers(login_resp.cookies["topstep_session"])
+
+        live_feed: LiveFeedService = app.state.live_feed_service
+        orig_update = live_feed.hub.update_contracts
+
+        async def gated_update(contracts: Any, *, live_mode: bool) -> None:
+            if "CON.F.US.MES.Z26" in contracts:
+                entered_update.set()
+                await asyncio.wait_for(release_update.wait(), timeout=5.0)
+            await orig_update(contracts, live_mode=live_mode)
+
+        monkeypatch.setattr(live_feed.hub, "update_contracts", gated_update)
+        portal = client.portal
+        assert portal is not None
+
+        with client.websocket_connect("/ws/market", headers=headers) as ws:
+            assert ws.receive_json()["type"] == "feed_status"
+            ws.send_json(
+                {"type": "subscribe", "contract_id": "CON.F.US.MES.Z26", "timeframe": "1m"}
+            )
+            portal.call(asyncio.wait_for, entered_update.wait(), 2.0)
+
+            logout_resp = client.post("/api/auth/logout", headers={"X-CSRF-Token": csrf})
+            assert logout_resp.status_code == 200
+            release_update.set()
+
+            with pytest.raises(WebSocketDisconnect) as exc_expired:
+                msg = _receive_json_with_timeout(ws, 2.0)
+                pytest.fail(f"Expected WebSocketDisconnect(1008), got {msg!r}")
+            assert exc_expired.value.code == 1008
+
+        assert live_feed.active_contracts == ()
+
+
+def test_r06_ws_max_clients_cap_accept_failure_releases_slot_without_leaking_tasks(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Contract (NC-13): Exception inside websocket.accept() frees client slot and leaks 0 tasks."""
+    from starlette.websockets import WebSocket as StarletteWebSocket
+
+    settings = Settings(
+        app_env="development",
+        app_password_hash=TEST_PASSWORD_HASH,
+        data_dir=tmp_path / "data",
+        signalr_enabled=False,
+        ws_max_clients=1,
+    )
+    app = create_app(settings=settings)
+
+    with TestClient(app, base_url="http://127.0.0.1:8000") as client:
+        login_resp = client.post("/api/auth/login", json={"password": TEST_PASSWORD})
+        assert login_resp.status_code == 200
+        headers = _ws_headers(login_resp.cookies["topstep_session"])
+        broadcaster: WsBroadcaster = app.state.ws_broadcaster
+        portal = client.portal
+        assert portal is not None
+
+        orig_accept = StarletteWebSocket.accept
+        fail_once = [True]
+
+        async def flaky_accept(self: StarletteWebSocket, *args: Any, **kwargs: Any) -> None:
+            if fail_once[0]:
+                fail_once[0] = False
+                raise RuntimeError("accept transport error")
+            await orig_accept(self, *args, **kwargs)
+
+        monkeypatch.setattr(StarletteWebSocket, "accept", flaky_accept)
+
+        with pytest.raises((WebSocketDisconnect, RuntimeError)):
+            with client.websocket_connect("/ws/market", headers=headers):
+                pass
+
+        assert broadcaster.client_count == 0
+        leaked_senders = portal.call(
+            lambda: [
+                t.get_name()
+                for t in asyncio.all_tasks()
+                if t.get_name().startswith("ws-sender-") and not t.done()
+            ]
+        )
+        assert leaked_senders == []
+
+        with client.websocket_connect("/ws/market", headers=headers) as ws_ok:
+            assert ws_ok.receive_json()["type"] == "feed_status"
+            assert broadcaster.client_count == 1
+
+
+async def test_r06_ws_broadcaster_capacity_and_deferred_sender_unit() -> None:
+    """Contract (NC-12/NC-13): WsBroadcaster enforces max_clients, deferred sender, and
+    non-mutating check_can_subscribe.
+    """
+    assert WS_CLOSE_TRY_AGAIN_LATER == 1013
+    with pytest.raises(ValueError, match="max_clients"):
+        WsBroadcaster(max_clients=0)
+
+    broadcaster = WsBroadcaster(max_clients=1, max_subscriptions_per_client=1)
+    ws1 = _FakeWsClient()
+    ws2 = _FakeWsClient()
+
+    sess1 = broadcaster.register(ws1, client_id="c1", defer_sender_start=True)
+    assert broadcaster.is_registered("c1") is True
+    assert sess1.sender_task is None
+
+    # check_can_subscribe validates without mutating session.subscriptions
+    cid, tf = broadcaster.check_can_subscribe(
+        "c1", "CON.F.US.MES.Z26", "1m", require_registered=True
+    )
+    assert (cid, tf) == ("CON.F.US.MES.Z26", "1m")
+    assert sess1.subscriptions == set()
+
+    with pytest.raises(ValueError, match="already registered"):
+        broadcaster.register(ws2, client_id="c1")
+
+    with pytest.raises(WsCapacityExceededError):
+        broadcaster.register(ws2, client_id="c2")
+    assert broadcaster.client_count == 1
+
+    # Enqueue before start_sender; sender_task starts cleanly on start_sender()
+    assert broadcaster.send_to_client("c1", {"type": "feed_status", "feed_state": "LIVE"}) is True
+    assert ws1.sent == []
+    broadcaster.start_sender("c1")
+    assert sess1.sender_task is not None
+    await asyncio.sleep(0.02)
+    assert ws1.sent == [{"type": "feed_status", "feed_state": "LIVE"}]
+
+    with pytest.raises(ValueError, match="closed"):
+        broadcaster.check_can_subscribe(
+            "missing", "CON.F.US.MES.Z26", "1m", require_registered=True
+        )
+
+    await broadcaster.close_all()
+    assert broadcaster.is_registered("c1") is False
+
+

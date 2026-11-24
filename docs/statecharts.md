@@ -95,3 +95,32 @@ stateDiagram-v2
     PAUSED_BUDGET --> [*]
     VERIFIED --> [*]
 ```
+
+---
+
+## 5. `/ws/market` Client Admission & Authoritative Subscription (`F01, F03, R06`)
+
+```mermaid
+stateDiagram-v2
+    [*] --> HANDSHAKE: Upgrade /ws/market
+    HANDSHAKE --> REJECTED_1008: "validate_ws_handshake fails (Host, Origin, or session cookie)"
+    HANDSHAKE --> REJECTED_1013: "len(_clients) >= ws_max_clients (per-process under --workers 1)"
+    HANDSHAKE --> CONNECTED: "register(defer_sender_start=True) -> accept() -> start_sender() -> feed_status"
+    HANDSHAKE --> DISCONNECTED: "accept() raises -> finally unregister() releases slot"
+    CONNECTED --> PENDING_ADMISSION: "subscribe: check_can_subscribe() passes (no subscription mutation)"
+    PENDING_ADMISSION --> SUBSCRIBED: "subscribe_ws_contract(broadcast_status=False) OK & session live -> subscribe() -> subscribed -> emit_status_snapshot()"
+    PENDING_ADMISSION --> ERROR: "Validation or subscribe_ws_contract raises -> selective rollback -> redacted error frame"
+    PENDING_ADMISSION --> DISCONNECTED: "Client closed or session expired mid-await -> unregister(1008) & sync_ws_contracts()"
+    SUBSCRIBED --> CONNECTED: Ready for next message or bar_update stream
+    ERROR --> CONNECTED: Connection stays open (non-fatal)
+    CONNECTED --> DISCONNECTED: "WebSocketDisconnect / session invalid / slow-consumer 4008 -> unregister() & sync_ws_contracts()"
+    REJECTED_1008 --> [*]
+    REJECTED_1013 --> [*]
+    DISCONNECTED --> [*]
+```
+
+**Invariants**:
+- Unauthenticated or foreign-`Origin`/`Host` probes always fail `validate_ws_handshake` with `1008` **before** `ws_max_clients` slot reservation (`1013`), so probes never consume capacity (`F01`, `NC-13`).
+- `ws_max_clients` (default `32`, bounded `1..256`) is enforced atomically per-process (valid under single-worker `--workers 1` `F03`) before allocating `_CoalescingClientQueue` or `ws-sender-*` tasks; `defer_sender_start=True` ensures `ws-sender-*` never sends before `accept()` completes, and `try / finally` releases the slot if `accept()` fails.
+- `subscribe` never mutates `session.subscriptions` or emits `{"type": "subscribed"}` until `subscribe_ws_contract(..., broadcast_status=False)` succeeds; `"subscribed"` confirms local + hub contract registration and always precedes the post-subscribe `"feed_status"` snapshot, while upstream SignalR connection health is conveyed via `"feed_status"` (`NC-12`).
+- Any `BaseException` during `subscribe_ws_contract` rolls back only newly added `_ws_contracts` / `_contracts` / pending tick / aggregator state while preserving pre-existing shared or `_explicit_contracts` entries.

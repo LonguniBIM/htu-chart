@@ -18,6 +18,11 @@ from app.engine.session_calendar import normalize_timeframe
 logger = logging.getLogger("topstep_chart.ws")
 
 WS_CLOSE_SLOW_CONSUMER = 4008
+WS_CLOSE_TRY_AGAIN_LATER = 1013
+
+
+class WsCapacityExceededError(ValueError):
+    """Raised when concurrent WebSocket clients exceed configured max_clients."""
 
 
 class WsClientTransport(Protocol):
@@ -149,6 +154,7 @@ class WsBroadcaster:
         send_timeout_sec: float = 5.0,
         supported_timeframes: Sequence[str] = DEFAULT_AGGREGATION_TIMEFRAMES,
         max_subscriptions_per_client: int = 16,
+        max_clients: int = 32,
     ) -> None:
         if client_queue_maxsize < 1:
             raise ValueError("client_queue_maxsize must be >= 1")
@@ -156,6 +162,8 @@ class WsBroadcaster:
             raise ValueError("send_timeout_sec must be > 0")
         if max_subscriptions_per_client < 1:
             raise ValueError("max_subscriptions_per_client must be >= 1")
+        if max_clients < 1:
+            raise ValueError("max_clients must be >= 1")
         canon_tfs = tuple(dict.fromkeys(normalize_timeframe(tf) for tf in supported_timeframes))
         if not canon_tfs:
             raise ValueError("supported_timeframes must contain at least one timeframe")
@@ -163,6 +171,7 @@ class WsBroadcaster:
         self._send_timeout_sec = send_timeout_sec
         self._supported_timeframes: tuple[str, ...] = canon_tfs
         self._max_subscriptions_per_client = int(max_subscriptions_per_client)
+        self._max_clients = int(max_clients)
         self._clients: dict[str, WsClientSession] = {}
         self._teardown_tasks: set[asyncio.Task[None]] = set()
         self._slow_disconnect_count = 0
@@ -173,6 +182,11 @@ class WsBroadcaster:
         return self._supported_timeframes
 
     @property
+    def max_clients(self) -> int:
+        """Maximum number of concurrent WebSocket clients allowed."""
+        return self._max_clients
+
+    @property
     def client_count(self) -> int:
         """Number of currently registered WebSocket clients."""
         return len(self._clients)
@@ -181,6 +195,10 @@ class WsBroadcaster:
     def slow_disconnect_count(self) -> int:
         """Total clients disconnected due to queue overflow or send timeout."""
         return self._slow_disconnect_count
+
+    def is_registered(self, client_id: str) -> bool:
+        """Return True iff client_id is currently registered."""
+        return client_id in self._clients
 
     def active_contract_ids(self) -> set[str]:
         """Return set of contract_ids currently subscribed by at least one client."""
@@ -196,24 +214,50 @@ class WsBroadcaster:
         *,
         client_id: str | None = None,
         session_validator: Callable[[], bool] | None = None,
+        defer_sender_start: bool = False,
     ) -> WsClientSession:
-        """Register a connected WebSocket client and start its independent sender task."""
+        """Register a WebSocket client atomically and optionally defer starting its sender task."""
         cid = client_id or uuid.uuid4().hex
+        if cid in self._clients:
+            raise ValueError(f"WebSocket client {cid!r} is already registered")
+        if len(self._clients) >= self._max_clients:
+            raise WsCapacityExceededError(
+                f"WebSocket client limit reached (maximum {self._max_clients} concurrent clients)"
+            )
         session = WsClientSession(
             client_id=cid,
             transport=transport,
             queue=_CoalescingClientQueue(self._queue_maxsize),
             session_validator=session_validator,
         )
-        session.sender_task = asyncio.create_task(
-            self._sender_loop(session),
-            name=f"ws-sender-{cid[:8]}",
-        )
+        if not defer_sender_start:
+            session.sender_task = asyncio.create_task(
+                self._sender_loop(session),
+                name=f"ws-sender-{cid[:8]}",
+            )
         self._clients[cid] = session
         return session
 
-    def subscribe(self, client_id: str, contract_id: str, timeframe: str) -> tuple[str, str]:
-        """Subscribe a registered client to (contract_id, timeframe)."""
+    def start_sender(self, client_id: str) -> None:
+        """Start the independent sender task for a client registered with defer_sender_start."""
+        session = self._clients.get(client_id)
+        if session is None or session.closed_event.is_set() or session.queue.is_closed:
+            return
+        if session.sender_task is None:
+            session.sender_task = asyncio.create_task(
+                self._sender_loop(session),
+                name=f"ws-sender-{session.client_id[:8]}",
+            )
+
+    def check_can_subscribe(
+        self,
+        client_id: str,
+        contract_id: str,
+        timeframe: str,
+        *,
+        require_registered: bool = False,
+    ) -> tuple[str, str]:
+        """Validate contract_id, timeframe, and per-client subscription cap without mutating."""
         cid = contract_id.strip().upper()
         StorageDatasetKey("topstepx", False, cid, "1m")
         root = infer_root_symbol(cid)
@@ -230,15 +274,29 @@ class WsBroadcaster:
                 f"(supported: {supported_str})"
             )
         session = self._clients.get(client_id)
+        if session is None:
+            if require_registered:
+                raise ValueError("WebSocket client session is closed")
+        elif (
+            (cid, tf) not in session.subscriptions
+            and len(session.subscriptions) >= self._max_subscriptions_per_client
+        ):
+            raise ValueError(
+                f"Subscription limit exceeded (maximum {self._max_subscriptions_per_client} "
+                "per client)"
+            )
+        return cid, tf
+
+    def subscribe(self, client_id: str, contract_id: str, timeframe: str) -> tuple[str, str]:
+        """Subscribe a registered client to (contract_id, timeframe)."""
+        cid, tf = self.check_can_subscribe(
+            client_id,
+            contract_id,
+            timeframe,
+            require_registered=False,
+        )
+        session = self._clients.get(client_id)
         if session is not None:
-            if (
-                (cid, tf) not in session.subscriptions
-                and len(session.subscriptions) >= self._max_subscriptions_per_client
-            ):
-                raise ValueError(
-                    f"Subscription limit exceeded (maximum {self._max_subscriptions_per_client} "
-                    "per client)"
-                )
             session.subscriptions.add((cid, tf))
         return cid, tf
 
