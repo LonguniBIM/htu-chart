@@ -1161,4 +1161,113 @@ describe("App bootstrap and R03 503 recovery (P1-R3-03, P1-R3-04, P2-005)", () =
     expect(screen.queryByRole("button", { name: "Retry Contracts" })).toBeNull();
     expect(screen.queryByText(/Incomplete contracts/)).toBeNull();
   });
+
+  it("retains unresolved mode and auto-retries when switching to Live fails with network TypeError (P1-R8-01, P2-001)", async () => {
+    /**
+     * Contract: When Sim bootstrap succeeds and switching to a Live layout fails with a transient
+     * network TypeError("Failed to fetch"), App surfaces the error message alongside "Retry Contracts",
+     * records live=true in unresolvedModesRef, and autonomously retries live=true after 2000ms.
+     * Defect caught: applyContractResolutionError ignoring non-503 transient errors and stranding Retry Contracts.
+     */
+    vi.useFakeTimers();
+    const liveLayout: LayoutRecord = {
+      ...SAMPLE_LAYOUT,
+      id: "layout-live",
+      name: "Live MNQ",
+      is_default: false,
+      panes: [
+        {
+          pane_id: "pane-live",
+          root_symbol: "MNQ",
+          timeframe: "5m",
+          live_mode: true,
+          playback_mode: "live",
+        },
+      ],
+    };
+
+    fetchSessionMock.mockResolvedValue({
+      authenticated: true,
+      csrf_token: "csrf-token-1234567890",
+    });
+    fetchStatusMock.mockResolvedValue({
+      connected: true,
+      live: true,
+      feed_state: "LIVE",
+    });
+    listLayoutsMock.mockResolvedValue([SAMPLE_LAYOUT, liveLayout]);
+
+    fetchContractsMock
+      .mockResolvedValueOnce({
+        live: false,
+        contracts: {
+          MES: {
+            selected: { id: "CON.F.US.MES.H26" },
+            error_type: null,
+            error: null,
+          },
+        },
+      })
+      .mockRejectedValueOnce(new TypeError("Failed to fetch"))
+      .mockResolvedValueOnce({
+        live: true,
+        contracts: {
+          MNQ: {
+            selected: { id: "CON.F.US.MNQ.H26" },
+            error_type: null,
+            error: null,
+          },
+        },
+      });
+
+    fetchBarsMock.mockResolvedValue({
+      provider: "topstepx",
+      live: false,
+      contract_id: "CON.F.US.MES.H26",
+      root_symbol: "MES",
+      timeframe: "5m",
+      start_time: 1000,
+      end_time: 1000,
+      count: 0,
+      include_partial: true,
+      quality: {
+        is_complete: true,
+        truncated: false,
+        provider_gap: false,
+        quarantined_count: 0,
+      },
+      bars: [],
+    });
+
+    render(<App />);
+    await act(async () => {
+      await flushMicrotasks();
+    });
+
+    expect(screen.getByText("CON.F.US.MES.H26")).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Retry Contracts" })).toBeNull();
+
+    await act(async () => {
+      fireEvent.change(screen.getByLabelText("Active layout"), {
+        target: { value: "layout-live" },
+      });
+      await flushMicrotasks();
+    });
+
+    expect(fetchContractsMock).toHaveBeenCalledTimes(2);
+    expect(fetchContractsMock.mock.calls[1]?.[1]).toBe(true);
+    expect(screen.getByText("Failed to fetch")).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Retry Contracts" })).toBeTruthy();
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(2000);
+      await flushMicrotasks();
+    });
+
+    expect(fetchContractsMock).toHaveBeenCalledTimes(3);
+    expect(fetchContractsMock.mock.calls[2]?.[1]).toBe(true);
+    expect(screen.getByText("CON.F.US.MNQ.H26")).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Retry Contracts" })).toBeNull();
+    expect(screen.queryByText("Failed to fetch")).toBeNull();
+  });
 });

@@ -190,15 +190,18 @@ export function App() {
 
   const applyContractResolutionError = useCallback(
     (err: unknown, attemptedModes: readonly boolean[]) => {
-      if (err instanceof ApiError && err.status === 503) {
+      const isAuthError =
+        err instanceof ApiError && (err.status === 401 || err.status === 403);
+      if (!isAuthError) {
         contractsRetryNeededRef.current = true;
         for (const mode of attemptedModes) {
           unresolvedModesRef.current.add(mode);
         }
         setContractsPendingRetry(true);
-        return;
       }
-      setLoadError(err instanceof Error ? err.message : "Failed to resolve contracts");
+      if (!(err instanceof ApiError && err.status === 503)) {
+        setLoadError(err instanceof Error ? err.message : "Failed to resolve contracts");
+      }
     },
     [],
   );
@@ -424,12 +427,8 @@ export function App() {
         }
         if (err instanceof ApiError && err.status === 503) {
           setContracts({});
-          contractsRetryNeededRef.current = true;
-          unresolvedModesRef.current = new Set(distinctModes);
-          setContractsPendingRetry(true);
-        } else {
-          setLoadError(err instanceof Error ? err.message : "Failed to resolve contracts");
         }
+        applyContractResolutionError(err, distinctModes);
       }
 
       if (isStale()) {
@@ -437,7 +436,7 @@ export function App() {
       }
       wsClient.connect();
     },
-    [fetchContractsForModes, wsClient],
+    [applyContractResolutionError, fetchContractsForModes, wsClient],
   );
 
   useEffect(() => {

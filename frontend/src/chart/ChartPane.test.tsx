@@ -1,5 +1,5 @@
 // @vitest-environment jsdom
-import { act, cleanup, render, screen } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { FetchBarsParams } from "../api/client";
 import type {
@@ -733,5 +733,370 @@ describe("ChartPane (F06, P1-R3-01, P1-R3-02)", () => {
 
     expect(screen.getByText("2 bars")).toBeTruthy();
     expect(screen.queryByRole("button", { name: "Retry" })).toBeNull();
+  });
+
+  it("flushes buffered WS bars in ascending order with closed-bar priority when post-ACK resync fetchBars rejects", async () => {
+    /**
+     * Contract: When WS bar_update frames (including a closed bar, a stale provisional tick at
+     * the same timestamp, and a newer bar) arrive while a post-ACK fetchBars resync is pending,
+     * rejecting that resync flushes pendingWsBarsRef onto candleSeries.update in ascending timestamp
+     * order while preserving the closed bar's OHLCV over the stale provisional tick.
+     * Defect caught: Buffered WS bars dropped or overwritten by stale provisional ticks on resync rejection.
+     */
+    const firstFetch = createDeferred<BarsResponse>();
+    const failedResyncFetch = createDeferred<BarsResponse>();
+    fetchBarsMock
+      .mockReturnValueOnce(firstFetch.promise)
+      .mockReturnValueOnce(failedResyncFetch.promise);
+
+    const coordinator = new PaneFetchCoordinator();
+    const fakeWs = createFakeWsClient();
+    const pane: PaneConfig = {
+      pane_id: "pane-1",
+      root_symbol: "MES",
+      timeframe: "5m",
+      live_mode: false,
+      playback_mode: "live",
+    };
+
+    render(
+      <ChartPane
+        pane={pane}
+        contractId="CON.F.US.MES.H26"
+        activeFeedLive={false}
+        wsClient={fakeWs.client}
+        coordinator={coordinator}
+      />,
+    );
+
+    await act(async () => {
+      firstFetch.resolve(makeBarsResponse("CON.F.US.MES.H26", [makeBar(1000, 5000, true)]));
+      await firstFetch.promise;
+    });
+
+    act(() => {
+      fakeWs.emitSubscribed({
+        type: "subscribed",
+        contract_id: "CON.F.US.MES.H26",
+        timeframe: "5m",
+      });
+    });
+    expect(fetchBarsMock).toHaveBeenCalledTimes(2);
+
+    // Emit newer bar first, then closed bar at 1060, then stale provisional tick at 1060
+    fakeWs.emitBarUpdate({
+      type: "bar_update",
+      contract_id: "CON.F.US.MES.H26",
+      live_mode: false,
+      timeframe: "5m",
+      is_recovered_historical: false,
+      recovery_tag: null,
+      bar: makeBar(1120, 5030, false),
+    });
+    fakeWs.emitBarUpdate({
+      type: "bar_update",
+      contract_id: "CON.F.US.MES.H26",
+      live_mode: false,
+      timeframe: "5m",
+      is_recovered_historical: false,
+      recovery_tag: null,
+      bar: makeBar(1060, 5020, true),
+    });
+    fakeWs.emitBarUpdate({
+      type: "bar_update",
+      contract_id: "CON.F.US.MES.H26",
+      live_mode: false,
+      timeframe: "5m",
+      is_recovered_historical: false,
+      recovery_tag: null,
+      bar: makeBar(1060, 5010, false),
+    });
+
+    expect(candleUpdate).not.toHaveBeenCalled();
+
+    await act(async () => {
+      failedResyncFetch.reject(new Error("Transient upstream 503"));
+      await Promise.resolve();
+    });
+
+    expect(screen.getByText(/resync error: Transient upstream 503/)).toBeTruthy();
+    expect(candleUpdate).toHaveBeenCalledTimes(2);
+    expect(candleUpdate.mock.calls.map((call) => (call[0] as { time: number }).time)).toEqual([
+      1060, 1120,
+    ]);
+    expect(candleUpdate.mock.calls[0]?.[0]).toEqual({
+      time: 1060,
+      open: 5019,
+      high: 5021,
+      low: 5018,
+      close: 5020,
+    });
+    expect(candleUpdate.mock.calls[1]?.[0]).toEqual({
+      time: 1120,
+      open: 5029,
+      high: 5031,
+      low: 5028,
+      close: 5030,
+    });
+    expect(volumeUpdate.mock.calls.map((call) => (call[0] as { time: number }).time)).toEqual([
+      1060, 1120,
+    ]);
+
+    // Subsequent live update after flush continues applying immediately
+    fakeWs.emitBarUpdate({
+      type: "bar_update",
+      contract_id: "CON.F.US.MES.H26",
+      live_mode: false,
+      timeframe: "5m",
+      is_recovered_historical: false,
+      recovery_tag: null,
+      bar: makeBar(1180, 5040, false),
+    });
+    expect(candleUpdate).toHaveBeenCalledTimes(3);
+    expect(candleUpdate.mock.calls[2]?.[0]).toEqual(
+      expect.objectContaining({ time: 1180, close: 5040 }),
+    );
+  });
+
+  it("enforces 1500ms -> 3000ms -> 6000ms automatic retry cap and recovers on manual Retry click", async () => {
+    /**
+     * Contract: Post-ACK resync rejections schedule automatic retries at [1500, 3000, 6000] ms,
+     * stop after 3 automatic retries, and allow manual Retry click to reset the counter and recover.
+     * Defect caught: Wrong backoff schedule, unbounded retry loop, or broken manual Retry recovery.
+     */
+    vi.useFakeTimers();
+    const firstFetch = createDeferred<BarsResponse>();
+    const resyncReject1 = createDeferred<BarsResponse>();
+    const resyncReject2 = createDeferred<BarsResponse>();
+    const resyncReject3 = createDeferred<BarsResponse>();
+    const resyncReject4 = createDeferred<BarsResponse>();
+    const manualSuccess = createDeferred<BarsResponse>();
+
+    fetchBarsMock
+      .mockReturnValueOnce(firstFetch.promise)
+      .mockReturnValueOnce(resyncReject1.promise)
+      .mockReturnValueOnce(resyncReject2.promise)
+      .mockReturnValueOnce(resyncReject3.promise)
+      .mockReturnValueOnce(resyncReject4.promise)
+      .mockReturnValueOnce(manualSuccess.promise);
+
+    const coordinator = new PaneFetchCoordinator();
+    const fakeWs = createFakeWsClient();
+    const pane: PaneConfig = {
+      pane_id: "pane-1",
+      root_symbol: "MES",
+      timeframe: "5m",
+      live_mode: false,
+      playback_mode: "live",
+    };
+
+    render(
+      <ChartPane
+        pane={pane}
+        contractId="CON.F.US.MES.H26"
+        activeFeedLive={false}
+        wsClient={fakeWs.client}
+        coordinator={coordinator}
+      />,
+    );
+
+    await act(async () => {
+      firstFetch.resolve(makeBarsResponse("CON.F.US.MES.H26", [makeBar(1000, 5000)]));
+      await firstFetch.promise;
+    });
+
+    act(() => {
+      fakeWs.emitSubscribed({
+        type: "subscribed",
+        contract_id: "CON.F.US.MES.H26",
+        timeframe: "5m",
+      });
+    });
+    expect(fetchBarsMock).toHaveBeenCalledTimes(2);
+
+    await act(async () => {
+      resyncReject1.reject(new Error("fail-1"));
+      await Promise.resolve();
+    });
+
+    // Retry 1 at 1500ms
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1499);
+      await Promise.resolve();
+    });
+    expect(fetchBarsMock).toHaveBeenCalledTimes(2);
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1);
+      await Promise.resolve();
+    });
+    expect(fetchBarsMock).toHaveBeenCalledTimes(3);
+
+    await act(async () => {
+      resyncReject2.reject(new Error("fail-2"));
+      await Promise.resolve();
+    });
+
+    // Retry 2 at 3000ms
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(2999);
+      await Promise.resolve();
+    });
+    expect(fetchBarsMock).toHaveBeenCalledTimes(3);
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1);
+      await Promise.resolve();
+    });
+    expect(fetchBarsMock).toHaveBeenCalledTimes(4);
+
+    await act(async () => {
+      resyncReject3.reject(new Error("fail-3"));
+      await Promise.resolve();
+    });
+
+    // Retry 3 at 6000ms
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(5999);
+      await Promise.resolve();
+    });
+    expect(fetchBarsMock).toHaveBeenCalledTimes(4);
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1);
+      await Promise.resolve();
+    });
+    expect(fetchBarsMock).toHaveBeenCalledTimes(5);
+
+    await act(async () => {
+      resyncReject4.reject(new Error("fail-4"));
+      await Promise.resolve();
+    });
+
+    // Cap reached: advancing timer further triggers zero additional automatic fetches
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(60000);
+      await Promise.resolve();
+    });
+    expect(fetchBarsMock).toHaveBeenCalledTimes(5);
+
+    // Manual Retry button triggers recovery fetch and clears Retry button
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+      await Promise.resolve();
+    });
+    expect(fetchBarsMock).toHaveBeenCalledTimes(6);
+
+    await act(async () => {
+      manualSuccess.resolve(
+        makeBarsResponse("CON.F.US.MES.H26", [makeBar(1000, 5000), makeBar(1060, 5015)]),
+      );
+      await manualSuccess.promise;
+    });
+
+    expect(screen.getByText("2 bars")).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Retry" })).toBeNull();
+  });
+
+  it("cancels pending retry timers on target change and unmount", async () => {
+    /**
+     * Contract: Pending snapshot retry timers scheduled by scheduleRetry must be cancelled when
+     * the pane target changes (MES -> MNQ) or when ChartPane unmounts, triggering zero stale fetches.
+     * Defect caught: Leaked retry timers firing stale fetchBars after symbol switch or unmount.
+     */
+    vi.useFakeTimers();
+    const mesInitial = createDeferred<BarsResponse>();
+    const mesResyncFail = createDeferred<BarsResponse>();
+    const mnqInitial = createDeferred<BarsResponse>();
+    const mnqResyncFail = createDeferred<BarsResponse>();
+
+    fetchBarsMock
+      .mockReturnValueOnce(mesInitial.promise)
+      .mockReturnValueOnce(mesResyncFail.promise)
+      .mockReturnValueOnce(mnqInitial.promise)
+      .mockReturnValueOnce(mnqResyncFail.promise);
+
+    const coordinator = new PaneFetchCoordinator();
+    const fakeWs = createFakeWsClient();
+    const mesPane: PaneConfig = {
+      pane_id: "pane-1",
+      root_symbol: "MES",
+      timeframe: "5m",
+      live_mode: false,
+      playback_mode: "live",
+    };
+
+    const { rerender, unmount } = render(
+      <ChartPane
+        pane={mesPane}
+        contractId="CON.F.US.MES.H26"
+        activeFeedLive={false}
+        wsClient={fakeWs.client}
+        coordinator={coordinator}
+      />,
+    );
+
+    await act(async () => {
+      mesInitial.resolve(makeBarsResponse("CON.F.US.MES.H26", [makeBar(1000, 5000)]));
+      await mesInitial.promise;
+    });
+
+    act(() => {
+      fakeWs.emitSubscribed({
+        type: "subscribed",
+        contract_id: "CON.F.US.MES.H26",
+        timeframe: "5m",
+      });
+    });
+    expect(fetchBarsMock).toHaveBeenCalledTimes(2);
+
+    await act(async () => {
+      mesResyncFail.reject(new Error("mes-resync-fail"));
+      await Promise.resolve();
+    });
+
+    // Switch target MES -> MNQ while 1500ms MES retry timer is pending
+    const mnqPane: PaneConfig = { ...mesPane, root_symbol: "MNQ" };
+    rerender(
+      <ChartPane
+        pane={mnqPane}
+        contractId="CON.F.US.MNQ.H26"
+        activeFeedLive={false}
+        wsClient={fakeWs.client}
+        coordinator={coordinator}
+      />,
+    );
+    expect(fetchBarsMock).toHaveBeenCalledTimes(3);
+
+    await act(async () => {
+      mnqInitial.resolve(makeBarsResponse("CON.F.US.MNQ.H26", [makeBar(2000, 18000)]));
+      await mnqInitial.promise;
+    });
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(10000);
+      await Promise.resolve();
+    });
+    expect(fetchBarsMock).toHaveBeenCalledTimes(3);
+
+    // Trigger pending MNQ resync retry timer, then unmount before timer fires
+    act(() => {
+      fakeWs.emitSubscribed({
+        type: "subscribed",
+        contract_id: "CON.F.US.MNQ.H26",
+        timeframe: "5m",
+      });
+    });
+    expect(fetchBarsMock).toHaveBeenCalledTimes(4);
+
+    await act(async () => {
+      mnqResyncFail.reject(new Error("mnq-resync-fail"));
+      await Promise.resolve();
+    });
+
+    unmount();
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(15000);
+      await Promise.resolve();
+    });
+    expect(fetchBarsMock).toHaveBeenCalledTimes(4);
   });
 });
