@@ -17,6 +17,7 @@ from __future__ import annotations
 import argparse
 import concurrent.futures
 import hashlib
+import inspect
 import json
 import os
 import re
@@ -951,6 +952,17 @@ def _write_once_outputs(out_dir: Path, report: dict[str, Any]) -> bool:
     return True
 
 
+def _call_verify_role(role: str, runtime_root: Path, repo_root: Path) -> dict[str, Any]:
+    sig = inspect.signature(verify_role)
+    has_kw = any(
+        p.kind == inspect.Parameter.VAR_KEYWORD or p.name == "repo_root"
+        for p in sig.parameters.values()
+    )
+    if has_kw:
+        return verify_role(role, runtime_root, repo_root=repo_root)
+    return verify_role(role, runtime_root)
+
+
 def main(argv: list[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
     repo_root = args.repo_root.resolve()
@@ -1224,8 +1236,8 @@ def main(argv: list[str] | None = None) -> int:
             return 2
 
         active_model = EXPECTED_REVIEW_MODEL
-        v1 = verify_role("pass1", args.runtime_root, repo_root=git_top)
-        v2 = verify_role("pass2", args.runtime_root, repo_root=git_top)
+        v1 = _call_verify_role("pass1", args.runtime_root, git_top)
+        v2 = _call_verify_role("pass2", args.runtime_root, git_top)
         if not (v1["ok"] and v2["ok"]):
             preflight_err = (
                 "Codex Room runtime failed safety/model preflight: "

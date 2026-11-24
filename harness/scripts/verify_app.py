@@ -10,6 +10,7 @@ Subcommands:
 from __future__ import annotations
 
 import argparse
+import inspect
 import json
 import os
 import re
@@ -294,6 +295,17 @@ def _check_hooks(root: Path) -> dict[str, Any]:
     }
 
 
+def _call_verify_role(role: str, runtime_root: Path, repo_root: Path) -> dict[str, Any]:
+    sig = inspect.signature(verify_role)
+    has_kw = any(
+        p.kind == inspect.Parameter.VAR_KEYWORD or p.name == "repo_root"
+        for p in sig.parameters.values()
+    )
+    if has_kw:
+        return verify_role(role, runtime_root, repo_root=repo_root)
+    return verify_role(role, runtime_root)
+
+
 def run_doctor(root: Path, runtime_root: Path) -> dict[str, Any]:
     """Run read-only diagnostic checks across toolchain, repo, and Codex Room."""
     root = root.resolve()
@@ -310,8 +322,8 @@ def run_doctor(root: Path, runtime_root: Path) -> dict[str, Any]:
         text=True,
         check=False,
     )
-    pass1_runtime = verify_role("pass1", runtime_root, repo_root=root)
-    pass2_runtime = verify_role("pass2", runtime_root, repo_root=root)
+    pass1_runtime = _call_verify_role("pass1", runtime_root, root)
+    pass2_runtime = _call_verify_role("pass2", runtime_root, root)
     hooks_report = _check_hooks(root)
     policy_report = _check_model_policy(root)
 
