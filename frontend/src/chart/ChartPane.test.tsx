@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { FetchBarsParams } from "../api/client";
+import { ApiError, type FetchBarsParams } from "../api/client";
 import type {
   BarsResponse,
   OhlcvBar,
@@ -1213,5 +1213,152 @@ describe("ChartPane (F06, P1-R3-01, P1-R3-02)", () => {
     });
 
     expect(screen.getByRole("status").textContent).toBe("Warning: incomplete");
+  });
+
+  it("clears series, skips retries, and invokes onAuthError on initial fetchBars 401 (P1-R12-001)", async () => {
+    /**
+     * Contract: When initial fetchBars rejects with ApiError(401), ChartPane immediately clears
+     * candleSeries and volumeSeries, sets auth error status without Retry button, invokes
+     * onAuthError(401, message), and schedules zero retry timers.
+     * Defect caught: Treating 401 on /api/bars as transient error with retry amplification.
+     */
+    vi.useFakeTimers();
+    const initialFetch = createDeferred<BarsResponse>();
+    fetchBarsMock.mockReturnValueOnce(initialFetch.promise);
+
+    const coordinator = new PaneFetchCoordinator();
+    const fakeWs = createFakeWsClient();
+    const onAuthError = vi.fn();
+    const pane: PaneConfig = {
+      pane_id: "pane-1",
+      root_symbol: "MES",
+      timeframe: "5m",
+      live_mode: false,
+      playback_mode: "live",
+    };
+
+    render(
+      <ChartPane
+        pane={pane}
+        contractId="CON.F.US.MES.H26"
+        activeFeedLive={false}
+        wsClient={fakeWs.client}
+        coordinator={coordinator}
+        onAuthError={onAuthError}
+      />,
+    );
+
+    candleSetData.mockClear();
+    volumeSetData.mockClear();
+
+    await act(async () => {
+      initialFetch.reject(new ApiError(401, "Session expired"));
+      await Promise.resolve();
+    });
+
+    expect(candleSetData).toHaveBeenCalledWith([]);
+    expect(volumeSetData).toHaveBeenCalledWith([]);
+    expect(onAuthError).toHaveBeenCalledWith(401, expect.stringContaining("Session expired"));
+    expect(screen.getByText("auth error")).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Retry" })).toBeNull();
+    expect(vi.getTimerCount()).toBe(0);
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(20000);
+      await Promise.resolve();
+    });
+    expect(fetchBarsMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("wipes loaded series, drops buffered WS bars, and invokes onAuthError on post-snapshot resync 403 (P1-R12-001, P2-R12-001)", async () => {
+    /**
+     * Contract: When a post-snapshot resync fetchBars rejects with ApiError(403), ChartPane clears
+     * previously loaded series data and quality warnings, discards buffered WS bars without
+     * calling series.update, schedules zero retries, and invokes onAuthError(403, message).
+     * Defect caught: Post-snapshot resync 401/403 retaining stale bars and scheduling retries.
+     */
+    vi.useFakeTimers();
+    const initialFetch = createDeferred<BarsResponse>();
+    const resyncFetch = createDeferred<BarsResponse>();
+    fetchBarsMock.mockReturnValueOnce(initialFetch.promise).mockReturnValueOnce(resyncFetch.promise);
+
+    const coordinator = new PaneFetchCoordinator();
+    const fakeWs = createFakeWsClient();
+    const onAuthError = vi.fn();
+    const pane: PaneConfig = {
+      pane_id: "pane-1",
+      root_symbol: "MES",
+      timeframe: "5m",
+      live_mode: false,
+      playback_mode: "live",
+    };
+
+    render(
+      <ChartPane
+        pane={pane}
+        contractId="CON.F.US.MES.H26"
+        activeFeedLive={false}
+        wsClient={fakeWs.client}
+        coordinator={coordinator}
+        onAuthError={onAuthError}
+      />,
+    );
+
+    await act(async () => {
+      initialFetch.resolve({
+        ...makeBarsResponse("CON.F.US.MES.H26", [makeBar(1000, 5000)]),
+        quality: {
+          is_complete: false,
+          truncated: true,
+          provider_gap: false,
+          quarantined_count: 0,
+        },
+      });
+      await initialFetch.promise;
+    });
+    expect(screen.getByRole("status").textContent).toBe("Warning: truncated");
+
+    act(() => {
+      fakeWs.emitSubscribed({
+        type: "subscribed",
+        contract_id: "CON.F.US.MES.H26",
+        timeframe: "5m",
+      });
+    });
+    expect(fetchBarsMock).toHaveBeenCalledTimes(2);
+
+    fakeWs.emitBarUpdate({
+      type: "bar_update",
+      contract_id: "CON.F.US.MES.H26",
+      live_mode: false,
+      timeframe: "5m",
+      is_recovered_historical: false,
+      recovery_tag: null,
+      bar: makeBar(1060, 5025),
+    });
+
+    candleSetData.mockClear();
+    volumeSetData.mockClear();
+
+    await act(async () => {
+      resyncFetch.reject(new ApiError(403, "Invalid CSRF token"));
+      await Promise.resolve();
+    });
+
+    expect(candleSetData).toHaveBeenCalledWith([]);
+    expect(volumeSetData).toHaveBeenCalledWith([]);
+    expect(candleUpdate).not.toHaveBeenCalled();
+    expect(volumeUpdate).not.toHaveBeenCalled();
+    expect(screen.queryByRole("status")).toBeNull();
+    expect(screen.getByText("auth error")).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Retry" })).toBeNull();
+    expect(onAuthError).toHaveBeenCalledWith(403, expect.stringContaining("Invalid CSRF token"));
+    expect(vi.getTimerCount()).toBe(0);
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(20000);
+      await Promise.resolve();
+    });
+    expect(fetchBarsMock).toHaveBeenCalledTimes(2);
   });
 });

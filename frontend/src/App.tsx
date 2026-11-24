@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent } from "react";
 import {
   ApiError,
+  clearCsrfToken,
   fetchContracts,
   fetchSession,
   fetchStatus,
@@ -86,6 +87,7 @@ export function App() {
   const unresolvedModesRef = useRef<Set<boolean>>(new Set());
   const prevFeedStateRef = useRef<string>("DISCONNECTED");
   const activeAuthControllerRef = useRef<AbortController | null>(null);
+  const pendingLogoutPromiseRef = useRef<Promise<void> | null>(null);
   const retryAbortControllerRef = useRef<AbortController | null>(null);
   const layoutResolveControllerRef = useRef<AbortController | null>(null);
   const sessionEpochRef = useRef<number>(0);
@@ -109,7 +111,10 @@ export function App() {
   }, [coordinator, wsClient]);
 
   const invalidateSessionLocally = useCallback(
-    (errorMessage?: string | null) => {
+    (errorMessage?: string | null, options?: { preserveCsrfForLogout?: boolean }) => {
+      if (!options?.preserveCsrfForLogout) {
+        clearCsrfToken();
+      }
       sessionEpochRef.current += 1;
       contractResolveGenerationRef.current += 1;
       activeAuthControllerRef.current?.abort();
@@ -280,10 +285,23 @@ export function App() {
           ? Array.from(modeSet)
           : distinctPaneLiveModes(activeLayoutRef.current?.panes ?? []);
 
+      const handleAuthFailFast = (err: unknown): never => {
+        if (
+          err instanceof ApiError &&
+          (err.status === 401 || err.status === 403) &&
+          !controller.signal.aborted &&
+          requestEpoch === sessionEpochRef.current &&
+          generation === contractResolveGenerationRef.current
+        ) {
+          invalidateSessionLocally(err.status === 403 ? err.message : null);
+        }
+        throw err;
+      };
+
       try {
         const [statusResult, contractsResult] = await Promise.allSettled([
-          fetchStatus(controller.signal),
-          fetchContractsForModes(modes, controller.signal),
+          fetchStatus(controller.signal).catch(handleAuthFailFast),
+          fetchContractsForModes(modes, controller.signal).catch(handleAuthFailFast),
         ]);
 
         if (
@@ -413,12 +431,16 @@ export function App() {
     const removeErrorListener = wsClient.onError((msg) => {
       setLoadError(msg.detail || "WebSocket error");
     });
+    const removeSessionExpiredListener = wsClient.onSessionExpired(() => {
+      invalidateSessionLocally(null);
+    });
     return () => {
       removeStateListener();
       removeStatusListener();
       removeErrorListener();
+      removeSessionExpiredListener();
     };
-  }, [retryUnresolvedContracts, wsClient]);
+  }, [invalidateSessionLocally, retryUnresolvedContracts, wsClient]);
 
   const bootstrapWorkspace = useCallback(
     async (signal?: AbortSignal) => {
@@ -564,6 +586,12 @@ export function App() {
     let loginSucceeded = false;
 
     try {
+      if (pendingLogoutPromiseRef.current !== null) {
+        await pendingLogoutPromiseRef.current;
+        if (controller.signal.aborted) {
+          return;
+        }
+      }
       await login(passwordInput, controller.signal);
       if (controller.signal.aborted) {
         return;
@@ -599,13 +627,30 @@ export function App() {
   };
 
   const handleLogout = async () => {
-    invalidateSessionLocally();
+    invalidateSessionLocally(null, { preserveCsrfForLogout: true });
+    const logoutTask = (async () => {
+      try {
+        await logout();
+      } catch {
+        // Clear local UI state even if session already expired
+      }
+    })();
+    pendingLogoutPromiseRef.current = logoutTask;
     try {
-      await logout();
-    } catch {
-      // Clear local UI state even if session already expired
+      await logoutTask;
+    } finally {
+      if (pendingLogoutPromiseRef.current === logoutTask) {
+        pendingLogoutPromiseRef.current = null;
+      }
     }
   };
+
+  const handlePaneAuthError = useCallback(
+    (status: number, message: string) => {
+      invalidateSessionLocally(status === 403 ? message : null);
+    },
+    [invalidateSessionLocally],
+  );
 
   const handlePaneSymbolChange = (paneId: string, nextSymbol: RootSymbol) => {
     setActiveLayout((prev) => {
@@ -784,6 +829,7 @@ export function App() {
             coordinator={coordinator}
             onSymbolChange={handlePaneSymbolChange}
             onTimeframeChange={handlePaneTimeframeChange}
+            onAuthError={handlePaneAuthError}
           />
         ))}
       </main>

@@ -9,6 +9,7 @@ import type {
 } from "./types";
 
 let inMemoryCsrfToken: string | null = null;
+let authGeneration = 0;
 
 export class ApiError extends Error {
   readonly status: number;
@@ -27,6 +28,7 @@ export function getCsrfToken(): string | null {
 }
 
 export function clearCsrfToken(): void {
+  authGeneration += 1;
   inMemoryCsrfToken = null;
 }
 
@@ -80,6 +82,7 @@ async function apiRequest<T>(url: string, options: RequestOptions = {}): Promise
 export async function fetchSession(
   signal?: AbortSignal,
 ): Promise<{ authenticated: boolean; csrf_token: string }> {
+  const gen = ++authGeneration;
   const opts: RequestOptions = {};
   if (signal !== undefined) {
     opts.signal = signal;
@@ -88,7 +91,9 @@ export async function fetchSession(
     "/api/auth/session",
     opts,
   );
-  inMemoryCsrfToken = result.csrf_token;
+  if (gen === authGeneration) {
+    inMemoryCsrfToken = result.csrf_token;
+  }
   return result;
 }
 
@@ -96,6 +101,7 @@ export async function login(
   password: string,
   signal?: AbortSignal,
 ): Promise<{ authenticated: boolean; csrf_token: string }> {
+  const gen = ++authGeneration;
   const opts: RequestOptions = { method: "POST", body: { password } };
   if (signal !== undefined) {
     opts.signal = signal;
@@ -104,11 +110,14 @@ export async function login(
     "/api/auth/login",
     opts,
   );
-  inMemoryCsrfToken = result.csrf_token;
+  if (gen === authGeneration) {
+    inMemoryCsrfToken = result.csrf_token;
+  }
   return result;
 }
 
 export async function logout(signal?: AbortSignal): Promise<{ authenticated: boolean }> {
+  const gen = ++authGeneration;
   const opts: RequestOptions = { method: "POST" };
   if (signal !== undefined) {
     opts.signal = signal;
@@ -116,7 +125,9 @@ export async function logout(signal?: AbortSignal): Promise<{ authenticated: boo
   try {
     return await apiRequest<{ authenticated: boolean }>("/api/auth/logout", opts);
   } finally {
-    inMemoryCsrfToken = null;
+    if (gen === authGeneration) {
+      inMemoryCsrfToken = null;
+    }
   }
 }
 

@@ -381,4 +381,57 @@ describe("MarketWsClient (P1-04, P1-05, P2-003)", () => {
     });
     expect(subscribedEvents).toHaveLength(1);
   });
+
+  it("invokes onSessionExpired and schedules zero reconnects on close 1008 (P1-R12-004)", () => {
+    /**
+     * Contract: When the active socket closes with WS_CLOSE_POLICY_VIOLATION (1008),
+     * MarketWsClient invokes onSessionExpired listeners with event.reason (or "Session expired"),
+     * ignores stale-socket 1008 closes, and schedules zero reconnect attempts.
+     * Defect caught: WS close 1008 silently disconnecting without notifying App to invalidate session.
+     */
+    const client = new MarketWsClient(() => "ws://127.0.0.1:8000/ws/market");
+    const expiredReasons: string[] = [];
+    const unsubscribe = client.onSessionExpired((reason) => {
+      expiredReasons.push(reason);
+    });
+
+    client.connect();
+    const ws1 = FakeWebSocket.instances[0];
+    expect(ws1).toBeDefined();
+    ws1?.emitOpen();
+
+    // Replace socket so ws1 is stale
+    client.disconnect();
+    client.connect();
+    const ws2 = FakeWebSocket.instances[1];
+    expect(ws2).toBeDefined();
+    ws2?.emitOpen();
+
+    // Stale socket 1008 close must be ignored
+    ws1?.emitClose(1008, "stale session expired");
+    expect(expiredReasons).toEqual([]);
+
+    // Active socket 1008 close notifies listener and schedules zero reconnects
+    ws2?.emitClose(1008, "Session expired");
+    expect(client.getConnectionState()).toBe("disconnected");
+    expect(expiredReasons).toEqual(["Session expired"]);
+
+    vi.advanceTimersByTime(60_000);
+    expect(FakeWebSocket.instances.length).toBe(2);
+
+    // Default reason fallback when event.reason is empty and unsubscribe cleanup
+    client.connect();
+    const ws3 = FakeWebSocket.instances[2];
+    expect(ws3).toBeDefined();
+    ws3?.emitOpen();
+    ws3?.emitClose(1008, "");
+    expect(expiredReasons).toEqual(["Session expired", "Session expired"]);
+
+    unsubscribe();
+    client.connect();
+    const ws4 = FakeWebSocket.instances[3];
+    ws4?.emitOpen();
+    ws4?.emitClose(1008, "after unsubscribe");
+    expect(expiredReasons).toHaveLength(2);
+  });
 });

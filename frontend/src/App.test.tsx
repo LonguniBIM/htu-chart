@@ -30,6 +30,7 @@ let barUpdateListeners = new Set<(msg: WsBarUpdateMessage) => void>();
 let resyncListeners = new Set<(msg: WsResyncRequiredMessage) => void>();
 let errorListeners = new Set<(msg: WsErrorMessage) => void>();
 let subscribedListeners = new Set<(msg: WsSubscribedMessage) => void>();
+let sessionExpiredListeners = new Set<(reason: string) => void>();
 
 vi.mock("./api/wsClient", () => ({
   MarketWsClient: class MockMarketWsClient {
@@ -76,6 +77,13 @@ vi.mock("./api/wsClient", () => ({
       subscribedListeners.add(listener);
       return () => {
         subscribedListeners.delete(listener);
+      };
+    }
+
+    onSessionExpired(listener: (reason: string) => void) {
+      sessionExpiredListeners.add(listener);
+      return () => {
+        sessionExpiredListeners.delete(listener);
       };
     }
   },
@@ -198,6 +206,7 @@ describe("App bootstrap and R03 503 recovery (P1-R3-03, P1-R3-04, P2-005)", () =
     resyncListeners = new Set();
     errorListeners = new Set();
     subscribedListeners = new Set();
+    sessionExpiredListeners = new Set();
     vi.stubGlobal("ResizeObserver", MockResizeObserver);
   });
 
@@ -1558,5 +1567,422 @@ describe("App bootstrap and R03 503 recovery (P1-R3-03, P1-R3-04, P2-005)", () =
       await flushMicrotasks();
     });
     expect(fetchContractsMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("fails fast on fetchStatus 401 in retryUnresolvedContracts and aborts pending fetchContracts (P1-R12-002)", async () => {
+    /**
+     * Contract: When retryUnresolvedContracts runs fetchStatus and fetchContracts in parallel and
+     * fetchStatus rejects with ApiError(401) while fetchContracts remains pending, App immediately
+     * invalidates the session, disconnects WS, renders login gate, and aborts fetchContracts'
+     * AbortSignal BEFORE the pending fetchContracts promise resolves.
+     * Defect caught: Waiting on Promise.allSettled before handling 401/403 from the faster sibling.
+     */
+    fetchSessionMock.mockResolvedValue({
+      authenticated: true,
+      csrf_token: "csrf-token-1234567890",
+    });
+    fetchStatusMock.mockResolvedValueOnce({
+      connected: false,
+      live: false,
+      feed_state: "DISCONNECTED",
+    });
+    listLayoutsMock.mockResolvedValue([SAMPLE_LAYOUT]);
+    fetchContractsMock.mockRejectedValueOnce(new ApiError(503, "TopstepX is not connected"));
+
+    render(<App />);
+    await act(async () => {
+      await flushMicrotasks();
+    });
+
+    let rejectStatus!: (reason?: unknown) => void;
+    fetchStatusMock.mockImplementationOnce(
+      () =>
+        new Promise<StatusResponse>((_resolve, reject) => {
+          rejectStatus = reject;
+        }),
+    );
+    let contractsSignal: AbortSignal | undefined;
+    let resolveContracts!: (value: ContractsResponse) => void;
+    fetchContractsMock.mockImplementationOnce((_symbols, _live, signal) => {
+      contractsSignal = signal;
+      return new Promise<ContractsResponse>((resolve) => {
+        resolveContracts = resolve;
+      });
+    });
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Retry Contracts" }));
+      await flushMicrotasks();
+    });
+    expect(contractsSignal?.aborted).toBe(false);
+
+    await act(async () => {
+      rejectStatus(new ApiError(401, "Session expired"));
+      await flushMicrotasks();
+    });
+
+    expect(contractsSignal?.aborted).toBe(true);
+    expect(mockWsDisconnect).toHaveBeenCalledTimes(1);
+    expect(screen.getByPlaceholderText("Enter terminal password")).toBeTruthy();
+
+    await act(async () => {
+      resolveContracts({
+        live: false,
+        contracts: {
+          MES: {
+            selected: { id: "CON.F.US.MES.H26" },
+            error_type: null,
+            error: null,
+          },
+        },
+      });
+      await flushMicrotasks();
+    });
+    expect(screen.getByPlaceholderText("Enter terminal password")).toBeTruthy();
+  });
+
+  it("fails fast on fetchContracts 401 in retryUnresolvedContracts and aborts pending fetchStatus (P1-R12-002)", async () => {
+    /**
+     * Contract: When retryUnresolvedContracts runs fetchStatus and fetchContracts in parallel and
+     * fetchContracts rejects with ApiError(401) while fetchStatus remains pending, App immediately
+     * invalidates the session, disconnects WS, renders login gate, and aborts fetchStatus's
+     * AbortSignal BEFORE the pending fetchStatus promise resolves.
+     * Defect caught: Waiting on Promise.allSettled before handling 401/403 from fetchContracts.
+     */
+    fetchSessionMock.mockResolvedValue({
+      authenticated: true,
+      csrf_token: "csrf-token-1234567890",
+    });
+    fetchStatusMock.mockResolvedValueOnce({
+      connected: false,
+      live: false,
+      feed_state: "DISCONNECTED",
+    });
+    listLayoutsMock.mockResolvedValue([SAMPLE_LAYOUT]);
+    fetchContractsMock.mockRejectedValueOnce(new ApiError(503, "TopstepX is not connected"));
+
+    render(<App />);
+    await act(async () => {
+      await flushMicrotasks();
+    });
+
+    let statusSignal: AbortSignal | undefined;
+    let resolveStatus!: (value: StatusResponse) => void;
+    fetchStatusMock.mockImplementationOnce((signal) => {
+      statusSignal = signal;
+      return new Promise<StatusResponse>((resolve) => {
+        resolveStatus = resolve;
+      });
+    });
+    let rejectContracts!: (reason?: unknown) => void;
+    fetchContractsMock.mockImplementationOnce(
+      () =>
+        new Promise<ContractsResponse>((_resolve, reject) => {
+          rejectContracts = reject;
+        }),
+    );
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Retry Contracts" }));
+      await flushMicrotasks();
+    });
+    expect(statusSignal?.aborted).toBe(false);
+
+    await act(async () => {
+      rejectContracts(new ApiError(401, "Session expired"));
+      await flushMicrotasks();
+    });
+
+    expect(statusSignal?.aborted).toBe(true);
+    expect(mockWsDisconnect).toHaveBeenCalledTimes(1);
+    expect(screen.getByPlaceholderText("Enter terminal password")).toBeTruthy();
+
+    await act(async () => {
+      resolveStatus({
+        connected: true,
+        live: false,
+        feed_state: "LIVE",
+      });
+      await flushMicrotasks();
+    });
+    expect(screen.getByPlaceholderText("Enter terminal password")).toBeTruthy();
+  });
+
+  it("serializes handleLogin behind an in-flight logout() request (P1-R12-003)", async () => {
+    /**
+     * Contract: When user clicks Logout and immediately submits Login while logout() is still
+     * pending, handleLogin must await pendingLogoutPromiseRef before calling login() and only
+     * proceed to bootstrapWorkspace after logout() settles.
+     * Defect caught: Concurrent login() racing with in-flight logout() and losing new session/CSRF.
+     */
+    fetchSessionMock.mockResolvedValue({
+      authenticated: true,
+      csrf_token: "csrf-token-session-1",
+    });
+    fetchStatusMock.mockResolvedValue({
+      connected: true,
+      live: false,
+      feed_state: "LIVE",
+    });
+    listLayoutsMock.mockResolvedValue([SAMPLE_LAYOUT]);
+    fetchContractsMock.mockResolvedValue({
+      live: false,
+      contracts: {
+        MES: {
+          selected: { id: "CON.F.US.MES.H26" },
+          error_type: null,
+          error: null,
+        },
+      },
+    });
+    fetchBarsMock.mockResolvedValue({
+      provider: "topstepx",
+      live: false,
+      contract_id: "CON.F.US.MES.H26",
+      root_symbol: "MES",
+      timeframe: "5m",
+      start_time: 1000,
+      end_time: 1000,
+      count: 0,
+      include_partial: true,
+      quality: {
+        is_complete: true,
+        truncated: false,
+        provider_gap: false,
+        quarantined_count: 0,
+      },
+      bars: [],
+    });
+
+    let resolveLogout!: (value: { authenticated: boolean }) => void;
+    logoutMock.mockImplementationOnce(
+      () =>
+        new Promise<{ authenticated: boolean }>((resolve) => {
+          resolveLogout = resolve;
+        }),
+    );
+    loginMock.mockResolvedValueOnce({
+      authenticated: true,
+      csrf_token: "csrf-token-session-2",
+    });
+
+    render(<App />);
+    await act(async () => {
+      await flushMicrotasks();
+    });
+
+    expect(screen.getByText("CON.F.US.MES.H26")).toBeTruthy();
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Logout" }));
+      await flushMicrotasks();
+    });
+    expect(logoutMock).toHaveBeenCalledTimes(1);
+    expect(screen.getByPlaceholderText("Enter terminal password")).toBeTruthy();
+
+    fireEvent.change(screen.getByLabelText("Terminal password"), {
+      target: { value: "terminal-secret" },
+    });
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Unlock Terminal" }));
+      await flushMicrotasks();
+    });
+
+    expect(loginMock).not.toHaveBeenCalled();
+
+    await act(async () => {
+      resolveLogout({ authenticated: false });
+      await flushMicrotasks();
+    });
+
+    expect(loginMock).toHaveBeenCalledTimes(1);
+    expect(screen.getByText("CON.F.US.MES.H26")).toBeTruthy();
+  });
+
+  it("guards in-memory CSRF token with monotonic authGeneration across logout/login/clearCsrfToken (P1-R12-003)", async () => {
+    /**
+     * Contract: client.ts sends the existing X-CSRF-Token on POST /api/auth/logout, prevents an
+     * older in-flight logout() finally block from clearing a newer login()'s CSRF token, and
+     * clearCsrfToken() prevents a stale in-flight fetchSession() from restoring CSRF memory.
+     * Defect caught: Overlapping auth calls or stale logout finally clobbering newer CSRF token.
+     */
+    const actualClient = await vi.importActual<typeof import("./api/client")>("./api/client");
+    actualClient.clearCsrfToken();
+
+    let resolveLogoutFetch!: (res: Response) => void;
+    let resolveStaleSessionFetch!: (res: Response) => void;
+    const seenHeaders: Array<{ url: string; csrf: string | null }> = [];
+
+    const fetchStub = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input.toString();
+      const headers = (init?.headers ?? {}) as Record<string, string>;
+      seenHeaders.push({ url, csrf: headers["X-CSRF-Token"] ?? null });
+
+      if (url === "/api/auth/login") {
+        const body = JSON.parse(String(init?.body ?? "{}")) as { password?: string };
+        const token = body.password === "pw-new" ? "csrf-new" : "csrf-old";
+        return Promise.resolve(
+          new Response(JSON.stringify({ authenticated: true, csrf_token: token }), {
+            status: 200,
+            headers: { "Content-Type": "application/json" },
+          }),
+        );
+      }
+      if (url === "/api/auth/logout") {
+        return new Promise<Response>((resolve) => {
+          resolveLogoutFetch = resolve;
+        });
+      }
+      if (url === "/api/auth/session") {
+        return new Promise<Response>((resolve) => {
+          resolveStaleSessionFetch = resolve;
+        });
+      }
+      throw new Error(`Unexpected fetch URL: ${url}`);
+    });
+    vi.stubGlobal("fetch", fetchStub);
+
+    await actualClient.login("pw-old");
+    expect(actualClient.getCsrfToken()).toBe("csrf-old");
+
+    const pendingLogout = actualClient.logout();
+    expect(seenHeaders.find((h) => h.url === "/api/auth/logout")?.csrf).toBe("csrf-old");
+
+    // Newer login completes while older logout is still in flight
+    await actualClient.login("pw-new");
+    expect(actualClient.getCsrfToken()).toBe("csrf-new");
+
+    resolveLogoutFetch(
+      new Response(JSON.stringify({ authenticated: false }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      }),
+    );
+    await pendingLogout;
+    expect(actualClient.getCsrfToken()).toBe("csrf-new");
+
+    // Stale fetchSession cannot restore token after clearCsrfToken()
+    const pendingSession = actualClient.fetchSession();
+    actualClient.clearCsrfToken();
+    expect(actualClient.getCsrfToken()).toBeNull();
+
+    resolveStaleSessionFetch(
+      new Response(JSON.stringify({ authenticated: true, csrf_token: "csrf-stale" }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      }),
+    );
+    await pendingSession;
+    expect(actualClient.getCsrfToken()).toBeNull();
+  });
+
+  it("invalidates session, disconnects WS, and renders login gate on WS close 1008 (P1-R12-004)", async () => {
+    /**
+     * Contract: When wsClient emits onSessionExpired (from WS close 1008 "Session expired"),
+     * App calls invalidateSessionLocally, disconnects WS, clears workspace state, and shows
+     * the login gate.
+     * Defect caught: WS close 1008 leaving authenticated workspace open until a manual action.
+     */
+    fetchSessionMock.mockResolvedValue({
+      authenticated: true,
+      csrf_token: "csrf-token-1234567890",
+    });
+    fetchStatusMock.mockResolvedValue({
+      connected: true,
+      live: false,
+      feed_state: "LIVE",
+    });
+    listLayoutsMock.mockResolvedValue([SAMPLE_LAYOUT]);
+    fetchContractsMock.mockResolvedValue({
+      live: false,
+      contracts: {
+        MES: {
+          selected: { id: "CON.F.US.MES.H26" },
+          error_type: null,
+          error: null,
+        },
+      },
+    });
+    fetchBarsMock.mockResolvedValue({
+      provider: "topstepx",
+      live: false,
+      contract_id: "CON.F.US.MES.H26",
+      root_symbol: "MES",
+      timeframe: "5m",
+      start_time: 1000,
+      end_time: 1000,
+      count: 0,
+      include_partial: true,
+      quality: {
+        is_complete: true,
+        truncated: false,
+        provider_gap: false,
+        quarantined_count: 0,
+      },
+      bars: [],
+    });
+
+    render(<App />);
+    await act(async () => {
+      await flushMicrotasks();
+    });
+
+    expect(screen.getByText("CON.F.US.MES.H26")).toBeTruthy();
+
+    act(() => {
+      for (const listener of sessionExpiredListeners) {
+        listener("Session expired");
+      }
+    });
+
+    expect(screen.getByPlaceholderText("Enter terminal password")).toBeTruthy();
+    expect(screen.queryByText("CON.F.US.MES.H26")).toBeNull();
+    expect(mockWsDisconnect).toHaveBeenCalledTimes(1);
+  });
+
+  it("invalidates session, disconnects WS, and schedules zero retries when ChartPane fetchBars fails with 401 (P1-R12-001)", async () => {
+    /**
+     * Contract: When bootstrap succeeds and ChartPane's fetchBars rejects with ApiError(401),
+     * App invalidates the session via onAuthError, renders the login screen, disconnects WS,
+     * and fires zero fetchBars retries when timers advance.
+     * Defect caught: Pane /api/bars 401 leaving App authenticated and retrying bars indefinitely.
+     */
+    vi.useFakeTimers();
+    fetchSessionMock.mockResolvedValue({
+      authenticated: true,
+      csrf_token: "csrf-token-1234567890",
+    });
+    fetchStatusMock.mockResolvedValue({
+      connected: true,
+      live: false,
+      feed_state: "LIVE",
+    });
+    listLayoutsMock.mockResolvedValue([SAMPLE_LAYOUT]);
+    fetchContractsMock.mockResolvedValue({
+      live: false,
+      contracts: {
+        MES: {
+          selected: { id: "CON.F.US.MES.H26" },
+          error_type: null,
+          error: null,
+        },
+      },
+    });
+    fetchBarsMock.mockRejectedValueOnce(new ApiError(401, "Session expired"));
+
+    render(<App />);
+    await act(async () => {
+      await flushMicrotasks();
+    });
+
+    expect(fetchBarsMock).toHaveBeenCalledTimes(1);
+    expect(screen.getByPlaceholderText("Enter terminal password")).toBeTruthy();
+    expect(mockWsDisconnect).toHaveBeenCalledTimes(1);
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(20000);
+      await flushMicrotasks();
+    });
+    expect(fetchBarsMock).toHaveBeenCalledTimes(1);
   });
 });

@@ -13,7 +13,7 @@ import {
   type Time,
   type UTCTimestamp,
 } from "lightweight-charts";
-import { fetchBars } from "../api/client";
+import { ApiError, fetchBars } from "../api/client";
 import { scheduleRetry } from "../api/retryTimer";
 import {
   ROOT_SYMBOLS,
@@ -43,6 +43,7 @@ export interface ChartPaneProps {
   coordinator: PaneFetchCoordinator;
   onSymbolChange?: (paneId: string, symbol: RootSymbol) => void;
   onTimeframeChange?: (paneId: string, timeframe: Timeframe) => void;
+  onAuthError?: (status: number, message: string) => void;
 }
 
 const SNAPSHOT_RETRY_BACKOFF_MS = [1500, 3000, 6000] as const;
@@ -109,6 +110,7 @@ export function ChartPane({
   coordinator,
   onSymbolChange,
   onTimeframeChange,
+  onAuthError,
 }: ChartPaneProps) {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const legendRef = useRef<HTMLDivElement | null>(null);
@@ -144,6 +146,8 @@ export function ChartPane({
   symbolRef.current = pane.root_symbol;
   const timeframeRef = useRef<Timeframe>(pane.timeframe);
   timeframeRef.current = pane.timeframe;
+  const onAuthErrorRef = useRef(onAuthError);
+  onAuthErrorRef.current = onAuthError;
 
   const applyLiveBarUpdate = useCallback((bar: OhlcvBar) => {
     if (lastBarTimeRef.current !== null && bar.time < lastBarTimeRef.current) {
@@ -378,6 +382,25 @@ export function ChartPane({
           return;
         }
         if (!coordinator.isResponseCurrent(ticket, currentTargetRef.current)) {
+          return;
+        }
+        if (err instanceof ApiError && (err.status === 401 || err.status === 403)) {
+          candleSeriesRef.current?.setData([]);
+          volumeSeriesRef.current?.setData([]);
+          pendingWsBarsRef.current = [];
+          bufferOverflowRef.current = false;
+          hasLoadedTargetKeyRef.current = "";
+          latestBarRef.current = null;
+          lastBarTimeRef.current = null;
+          if (legendRef.current !== null) {
+            legendRef.current.textContent = formatLegendText(pane.root_symbol, pane.timeframe, null);
+          }
+          setBarsQuality(null);
+          retryCancelRef.current?.();
+          retryCancelRef.current = null;
+          snapshotRetryCountRef.current = 0;
+          setLoadStatus("auth error");
+          onAuthErrorRef.current?.(err.status, err.message);
           return;
         }
         const message = err instanceof Error ? err.message : "Failed to load bars";

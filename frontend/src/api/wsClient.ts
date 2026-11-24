@@ -16,6 +16,7 @@ type ResyncRequiredListener = (message: WsResyncRequiredMessage) => void;
 type SubscribedListener = (message: WsSubscribedMessage) => void;
 type ErrorListener = (message: WsErrorMessage) => void;
 type ConnectionStateListener = (state: WsConnectionState) => void;
+type SessionExpiredListener = (reason: string) => void;
 
 interface SubscriptionEntry {
   contractId: string;
@@ -54,6 +55,7 @@ export class MarketWsClient {
   private readonly subscribedListeners = new Set<SubscribedListener>();
   private readonly errorListeners = new Set<ErrorListener>();
   private readonly connectionListeners = new Set<ConnectionStateListener>();
+  private readonly sessionExpiredListeners = new Set<SessionExpiredListener>();
   private readonly urlFactory: () => string;
 
   constructor(urlFactory: () => string = buildMarketWsUrl) {
@@ -177,6 +179,13 @@ export class MarketWsClient {
     };
   }
 
+  onSessionExpired(listener: SessionExpiredListener): () => void {
+    this.sessionExpiredListeners.add(listener);
+    return () => {
+      this.sessionExpiredListeners.delete(listener);
+    };
+  }
+
   private setConnectionState(next: WsConnectionState): void {
     if (this.connectionState === next) {
       return;
@@ -278,7 +287,16 @@ export class MarketWsClient {
         }
       }
 
-      if (!this.shouldRun || event.code === WS_CLOSE_POLICY_VIOLATION) {
+      if (event.code === WS_CLOSE_POLICY_VIOLATION) {
+        this.shouldRun = false;
+        const reason = event.reason || "Session expired";
+        for (const listener of this.sessionExpiredListeners) {
+          listener(reason);
+        }
+        return;
+      }
+
+      if (!this.shouldRun) {
         this.shouldRun = false;
         return;
       }
