@@ -790,21 +790,38 @@ def _extract_agy_structured_output(stdout_lines: list[str]) -> dict[str, Any] | 
     return None
 
 
-def _archive_pass_logs(out_dir: Path, pass_name: str, tag: str) -> None:
-    """Move pass artifacts aside under `<pass_name>.<tag>.<suffix>` before retry/fallback."""
-    for suffix in (".json", ".raw.jsonl", ".stderr.log"):
+def _sanitize_archive_token(value: str) -> str:
+    """Sanitize backend or model identifiers for safe pass-archive filenames."""
+    cleaned = re.sub(r"[^A-Za-z0-9._-]+", "_", value).strip("._-")
+    return cleaned or "default"
+
+
+def _archive_pass_logs(out_dir: Path, pass_name: str, tag: str) -> str:
+    """Move pass artifacts aside under `<pass_name>.<tag>.<suffix>` without overwriting."""
+    suffixes = (".json", ".raw.jsonl", ".stderr.log")
+    existing_srcs = [s for s in suffixes if (out_dir / f"{pass_name}{s}").is_file()]
+    if not existing_srcs:
+        return tag
+    actual_tag = tag
+    seq = 1
+    while any((out_dir / f"{pass_name}.{actual_tag}{s}").exists() for s in existing_srcs):
+        actual_tag = f"{tag}-seq{seq}"
+        seq += 1
+    for suffix in existing_srcs:
         src = out_dir / f"{pass_name}{suffix}"
-        if src.is_file():
-            dst = out_dir / f"{pass_name}.{tag}{suffix}"
-            src.replace(dst)
+        dst = out_dir / f"{pass_name}.{actual_tag}{suffix}"
+        src.replace(dst)
+    return actual_tag
 
 
 def _archive_failed_codex_logs(
     out_dir: Path, pass_names: tuple[str, ...] = ("pass1", "pass2")
-) -> None:
+) -> list[str]:
     """Preserve failed Codex pass logs before running fallback backend."""
+    tags: list[str] = []
     for pass_name in pass_names:
-        _archive_pass_logs(out_dir, pass_name, "codex-failed")
+        tags.append(_archive_pass_logs(out_dir, pass_name, "codex-failed"))
+    return tags
 
 
 def _git_output(repo_root: Path, args: list[str], *, timeout_sec: float = 60.0) -> subprocess.CompletedProcess[str]:
@@ -1671,18 +1688,36 @@ def _preflight_g4_caps(
     now_iso = datetime.now(timezone.utc).isoformat()
 
     def _check_and_reserve_locked() -> tuple[int | None, Path | None, str | None]:
-        fs_rounds, fs_sha = task_runner.count_review_attempts(
-            attempt_roots, candidate_sha=candidate_sha
-        )
         tracker = task_runner.load_g4_tracker(tracker_path, task_id=args.task_id)
-        t_completed = int(tracker.get("completed_rounds", 0))
-        t_in_flight = len(tracker.get("in_flight", {}))
+        union = task_runner.collect_g4_attempt_union(
+            attempt_roots, tracker, candidate_sha=candidate_sha
+        )
+        effective_rounds = int(union["total_rounds"])
         t_sha = int(tracker.get("sha_invocations", {}).get(candidate_sha, 0))
+        effective_sha = max(int(union["sha_count"]), t_sha)
+        prior_sha_statuses = {st for st in union["sha_statuses"].values() if st}
+        non_infra_statuses = {st for st in prior_sha_statuses if st != "BLOCKED_INFRA"}
+        norm_out = task_runner._norm_attempt_dir(out_dir)
 
-        effective_rounds = max(t_completed + t_in_flight, fs_rounds)
-        effective_sha = max(t_sha, fs_sha)
+        resume_bad_status: str | None = None
+        if args.resume_from is not None:
+            resume_rev = task_runner._read_optional_json_dict(
+                Path(args.resume_from).resolve() / "consolidated-review.json"
+            )
+            if resume_rev is not None:
+                rev_sha = resume_rev.get("revision_sha")
+                rev_status = str(resume_rev.get("review_gate_status") or "")
+                if rev_sha in {None, candidate_sha} and rev_status != "BLOCKED_INFRA":
+                    resume_bad_status = rev_status or "UNKNOWN"
 
         if ledger_path is None:
+            if tracker.get("in_flight") or "IN_PROGRESS" in prior_sha_statuses:
+                print(
+                    "[codex_room_review] BLOCKED: Active G4 review already in flight "
+                    f"for task {args.task_id!r}.",
+                    file=sys.stderr,
+                )
+                return 2, None, None
             if effective_rounds >= max_g4_root:
                 print(
                     f"[codex_room_review] PAUSED_BUDGET: G4 round cap reached "
@@ -1697,9 +1732,18 @@ def _preflight_g4_caps(
                     file=sys.stderr,
                 )
                 return 2, None, None
+            if args.resume_from is not None and (
+                (effective_sha >= 1 and non_infra_statuses) or resume_bad_status is not None
+            ):
+                print(
+                    f"[codex_room_review] BLOCKED: Cannot resume G4 for candidate_sha "
+                    f"{candidate_sha[:12]}; only BLOCKED_INFRA attempts may resume.",
+                    file=sys.stderr,
+                )
+                return 2, None, None
             tracker["in_flight"][reservation_id] = {
                 "candidate_sha": candidate_sha,
-                "out_dir": str(out_dir),
+                "out_dir": norm_out,
                 "pid": os.getpid(),
                 "reserved_at_utc": now_iso,
             }
@@ -1718,11 +1762,22 @@ def _preflight_g4_caps(
         )
         l_max_sha = int(cb.get("max_g4_invocations_per_candidate_sha", max_g4_sha))
 
-        ledger_in_flight = len(ledger.get("active_g4_reservations", {}))
-        g4_total = int(ledger.get("g4_rounds_total", 0))
-        if g4_total >= l_max_root or g4_total + ledger_in_flight >= l_max_root or (
-            effective_rounds >= l_max_root
+        ledger_active = ledger.get("active_g4_reservations", {})
+        if (
+            tracker.get("in_flight")
+            or ledger_active
+            or "IN_PROGRESS" in prior_sha_statuses
         ):
+            print(
+                "[codex_room_review] BLOCKED: Active G4 review already in flight "
+                f"for task {args.task_id!r}.",
+                file=sys.stderr,
+            )
+            return 2, None, None
+
+        ledger_in_flight = len(ledger_active)
+        g4_total = int(ledger.get("g4_rounds_total", 0))
+        if g4_total >= l_max_root or effective_rounds >= l_max_root:
             if ledger_in_flight == 0 and ledger["state"] != "VERIFIED":
                 ledger["state"] = "PAUSED_BUDGET"
                 task_runner._append_event(
@@ -1737,14 +1792,13 @@ def _preflight_g4_caps(
                 task_runner.save_ledger(ledger_path, ledger)
             print(
                 f"[codex_room_review] PAUSED_BUDGET: G4 round cap reached "
-                f"(ledger={g4_total}, in_flight={ledger_in_flight}, "
-                f"effective={effective_rounds}, cap={l_max_root}).",
+                f"(ledger={g4_total}, effective={effective_rounds}, cap={l_max_root}).",
                 file=sys.stderr,
             )
             return 2, None, None
 
         g4_pkt = int(ledger.get("g4_rounds_in_packet", 0))
-        if g4_pkt >= l_max_pkt or g4_pkt + ledger_in_flight >= l_max_pkt:
+        if g4_pkt >= l_max_pkt:
             if ledger_in_flight == 0 and ledger["state"] not in {"PAUSED_BUDGET", "VERIFIED"}:
                 ledger["state"] = "NEEDS_REPLAN"
                 task_runner._append_event(
@@ -1755,18 +1809,22 @@ def _preflight_g4_caps(
                 task_runner.save_ledger(ledger_path, ledger)
             print(
                 f"[codex_room_review] NEEDS_REPLAN: G4 packet cap reached "
-                f"(packet_rounds={g4_pkt}, in_flight={ledger_in_flight}, cap={l_max_pkt}).",
+                f"(packet_rounds={g4_pkt}, cap={l_max_pkt}).",
                 file=sys.stderr,
             )
             return 2, None, None
 
         inv_map = ledger.setdefault("g4_invocations_by_sha", {})
         sha_count = max(int(inv_map.get(candidate_sha, 0)), effective_sha)
+        last_status = ledger.get("last_g4_status")
         allow_resume = (
             ledger["state"] == "BLOCKED_INFRA"
+            and last_status in {None, "BLOCKED_INFRA"}
             and args.resume_from is not None
             and ledger.get("last_g4_candidate_sha") == candidate_sha
             and sha_count < l_max_sha
+            and not non_infra_statuses
+            and resume_bad_status is None
         )
         if ledger["state"] in halted_states and not allow_resume:
             print(
@@ -1792,6 +1850,14 @@ def _preflight_g4_caps(
             )
             return 2, None, None
 
+        if args.resume_from is not None and sha_count >= 1 and not allow_resume:
+            print(
+                f"[codex_room_review] BLOCKED: Cannot resume G4 for candidate_sha "
+                f"{candidate_sha[:12]}; only BLOCKED_INFRA attempts may resume.",
+                file=sys.stderr,
+            )
+            return 2, None, None
+
         spent = float(ledger.get("spent_api_equiv_usd", 0.0))
         limit = float(ledger.get("budget_limit_usd", 0.0))
         if limit > 0 and round(spent, 8) > round(limit, 8):
@@ -1811,7 +1877,7 @@ def _preflight_g4_caps(
 
         tracker["in_flight"][reservation_id] = {
             "candidate_sha": candidate_sha,
-            "out_dir": str(out_dir),
+            "out_dir": norm_out,
             "pid": os.getpid(),
             "reserved_at_utc": now_iso,
         }
@@ -1821,7 +1887,7 @@ def _preflight_g4_caps(
         active_g4 = ledger.setdefault("active_g4_reservations", {})
         active_g4[reservation_id] = {
             "candidate_sha": candidate_sha,
-            "out_dir": str(out_dir),
+            "out_dir": norm_out,
             "reserved_at_utc": now_iso,
         }
         inv_map[candidate_sha] = sha_count + 1
@@ -1918,9 +1984,20 @@ def _extract_agy_cumulative_usage(
     return conv_id, model_name, max_in, max_cache, max_out
 
 
+def _extract_raw_log_tag(raw_path: Path, pass_name: str) -> str:
+    """Extract archive tag from `<pass_name>[.<tag>].raw.jsonl` without dot splitting."""
+    prefix = f"{pass_name}."
+    suffix = ".raw.jsonl"
+    name = raw_path.name
+    if name.startswith(prefix) and name.endswith(suffix) and len(name) > len(prefix) + len(suffix):
+        return name[len(prefix) : -len(suffix)]
+    return ""
+
+
 def _resolve_raw_log_model(
     raw_path: Path,
     *,
+    pass_name: str,
     is_codex: bool,
     pass_state: PassState,
     active_backend: str,
@@ -1928,16 +2005,15 @@ def _resolve_raw_log_model(
     primary_model: str | None,
     route_models_by_tag: dict[str, str],
 ) -> str | None:
-    parts = raw_path.name.split(".")
-    tag = parts[1] if len(parts) >= 4 else ""
+    tag = _extract_raw_log_tag(raw_path, pass_name)
+    if tag and tag in route_models_by_tag:
+        return route_models_by_tag[tag]
     if is_codex:
         if pass_state.backend == "codex" and pass_state.model:
             return pass_state.model
         if active_backend == "codex" and active_model:
             return active_model
         return primary_model or EXPECTED_REVIEW_MODEL
-    if tag in route_models_by_tag:
-        return route_models_by_tag[tag]
     if pass_state.backend == "agy" and pass_state.model:
         return pass_state.model
     return active_model if active_backend == "agy" else None
@@ -1963,6 +2039,7 @@ def _bill_pass_raw_logs(
             if codex_deltas:
                 c_model = _resolve_raw_log_model(
                     raw_path,
+                    pass_name=pass_name,
                     is_codex=True,
                     pass_state=p_state,
                     active_backend=active_backend,
@@ -1993,6 +2070,7 @@ def _bill_pass_raw_logs(
                 continue
             a_model = ev_model or _resolve_raw_log_model(
                 raw_path,
+                pass_name=pass_name,
                 is_codex=False,
                 pass_state=p_state,
                 active_backend=active_backend,
@@ -2023,6 +2101,7 @@ def _record_g4_outcome(
     ledger_path: Path | None,
     reservation_id: str | None,
     *,
+    task_id: str,
     git_top: Path,
     out_dir: Path,
     candidate_sha: str,
@@ -2037,18 +2116,35 @@ def _record_g4_outcome(
     """Release G4 in-flight reservation, record spend, and transition tracker + ledger."""
     gate_status = str(report.get("review_gate_status", "BLOCKED"))
     count_round = gate_status in {"PASSED", "CHANGES_REQUESTED", "BLOCKED"}
+    attempt_roots = [git_top / "harness" / "runs" / task_id / "attempts"]
+    if out_dir.parent.name == "attempts":
+        attempt_roots.append(out_dir.parent)
 
     def _update_locked() -> str | None:
+        prior_sha_statuses: set[str] = set()
         if tracker_path is not None:
             tracker = task_runner.load_g4_tracker(tracker_path)
+            prior_union = task_runner.collect_g4_attempt_union(
+                attempt_roots, tracker, candidate_sha=candidate_sha
+            )
+            prior_sha_statuses = {
+                st for st in prior_union["sha_statuses"].values() if st and st != "IN_PROGRESS"
+            }
+            norm_out = task_runner._norm_attempt_dir(out_dir)
+            completed_at = datetime.now(timezone.utc).isoformat()
             if reservation_id:
                 tracker["in_flight"].pop(reservation_id, None)
                 tracker["attempts"][reservation_id] = {
                     "candidate_sha": candidate_sha,
                     "status": gate_status,
-                    "out_dir": str(out_dir),
-                    "completed_at_utc": datetime.now(timezone.utc).isoformat(),
+                    "out_dir": norm_out,
+                    "completed_at_utc": completed_at,
                 }
+            tracker.setdefault("completed_attempts", {})[norm_out] = {
+                "candidate_sha": candidate_sha,
+                "status": gate_status,
+                "completed_at_utc": completed_at,
+            }
             if count_round:
                 tracker["completed_rounds"] = int(tracker.get("completed_rounds", 0)) + 1
             task_runner.save_g4_tracker(tracker_path, tracker)
@@ -2067,6 +2163,10 @@ def _record_g4_outcome(
             route_models_by_tag=route_models_by_tag,
         )
         ledger = task_runner.load_ledger(ledger_path, repo_root=git_top)
+        prior_changes_requested = "CHANGES_REQUESTED" in prior_sha_statuses or (
+            ledger.get("last_g4_candidate_sha") == candidate_sha
+            and ledger.get("last_g4_status") == "CHANGES_REQUESTED"
+        )
         if reservation_id:
             ledger.setdefault("active_g4_reservations", {}).pop(reservation_id, None)
         if gate_status in {"PASSED", "CHANGES_REQUESTED"}:
@@ -2086,9 +2186,19 @@ def _record_g4_outcome(
                 {"candidate_sha": candidate_sha, "spent_usd": spent, "limit_usd": limit},
             )
         elif gate_status == "PASSED":
-            ledger["candidate_sha"] = candidate_sha
-            ledger["state"] = "READY_FOR_ACCEPTANCE"
-            task_runner._append_event(ledger, "G4_PASSED", {"candidate_sha": candidate_sha})
+            if prior_changes_requested:
+                ledger["candidate_sha"] = None
+                ledger["state"] = "BLOCKED"
+                ledger["last_g4_status"] = "BLOCKED"
+                task_runner._append_event(
+                    ledger,
+                    "G4_BLOCKED_PRIOR_CHANGES_REQUESTED",
+                    {"candidate_sha": candidate_sha},
+                )
+            else:
+                ledger["candidate_sha"] = candidate_sha
+                ledger["state"] = "READY_FOR_ACCEPTANCE"
+                task_runner._append_event(ledger, "G4_PASSED", {"candidate_sha": candidate_sha})
         elif gate_status == "CHANGES_REQUESTED":
             ledger["candidate_sha"] = None
             ledger["consecutive_failed_candidates"] = (
@@ -2584,6 +2694,7 @@ def _execute_after_preflight(
             active_tracker_path,
             active_ledger_path,
             active_reservation_id,
+            task_id=args.task_id,
             git_top=git_top,
             out_dir=out_dir,
             candidate_sha=candidate_sha,
@@ -2793,8 +2904,11 @@ def _execute_after_preflight(
             )
             if max_sleep > 0:
                 time.sleep(max_sleep)
+            safe_model = _sanitize_archive_token(model_name or "default")
             for p in retry_targets:
-                _archive_pass_logs(out_dir, p, f"retry{retries_used[p]}")
+                retry_tag = f"{backend_name}-{safe_model}-retry{retries_used[p]}"
+                actual_tag = _archive_pass_logs(out_dir, p, retry_tag)
+                route_models_by_tag[actual_tag] = model_name
                 retries_used[p] += 1
 
             retry_batch, ro_err = _invoke_passes(
@@ -2895,7 +3009,8 @@ def _execute_after_preflight(
                 stage_extra_errors.extend(st_errs)
                 return _finalize_and_exit()
             fallback_reason = "; ".join(st_errs)
-            _archive_failed_codex_logs(out_dir, tuple(failed_passes))
+            for tag in _archive_failed_codex_logs(out_dir, tuple(failed_passes)):
+                route_models_by_tag[tag] = primary_model or EXPECTED_REVIEW_MODEL
         else:
             forced_gate_status = outcome
             stage_extra_errors.extend(st_errs)
@@ -2956,7 +3071,8 @@ def _execute_after_preflight(
             if outcome == "QUOTA_EXHAUSTED":
                 _mark_pool_exhausted(route_model)
                 for fp in failed_passes:
-                    _archive_pass_logs(out_dir, fp, f"agy-failed-{route_idx}")
+                    actual_tag = _archive_pass_logs(out_dir, fp, f"agy-failed-{route_idx}")
+                    route_models_by_tag[actual_tag] = route_model
                 stage_extra_errors.extend(st_errs)
                 continue
             forced_gate_status = outcome

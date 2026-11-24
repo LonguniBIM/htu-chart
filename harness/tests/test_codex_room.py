@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+import subprocess
 import sys
 import tomllib
 from pathlib import Path
@@ -1740,7 +1742,7 @@ def test_transient_rate_or_transport_retries_only_failed_pass_once_then_blocks_i
     assert rc_ok == 0
     assert len(p1_calls.read_text(encoding="utf-8").splitlines()) == 1
     assert len(p2_calls.read_text(encoding="utf-8").splitlines()) == 2
-    assert (out_ok / "pass2.retry0.raw.jsonl").is_file()
+    assert (out_ok / "pass2.codex-gpt-6.1-sol-retry0.raw.jsonl").is_file()
 
     # Persistent 503 after 1 retry -> BLOCKED_INFRA (rc == 2), no agy fallback.
     agy_called = tmp_path / "agy_no_transient_fb.flag"
@@ -1863,7 +1865,7 @@ def test_agy_typed_classifier_handles_auth_quota_and_zero_token_startup_race(
         ]
     )
     assert rc == 0
-    assert (out_dir / "pass1.retry0.raw.jsonl").is_file()
+    assert (out_dir / f"pass1.agy-{DEFAULT_AGY_FALLBACK_MODEL}-retry0.raw.jsonl").is_file()
 
 
 def test_resume_from_reuses_matching_provenance_and_rejects_stale_provenance(
@@ -2874,6 +2876,457 @@ def test_g4_custom_out_dir_bypass_and_concurrent_race_at_cap_boundary(
     )
     assert rc7 == 2
     assert not (out_c / "frozen").exists()
+
+
+def test_g4_union_counts_legacy_attempts_and_custom_out_dir(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Preflight counts exact union of legacy attempts/ dirs and custom --out-dir runs."""
+    repo_dir, sha1 = _init_policy_repo(tmp_path / "repo_union_g4", qualified_routes=[])
+    attempts_root = repo_dir / "harness" / "runs" / "T-UNION-G4" / "attempts"
+    for idx in range(5):
+        p_sha = f"{idx + 1}" * 40
+        p_dir = attempts_root / f"20261124T00000{idx}Z-{p_sha[:12]}"
+        p_dir.mkdir(parents=True, exist_ok=True)
+        (p_dir / "consolidated-review.json").write_text(
+            json.dumps(
+                {
+                    "revision_sha": p_sha,
+                    "passes_completed": 2,
+                    "independent_contexts": True,
+                    "review_gate_status": "CHANGES_REQUESTED",
+                    "blocking_open_count": 1,
+                    "consolidated_findings": [],
+                }
+            ),
+            encoding="utf-8",
+        )
+
+    calls1 = _install_counting_codex_stub(tmp_path, monkeypatch, sha1)
+    custom_out_6 = tmp_path / "custom_union_6"
+    rc6 = codex_room_review.main(
+        [
+            "--commit",
+            sha1,
+            "--task-id",
+            "T-UNION-G4",
+            "--out-dir",
+            str(custom_out_6),
+            "--repo-root",
+            str(repo_dir),
+            "--backend",
+            "codex",
+        ]
+    )
+    assert rc6 == 0
+    assert _count_calls(calls1) == 2
+
+    (repo_dir / "u7.txt").write_text("u7\n", encoding="utf-8")
+    sha2 = _commit_repo_change(repo_dir, "union commit 7")
+    calls2 = _install_counting_codex_stub(tmp_path, monkeypatch, sha2)
+    custom_out_7 = tmp_path / "custom_union_7"
+    rc7 = codex_room_review.main(
+        [
+            "--commit",
+            sha2,
+            "--task-id",
+            "T-UNION-G4",
+            "--out-dir",
+            str(custom_out_7),
+            "--repo-root",
+            str(repo_dir),
+            "--backend",
+            "codex",
+        ]
+    )
+    assert rc7 == 2
+    assert _count_calls(calls2) == 0
+    assert not (custom_out_7 / "frozen").exists()
+
+
+def test_g4_blocks_inflight_resume_and_non_infra_resume(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Reject --resume-from when active in-flight exists or prior verdict != BLOCKED_INFRA."""
+    from harness.scripts import task_runner
+
+    repo_dir, sha1 = _init_policy_repo(tmp_path / "repo_res_guard", qualified_routes=[])
+    finding = _sample_finding("P1-99", "high", "Blocking finding")
+    calls_dir = _install_counting_codex_stub(
+        tmp_path,
+        monkeypatch,
+        sha1,
+        pass1_verdict="CHANGES_REQUESTED",
+        pass1_findings=[finding],
+    )
+    ledger_path = _setup_ledger_for_g4_test(
+        repo_dir, "T-RES-GUARD", state="REVIEW_FROZEN_G4", candidate_sha=sha1
+    )
+    out1 = repo_dir / "harness" / "runs" / "T-RES-GUARD" / "attempts" / f"att1-{sha1[:12]}"
+    rc1 = codex_room_review.main(
+        [
+            "--commit",
+            sha1,
+            "--task-id",
+            "T-RES-GUARD",
+            "--out-dir",
+            str(out1),
+            "--repo-root",
+            str(repo_dir),
+            "--backend",
+            "codex",
+            "--fail-on-blocking",
+        ]
+    )
+    assert rc1 == 1
+    assert _count_calls(calls_dir) == 2
+
+    # Sequential --resume-from after CHANGES_REQUESTED must fail closed even if state tampered.
+    led_tamper = task_runner.load_ledger(ledger_path)
+    led_tamper["state"] = "BLOCKED_INFRA"
+    task_runner.save_ledger(ledger_path, led_tamper)
+    out2 = tmp_path / "res_after_cr"
+    rc_after_cr = codex_room_review.main(
+        [
+            "--commit",
+            sha1,
+            "--task-id",
+            "T-RES-GUARD",
+            "--resume-from",
+            str(out1),
+            "--out-dir",
+            str(out2),
+            "--repo-root",
+            str(repo_dir),
+            "--backend",
+            "codex",
+        ]
+    )
+    assert rc_after_cr == 2
+    assert _count_calls(calls_dir) == 2
+
+    # Concurrent in-flight reservation must block --resume-from on BLOCKED_INFRA ledger.
+    (repo_dir / "res2.txt").write_text("r2\n", encoding="utf-8")
+    sha2 = _commit_repo_change(repo_dir, "inflight resume commit")
+    calls2 = _install_counting_codex_stub(tmp_path, monkeypatch, sha2)
+    prior_inf = (
+        repo_dir / "harness" / "runs" / "T-RES-INFLIGHT" / "attempts" / f"att1-{sha2[:12]}"
+    )
+    prior_inf.mkdir(parents=True, exist_ok=True)
+    (prior_inf / "consolidated-review.json").write_text(
+        json.dumps(
+            {
+                "revision_sha": sha2,
+                "review_gate_status": "BLOCKED_INFRA",
+                "consolidated_findings": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    led_inf = _setup_ledger_for_g4_test(
+        repo_dir,
+        "T-RES-INFLIGHT",
+        state="BLOCKED_INFRA",
+        candidate_sha=sha2,
+        last_g4_candidate_sha=sha2,
+        g4_invocations_by_sha={sha2: 1},
+    )
+    t_inf_path = task_runner.default_g4_tracker_path("T-RES-INFLIGHT", repo_root=repo_dir)
+    t_inf = task_runner.load_g4_tracker(t_inf_path, task_id="T-RES-INFLIGHT")
+    t_inf["in_flight"]["active-1"] = {
+        "candidate_sha": sha2,
+        "out_dir": task_runner._norm_attempt_dir(prior_inf),
+    }
+    task_runner.save_g4_tracker(t_inf_path, t_inf)
+    ld_inf = task_runner.load_ledger(led_inf)
+    ld_inf["active_g4_reservations"] = {"active-1": {"candidate_sha": sha2}}
+    ld_inf["last_g4_status"] = "BLOCKED_INFRA"
+    task_runner.save_ledger(led_inf, ld_inf)
+
+    rc_inf = codex_room_review.main(
+        [
+            "--commit",
+            sha2,
+            "--task-id",
+            "T-RES-INFLIGHT",
+            "--resume-from",
+            str(prior_inf),
+            "--out-dir",
+            str(tmp_path / "res_inflight_out"),
+            "--repo-root",
+            str(repo_dir),
+            "--backend",
+            "codex",
+        ]
+    )
+    assert rc_inf == 2
+    assert _count_calls(calls2) == 0
+
+    # Finalization guard: prior CHANGES_REQUESTED on sha1 must never become READY_FOR_ACCEPTANCE.
+    led_final = task_runner.load_ledger(ledger_path)
+    led_final["state"] = "REVIEW_FROZEN_G4"
+    led_final["candidate_sha"] = sha1
+    task_runner.save_ledger(ledger_path, led_final)
+    t_guard_path = task_runner.default_g4_tracker_path("T-RES-GUARD", repo_root=repo_dir)
+    p1_state = codex_room_review.PassState(
+        pass_name="pass1", lens="correctness_and_tests", backend="codex", model="gpt-6.1-sol"
+    )
+    p2_state = codex_room_review.PassState(
+        pass_name="pass2",
+        lens="security_and_invariants",
+        backend="codex",
+        model="gpt-6.1-sol",
+    )
+    final_state = codex_room_review._record_g4_outcome(
+        t_guard_path,
+        ledger_path,
+        None,
+        task_id="T-RES-GUARD",
+        git_top=repo_dir,
+        out_dir=tmp_path / "res_finalize_probe",
+        candidate_sha=sha1,
+        report={"review_gate_status": "PASSED", "errors": []},
+        states={"pass1": p1_state, "pass2": p2_state},
+        reused_passes=["pass1", "pass2"],
+        active_backend="codex",
+        active_model="gpt-6.1-sol",
+        primary_model="gpt-6.1-sol",
+        route_models_by_tag={},
+    )
+    assert final_state == "BLOCKED"
+    led_checked = json.loads(ledger_path.read_text(encoding="utf-8"))
+    assert led_checked["state"] == "BLOCKED"
+    assert led_checked["candidate_sha"] is None
+
+
+def test_g4_codex_and_agy_retries_preserve_all_archives_and_bill_accurately(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Codex retry + quota -> AGY fallback retry preserves all archives and bills both."""
+    repo_dir, sha1 = _init_policy_repo(
+        tmp_path / "repo_dual_retry", qualified_routes=["gemini-4-carbon-high"]
+    )
+    codex_calls = tmp_path / "dual_codex_count.txt"
+    codex_script = tmp_path / "fake_codex_dual_retry.py"
+    codex_prefix = _write_fake_codex_script(
+        codex_script,
+        (
+            "import json, pathlib, sys\n"
+            "args = sys.argv[1:]\n"
+            "out_path = pathlib.Path(args[args.index('-o') + 1])\n"
+            "_ = sys.stdin.read()\n"
+            "if out_path.name == 'pass1.json':\n"
+            f"    payload = {{'revision_sha': {sha1!r}, 'lens': 'correctness_and_tests', "
+            "'verdict': 'APPROVE', 'summary': 'ok', 'findings': [], "
+            "'test_quality_issues': [], 'unverified_areas': []}\n"
+            "    out_path.write_text(json.dumps(payload), encoding='utf-8')\n"
+            "    print(json.dumps({'type': 'turn.completed', 'usage': "
+            "{'input_tokens': 10000, 'cached_input_tokens': 0, 'output_tokens': 1000}}), "
+            "flush=True)\n"
+            "    sys.exit(0)\n"
+            f"cf = pathlib.Path({str(codex_calls)!r})\n"
+            "n = len(cf.read_text(encoding='utf-8').splitlines()) if cf.is_file() else 0\n"
+            "cf.write_text('x\\n' * (n + 1), encoding='utf-8')\n"
+            "print(json.dumps({'type': 'turn.completed', 'usage': "
+            "{'input_tokens': 10000, 'cached_input_tokens': 0, 'output_tokens': 1000}}), "
+            "flush=True)\n"
+            "if n == 0:\n"
+            "    sys.stderr.write('503 service unavailable\\n')\n"
+            "    sys.exit(1)\n"
+            "print(json.dumps({'type': 'error', 'message': 'usage_limit_reached'}), flush=True)\n"
+            "sys.exit(1)\n"
+        ),
+    )
+    agy_calls = tmp_path / "dual_agy_count.txt"
+    agy_script = tmp_path / "fake_agy_dual_retry.py"
+    agy_prefix = _write_fake_codex_script(
+        agy_script,
+        (
+            "import json, pathlib, sys\n"
+            f"af = pathlib.Path({str(agy_calls)!r})\n"
+            "n = len(af.read_text(encoding='utf-8').splitlines()) if af.is_file() else 0\n"
+            "af.write_text('x\\n' * (n + 1), encoding='utf-8')\n"
+            "if n == 0:\n"
+            "    print(json.dumps({'event': 'result', 'conversation_id': 'conv-dual-p2', "
+            "'result': {'status': 'ERROR', 'conversation_id': 'conv-dual-p2', "
+            "'error': '503 service unavailable', "
+            "'usage': {'input_tokens': 100000, 'cache_read_tokens': 0, "
+            "'output_tokens': 10000, 'thinking_tokens': 2000}}}), flush=True)\n"
+            "    sys.exit(1)\n"
+            f"payload = {{'revision_sha': {sha1!r}, 'lens': 'security_and_invariants', "
+            "'verdict': 'APPROVE', 'summary': 'ok', 'findings': [], "
+            "'test_quality_issues': [], 'unverified_areas': []}\n"
+            "print(json.dumps({'event': 'result', 'conversation_id': 'conv-dual-p2', "
+            "'result': {'status': 'SUCCESS', 'conversation_id': 'conv-dual-p2', "
+            "'structured_output': payload, "
+            "'usage': {'input_tokens': 150000, 'cache_read_tokens': 0, "
+            "'output_tokens': 10000, 'thinking_tokens': 2000}}}), flush=True)\n"
+        ),
+    )
+    monkeypatch.setattr(
+        codex_room_review, "verify_role", lambda role, root: {"ok": True, "errors": []}
+    )
+    monkeypatch.setattr(codex_room_review, "resolve_codex_command", lambda: codex_prefix)
+    monkeypatch.setattr(codex_room_review, "resolve_agy_command", lambda: agy_prefix)
+
+    ledger_path = _setup_ledger_for_g4_test(
+        repo_dir, "T-DUAL-RETRY", state="REVIEW_FROZEN_G4", candidate_sha=sha1
+    )
+    out_dir = repo_dir / "harness" / "runs" / "T-DUAL-RETRY" / "attempts" / f"att1-{sha1[:12]}"
+    rc = codex_room_review.main(
+        [
+            "--commit",
+            sha1,
+            "--task-id",
+            "T-DUAL-RETRY",
+            "--out-dir",
+            str(out_dir),
+            "--repo-root",
+            str(repo_dir),
+            "--backend",
+            "auto",
+        ]
+    )
+    assert rc == 0
+    assert (out_dir / "pass2.codex-gpt-6.1-sol-retry0.raw.jsonl").is_file()
+    assert (out_dir / "pass2.codex-failed.raw.jsonl").is_file()
+    assert (out_dir / "pass2.agy-gemini-4-carbon-high-retry0.raw.jsonl").is_file()
+    assert (out_dir / "pass2.raw.jsonl").is_file()
+
+    # Wait: pass1 ($0.037) + codex p2 retry0 ($0.037) + codex p2 failed ($0.037) +
+    # agy high-water 150k/10k ($0.525) = $0.636.
+    led_after = json.loads(ledger_path.read_text(encoding="utf-8"))
+    assert led_after["spent_api_equiv_usd"] == pytest.approx(0.636, abs=1e-6)
+    assert led_after["state"] == "READY_FOR_ACCEPTANCE"
+
+
+def test_g4_cross_process_os_lock_race_for_sixth_slot(tmp_path: Path) -> None:
+    """Two real OS child processes racing for the 6th G4 slot serialize with rc {0, 2}."""
+    repo_dir, _ = _init_policy_repo(tmp_path / "repo_proc_race", qualified_routes=[])
+    (repo_dir / "pr5.txt").write_text("p5\n", encoding="utf-8")
+    sha_a = _commit_repo_change(repo_dir, "proc race sha a")
+    (repo_dir / "pr6.txt").write_text("p6\n", encoding="utf-8")
+    sha_b = _commit_repo_change(repo_dir, "proc race sha b")
+
+    attempts_root = repo_dir / "harness" / "runs" / "T-PROC-RACE" / "attempts"
+    for idx in range(5):
+        p_sha = f"{idx + 1}" * 40
+        p_dir = attempts_root / f"20261124T00000{idx}Z-{p_sha[:12]}"
+        p_dir.mkdir(parents=True, exist_ok=True)
+        (p_dir / "consolidated-review.json").write_text(
+            json.dumps(
+                {
+                    "revision_sha": p_sha,
+                    "passes_completed": 2,
+                    "independent_contexts": True,
+                    "review_gate_status": "CHANGES_REQUESTED",
+                    "blocking_open_count": 1,
+                    "consolidated_findings": [],
+                }
+            ),
+            encoding="utf-8",
+        )
+
+    fake_codex = tmp_path / "proc_fake_codex.py"
+    _write_fake_codex_script(
+        fake_codex,
+        (
+            "import json, pathlib, sys, time\n"
+            "args = sys.argv[1:]\n"
+            "out_path = pathlib.Path(args[args.index('-o') + 1])\n"
+            "prompt = sys.stdin.read()\n"
+            "time.sleep(0.25)\n"
+            "is_p2 = 'security_and_invariants' in prompt\n"
+            "lens = 'security_and_invariants' if is_p2 else 'correctness_and_tests'\n"
+            "sha_val = None\n"
+            "for ln in prompt.splitlines():\n"
+            "    if ln.strip().startswith('- **Candidate SHA**:'):\n"
+            "        sha_val = ln.split('`')[1]\n"
+            "        break\n"
+            "payload = {'revision_sha': sha_val, 'lens': lens, 'verdict': 'APPROVE', "
+            "'summary': 'ok', 'findings': [], 'test_quality_issues': [], 'unverified_areas': []}\n"
+            "out_path.write_text(json.dumps(payload), encoding='utf-8')\n"
+        ),
+    )
+
+    go_flag = tmp_path / "proc_go.flag"
+    driver = tmp_path / "proc_driver.py"
+    driver.write_text(
+        (
+            "import pathlib, sys, time\n"
+            "from harness.scripts import codex_room_review\n"
+            "repo_root, sha, out_dir, ready_f, go_f, codex_sc = sys.argv[1:7]\n"
+            "codex_room_review.verify_role = lambda role, root: {'ok': True, 'errors': []}\n"
+            "codex_room_review.resolve_codex_command = lambda: [sys.executable, codex_sc]\n"
+            "pathlib.Path(ready_f).write_text('1', encoding='utf-8')\n"
+            "deadline = time.monotonic() + 15.0\n"
+            "while not pathlib.Path(go_f).is_file() and time.monotonic() < deadline:\n"
+            "    time.sleep(0.01)\n"
+            "rc = codex_room_review.main([\n"
+            "    '--commit', sha, '--task-id', 'T-PROC-RACE',\n"
+            "    '--out-dir', out_dir, '--repo-root', repo_root, '--backend', 'codex',\n"
+            "])\n"
+            "sys.exit(rc)\n"
+        ),
+        encoding="utf-8",
+    )
+
+    ready_a = tmp_path / "ready_a.flag"
+    ready_b = tmp_path / "ready_b.flag"
+    out_a = tmp_path / "proc_out_a"
+    out_b = tmp_path / "proc_out_b"
+    env = dict(os.environ)
+    env["PYTHONPATH"] = str(REPO_ROOT)
+
+    proc_a = subprocess.Popen(
+        [
+            sys.executable,
+            str(driver),
+            str(repo_dir),
+            sha_a,
+            str(out_a),
+            str(ready_a),
+            str(go_flag),
+            str(fake_codex),
+        ],
+        env=env,
+        cwd=str(REPO_ROOT),
+    )
+    proc_b = subprocess.Popen(
+        [
+            sys.executable,
+            str(driver),
+            str(repo_dir),
+            sha_b,
+            str(out_b),
+            str(ready_b),
+            str(go_flag),
+            str(fake_codex),
+        ],
+        env=env,
+        cwd=str(REPO_ROOT),
+    )
+    import time
+
+    deadline = time.monotonic() + 15.0
+    while (not ready_a.is_file() or not ready_b.is_file()) and time.monotonic() < deadline:
+        time.sleep(0.02)
+    go_flag.write_text("go\n", encoding="utf-8")
+    rc_a = proc_a.wait(timeout=30)
+    rc_b = proc_b.wait(timeout=30)
+
+    assert sorted([rc_a, rc_b]) == [0, 2]
+    loser_out = out_a if rc_a == 2 else out_b
+    assert not (loser_out / "frozen").exists()
+    assert not (loser_out / ".review-attempt.lock").exists()
+    from harness.scripts import task_runner
+
+    t_path = task_runner.default_g4_tracker_path("T-PROC-RACE", repo_root=repo_dir)
+    t_after = json.loads(t_path.read_text(encoding="utf-8"))
+    assert t_after["completed_rounds"] == 1
+    assert t_after["in_flight"] == {}
+    assert len(t_after["completed_attempts"]) == 1
+
 
 
 

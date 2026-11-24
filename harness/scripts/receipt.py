@@ -495,7 +495,6 @@ def _evaluate_ledger_and_attempts(
     max_total_cand = int(breakers.get("max_total_candidates_per_root_task", 6))
 
     attempts_dir = active_root / "harness" / "runs" / task_id / "attempts"
-    fs_rounds, _ = task_runner.count_review_attempts([attempts_dir])
     effective_tracker = tracker_data
     if effective_tracker is None:
         try:
@@ -504,12 +503,10 @@ def _evaluate_ledger_and_attempts(
                 effective_tracker = task_runner.load_g4_tracker(t_path, task_id=task_id)
         except (OSError, UnicodeDecodeError, ValueError, json.JSONDecodeError):
             effective_tracker = None
-    tracker_rounds = 0
-    if isinstance(effective_tracker, dict):
-        tracker_rounds = int(effective_tracker.get("completed_rounds", 0)) + len(
-            effective_tracker.get("in_flight", {})
-        )
-    effective_attempts = max(fs_rounds, tracker_rounds)
+    attempt_union = task_runner.collect_g4_attempt_union([attempts_dir], effective_tracker)
+    effective_attempts = int(attempt_union["total_rounds"])
+    if isinstance(effective_tracker, dict) and effective_tracker.get("in_flight"):
+        blockers.append("Task G4 tracker still has active in-flight reservation(s).")
     if effective_attempts > max_g4_root:
         blockers.append(
             f"Review attempts ({effective_attempts}) exceed "

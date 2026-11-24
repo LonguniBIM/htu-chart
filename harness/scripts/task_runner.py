@@ -112,22 +112,28 @@ def _read_optional_json_dict(path: Path) -> dict[str, Any] | None:
         return {}
 
 
-def count_review_attempts(
+def _norm_attempt_dir(path_val: Path | str) -> str:
+    return Path(path_val).resolve().as_posix()
+
+
+def collect_g4_attempt_union(
     attempts_dirs: list[Path],
+    tracker: dict[str, Any] | None = None,
     *,
     candidate_sha: str | None = None,
-) -> tuple[int, int]:
-    """Count completed/locked G4 attempts and prior invocations for ``candidate_sha``."""
-    seen_dirs: set[Path] = set()
-    prior_rounds = 0
-    same_sha = 0
+) -> dict[str, Any]:
+    """Compute exact union of canonical attempt dirs across filesystem and ``g4-tracker.json``."""
+    seen_roots: set[Path] = set()
+    round_dirs: set[str] = set()
+    sha_dirs: set[str] = set()
+    sha_statuses: dict[str, str] = {}
     completed_statuses = {"PASSED", "CHANGES_REQUESTED", "BLOCKED"}
 
     for raw_dir in attempts_dirs:
         resolved_dir = raw_dir.resolve()
-        if resolved_dir in seen_dirs or not resolved_dir.is_dir():
+        if resolved_dir in seen_roots or not resolved_dir.is_dir():
             continue
-        seen_dirs.add(resolved_dir)
+        seen_roots.add(resolved_dir)
 
         for child in sorted(resolved_dir.iterdir()):
             if not child.is_dir():
@@ -139,12 +145,16 @@ def count_review_attempts(
             if rev_data is None and lock_data is not None and lock_data.get("dry_run") is True:
                 continue
 
+            norm_dir = _norm_attempt_dir(child)
+            status_str = ""
             if rev_data is not None:
-                status = rev_data.get("review_gate_status")
-                if status in completed_statuses or not rev_data:
-                    prior_rounds += 1
+                raw_status = rev_data.get("review_gate_status")
+                status_str = str(raw_status) if raw_status is not None else ""
+                if status_str in completed_statuses or not rev_data:
+                    round_dirs.add(norm_dir)
             elif lock_data is not None:
-                prior_rounds += 1
+                status_str = "IN_PROGRESS"
+                round_dirs.add(norm_dir)
 
             if candidate_sha:
                 lock_sha = lock_data.get("candidate_sha") if lock_data is not None else None
@@ -159,9 +169,83 @@ def count_review_attempts(
                     )
                 )
                 if matched_sha:
-                    same_sha += 1
+                    sha_dirs.add(norm_dir)
+                    if status_str:
+                        sha_statuses[norm_dir] = status_str
 
-    return prior_rounds, same_sha
+    tracker_completed_round_dirs: set[str] = set()
+    if isinstance(tracker, dict):
+        comp_map = tracker.get("completed_attempts", {})
+        if isinstance(comp_map, dict):
+            for raw_out, entry in comp_map.items():
+                if not isinstance(entry, dict):
+                    continue
+                norm_dir = _norm_attempt_dir(raw_out)
+                st = str(entry.get("status") or "")
+                if st in completed_statuses:
+                    round_dirs.add(norm_dir)
+                    tracker_completed_round_dirs.add(norm_dir)
+                if candidate_sha and entry.get("candidate_sha") == candidate_sha:
+                    sha_dirs.add(norm_dir)
+                    if st:
+                        sha_statuses[norm_dir] = st
+
+        att_map = tracker.get("attempts", {})
+        if isinstance(att_map, dict):
+            for res_id, entry in att_map.items():
+                if not isinstance(entry, dict):
+                    continue
+                raw_out = entry.get("out_dir")
+                norm_dir = _norm_attempt_dir(raw_out) if raw_out else f"attempt:{res_id}"
+                st = str(entry.get("status") or "")
+                if st in completed_statuses:
+                    round_dirs.add(norm_dir)
+                    tracker_completed_round_dirs.add(norm_dir)
+                if candidate_sha and entry.get("candidate_sha") == candidate_sha:
+                    sha_dirs.add(norm_dir)
+                    if norm_dir not in sha_statuses and st:
+                        sha_statuses[norm_dir] = st
+
+        in_flight_map = tracker.get("in_flight", {})
+        if isinstance(in_flight_map, dict):
+            for res_id, entry in in_flight_map.items():
+                if not isinstance(entry, dict):
+                    continue
+                raw_out = entry.get("out_dir")
+                norm_dir = _norm_attempt_dir(raw_out) if raw_out else f"in-flight:{res_id}"
+                round_dirs.add(norm_dir)
+                if candidate_sha and entry.get("candidate_sha") == candidate_sha:
+                    sha_dirs.add(norm_dir)
+                    sha_statuses[norm_dir] = "IN_PROGRESS"
+
+    seeded_legacy = 0
+    if isinstance(tracker, dict):
+        raw_comp = int(tracker.get("completed_rounds", 0))
+        seeded_legacy = max(0, raw_comp - len(tracker_completed_round_dirs))
+
+    seeded_sha = 0
+    if candidate_sha and isinstance(tracker, dict) and not sha_dirs:
+        sha_map = tracker.get("sha_invocations", {})
+        if isinstance(sha_map, dict):
+            seeded_sha = int(sha_map.get(candidate_sha, 0))
+
+    return {
+        "round_dirs": round_dirs,
+        "total_rounds": len(round_dirs) + seeded_legacy,
+        "sha_dirs": sha_dirs,
+        "sha_count": max(len(sha_dirs), seeded_sha),
+        "sha_statuses": sha_statuses,
+    }
+
+
+def count_review_attempts(
+    attempts_dirs: list[Path],
+    *,
+    candidate_sha: str | None = None,
+) -> tuple[int, int]:
+    """Count completed/locked G4 attempts and prior invocations for ``candidate_sha``."""
+    summary = collect_g4_attempt_union(attempts_dirs, None, candidate_sha=candidate_sha)
+    return int(summary["total_rounds"]), int(summary["sha_count"])
 
 
 def _ensure_ledger_defaults(
@@ -385,6 +469,8 @@ def load_g4_tracker(tracker_path: Path, *, task_id: str = "") -> dict[str, Any]:
         data["sha_invocations"] = {}
     if not isinstance(data.get("in_flight"), dict):
         data["in_flight"] = {}
+    if not isinstance(data.get("completed_attempts"), dict):
+        data["completed_attempts"] = {}
     if not isinstance(data.get("attempts"), dict):
         data["attempts"] = {}
     return data

@@ -1544,4 +1544,109 @@ def test_g5_receipt_evaluates_and_writes_atomically_under_ledger_lock(
         assert rec_race["conclusion"] == "VERIFIED"
 
 
+def test_g5_receipt_blocks_union_over_cap_across_attempts_and_custom_out_dir(
+    tmp_path: Path,
+) -> None:
+    """6 legacy attempts/ dirs + 1 custom --out-dir in g4-tracker = 7 > 6 blocks G5."""
+    from harness.scripts import receipt as receipt_mod
+    from harness.scripts import task_runner
+
+    repo = tmp_path / "repo_g5_union"
+    repo.mkdir()
+    subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+    subprocess.run(
+        ["git", "config", "user.email", "test@example.com"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.name", "Test User"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+    )
+    src = repo / "mod.py"
+    src.write_text("x = 1\n", encoding="utf-8")
+    subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+    subprocess.run(["git", "commit", "-m", "base"], cwd=repo, check=True, capture_output=True)
+    base_sha = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=repo, check=True, capture_output=True, text=True
+    ).stdout.strip()
+    src.write_text("x = 2\n", encoding="utf-8")
+    subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+    subprocess.run(["git", "commit", "-m", "cand"], cwd=repo, check=True, capture_output=True)
+    cand_sha = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=repo, check=True, capture_output=True, text=True
+    ).stdout.strip()
+
+    v_path = tmp_path / "v_union.json"
+    r_path = tmp_path / "r_union.json"
+    v_path.write_text(json.dumps(_verifier(cand_sha)), encoding="utf-8")
+    r_path.write_text(json.dumps(_review(cand_sha)), encoding="utf-8")
+
+    attempts_root = repo / "harness" / "runs" / "T-G5-UNION" / "attempts"
+    for idx in range(6):
+        p_sha = f"{idx + 1}" * 40
+        p_dir = attempts_root / f"att-{idx}-{p_sha[:12]}"
+        p_dir.mkdir(parents=True, exist_ok=True)
+        (p_dir / "consolidated-review.json").write_text(
+            json.dumps(
+                {
+                    "revision_sha": p_sha,
+                    "passes_completed": 2,
+                    "independent_contexts": True,
+                    "review_gate_status": "CHANGES_REQUESTED",
+                    "blocking_open_count": 1,
+                    "consolidated_findings": [],
+                }
+            ),
+            encoding="utf-8",
+        )
+
+    tracker_path = task_runner.default_g4_tracker_path("T-G5-UNION", repo_root=repo)
+    tracker = task_runner.load_g4_tracker(tracker_path, task_id="T-G5-UNION")
+    custom_out = (tmp_path / "custom_out_g5").resolve().as_posix()
+    tracker["completed_rounds"] = 1
+    tracker["completed_attempts"] = {
+        custom_out: {"candidate_sha": cand_sha, "status": "PASSED"}
+    }
+    task_runner.save_g4_tracker(tracker_path, tracker)
+
+    ledger_path = repo / "harness" / "runs" / "T-G5-UNION" / "ledger.json"
+    ledger = task_runner.init_or_load_ledger(
+        ledger_path, root_task_id="T-G5-UNION", base_sha=base_sha, budget_usd=6.0
+    )
+    ledger["state"] = "READY_FOR_ACCEPTANCE"
+    ledger["candidate_sha"] = cand_sha
+    task_runner.save_ledger(ledger_path, ledger)
+
+    out_union = tmp_path / "out_g5_union"
+    rc_union = receipt_mod.main(
+        [
+            "--task-id",
+            "T-G5-UNION",
+            "--phase",
+            "1",
+            "--base-sha",
+            base_sha,
+            "--candidate-sha",
+            cand_sha,
+            "--verifier-json",
+            str(v_path),
+            "--review-json",
+            str(r_path),
+            "--repo-root",
+            str(repo),
+            "--out-dir",
+            str(out_union),
+        ]
+    )
+    assert rc_union == 2
+    rec_union = json.loads((out_union / "receipt.json").read_text(encoding="utf-8"))
+    assert rec_union["conclusion"] == "BLOCKED"
+    assert any("7" in b and "max_g4_rounds_per_root_task" in b for b in rec_union["blockers"])
+
+
+
 
