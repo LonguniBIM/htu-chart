@@ -1648,5 +1648,178 @@ def test_g5_receipt_blocks_union_over_cap_across_attempts_and_custom_out_dir(
     assert any("7" in b and "max_g4_rounds_per_root_task" in b for b in rec_union["blockers"])
 
 
+def test_g5_receipt_blocks_per_sha_cap_and_verifies_ledger_hash_exact(
+    tmp_path: Path,
+) -> None:
+    """Exceeding max_g4_invocations_per_candidate_sha (2) blocks G5 even with rounds <= 6."""
+    import hashlib
+
+    from harness.scripts import receipt as receipt_mod
+    from harness.scripts import task_runner
+
+    repo = tmp_path / "repo_g5_sha_cap"
+    repo.mkdir()
+    subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+    subprocess.run(
+        ["git", "config", "user.email", "test@example.com"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.name", "Test User"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+    )
+    src = repo / "mod.py"
+    src.write_text("x = 1\n", encoding="utf-8")
+    subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+    subprocess.run(["git", "commit", "-m", "base"], cwd=repo, check=True, capture_output=True)
+    base_sha = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=repo, check=True, capture_output=True, text=True
+    ).stdout.strip()
+    src.write_text("x = 2\n", encoding="utf-8")
+    subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+    subprocess.run(["git", "commit", "-m", "cand"], cwd=repo, check=True, capture_output=True)
+    cand_sha = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=repo, check=True, capture_output=True, text=True
+    ).stdout.strip()
+
+    v_path = tmp_path / "v_sha.json"
+    r_path = tmp_path / "r_sha.json"
+    v_path.write_text(json.dumps(_verifier(cand_sha)), encoding="utf-8")
+    r_path.write_text(json.dumps(_review(cand_sha)), encoding="utf-8")
+
+    # 1. Two BLOCKED_INFRA + one PASSED attempt on same SHA -> 1 round <= 6, yet 3 > 2 -> BLOCKED.
+    attempts_sha = repo / "harness" / "runs" / "T-G5-SHA-FS" / "attempts"
+    for idx, st in enumerate(("BLOCKED_INFRA", "BLOCKED_INFRA", "PASSED")):
+        d = attempts_sha / f"att-{idx}-{cand_sha[:12]}"
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "consolidated-review.json").write_text(
+            json.dumps(
+                {
+                    "revision_sha": cand_sha,
+                    "passes_completed": 2,
+                    "independent_contexts": True,
+                    "review_gate_status": st,
+                    "blocking_open_count": 0,
+                    "consolidated_findings": [],
+                }
+            ),
+            encoding="utf-8",
+        )
+    led_fs = repo / "harness" / "runs" / "T-G5-SHA-FS" / "ledger.json"
+    l_fs = task_runner.init_or_load_ledger(
+        led_fs, root_task_id="T-G5-SHA-FS", base_sha=base_sha, budget_usd=6.0
+    )
+    l_fs["state"] = "READY_FOR_ACCEPTANCE"
+    l_fs["candidate_sha"] = cand_sha
+    l_fs["g4_rounds_total"] = 1
+    task_runner.save_ledger(led_fs, l_fs)
+
+    out_fs = tmp_path / "out_g5_sha_fs"
+    rc_fs = receipt_mod.main(
+        [
+            "--task-id",
+            "T-G5-SHA-FS",
+            "--phase",
+            "1",
+            "--base-sha",
+            base_sha,
+            "--candidate-sha",
+            cand_sha,
+            "--verifier-json",
+            str(v_path),
+            "--review-json",
+            str(r_path),
+            "--repo-root",
+            str(repo),
+            "--out-dir",
+            str(out_fs),
+        ]
+    )
+    assert rc_fs == 2
+    rec_fs = json.loads((out_fs / "receipt.json").read_text(encoding="utf-8"))
+    assert rec_fs["conclusion"] == "BLOCKED"
+    assert any("max_g4_invocations_per_candidate_sha" in b for b in rec_fs["blockers"])
+
+    # 2. Ledger g4_invocations_by_sha[cand_sha] == 3 with rounds <= 6 -> BLOCKED.
+    led_map = repo / "harness" / "runs" / "T-G5-SHA-LED" / "ledger.json"
+    l_map = task_runner.init_or_load_ledger(
+        led_map, root_task_id="T-G5-SHA-LED", base_sha=base_sha, budget_usd=6.0
+    )
+    l_map["state"] = "READY_FOR_ACCEPTANCE"
+    l_map["candidate_sha"] = cand_sha
+    l_map["g4_rounds_total"] = 1
+    l_map["g4_invocations_by_sha"] = {cand_sha: 3}
+    task_runner.save_ledger(led_map, l_map)
+
+    out_map = tmp_path / "out_g5_sha_led"
+    rc_map = receipt_mod.main(
+        [
+            "--task-id",
+            "T-G5-SHA-LED",
+            "--phase",
+            "1",
+            "--base-sha",
+            base_sha,
+            "--candidate-sha",
+            cand_sha,
+            "--verifier-json",
+            str(v_path),
+            "--review-json",
+            str(r_path),
+            "--repo-root",
+            str(repo),
+            "--out-dir",
+            str(out_map),
+        ]
+    )
+    assert rc_map == 2
+    rec_map = json.loads((out_map / "receipt.json").read_text(encoding="utf-8"))
+    assert rec_map["conclusion"] == "BLOCKED"
+    assert any("g4_invocations_by_sha" in b for b in rec_map["blockers"])
+
+    # 3. Valid VERIFIED run checks exact sha256(ledger.json) recorded in artifact_hashes.
+    led_ok = repo / "harness" / "runs" / "T-G5-SHA-OK" / "ledger.json"
+    l_ok = task_runner.init_or_load_ledger(
+        led_ok, root_task_id="T-G5-SHA-OK", base_sha=base_sha, budget_usd=6.0
+    )
+    l_ok["state"] = "READY_FOR_ACCEPTANCE"
+    l_ok["candidate_sha"] = cand_sha
+    l_ok["g4_rounds_total"] = 1
+    l_ok["g4_invocations_by_sha"] = {cand_sha: 2}
+    task_runner.save_ledger(led_ok, l_ok)
+    expected_ledger_sha = hashlib.sha256(led_ok.read_bytes()).hexdigest()
+
+    out_ok = tmp_path / "out_g5_sha_ok"
+    rc_ok = receipt_mod.main(
+        [
+            "--task-id",
+            "T-G5-SHA-OK",
+            "--phase",
+            "1",
+            "--base-sha",
+            base_sha,
+            "--candidate-sha",
+            cand_sha,
+            "--verifier-json",
+            str(v_path),
+            "--review-json",
+            str(r_path),
+            "--repo-root",
+            str(repo),
+            "--out-dir",
+            str(out_ok),
+        ]
+    )
+    assert rc_ok == 0
+    rec_ok = json.loads((out_ok / "receipt.json").read_text(encoding="utf-8"))
+    assert rec_ok["conclusion"] == "VERIFIED"
+    assert rec_ok["artifact_hashes"]["ledger_json_sha256"] == expected_ledger_sha
+
+
+
 
 

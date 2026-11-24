@@ -2076,6 +2076,7 @@ def _setup_ledger_for_g4_test(
     state: str,
     candidate_sha: str | None = None,
     last_g4_candidate_sha: str | None = None,
+    last_g4_status: str | None = None,
     g4_rounds_total: int = 0,
     g4_rounds_in_packet: int = 0,
     g4_invocations_by_sha: dict[str, int] | None = None,
@@ -2092,6 +2093,7 @@ def _setup_ledger_for_g4_test(
     ledger["state"] = state
     ledger["candidate_sha"] = candidate_sha
     ledger["last_g4_candidate_sha"] = last_g4_candidate_sha
+    ledger["last_g4_status"] = last_g4_status
     ledger["g4_rounds_total"] = g4_rounds_total
     ledger["g4_rounds_in_packet"] = g4_rounds_in_packet
     ledger["g4_invocations_by_sha"] = dict(g4_invocations_by_sha or {})
@@ -2578,7 +2580,21 @@ def test_g4_require_ledger_agy_dedup_and_resume_reuse_no_double_charge(
         state="BLOCKED_INFRA",
         candidate_sha=sha1,
         last_g4_candidate_sha=sha1,
+        last_g4_status="BLOCKED_INFRA",
         g4_invocations_by_sha={sha1: 1},
+    )
+    (prior_dir / "consolidated-review.json").write_text(
+        json.dumps(
+            {
+                "revision_sha": sha1,
+                "passes_completed": 1,
+                "independent_contexts": False,
+                "review_gate_status": "BLOCKED_INFRA",
+                "blocking_open_count": 0,
+                "consolidated_findings": [],
+            }
+        ),
+        encoding="utf-8",
     )
     rc_agy = codex_room_review.main(
         [
@@ -3325,7 +3341,204 @@ def test_g4_cross_process_os_lock_race_for_sixth_slot(tmp_path: Path) -> None:
     t_after = json.loads(t_path.read_text(encoding="utf-8"))
     assert t_after["completed_rounds"] == 1
     assert t_after["in_flight"] == {}
-    assert len(t_after["completed_attempts"]) == 1
+    assert len(t_after["completed_attempts"]) == 6
+
+
+def test_g4_persists_non_canonical_attempts_across_out_dir_switch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Custom X/attempts/* discovered on call 6 are persisted in tracker across out-dir switch."""
+    from harness.scripts import receipt as receipt_mod
+    from harness.scripts import task_runner
+
+    repo_dir, sha1 = _init_policy_repo(tmp_path / "repo_persist_ext", qualified_routes=[])
+    custom_x_attempts = tmp_path / "custom_x" / "attempts"
+    for idx in range(5):
+        p_sha = f"{idx + 1}" * 40
+        p_dir = custom_x_attempts / f"a{idx + 1}-{p_sha[:12]}"
+        p_dir.mkdir(parents=True, exist_ok=True)
+        (p_dir / "consolidated-review.json").write_text(
+            json.dumps(
+                {
+                    "revision_sha": p_sha,
+                    "passes_completed": 2,
+                    "independent_contexts": True,
+                    "review_gate_status": "CHANGES_REQUESTED",
+                    "blocking_open_count": 1,
+                    "consolidated_findings": [],
+                }
+            ),
+            encoding="utf-8",
+        )
+
+    calls1 = _install_counting_codex_stub(tmp_path, monkeypatch, sha1)
+    out6 = custom_x_attempts / f"a6-{sha1[:12]}"
+    rc6 = codex_room_review.main(
+        [
+            "--commit",
+            sha1,
+            "--task-id",
+            "T-EXT-PERSIST",
+            "--out-dir",
+            str(out6),
+            "--repo-root",
+            str(repo_dir),
+            "--backend",
+            "codex",
+        ]
+    )
+    assert rc6 == 0
+    assert _count_calls(calls1) == 2
+
+    t_path = task_runner.default_g4_tracker_path("T-EXT-PERSIST", repo_root=repo_dir)
+    t_data = task_runner.load_g4_tracker(t_path, task_id="T-EXT-PERSIST")
+    canon_attempts = repo_dir / "harness" / "runs" / "T-EXT-PERSIST" / "attempts"
+    union_check = task_runner.collect_g4_attempt_union([canon_attempts], t_data)
+    assert union_check["total_rounds"] == 6
+
+    (repo_dir / "ext7.txt").write_text("ext7\n", encoding="utf-8")
+    sha2 = _commit_repo_change(repo_dir, "ext switch commit 7")
+    calls2 = _install_counting_codex_stub(tmp_path, monkeypatch, sha2)
+    out7 = tmp_path / "custom_y" / "a7"
+    rc7 = codex_room_review.main(
+        [
+            "--commit",
+            sha2,
+            "--task-id",
+            "T-EXT-PERSIST",
+            "--out-dir",
+            str(out7),
+            "--repo-root",
+            str(repo_dir),
+            "--backend",
+            "codex",
+        ]
+    )
+    assert rc7 == 2
+    assert _count_calls(calls2) == 0
+
+    # G5 receipt.py also observes >= 6 rounds from g4-tracker.json (and blocks at 7).
+    extra_canon = canon_attempts / f"a_extra-{sha2[:12]}"
+    extra_canon.mkdir(parents=True, exist_ok=True)
+    (extra_canon / "consolidated-review.json").write_text(
+        json.dumps(
+            {
+                "revision_sha": sha2,
+                "passes_completed": 2,
+                "independent_contexts": True,
+                "review_gate_status": "PASSED",
+                "blocking_open_count": 0,
+                "consolidated_findings": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    v_path = tmp_path / "v_ext.json"
+    r_path = tmp_path / "r_ext.json"
+    v_path.write_text(
+        json.dumps({"status": "VERIFIED", "phase": 1, "git_sha": sha2, "steps": []}),
+        encoding="utf-8",
+    )
+    r_path.write_text(
+        json.dumps(
+            {
+                "revision_sha": sha2,
+                "passes_completed": 2,
+                "independent_contexts": True,
+                "review_gate_status": "PASSED",
+                "blocking_open_count": 0,
+                "consolidated_findings": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    rec_eval = receipt_mod.evaluate_receipt(
+        task_id="T-EXT-PERSIST",
+        phase=1,
+        base_sha="0" * 40,
+        candidate_sha=sha2,
+        verifier_data=json.loads(v_path.read_text(encoding="utf-8")),
+        review_data=json.loads(r_path.read_text(encoding="utf-8")),
+        repo_root=repo_dir,
+    )
+    assert rec_eval["conclusion"] == "BLOCKED"
+    assert any("7" in b and "max_g4_rounds_per_root_task" in b for b in rec_eval["blockers"])
+
+
+def test_g4_rejects_resume_from_missing_consolidated_review(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """--resume-from to a directory missing consolidated-review.json fails closed (rc == 2)."""
+    from harness.scripts import task_runner
+
+    repo_dir, sha1 = _init_policy_repo(tmp_path / "repo_missing_rev", qualified_routes=[])
+    calls = _install_counting_codex_stub(tmp_path, monkeypatch, sha1)
+
+    empty_dir = tmp_path / "empty_prior_dir"
+    empty_dir.mkdir()
+    _setup_ledger_for_g4_test(
+        repo_dir,
+        "T-RES-EMPTY-LED",
+        state="BLOCKED_INFRA",
+        candidate_sha=sha1,
+        last_g4_candidate_sha=sha1,
+        last_g4_status="BLOCKED_INFRA",
+        g4_invocations_by_sha={sha1: 1},
+    )
+    rc_led = codex_room_review.main(
+        [
+            "--commit",
+            sha1,
+            "--task-id",
+            "T-RES-EMPTY-LED",
+            "--resume-from",
+            str(empty_dir),
+            "--out-dir",
+            str(tmp_path / "out_res_empty_led"),
+            "--repo-root",
+            str(repo_dir),
+            "--backend",
+            "codex",
+        ]
+    )
+    assert rc_led == 2
+    assert _count_calls(calls) == 0
+
+    # Also fail closed in ledgerless mode when sha1 was already invoked once.
+    t_path = task_runner.default_g4_tracker_path("T-RES-EMPTY-NOLOG", repo_root=repo_dir)
+    t_nolog = task_runner.load_g4_tracker(t_path, task_id="T-RES-EMPTY-NOLOG")
+    t_nolog["in_flight"]["res-abort"] = {
+        "candidate_sha": sha1,
+        "out_dir": task_runner._norm_attempt_dir(empty_dir),
+    }
+    t_nolog["sha_invocations"][sha1] = 1
+    task_runner.save_g4_tracker(t_path, t_nolog)
+    codex_room_review._release_g4_reservation_on_abort(
+        t_path, None, "res-abort", git_top=repo_dir, candidate_sha=sha1
+    )
+    t_after_abort = task_runner.load_g4_tracker(t_path, task_id="T-RES-EMPTY-NOLOG")
+    norm_empty = task_runner._norm_attempt_dir(empty_dir)
+    assert t_after_abort["completed_attempts"][norm_empty]["status"] == "ABORTED"
+
+    rc_nolog = codex_room_review.main(
+        [
+            "--commit",
+            sha1,
+            "--task-id",
+            "T-RES-EMPTY-NOLOG",
+            "--resume-from",
+            str(empty_dir),
+            "--out-dir",
+            str(tmp_path / "out_res_empty_nolog"),
+            "--repo-root",
+            str(repo_dir),
+            "--backend",
+            "codex",
+        ]
+    )
+    assert rc_nolog == 2
+    assert _count_calls(calls) == 0
+
 
 
 

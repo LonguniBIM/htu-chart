@@ -127,6 +127,7 @@ def collect_g4_attempt_union(
     round_dirs: set[str] = set()
     sha_dirs: set[str] = set()
     sha_statuses: dict[str, str] = {}
+    discovered_entries: dict[str, dict[str, Any]] = {}
     completed_statuses = {"PASSED", "CHANGES_REQUESTED", "BLOCKED"}
 
     for raw_dir in attempts_dirs:
@@ -147,18 +148,22 @@ def collect_g4_attempt_union(
 
             norm_dir = _norm_attempt_dir(child)
             status_str = ""
+            lock_sha = lock_data.get("candidate_sha") if lock_data is not None else None
+            rev_sha = rev_data.get("revision_sha") if rev_data is not None else None
             if rev_data is not None:
                 raw_status = rev_data.get("review_gate_status")
                 status_str = str(raw_status) if raw_status is not None else ""
                 if status_str in completed_statuses or not rev_data:
                     round_dirs.add(norm_dir)
+                discovered_entries[norm_dir] = {
+                    "candidate_sha": rev_sha or lock_sha,
+                    "status": status_str or "BLOCKED",
+                }
             elif lock_data is not None:
                 status_str = "IN_PROGRESS"
                 round_dirs.add(norm_dir)
 
             if candidate_sha:
-                lock_sha = lock_data.get("candidate_sha") if lock_data is not None else None
-                rev_sha = rev_data.get("revision_sha") if rev_data is not None else None
                 matched_sha = (
                     lock_sha == candidate_sha
                     or rev_sha == candidate_sha
@@ -235,6 +240,7 @@ def collect_g4_attempt_union(
         "sha_dirs": sha_dirs,
         "sha_count": max(len(sha_dirs), seeded_sha),
         "sha_statuses": sha_statuses,
+        "discovered_entries": discovered_entries,
     }
 
 

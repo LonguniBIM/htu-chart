@@ -1640,6 +1640,33 @@ def _resolve_g4_ledger_path(args: argparse.Namespace, git_top: Path) -> Path | N
     return auto_path.resolve() if auto_path.is_file() else None
 
 
+def _seed_tracker_from_union(
+    tracker: dict[str, Any], union: dict[str, Any], now_iso: str
+) -> bool:
+    """Persist discovered attempt directories and per-SHA counts into tracker."""
+    changed = False
+    completed_map = tracker.setdefault("completed_attempts", {})
+    for norm_dir, meta in union.get("discovered_entries", {}).items():
+        if norm_dir not in completed_map:
+            completed_map[norm_dir] = {
+                "candidate_sha": meta.get("candidate_sha"),
+                "status": meta.get("status"),
+                "completed_at_utc": now_iso,
+            }
+            changed = True
+    sha_counts: dict[str, int] = {}
+    for entry in completed_map.values():
+        if isinstance(entry, dict) and isinstance(entry.get("candidate_sha"), str):
+            sha_key = entry["candidate_sha"]
+            sha_counts[sha_key] = sha_counts.get(sha_key, 0) + 1
+    inv_map = tracker.setdefault("sha_invocations", {})
+    for sha_key, cnt in sha_counts.items():
+        if int(inv_map.get(sha_key, 0)) < cnt:
+            inv_map[sha_key] = cnt
+            changed = True
+    return changed
+
+
 def _preflight_g4_caps(
     args: argparse.Namespace,
     out_dir: Path,
@@ -1692,6 +1719,8 @@ def _preflight_g4_caps(
         union = task_runner.collect_g4_attempt_union(
             attempt_roots, tracker, candidate_sha=candidate_sha
         )
+        if _seed_tracker_from_union(tracker, union, now_iso):
+            task_runner.save_g4_tracker(tracker_path, tracker)
         effective_rounds = int(union["total_rounds"])
         t_sha = int(tracker.get("sha_invocations", {}).get(candidate_sha, 0))
         effective_sha = max(int(union["sha_count"]), t_sha)
@@ -1699,16 +1728,19 @@ def _preflight_g4_caps(
         non_infra_statuses = {st for st in prior_sha_statuses if st != "BLOCKED_INFRA"}
         norm_out = task_runner._norm_attempt_dir(out_dir)
 
-        resume_bad_status: str | None = None
+        resume_err: str | None = None
         if args.resume_from is not None:
-            resume_rev = task_runner._read_optional_json_dict(
-                Path(args.resume_from).resolve() / "consolidated-review.json"
-            )
-            if resume_rev is not None:
+            resume_rev_path = Path(args.resume_from).resolve() / "consolidated-review.json"
+            resume_rev = task_runner._read_optional_json_dict(resume_rev_path)
+            if resume_rev is None:
+                resume_err = "missing or invalid consolidated-review.json"
+            else:
                 rev_sha = resume_rev.get("revision_sha")
                 rev_status = str(resume_rev.get("review_gate_status") or "")
-                if rev_sha in {None, candidate_sha} and rev_status != "BLOCKED_INFRA":
-                    resume_bad_status = rev_status or "UNKNOWN"
+                if rev_sha != candidate_sha:
+                    resume_err = f"revision_sha {rev_sha!r} != {candidate_sha[:12]}"
+                elif rev_status != "BLOCKED_INFRA":
+                    resume_err = f"review_gate_status={rev_status!r} != 'BLOCKED_INFRA'"
 
         if ledger_path is None:
             if tracker.get("in_flight") or "IN_PROGRESS" in prior_sha_statuses:
@@ -1732,8 +1764,8 @@ def _preflight_g4_caps(
                     file=sys.stderr,
                 )
                 return 2, None, None
-            if args.resume_from is not None and (
-                (effective_sha >= 1 and non_infra_statuses) or resume_bad_status is not None
+            if args.resume_from is not None and effective_sha >= 1 and (
+                non_infra_statuses or resume_err is not None
             ):
                 print(
                     f"[codex_room_review] BLOCKED: Cannot resume G4 for candidate_sha "
@@ -1819,12 +1851,12 @@ def _preflight_g4_caps(
         last_status = ledger.get("last_g4_status")
         allow_resume = (
             ledger["state"] == "BLOCKED_INFRA"
-            and last_status in {None, "BLOCKED_INFRA"}
+            and last_status == "BLOCKED_INFRA"
             and args.resume_from is not None
             and ledger.get("last_g4_candidate_sha") == candidate_sha
             and sha_count < l_max_sha
             and not non_infra_statuses
-            and resume_bad_status is None
+            and resume_err is None
         )
         if ledger["state"] in halted_states and not allow_resume:
             print(
@@ -2248,16 +2280,31 @@ def _release_g4_reservation_on_abort(
         if tracker_path is not None and tracker_path.is_file():
             tracker = task_runner.load_g4_tracker(tracker_path)
             if reservation_id in tracker.get("in_flight", {}):
-                tracker["in_flight"].pop(reservation_id, None)
+                entry = tracker["in_flight"].pop(reservation_id, None)
+                raw_out = entry.get("out_dir") if isinstance(entry, dict) else None
+                if raw_out:
+                    norm_out = task_runner._norm_attempt_dir(raw_out)
+                    completed_at = datetime.now(timezone.utc).isoformat()
+                    tracker["attempts"][reservation_id] = {
+                        "candidate_sha": candidate_sha,
+                        "status": "ABORTED",
+                        "out_dir": norm_out,
+                        "completed_at_utc": completed_at,
+                    }
+                    tracker.setdefault("completed_attempts", {})[norm_out] = {
+                        "candidate_sha": candidate_sha,
+                        "status": "ABORTED",
+                        "completed_at_utc": completed_at,
+                    }
                 task_runner.save_g4_tracker(tracker_path, tracker)
         if ledger_path is not None and ledger_path.is_file():
             ledger = task_runner.load_ledger(ledger_path, repo_root=git_top)
             active = ledger.get("active_g4_reservations", {})
             if reservation_id in active:
                 active.pop(reservation_id, None)
-                ledger["state"] = "BLOCKED_INFRA"
+                ledger["state"] = "BLOCKED"
                 ledger["last_g4_candidate_sha"] = candidate_sha
-                ledger["last_g4_status"] = "BLOCKED_INFRA"
+                ledger["last_g4_status"] = "ABORTED"
                 task_runner._append_event(
                     ledger,
                     "G4_ABORTED_RELEASE",

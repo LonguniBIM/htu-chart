@@ -492,6 +492,7 @@ def _evaluate_ledger_and_attempts(
     blockers: list[str] = []
     breakers = task_runner.load_circuit_breakers(repo_root=active_root)
     max_g4_root = int(breakers.get("max_g4_rounds_per_root_task", 6))
+    max_g4_sha = int(breakers.get("max_g4_invocations_per_candidate_sha", 2))
     max_total_cand = int(breakers.get("max_total_candidates_per_root_task", 6))
 
     attempts_dir = active_root / "harness" / "runs" / task_id / "attempts"
@@ -503,7 +504,9 @@ def _evaluate_ledger_and_attempts(
                 effective_tracker = task_runner.load_g4_tracker(t_path, task_id=task_id)
         except (OSError, UnicodeDecodeError, ValueError, json.JSONDecodeError):
             effective_tracker = None
-    attempt_union = task_runner.collect_g4_attempt_union([attempts_dir], effective_tracker)
+    attempt_union = task_runner.collect_g4_attempt_union(
+        [attempts_dir], effective_tracker, candidate_sha=candidate_sha
+    )
     effective_attempts = int(attempt_union["total_rounds"])
     if isinstance(effective_tracker, dict) and effective_tracker.get("in_flight"):
         blockers.append("Task G4 tracker still has active in-flight reservation(s).")
@@ -511,6 +514,19 @@ def _evaluate_ledger_and_attempts(
         blockers.append(
             f"Review attempts ({effective_attempts}) exceed "
             f"max_g4_rounds_per_root_task ({max_g4_root})."
+        )
+
+    sha_union_count = len(attempt_union["sha_dirs"])
+    tracker_sha_count = (
+        int(effective_tracker.get("sha_invocations", {}).get(candidate_sha, 0))
+        if isinstance(effective_tracker, dict)
+        else 0
+    )
+    if sha_union_count > max_g4_sha or tracker_sha_count > max_g4_sha:
+        blockers.append(
+            f"G4 invocations for candidate {candidate_sha[:12]} "
+            f"(union={sha_union_count}, tracker={tracker_sha_count}) exceed "
+            f"max_g4_invocations_per_candidate_sha ({max_g4_sha})."
         )
 
     if require_ledger and ledger_data is None:
@@ -529,6 +545,13 @@ def _evaluate_ledger_and_attempts(
 
     if ledger_data.get("active_g4_reservations"):
         blockers.append("Task ledger still has active in-flight G4 reservation(s).")
+
+    ledger_sha_count = int(ledger_data.get("g4_invocations_by_sha", {}).get(candidate_sha, 0))
+    if ledger_sha_count > max_g4_sha:
+        blockers.append(
+            f"Ledger g4_invocations_by_sha[{candidate_sha[:12]}] ({ledger_sha_count}) "
+            f"exceeds max_g4_invocations_per_candidate_sha ({max_g4_sha})."
+        )
 
     g4_total = int(ledger_data.get("g4_rounds_total", 0))
     total_cand = int(ledger_data.get("total_candidates", 0))
