@@ -1004,3 +1004,40 @@ async def test_f01_alert_routes_require_session_csrf_and_redact_telegram_secrets
             assert chat_id not in status_resp.text
     finally:
         await tg_mock.aclose()
+
+
+async def test_f01_auth_session_recovers_csrf_after_reload_and_enables_logout() -> None:
+    """Contract: GET /api/auth/session recovers CSRF token from HttpOnly session cookie on reload.
+
+    Defect caught: Browser reload wiping in-memory CSRF token and breaking logout/mutations.
+    """
+    settings = Settings(app_password_hash=TEST_PASSWORD_HASH)
+    async with _async_client(settings) as (client, app):
+        assert (await client.get("/api/auth/session")).status_code == 401
+
+        login_resp = await client.post("/api/auth/login", json={"password": TEST_PASSWORD})
+        assert login_resp.status_code == 200
+        session_cookie = login_resp.cookies["topstep_session"]
+
+        # Simulate page reload: fresh HTTP client carrying only the HttpOnly cookie
+        asgi_reload = httpx.ASGITransport(app=app, client=("127.0.0.1", 54322))
+        async with httpx.AsyncClient(
+            transport=asgi_reload,
+            base_url="http://127.0.0.1:8000",
+            cookies={"topstep_session": session_cookie},
+        ) as reloaded_client:
+            session_resp = await reloaded_client.get("/api/auth/session")
+            assert session_resp.status_code == 200
+            session_payload = session_resp.json()
+            assert session_payload["authenticated"] is True
+            recovered_csrf = session_payload["csrf_token"]
+            assert isinstance(recovered_csrf, str) and len(recovered_csrf) >= 20
+
+            logout_resp = await reloaded_client.post(
+                "/api/auth/logout",
+                headers={"X-CSRF-Token": recovered_csrf},
+            )
+            assert logout_resp.status_code == 200
+            assert logout_resp.json() == {"authenticated": False}
+            assert (await reloaded_client.get("/api/status")).status_code == 401
+            assert (await reloaded_client.get("/api/auth/session")).status_code == 401

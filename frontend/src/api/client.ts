@@ -77,6 +77,21 @@ async function apiRequest<T>(url: string, options: RequestOptions = {}): Promise
   return (await response.json()) as T;
 }
 
+export async function fetchSession(
+  signal?: AbortSignal,
+): Promise<{ authenticated: boolean; csrf_token: string }> {
+  const opts: RequestOptions = {};
+  if (signal !== undefined) {
+    opts.signal = signal;
+  }
+  const result = await apiRequest<{ authenticated: boolean; csrf_token: string }>(
+    "/api/auth/session",
+    opts,
+  );
+  inMemoryCsrfToken = result.csrf_token;
+  return result;
+}
+
 export async function login(
   password: string,
   signal?: AbortSignal,

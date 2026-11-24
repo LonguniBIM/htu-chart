@@ -2,15 +2,18 @@
 
 from __future__ import annotations
 
+import sqlite3
 from contextlib import asynccontextmanager
 from pathlib import Path
 
 import httpx
+import pytest
 from argon2 import PasswordHasher
 
 from app.api.routes_layout import LAYOUT_TEMPLATE_PANE_COUNTS
 from app.config import Settings
 from app.main import create_app
+from app.storage.sqlite_store import SqliteStore
 
 TEST_PASSWORD = "layout-test-password-123"
 TEST_PASSWORD_HASH = PasswordHasher().hash(TEST_PASSWORD)
@@ -284,3 +287,207 @@ async def test_layouts_validation_rejects_bad_template_counts_symbols_and_timefr
         assert saved["panes"][0]["root_symbol"] == "MES"
         assert saved["panes"][0]["timeframe"] == "1h"
         assert saved["panes"][0]["playback_mode"] == "replay"
+
+
+async def test_layouts_delete_default_promotes_oldest_directly_in_sqlite_store(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Contract: Deleting default layout promotes oldest remaining layout atomically in SQLite.
+
+    Defect caught: ensure_default_layout() masking missing default promotion inside delete_layout.
+    """
+    async with _async_client(tmp_path) as (client, app):
+        timestamps = iter([1000, 2000, 3000, 4000])
+        monkeypatch.setattr(app.state.sqlite_store, "_now_utc", lambda: next(timestamps))
+
+        csrf = await _login(client)
+        headers = {"X-CSRF-Token": csrf}
+
+        # Seed layout-4-future (created_at=1000)
+        initial = await client.get("/api/layouts")
+        assert initial.status_code == 200
+        oldest_id = initial.json()["layouts"][0]["id"]
+
+        # Create second (non-default, created_at=2000) and third (default, created_at=3000)
+        second_resp = await client.post(
+            "/api/layouts",
+            json=_valid_layout_payload(name="Second Desk", template_id="2-cols", is_default=False),
+            headers=headers,
+        )
+        assert second_resp.status_code == 201
+        second_id = second_resp.json()["layout"]["id"]
+
+        third_resp = await client.post(
+            "/api/layouts",
+            json=_valid_layout_payload(name="Third Default", template_id="2-rows", is_default=True),
+            headers=headers,
+        )
+        assert third_resp.status_code == 201
+        third_id = third_resp.json()["layout"]["id"]
+
+        del_resp = await client.delete(f"/api/layouts/{third_id}", headers=headers)
+        assert del_resp.status_code == 200
+
+        # Inspect SqliteStore directly BEFORE calling GET /api/layouts (which runs ensure_default)
+        promoted = await app.state.sqlite_store.list_layouts()
+        assert len(promoted) == 2
+        assert promoted[0].id == oldest_id
+        assert promoted[0].is_default is True
+        assert promoted[1].id == second_id
+        assert promoted[1].is_default is False
+
+
+async def test_layouts_persist_across_sqlite_store_reopen(tmp_path: Path) -> None:
+    """Contract: Created and updated layouts survive closing and reopening SqliteStore.
+
+    Defect caught: Uncommitted SQLite transactions or volatile state lost across restarts.
+    """
+    db_path = tmp_path / "data" / "metadata.db"
+    store1 = SqliteStore(db_path)
+    store1.initialize()
+    try:
+        await store1.ensure_default_layout()
+        two_panes = _valid_layout_payload(template_id="2-cols")["panes"]
+        three_panes = _valid_layout_payload(template_id="3-cols")["panes"]
+        assert isinstance(two_panes, list)
+        assert isinstance(three_panes, list)
+
+        created = await store1.create_layout(
+            name="Swing Desk",
+            template_id="2-cols",
+            panes=two_panes,
+            sync_config={
+                "symbol": True,
+                "interval": False,
+                "crosshair": True,
+                "time": False,
+                "dateRange": False,
+            },
+            is_default=True,
+        )
+        updated = await store1.update_layout(
+            created.id,
+            name="Swing Desk v2",
+            template_id="3-cols",
+            panes=three_panes,
+            sync_config={
+                "symbol": False,
+                "interval": True,
+                "crosshair": True,
+                "time": True,
+                "dateRange": False,
+            },
+            is_default=True,
+        )
+        assert updated is not None
+    finally:
+        store1.close()
+
+    store2 = SqliteStore(db_path)
+    store2.initialize()
+    try:
+        all_layouts = await store2.list_layouts()
+        assert len(all_layouts) == 2
+        reloaded = await store2.get_layout(created.id)
+        assert reloaded is not None
+        assert reloaded.name == "Swing Desk v2"
+        assert reloaded.template_id == "3-cols"
+        assert reloaded.is_default is True
+        assert len(reloaded.panes) == 3
+        assert reloaded.sync_config["time"] is True
+
+        seeded = await store2.get_layout("layout-4-future")
+        assert seeded is not None
+        assert seeded.is_default is False
+    finally:
+        store2.close()
+
+
+async def test_layouts_default_swap_rolls_back_atomically_on_mid_tx_failure(
+    tmp_path: Path,
+) -> None:
+    """Contract: Failed create_layout/update_layout default-swap rolls back prior is_default reset.
+
+    Defect caught: Partial transaction committing is_default=0 across all layouts on DB error.
+    """
+    db_path = tmp_path / "data" / "rollback.db"
+    store = SqliteStore(db_path)
+    store.initialize()
+    try:
+        seeded = await store.ensure_default_layout()
+        assert seeded.is_default is True
+
+        two_panes = _valid_layout_payload(template_id="2-cols")["panes"]
+        assert isinstance(two_panes, list)
+        default_sync = {
+            "symbol": False,
+            "interval": True,
+            "crosshair": True,
+            "time": False,
+            "dateRange": False,
+        }
+        secondary = await store.create_layout(
+            name="Secondary Desk",
+            template_id="2-cols",
+            panes=two_panes,
+            sync_config=default_sync,
+            is_default=False,
+        )
+
+        # Inject mid-transaction DB failure that fires AFTER `UPDATE layouts SET is_default = 0`
+        with store._lock:
+            conn = store._ensure_conn_locked()
+            conn.executescript(
+                """
+                CREATE TRIGGER fail_insert_default_swap
+                BEFORE INSERT ON layouts
+                WHEN NEW.name = 'TriggerFailInsert'
+                BEGIN
+                    SELECT RAISE(ABORT, 'injected insert failure');
+                END;
+
+                CREATE TRIGGER fail_update_default_swap
+                BEFORE UPDATE OF name ON layouts
+                WHEN NEW.name = 'TriggerFailUpdate'
+                BEGIN
+                    SELECT RAISE(ABORT, 'injected update failure');
+                END;
+                """
+            )
+            conn.commit()
+
+        with pytest.raises(sqlite3.DatabaseError, match="injected insert failure"):
+            await store.create_layout(
+                name="TriggerFailInsert",
+                template_id="2-cols",
+                panes=two_panes,
+                sync_config=default_sync,
+                is_default=True,
+            )
+
+        after_insert_fail = await store.list_layouts()
+        assert len(after_insert_fail) == 2
+        defaults_after_insert = [item.id for item in after_insert_fail if item.is_default]
+        assert defaults_after_insert == [seeded.id]
+
+        with pytest.raises(sqlite3.DatabaseError, match="injected update failure"):
+            await store.update_layout(
+                secondary.id,
+                name="TriggerFailUpdate",
+                template_id="2-cols",
+                panes=two_panes,
+                sync_config=default_sync,
+                is_default=True,
+            )
+
+        after_update_fail = await store.list_layouts()
+        assert len(after_update_fail) == 2
+        defaults_after_update = [item.id for item in after_update_fail if item.is_default]
+        assert defaults_after_update == [seeded.id]
+        reloaded_secondary = await store.get_layout(secondary.id)
+        assert reloaded_secondary is not None
+        assert reloaded_secondary.name == "Secondary Desk"
+        assert reloaded_secondary.is_default is False
+    finally:
+        store.close()

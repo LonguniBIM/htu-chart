@@ -1,7 +1,8 @@
-import { useCallback, useEffect, useMemo, useState, type FormEvent } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent } from "react";
 import {
   ApiError,
   fetchContracts,
+  fetchSession,
   fetchStatus,
   listLayouts,
   login,
@@ -10,6 +11,7 @@ import {
 import type {
   ContractResolutionEntry,
   LayoutRecord,
+  PaneConfig,
   RootSymbol,
   StatusResponse,
   Timeframe,
@@ -19,6 +21,15 @@ import { ChartPane } from "./chart/ChartPane";
 import { PaneFetchCoordinator } from "./chart/fetchGuard";
 
 type AuthStage = "checking" | "unauthenticated" | "authenticated";
+
+function contractCacheKey(liveMode: boolean, rootSymbol: RootSymbol): string {
+  return `${liveMode ? "live" : "sim"}:${rootSymbol}`;
+}
+
+function distinctPaneLiveModes(panes: readonly PaneConfig[]): boolean[] {
+  const modes = Array.from(new Set(panes.map((pane) => pane.live_mode)));
+  return modes.length > 0 ? modes : [false];
+}
 
 function resolveContractId(entry: ContractResolutionEntry | undefined): string | null {
   if (entry === undefined || entry.selected === null) {
@@ -40,6 +51,7 @@ export function App() {
 
   const wsClient = useMemo(() => new MarketWsClient(), []);
   const coordinator = useMemo(() => new PaneFetchCoordinator(), []);
+  const resolvedModesRef = useRef<Set<boolean>>(new Set());
 
   useEffect(() => {
     return () => {
@@ -62,10 +74,31 @@ export function App() {
     };
   }, [wsClient]);
 
+  const fetchContractsForModes = useCallback(
+    async (modes: readonly boolean[], signal?: AbortSignal): Promise<Record<string, ContractResolutionEntry>> => {
+      const updates: Record<string, ContractResolutionEntry> = {};
+      for (const liveMode of modes) {
+        const resolved = await fetchContracts(
+          ["MES", "MNQ", "MYM", "MGC"],
+          liveMode,
+          signal,
+        );
+        const effectiveLive = Boolean(resolved.live);
+        resolvedModesRef.current.add(effectiveLive);
+        for (const [symbol, entry] of Object.entries(resolved.contracts)) {
+          updates[`${effectiveLive ? "live" : "sim"}:${symbol}`] = entry;
+        }
+      }
+      return updates;
+    },
+    [],
+  );
+
   const bootstrapWorkspace = useCallback(
     async (signal?: AbortSignal) => {
       setLoadError(null);
       const statusOpts = signal !== undefined ? signal : undefined;
+      await fetchSession(statusOpts);
       const status = await fetchStatus(statusOpts);
       setStatusData(status);
 
@@ -75,13 +108,11 @@ export function App() {
         loadedLayouts.find((item) => item.is_default) ?? loadedLayouts[0] ?? null;
       setActiveLayout(defaultLayout);
 
+      resolvedModesRef.current.clear();
+      const distinctModes = distinctPaneLiveModes(defaultLayout?.panes ?? []);
       try {
-        const resolved = await fetchContracts(
-          ["MES", "MNQ", "MYM", "MGC"],
-          undefined,
-          statusOpts,
-        );
-        setContracts(resolved.contracts);
+        const resolvedMap = await fetchContractsForModes(distinctModes, statusOpts);
+        setContracts(resolvedMap);
       } catch (err: unknown) {
         if (err instanceof ApiError && err.status === 503) {
           setContracts({});
@@ -92,7 +123,7 @@ export function App() {
 
       wsClient.connect();
     },
-    [wsClient],
+    [fetchContractsForModes, wsClient],
   );
 
   useEffect(() => {
@@ -141,6 +172,7 @@ export function App() {
     setActiveLayout(null);
     setLayouts([]);
     setContracts({});
+    resolvedModesRef.current.clear();
     setStatusData(null);
     setAuthStage("unauthenticated");
   };
@@ -227,6 +259,27 @@ export function App() {
               onChange={(e) => {
                 const picked = layouts.find((item) => item.id === e.target.value) ?? null;
                 setActiveLayout(picked);
+                if (picked !== null) {
+                  const missingModes = distinctPaneLiveModes(picked.panes).filter(
+                    (mode) => !resolvedModesRef.current.has(mode),
+                  );
+                  if (missingModes.length > 0) {
+                    void fetchContractsForModes(missingModes)
+                      .then((updates) => {
+                        setContracts((prev) => ({ ...prev, ...updates }));
+                      })
+                      .catch((err: unknown) => {
+                        if (err instanceof ApiError && err.status === 503) {
+                          return;
+                        }
+                        if (!(err instanceof DOMException && err.name === "AbortError")) {
+                          setLoadError(
+                            err instanceof Error ? err.message : "Failed to resolve contracts",
+                          );
+                        }
+                      });
+                  }
+                }
               }}
             >
               {layouts.map((item) => (
@@ -251,7 +304,9 @@ export function App() {
           <ChartPane
             key={pane.pane_id}
             pane={pane}
-            contractId={resolveContractId(contracts[pane.root_symbol])}
+            contractId={resolveContractId(
+              contracts[contractCacheKey(pane.live_mode, pane.root_symbol)],
+            )}
             wsClient={wsClient}
             coordinator={coordinator}
             onSymbolChange={handlePaneSymbolChange}

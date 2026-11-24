@@ -1,5 +1,26 @@
 import { describe, expect, it } from "vitest";
-import { PaneFetchCoordinator, type PaneFetchTarget } from "./fetchGuard";
+import type { OhlcvBar } from "../api/types";
+import {
+  PaneFetchCoordinator,
+  appendBoundedWsBar,
+  buildPaneTargetKey,
+  matchesWsBarTarget,
+  reconcileSnapshotWithBufferedBars,
+  type FetchTicket,
+  type PaneFetchTarget,
+} from "./fetchGuard";
+
+function makeBar(time: number, close: number): OhlcvBar {
+  return {
+    time,
+    open: close - 1,
+    high: close + 1,
+    low: close - 2,
+    close,
+    volume: 10,
+    is_closed: true,
+  };
+}
 
 interface Deferred<T> {
   promise: Promise<T>;
@@ -91,5 +112,121 @@ describe("PaneFetchCoordinator (F06)", () => {
     guard.abortPane("pane-2");
     expect(ticket.signal.aborted).toBe(true);
     expect(guard.isResponseCurrent(ticket, baseState)).toBe(false);
+  });
+
+  it("rejects an un-aborted ticket when slot generation has advanced for identical target", () => {
+    /**
+     * Contract: Even when a ticket's AbortSignal is un-aborted and all target fields match,
+     * isResponseCurrent must return false if slot.generation !== ticket.generation.
+     * Defect caught: Generation-blind equality check accepting stale responses after resync.
+     */
+    const guard = new PaneFetchCoordinator();
+    const target: PaneFetchTarget = {
+      pane_id: "pane-1",
+      contract_id: "CON.F.US.MES.H26",
+      timeframe: "5m",
+      live_mode: false,
+      playback_mode: "live",
+    };
+
+    const ticket1 = guard.beginFetch(target);
+    const ticket2 = guard.beginFetch(target);
+    expect(ticket1.generation).toBe(1);
+    expect(ticket2.generation).toBe(2);
+
+    const staleUnaborted: FetchTicket = {
+      generation: 1,
+      signal: new AbortController().signal,
+      target: { ...target },
+    };
+    expect(staleUnaborted.signal.aborted).toBe(false);
+    expect(guard.isResponseCurrent(staleUnaborted, target)).toBe(false);
+    expect(guard.isResponseCurrent(ticket2, target)).toBe(true);
+  });
+});
+
+describe("ChartPane dataset isolation and REST/WS reconciliation (P1-01, P1-02, P2-002)", () => {
+  it("reconcileSnapshotWithBufferedBars preserves newer WS bars and deduplicates overlapping timestamps", () => {
+    /**
+     * Contract: Merging REST snapshot bars with buffered WS updates preserves newer WS bars
+     * (time >= lastRestTime), overwrites the forming tail bar, sorts ascending, and drops older ticks.
+     * Defect caught: In-flight WS ticks lost or duplicated when REST snapshot resolves.
+     */
+    const restBars: OhlcvBar[] = [
+      makeBar(900, 5000),
+      makeBar(1000, 5005),
+    ];
+    const bufferedBars: OhlcvBar[] = [
+      makeBar(500, 4990), // older than lastRestTime=1000 -> ignored
+      makeBar(1000, 5007), // forming tail bar update -> overwrites REST bar at 1000
+      makeBar(2000, 5012), // newer bar arrived while REST in flight -> appended
+      makeBar(2000, 5015), // later tick on 2000 -> overwrites earlier 2000
+    ];
+
+    const merged = reconcileSnapshotWithBufferedBars(restBars, bufferedBars);
+    expect(merged.map((b) => b.time)).toEqual([900, 1000, 2000]);
+    expect(merged.map((b) => b.time)).toContain(2000);
+    expect(merged[1]?.close).toBe(5007);
+    expect(merged[2]?.close).toBe(5015);
+  });
+
+  it("reconcileSnapshotWithBufferedBars handles empty REST snapshots without dropping buffered WS bars", () => {
+    /**
+     * Contract: When REST snapshot returns empty bars, buffered WS bars for the active generation
+     * are retained in ascending time order and deduplicated.
+     * Defect caught: Empty REST response discarding initial live WS bar stream.
+     */
+    const merged = reconcileSnapshotWithBufferedBars([], [
+      makeBar(2000, 102),
+      makeBar(1000, 101),
+      makeBar(2000, 103),
+    ]);
+    expect(merged.map((b) => b.time)).toEqual([1000, 2000]);
+    expect(merged[1]?.close).toBe(103);
+  });
+
+  it("isolates cross-contract WS bars and tracks target-change clear + bounded buffer per generation", () => {
+    /**
+     * Contract: Target changes alter buildPaneTargetKey immediately, matchesWsBarTarget rejects
+     * prior contract/timeframe/mode messages, and appendBoundedWsBar enforces bounded buffering.
+     * Defect caught: Prior contract bars contaminating a switched pane before REST fetch completes.
+     */
+    const mesTarget: PaneFetchTarget = {
+      pane_id: "pane-1",
+      contract_id: "CON.F.US.MES.H26",
+      timeframe: "5m",
+      live_mode: false,
+      playback_mode: "live",
+    };
+    const mnqTarget: PaneFetchTarget = {
+      ...mesTarget,
+      contract_id: "CON.F.US.MNQ.H26",
+    };
+
+    expect(buildPaneTargetKey(mesTarget)).not.toBe(buildPaneTargetKey(mnqTarget));
+    expect(
+      matchesWsBarTarget(
+        { contract_id: "CON.F.US.MES.H26", timeframe: "5m", live_mode: false },
+        mnqTarget,
+      ),
+    ).toBe(false);
+    expect(
+      matchesWsBarTarget(
+        { contract_id: "con.f.us.mnq.h26", timeframe: "5m", live_mode: false },
+        mnqTarget,
+      ),
+    ).toBe(true);
+    expect(
+      matchesWsBarTarget(
+        { contract_id: "CON.F.US.MNQ.H26", timeframe: "5m", live_mode: true },
+        mnqTarget,
+      ),
+    ).toBe(false);
+
+    const buffer: OhlcvBar[] = [];
+    appendBoundedWsBar(buffer, makeBar(100, 1), 2);
+    appendBoundedWsBar(buffer, makeBar(200, 2), 2);
+    appendBoundedWsBar(buffer, makeBar(300, 3), 2);
+    expect(buffer.map((b) => b.time)).toEqual([200, 300]);
   });
 });

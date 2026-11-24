@@ -37,6 +37,7 @@ export function buildMarketWsUrl(): string {
 export class MarketWsClient {
   private socket: WebSocket | null = null;
   private shouldRun = false;
+  private hasConnectedOnce = false;
   private reconnectAttempt = 0;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private pingTimer: ReturnType<typeof setInterval> | null = null;
@@ -57,6 +58,10 @@ export class MarketWsClient {
     return this.connectionState;
   }
 
+  getConnectionState(): WsConnectionState {
+    return this.connectionState;
+  }
+
   connect(): void {
     this.shouldRun = true;
     if (
@@ -72,6 +77,7 @@ export class MarketWsClient {
 
   disconnect(): void {
     this.shouldRun = false;
+    this.hasConnectedOnce = false;
     this.reconnectAttempt = 0;
     this.clearTimers();
     if (this.socket !== null) {
@@ -170,6 +176,8 @@ export class MarketWsClient {
       if (this.socket !== ws) {
         return;
       }
+      const wasReconnect = this.hasConnectedOnce;
+      this.hasConnectedOnce = true;
       this.reconnectAttempt = 0;
       this.setConnectionState("connected");
       for (const entry of this.subscriptions.values()) {
@@ -181,6 +189,15 @@ export class MarketWsClient {
           });
         }
       }
+      if (wasReconnect) {
+        for (const listener of this.resyncListeners) {
+          listener({
+            type: "resync_required",
+            reason: "ws_reconnected",
+            contract_id: null,
+          });
+        }
+      }
       this.clearPingTimer();
       this.pingTimer = setInterval(() => {
         this.sendFrame({ type: "ping" });
@@ -188,6 +205,9 @@ export class MarketWsClient {
     });
 
     ws.addEventListener("message", (event: MessageEvent<unknown>) => {
+      if (this.socket !== ws) {
+        return;
+      }
       if (typeof event.data !== "string") {
         return;
       }
@@ -213,9 +233,10 @@ export class MarketWsClient {
     });
 
     ws.addEventListener("close", (event: CloseEvent) => {
-      if (this.socket === ws) {
-        this.socket = null;
+      if (this.socket !== ws) {
+        return;
       }
+      this.socket = null;
       this.clearPingTimer();
       this.setConnectionState("disconnected");
 
@@ -237,6 +258,9 @@ export class MarketWsClient {
     });
 
     ws.addEventListener("error", () => {
+      if (this.socket !== ws) {
+        return;
+      }
       // Close event handles reconnect scheduling cleanly.
     });
   }

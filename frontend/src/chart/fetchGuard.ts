@@ -1,4 +1,6 @@
-import type { PlaybackMode, Timeframe } from "../api/types";
+import type { OhlcvBar, PlaybackMode, Timeframe, WsBarUpdateMessage } from "../api/types";
+
+export const MAX_PENDING_WS_BARS = 500;
 
 export interface PaneFetchTarget {
   pane_id: string;
@@ -92,4 +94,64 @@ export class PaneFetchCoordinator {
     }
     this.panes.clear();
   }
+}
+
+export function buildPaneTargetKey(target: PaneFetchTarget): string {
+  return `${target.pane_id}|${target.contract_id}|${target.timeframe}|${target.live_mode}|${target.playback_mode}`;
+}
+
+export function matchesWsBarTarget(
+  msg: Pick<WsBarUpdateMessage, "contract_id" | "timeframe" | "live_mode">,
+  target: PaneFetchTarget,
+): boolean {
+  if (!target.contract_id) {
+    return false;
+  }
+  return (
+    msg.contract_id.toUpperCase() === target.contract_id.toUpperCase() &&
+    msg.timeframe === target.timeframe &&
+    msg.live_mode === target.live_mode
+  );
+}
+
+export function appendBoundedWsBar(
+  buffer: OhlcvBar[],
+  bar: OhlcvBar,
+  maxBars: number = MAX_PENDING_WS_BARS,
+): void {
+  if (maxBars <= 0) {
+    return;
+  }
+  if (buffer.length >= maxBars) {
+    buffer.shift();
+  }
+  buffer.push(bar);
+}
+
+/**
+ * Merge REST snapshot bars with buffered WebSocket bar updates collected while
+ * fetchBars was in flight. Sorts ascending by `time`, deduplicates by `time`,
+ * and lets buffered WS bars overwrite or append when `wsBar.time >= lastRestTime`.
+ */
+export function reconcileSnapshotWithBufferedBars(
+  restBars: readonly OhlcvBar[],
+  bufferedBars: readonly OhlcvBar[],
+): OhlcvBar[] {
+  const byTime = new Map<number, OhlcvBar>();
+  let lastRestTime: number | null = null;
+
+  for (const bar of restBars) {
+    byTime.set(bar.time, bar);
+    if (lastRestTime === null || bar.time > lastRestTime) {
+      lastRestTime = bar.time;
+    }
+  }
+
+  for (const wsBar of bufferedBars) {
+    if (lastRestTime === null || wsBar.time >= lastRestTime) {
+      byTime.set(wsBar.time, wsBar);
+    }
+  }
+
+  return Array.from(byTime.values()).sort((a, b) => a.time - b.time);
 }

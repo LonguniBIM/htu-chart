@@ -124,6 +124,14 @@ async def login(
     return {"authenticated": True, "csrf_token": session.csrf_token}
 
 
+@router.get("/auth/session")
+async def get_auth_session(
+    session: Annotated[SessionData, Depends(require_session)],
+) -> dict[str, Any]:
+    """Recover authenticated session state and CSRF token after page reload."""
+    return {"authenticated": True, "csrf_token": session.csrf_token}
+
+
 @router.post("/auth/logout")
 async def logout(
     response: Response,

@@ -23,7 +23,14 @@ import {
   type Timeframe,
 } from "../api/types";
 import type { MarketWsClient } from "../api/wsClient";
-import { PaneFetchCoordinator, type PaneFetchTarget } from "./fetchGuard";
+import {
+  PaneFetchCoordinator,
+  appendBoundedWsBar,
+  buildPaneTargetKey,
+  matchesWsBarTarget,
+  reconcileSnapshotWithBufferedBars,
+  type PaneFetchTarget,
+} from "./fetchGuard";
 
 export interface ChartPaneProps {
   pane: PaneConfig;
@@ -83,6 +90,10 @@ export function ChartPane({
   const volumeSeriesRef = useRef<ISeriesApi<"Histogram"> | null>(null);
   const latestBarRef = useRef<OhlcvBar | null>(null);
   const lastBarTimeRef = useRef<number | null>(null);
+  const activeGenerationRef = useRef<number>(0);
+  const snapshotReadyGenRef = useRef<number>(0);
+  const pendingWsBarsRef = useRef<OhlcvBar[]>([]);
+  const lastTargetKeyRef = useRef<string>("");
 
   const [loadStatus, setLoadStatus] = useState<string>("idle");
   const [resyncNonce, setResyncNonce] = useState<number>(0);
@@ -208,7 +219,16 @@ export function ChartPane({
 
   useEffect(() => {
     const resolvedContractId = contractId?.trim() ?? "";
-    if (!resolvedContractId) {
+    const target: PaneFetchTarget = {
+      pane_id: pane.pane_id,
+      contract_id: resolvedContractId,
+      timeframe: pane.timeframe,
+      live_mode: pane.live_mode,
+      playback_mode: pane.playback_mode,
+    };
+    const nextTargetKey = buildPaneTargetKey(target);
+    if (nextTargetKey !== lastTargetKeyRef.current) {
+      lastTargetKeyRef.current = nextTargetKey;
       candleSeriesRef.current?.setData([]);
       volumeSeriesRef.current?.setData([]);
       latestBarRef.current = null;
@@ -216,17 +236,22 @@ export function ChartPane({
       if (legendRef.current !== null) {
         legendRef.current.textContent = formatLegendText(pane.root_symbol, pane.timeframe, null);
       }
+    }
+
+    if (!resolvedContractId) {
+      coordinator.abortPane(pane.pane_id);
+      activeGenerationRef.current += 1;
+      pendingWsBarsRef.current = [];
+      if (legendRef.current !== null) {
+        legendRef.current.textContent = formatLegendText(pane.root_symbol, pane.timeframe, null);
+      }
       setLoadStatus("no-contract");
       return;
     }
 
-    const ticket = coordinator.beginFetch({
-      pane_id: pane.pane_id,
-      contract_id: resolvedContractId,
-      timeframe: pane.timeframe,
-      live_mode: pane.live_mode,
-      playback_mode: pane.playback_mode,
-    });
+    const ticket = coordinator.beginFetch(target);
+    activeGenerationRef.current = ticket.generation;
+    pendingWsBarsRef.current = [];
     setLoadStatus("loading");
 
     void fetchBars(
@@ -243,11 +268,17 @@ export function ChartPane({
         if (!coordinator.isResponseCurrent(ticket, currentTargetRef.current)) {
           return;
         }
-        const candles = response.bars.map(toCandleDatum);
-        const volumes = response.bars.map(toVolumeDatum);
+        const mergedBars = reconcileSnapshotWithBufferedBars(
+          response.bars,
+          pendingWsBarsRef.current,
+        );
+        const candles = mergedBars.map(toCandleDatum);
+        const volumes = mergedBars.map(toVolumeDatum);
         candleSeriesRef.current?.setData(candles);
         volumeSeriesRef.current?.setData(volumes);
-        const lastBar = response.bars[response.bars.length - 1] ?? null;
+        snapshotReadyGenRef.current = ticket.generation;
+        pendingWsBarsRef.current = [];
+        const lastBar = mergedBars[mergedBars.length - 1] ?? null;
         latestBarRef.current = lastBar;
         lastBarTimeRef.current = lastBar?.time ?? null;
         if (legendRef.current !== null) {
@@ -258,7 +289,7 @@ export function ChartPane({
           );
         }
         chartRef.current?.timeScale().fitContent();
-        setLoadStatus(`${response.count} bars`);
+        setLoadStatus(`${mergedBars.length} bars`);
       })
       .catch((err: unknown) => {
         if (err instanceof DOMException && err.name === "AbortError") {
@@ -293,11 +324,11 @@ export function ChartPane({
 
     const unsubscribeWs = wsClient.subscribe(resolvedContractId, pane.timeframe);
     const removeBarListener = wsClient.onBarUpdate((msg) => {
-      if (
-        msg.contract_id.toUpperCase() !== resolvedContractId.toUpperCase() ||
-        msg.timeframe !== pane.timeframe ||
-        msg.live_mode !== pane.live_mode
-      ) {
+      if (!matchesWsBarTarget(msg, currentTargetRef.current)) {
+        return;
+      }
+      if (snapshotReadyGenRef.current !== activeGenerationRef.current) {
+        appendBoundedWsBar(pendingWsBarsRef.current, msg.bar);
         return;
       }
       if (lastBarTimeRef.current !== null && msg.bar.time < lastBarTimeRef.current) {
@@ -309,8 +340,8 @@ export function ChartPane({
       lastBarTimeRef.current = msg.bar.time;
       if (legendRef.current !== null) {
         legendRef.current.textContent = formatLegendText(
-          pane.root_symbol,
-          pane.timeframe,
+          symbolRef.current,
+          timeframeRef.current,
           msg.bar,
         );
       }
@@ -329,7 +360,7 @@ export function ChartPane({
       removeResyncListener();
       unsubscribeWs();
     };
-  }, [contractId, pane.live_mode, pane.root_symbol, pane.timeframe, wsClient]);
+  }, [contractId, pane.live_mode, pane.timeframe, wsClient]);
 
   return (
     <section className="chart-pane" data-pane-id={pane.pane_id}>
