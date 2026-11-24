@@ -572,8 +572,8 @@ def test_p1_003_zero_depth_globstar_and_nested_headings_and_policy_union(tmp_pat
     policy = tmp_path / "harness" / "model-policy.json"
     policy.parent.mkdir(parents=True, exist_ok=True)
     policy.write_text(json.dumps({"excluded_model_prefixes": ["custom-banned"]}), encoding="utf-8")
-    prefixes, sha, err = brief_gate._load_policy(tmp_path, policy)
-    assert err is None and sha is not None
+    prefixes, sha, pol_path, err = brief_gate._load_policy(tmp_path, policy)
+    assert err is None and sha is not None and pol_path is not None
     assert "gemini-3.8-flash" in prefixes
     assert "custom-banned" in prefixes
 
@@ -603,3 +603,40 @@ def test_p1_003_zero_depth_globstar_and_nested_headings_and_policy_union(tmp_pat
     p_tpl_l1.write_text(filled, encoding="utf-8")
     rc_tpl = brief_gate.main(["--packet", str(p_tpl_l1), "--repo-root", str(tmp_path)])
     assert rc_tpl == 1
+
+
+def test_a4_indented_sub_bullets_strict_risk_tags_and_policy_path(tmp_path: Path) -> None:
+    """F1-03/P2-003/F1-02: Indented key:value sub-bullets, strict Risk Tags, policy_path."""
+    base_sha = _init_git_repo(tmp_path)
+
+    # Indented key: value child bullets under bulleted risk headers must satisfy Layer 2
+    indented_contracts = (
+        "\n- **Pre-Fix RED Reproduction**:\n"
+        "  - **Command**: `pytest backend/tests/test_bug.py -q`\n"
+        "  - **Observed**: Fails on base SHA with AssertionError.\n"
+        "- **Atomicity / Rollback / Concurrency Contract**:\n"
+        "  - **Locking**: Exclusive file lock + atomic os.replace.\n"
+    )
+    p_ind = tmp_path / "p_ind.md"
+    p_ind.write_text(
+        _render_packet(
+            base_sha,
+            is_bugfix="Yes",
+            risk_tags="persistence, concurrency",
+            extra_sections=indented_contracts,
+        ),
+        encoding="utf-8",
+    )
+    custom_pol = tmp_path / "custom-policy.json"
+    custom_pol.write_text(json.dumps({"excluded_model_prefixes": []}), encoding="utf-8")
+    res_ind = brief_gate.validate_brief(p_ind, repo_root=tmp_path, policy_path=custom_pol)
+    assert res_ind["status"] == "VALID"
+    assert res_ind["policy_path"] == custom_pol.resolve().as_posix()
+
+    # Invalid Risk Tags (slash, typo, none+tag, empty) must BLOCKED_BRIEF (rc=2)
+    for bad_tag in ("persistence / concurrency", "unknown_tag", "None, persistence", ""):
+        p_bad = tmp_path / "p_bad_tag.md"
+        p_bad.write_text(_render_packet(base_sha, risk_tags=bad_tag), encoding="utf-8")
+        res_bad = brief_gate.validate_brief(p_bad, repo_root=tmp_path)
+        assert res_bad["status"] == "BLOCKED_BRIEF"
+        assert brief_gate.main(["--packet", str(p_bad), "--repo-root", str(tmp_path)]) == 2

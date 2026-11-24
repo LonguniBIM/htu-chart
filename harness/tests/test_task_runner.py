@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import concurrent.futures
+import json
 import math
 import shutil
 import subprocess
 import sys
+import time
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -382,6 +384,11 @@ def test_scope_violation_circuit_breakers_and_replan_durability(tmp_path: Path) 
         if idx == 4:
             assert l_fail["state"] == "NEEDS_REPLAN"
             b4, pkt4, readiness4 = _setup_repo_with_valid_packet(tmp_path, packet_version=4)
+            # 2nd auto-replan from NEEDS_REPLAN when auto_replans_used==1 -> PAUSED_BUDGET
+            l_pause, rc_pause, _ = task_runner.record_replan(
+                ledger_path, readiness4, packet_path=pkt4, human_approved=False
+            )
+            assert rc_pause == 2 and l_pause["state"] == "PAUSED_BUDGET"
             l_hum2, rc_hum2, _ = task_runner.record_replan(
                 ledger_path, readiness4, packet_path=pkt4, human_approved=True
             )
@@ -829,3 +836,109 @@ def test_p1_001_003_004_005_006_007_hardening(
     assert "--timeout" in rev_cmd and "--idle-timeout" in rev_cmd
     assert rev_timeout >= 1260.0
     assert "--task-manifest" in rec_cmd and "--candidate-sha" in rec_cmd
+
+
+def test_a4_redos_crash_renames_policy_e2e_and_missing_ledger_cli(tmp_path: Path) -> None:
+    """P2-001/P2-002/F1-01/F1-02/F1-05: Linear regex, crash handling, git mv, --policy, CLI."""
+    # P2-001: 80 '#' chars must evaluate linearly without ReDoS
+    t0 = time.monotonic()
+    assert task_runner._extract_peer_signal("#" * 80) is None
+    assert (time.monotonic() - t0) < 0.1
+    assert task_runner._extract_peer_signal("[receipt] BLOCKED — gate failed") is None
+
+    # F1-05: missing --ledger CLI exits 2 cleanly
+    rc_missing = task_runner.main(["status", "--ledger", str(tmp_path / "does_not_exist.json")])
+    assert rc_missing == 2
+
+    # F1-02: custom --policy propagates via readiness.json through check_dispatch & record_replan
+    base_sha, pkt1, _ = _setup_repo_with_valid_packet(tmp_path, packet_version=1, budget_usd=5.0)
+    custom_pol = tmp_path / "custom-policy.json"
+    custom_pol.write_text(
+        json.dumps({"excluded_model_prefixes": ["banned-custom"]}),
+        encoding="utf-8",
+    )
+    r_pol = tmp_path / "readiness_pol.json"
+    assert (
+        brief_gate.main(
+            [
+                "--packet",
+                str(pkt1),
+                "--repo-root",
+                str(tmp_path),
+                "--policy",
+                str(custom_pol),
+                "--out",
+                str(r_pol),
+            ]
+        )
+        == 0
+    )
+    ledger_path = tmp_path / "ledger_e2e.json"
+    task_runner.init_or_load_ledger(
+        ledger_path, root_task_id="T-RUN-01", base_sha=base_sha, budget_usd=5.0
+    )
+    ok_d, _, rc_d, _ = task_runner.check_dispatch(
+        ledger_path, r_pol, pkt1, "gemini-4-hydrogen-high", repo_root=tmp_path
+    )
+    assert ok_d and rc_d == 0
+
+    # P2-002: exit_code=1 with total_tokens=200 & CANDIDATE_READY/[receipt] BLOCKED -> failed
+    out_cr, l_cr, rc_cr = task_runner.record_peer_outcome(
+        ledger_path,
+        raw_output="[receipt] BLOCKED\nCANDIDATE_READY",
+        exit_code=1,
+        total_tokens=200,
+        repo_root=tmp_path,
+    )
+    assert out_cr == "PEER_ROUND_FAILED" and rc_cr == 1
+    assert l_cr["total_candidates"] == 1 and l_cr["consecutive_failed_candidates"] == 1
+
+    # P2-002: CANDIDATE_READY with candidate_sha=None -> PEER_ROUND_FAILED & persists counters
+    out_none, l_none, rc_none = task_runner.record_peer_outcome(
+        ledger_path,
+        signal="CANDIDATE_READY",
+        candidate_sha=None,
+        repo_root=tmp_path,
+    )
+    assert out_none == "PEER_ROUND_FAILED" and rc_none == 1
+    assert l_none["total_candidates"] == 2 and l_none["state"] == "NEEDS_REPLAN"
+
+    # Replan with custom --policy and bumped budget on human_approved=True
+    _, pkt2, _ = _setup_repo_with_valid_packet(tmp_path, packet_version=2, budget_usd=9.5)
+    r_pol2 = tmp_path / "readiness_pol2.json"
+    assert (
+        brief_gate.main(
+            [
+                "--packet",
+                str(pkt2),
+                "--repo-root",
+                str(tmp_path),
+                "--policy",
+                str(custom_pol),
+                "--out",
+                str(r_pol2),
+            ]
+        )
+        == 0
+    )
+    l_rep, rc_rep, _ = task_runner.record_replan(
+        ledger_path, r_pol2, human_approved=True, repo_root=tmp_path
+    )
+    assert rc_rep == 0 and l_rep["budget_limit_usd"] == pytest.approx(9.5)
+
+    # F1-01: git mv from denied file into owned path must fail as SCOPE_VIOLATION (--no-renames)
+    _git(tmp_path, "rm", "-f", "backend/app/feature.py")
+    _git(tmp_path, "mv", "backend/app/protected.py", "backend/app/feature.py")
+    _git(tmp_path, "commit", "-m", "sneaky rename from denied")
+    rename_sha = _git(tmp_path, "rev-parse", "HEAD")
+
+    out_mv, l_mv, rc_mv = task_runner.record_peer_outcome(
+        ledger_path,
+        signal="CANDIDATE_READY",
+        candidate_sha=rename_sha,
+        readiness_path=r_pol2,
+        packet_path=pkt2,
+        repo_root=tmp_path,
+    )
+    assert out_mv == "SCOPE_VIOLATION" and rc_mv == 1
+    assert l_mv["candidate_sha"] is None

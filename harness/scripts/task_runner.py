@@ -84,8 +84,8 @@ DISPATCH_ALLOWED_STATES = frozenset({"INTAKE_G0", "BRIEF_GATE_G05", "ACTIVE_PEER
 PEER_ESCALATION_SIGNALS = frozenset({"REOPEN_REQUEST", "DEPENDENCY_REQUEST", "BLOCKED"})
 SAFE_TASK_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 SIGNAL_HEADER_RE = re.compile(
-    r"^\s*(?:@\S+\s+)?(?:\[[^\]]+\]\s+)?(?:#+\s*|\*\*|`)*"
-    r"\b(CANDIDATE_READY|REOPEN_REQUEST|DEPENDENCY_REQUEST|BLOCKED)\b"
+    r"^(?:@\S+[ \t]+)?(?:\[(?i:done|blocked|reopen|dependency|peer)\][ \t]+)?"
+    r"[#*` \t]*\b(CANDIDATE_READY|REOPEN_REQUEST|DEPENDENCY_REQUEST|BLOCKED)\b"
 )
 
 
@@ -557,8 +557,17 @@ def _is_model_excluded(
     return any(norm.startswith(p.lower()) for p in excluded_prefixes)
 
 
-def _load_policy_state(repo_root: Path) -> tuple[tuple[str, ...], str | None, str | None]:
-    policy_file = repo_root / "harness" / "model-policy.json"
+def _load_policy_state(
+    repo_root: Path,
+    policy_path: Path | None = None,
+) -> tuple[tuple[str, ...], str | None, str | None]:
+    policy_file = (
+        policy_path.resolve()
+        if policy_path is not None
+        else (repo_root / "harness" / "model-policy.json").resolve()
+    )
+    if policy_path is not None and not policy_file.is_file():
+        return DEFAULT_EXCLUDED_MODEL_PREFIXES, None, f"Policy file not found: {policy_file}"
     if not policy_file.is_file():
         return DEFAULT_EXCLUDED_MODEL_PREFIXES, None, None
     try:
@@ -600,6 +609,7 @@ def check_dispatch(
     peer_model: str,
     *,
     repo_root: Path | None = None,
+    policy_path: Path | None = None,
     reserve_usd: float = 0.0,
     reservation_id: str | None = None,
     now_utc: datetime | None = None,
@@ -617,6 +627,7 @@ def check_dispatch(
             packet_path,
             peer_model,
             root=root,
+            policy_path=policy_path,
             reserve_usd=valid_reserve,
             reservation_id=reservation_id,
             now_utc=now_utc,
@@ -630,6 +641,7 @@ def _check_dispatch_locked(
     peer_model: str,
     *,
     root: Path,
+    policy_path: Path | None,
     reserve_usd: float,
     reservation_id: str | None,
     now_utc: datetime | None,
@@ -760,7 +772,12 @@ def _check_dispatch_locked(
         save_ledger(ledger_path, ledger)
         return False, ledger, 2, msg
 
-    excluded_prefixes, current_policy_sha, policy_err = _load_policy_state(root)
+    effective_policy = policy_path or (
+        Path(str(readiness["policy_path"])) if readiness.get("policy_path") else None
+    )
+    excluded_prefixes, current_policy_sha, policy_err = _load_policy_state(
+        root, effective_policy
+    )
     if policy_err:
         ledger["state"] = "BLOCKED"
         _append_event(ledger, "MODEL_POLICY_BLOCKED", {"reason": policy_err})
@@ -901,7 +918,7 @@ def _extract_peer_signals(raw_output: str | None) -> list[str]:
                         continue
             except json.JSONDecodeError:
                 pass
-        match = SIGNAL_HEADER_RE.match(line)
+        match = SIGNAL_HEADER_RE.match(line.lstrip())
         if match:
             found.append(match.group(1).upper())
     return found
@@ -1034,11 +1051,35 @@ def _record_peer_outcome_locked(
 
     norm_status = str(status or "").strip().upper()
     explicit_sig = signal.strip().upper() if signal is not None else ""
+    is_error_exit = norm_status == "ERROR" or (exit_code is not None and exit_code != 0)
+
+    def _record_peer_failure(
+        extra_detail: dict[str, Any] | None = None,
+    ) -> tuple[str, dict[str, Any], int]:
+        ledger["transient_retries_in_stage"] = 0
+        ledger["candidate_sha"] = None
+        ledger["total_candidates"] = int(ledger["total_candidates"]) + 1
+        ledger["candidates_in_packet"] = int(ledger["candidates_in_packet"]) + 1
+        ledger["consecutive_failed_candidates"] = (
+            int(ledger["consecutive_failed_candidates"]) + 1
+        )
+        new_state = _apply_candidate_failure_breakers(ledger)
+        payload = {
+            "candidate_sha": candidate_sha,
+            "exit_code": exit_code,
+            "total_tokens": total_tokens,
+            "error_message": error_message or (raw_output or ""),
+        }
+        if extra_detail:
+            payload.update(extra_detail)
+        _append_event(ledger, "PEER_ROUND_FAILED", payload)
+        save_ledger(ledger_path, ledger)
+        return "PEER_ROUND_FAILED", ledger, (2 if new_state == "PAUSED_BUDGET" else 1)
 
     # Evaluate 0-token startup failure BEFORE scanning raw_output prose/stderr
     is_infra_zero_tok = (
         explicit_sig in {"", "INFRA_STARTUP_ERROR"}
-        and (norm_status == "ERROR" or (exit_code is not None and exit_code != 0))
+        and is_error_exit
         and total_tokens == 0
     )
     if explicit_sig == "INFRA_STARTUP_ERROR" or is_infra_zero_tok:
@@ -1066,6 +1107,10 @@ def _record_peer_outcome_locked(
         save_ledger(ledger_path, ledger)
         return "INFRA_STARTUP_ERROR", ledger, 2
 
+    # Non-zero-token or unknown-token CLI crashes without explicit signal fail immediately
+    if signal is None and is_error_exit:
+        return _record_peer_failure()
+
     has_cand = candidate_sha is not None
     detected_signal = explicit_sig or (
         _extract_peer_signal(raw_output, has_candidate_sha=has_cand) or ""
@@ -1085,6 +1130,9 @@ def _record_peer_outcome_locked(
         return detected_signal, ledger, 0
 
     if detected_signal == "CANDIDATE_READY" or candidate_sha is not None:
+        if candidate_sha is None or not is_hex_sha40(candidate_sha) or is_error_exit:
+            return _record_peer_failure({"reason": "Missing or invalid candidate_sha."})
+
         if readiness_path is None or not readiness_path.is_file():
             raise ValueError("CANDIDATE_READY requires a valid readiness.json path.")
         readiness = json.loads(readiness_path.read_text(encoding="utf-8"))
@@ -1131,13 +1179,8 @@ def _record_peer_outcome_locked(
             return "BLOCKED_BRIEF", ledger, 2
 
         git_top = resolve_git_toplevel(root, timeout_sec=30.0)
-        cand_valid = (
-            candidate_sha is not None
-            and is_hex_sha40(candidate_sha)
-            and candidate_sha != r_base
-            and (exit_code == 0 and norm_status != "ERROR")
-        )
-        if cand_valid and candidate_sha is not None:
+        cand_valid = candidate_sha != r_base
+        if cand_valid:
             cat = run_managed_stage_cmd(
                 "peer_round",
                 ["git", "-C", str(git_top), "cat-file", "-t", candidate_sha],
@@ -1147,26 +1190,7 @@ def _record_peer_outcome_locked(
             cand_valid = cat.returncode == 0 and cat.stdout.strip() == "commit"
 
         if not cand_valid:
-            ledger["transient_retries_in_stage"] = 0
-            ledger["candidate_sha"] = None
-            ledger["total_candidates"] = int(ledger["total_candidates"]) + 1
-            ledger["candidates_in_packet"] = int(ledger["candidates_in_packet"]) + 1
-            ledger["consecutive_failed_candidates"] = (
-                int(ledger["consecutive_failed_candidates"]) + 1
-            )
-            new_state = _apply_candidate_failure_breakers(ledger)
-            _append_event(
-                ledger,
-                "PEER_ROUND_FAILED",
-                {
-                    "candidate_sha": candidate_sha,
-                    "exit_code": exit_code,
-                    "total_tokens": total_tokens,
-                    "error_message": error_message or (raw_output or ""),
-                },
-            )
-            save_ledger(ledger_path, ledger)
-            return "PEER_ROUND_FAILED", ledger, (2 if new_state == "PAUSED_BUDGET" else 1)
+            return _record_peer_failure({"reason": "Unreachable or non-distinct candidate_sha."})
 
         ledger["transient_retries_in_stage"] = 0
         ledger["total_candidates"] = int(ledger["total_candidates"]) + 1
@@ -1176,7 +1200,10 @@ def _record_peer_outcome_locked(
             "git",
             "-C",
             str(git_top),
+            "-c",
+            "core.quotepath=false",
             "diff",
+            "--no-renames",
             "--name-only",
             f"{r_base}..{candidate_sha}",
         ]
@@ -1220,26 +1247,8 @@ def _record_peer_outcome_locked(
         save_ledger(ledger_path, ledger)
         return "CANDIDATE_READY", ledger, 0
 
-    if norm_status == "ERROR" or (exit_code is not None and exit_code != 0):
-        ledger["transient_retries_in_stage"] = 0
-        ledger["candidate_sha"] = None
-        ledger["total_candidates"] = int(ledger["total_candidates"]) + 1
-        ledger["candidates_in_packet"] = int(ledger["candidates_in_packet"]) + 1
-        ledger["consecutive_failed_candidates"] = (
-            int(ledger["consecutive_failed_candidates"]) + 1
-        )
-        new_state = _apply_candidate_failure_breakers(ledger)
-        _append_event(
-            ledger,
-            "PEER_ROUND_FAILED",
-            {
-                "exit_code": exit_code,
-                "total_tokens": total_tokens,
-                "error_message": error_message or (raw_output or ""),
-            },
-        )
-        save_ledger(ledger_path, ledger)
-        return "PEER_ROUND_FAILED", ledger, (2 if new_state == "PAUSED_BUDGET" else 1)
+    if is_error_exit:
+        return _record_peer_failure()
 
     raise ValueError(
         f"Unable to classify Peer outcome (signal={signal!r}, status={status!r}, "
@@ -1351,6 +1360,7 @@ def record_replan(
     packet_path: Path | None = None,
     human_approved: bool = False,
     repo_root: Path | None = None,
+    policy_path: Path | None = None,
 ) -> tuple[dict[str, Any], int, str]:
     """Advance ledger to a bumped ``packet_version`` after validated ``readiness.json``."""
     with _ledger_lock(ledger_path):
@@ -1411,7 +1421,10 @@ def record_replan(
             except (ValueError, TimeoutError):
                 active_root = REPO_ROOT.resolve()
 
-        _, current_policy_sha, policy_err = _load_policy_state(active_root)
+        effective_policy = policy_path or (
+            Path(str(readiness["policy_path"])) if readiness.get("policy_path") else None
+        )
+        _, current_policy_sha, policy_err = _load_policy_state(active_root, effective_policy)
         if policy_err:
             return ledger, 2, policy_err
         if readiness.get("policy_sha256") != current_policy_sha:
@@ -1688,6 +1701,7 @@ def _build_parser() -> argparse.ArgumentParser:
     p_disp.add_argument("--packet", type=Path, required=True)
     p_disp.add_argument("--peer-model", required=True)
     p_disp.add_argument("--repo-root", type=Path, default=REPO_ROOT)
+    p_disp.add_argument("--policy", type=Path, default=None)
     p_disp.add_argument("--reserve-usd", type=float, default=0.0)
     p_disp.add_argument("--reservation-id", default=None)
     p_disp.add_argument("--json", action="store_true")
@@ -1720,6 +1734,7 @@ def _build_parser() -> argparse.ArgumentParser:
     p_rep.add_argument("--packet", type=Path, default=None)
     p_rep.add_argument("--human-approved", action="store_true")
     p_rep.add_argument("--repo-root", type=Path, default=None)
+    p_rep.add_argument("--policy", type=Path, default=None)
     p_rep.add_argument("--json", action="store_true")
 
     p_use = sub.add_parser("record-usage", help="Record model token usage with deduplication.")
@@ -1755,7 +1770,7 @@ def main(argv: list[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
     try:
         return _dispatch_cli(args)
-    except ValueError as exc:
+    except (ValueError, FileNotFoundError) as exc:
         print(f"[task_runner] ERROR: {exc}", file=sys.stderr)
         return 2
 
@@ -1785,6 +1800,7 @@ def _dispatch_cli(args: argparse.Namespace) -> int:
             args.packet,
             args.peer_model,
             repo_root=args.repo_root,
+            policy_path=args.policy,
             reserve_usd=args.reserve_usd,
             reservation_id=args.reservation_id,
         )
@@ -1841,6 +1857,7 @@ def _dispatch_cli(args: argparse.Namespace) -> int:
             packet_path=args.packet,
             human_approved=args.human_approved,
             repo_root=args.repo_root,
+            policy_path=args.policy,
         )
         if args.json:
             print(json.dumps({"message": msg, "ledger": ledger}, indent=2))

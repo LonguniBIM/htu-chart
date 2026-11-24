@@ -95,6 +95,17 @@ CALENDAR_PATH_MARKERS = (
     "aggregation",
     "vwap",
 )
+VALID_RISK_TAGS = frozenset(
+    {
+        "none",
+        "persistence",
+        "concurrency",
+        "websocket",
+        "security",
+        "auth",
+        "session_calendar",
+    }
+)
 HTML_COMMENT_RE = re.compile(r"<!--.*?-->", re.DOTALL)
 TEMPLATE_PLACEHOLDER_RE = re.compile(
     r"<(?:"
@@ -292,16 +303,23 @@ def _parse_pos_float(raw: str) -> float | None:
     return parsed
 
 
-def _parse_risk_tags(raw: str | None) -> list[str]:
-    if not raw:
-        return []
-    cleaned = raw.replace("`", "")
-    tags: list[str] = []
-    for part in cleaned.split(","):
-        tag = part.strip().lower()
-        if tag and tag != "none":
-            tags.append(tag)
-    return tags
+def _parse_risk_tags(raw: str | None) -> tuple[list[str], str | None]:
+    if raw is None:
+        return [], None
+    cleaned = raw.replace("`", "").strip()
+    if not cleaned:
+        return [], "Risk Tags header cannot be empty when specified (use 'None' if no risk tags)."
+    if "/" in cleaned:
+        return [], f"Risk Tags must be comma-separated without '/': {raw!r}."
+    raw_tokens = [part.strip().lower() for part in cleaned.split(",")]
+    if any(not tok for tok in raw_tokens):
+        return [], f"Risk Tags contains empty entry: {raw!r}."
+    unknown = [tok for tok in raw_tokens if tok not in VALID_RISK_TAGS]
+    if unknown:
+        return [], f"Unknown Risk Tags {unknown!r}; allowed: {sorted(VALID_RISK_TAGS)!r}."
+    if "none" in raw_tokens and len(raw_tokens) > 1:
+        return [], f"Risk Tags cannot combine 'None' with other tags: {raw!r}."
+    return [tok for tok in raw_tokens if tok != "none"], None
 
 
 def _iter_non_fenced_lines(text: str) -> list[tuple[int, str]]:
@@ -332,12 +350,15 @@ def _parse_packet_structure(
     active_scope: str | None = None
     active_scope_indent: int = -1
     heading_stack: list[tuple[int, str]] = []
-    active_item_key: str | None = None
-    active_item_indent: int = -1
+    item_stack: list[tuple[int, str]] = []
 
     def _append_to_headings(line_text: str) -> None:
         for _, h_key in heading_stack:
             sections.setdefault(h_key, []).append(line_text)
+
+    def _append_to_items(line_text: str) -> None:
+        for _, i_key in item_stack:
+            sections.setdefault(i_key, []).append(line_text)
 
     for _, line in lines:
         stripped = line.strip()
@@ -348,8 +369,7 @@ def _parse_packet_structure(
             norm_title = _normalize_key(title.replace("`", ""))
             active_scope = None
             active_scope_indent = -1
-            active_item_key = None
-            active_item_indent = -1
+            item_stack.clear()
             if "owned paths" in norm_title:
                 active_scope = "owned"
                 active_scope_indent = -1
@@ -393,20 +413,24 @@ def _parse_packet_structure(
 
             if key_norm in KNOWN_META_KEYS and indent <= 1 and key_norm not in metadata:
                 metadata[key_norm] = val
-                active_item_key = None
+                item_stack.clear()
             elif key_norm.startswith("owned paths"):
                 active_scope = "owned"
                 active_scope_indent = indent
-                active_item_key = None
+                item_stack.clear()
             elif key_norm.startswith("denied paths") or key_norm.startswith("do not touch"):
                 active_scope = "denied"
                 active_scope_indent = indent
-                active_item_key = None
+                item_stack.clear()
             else:
+                while item_stack and item_stack[-1][0] >= indent:
+                    item_stack.pop()
                 _append_to_headings(stripped)
-                sections.setdefault(key_norm, []).append(val)
-                active_item_key = key_norm
-                active_item_indent = indent
+                _append_to_items(stripped)
+                sections.setdefault(key_norm, [])
+                if val:
+                    sections[key_norm].append(val)
+                item_stack.append((indent, key_norm))
             continue
 
         num_match = re.match(
@@ -417,54 +441,60 @@ def _parse_packet_structure(
             indent = len(num_match.group("indent").expandtabs(2))
             label_norm = _normalize_key(num_match.group("title"))
             rest = num_match.group("rest").strip()
+            while item_stack and item_stack[-1][0] >= indent:
+                item_stack.pop()
             _append_to_headings(stripped)
+            _append_to_items(stripped)
             sections.setdefault(label_norm, [])
             if rest:
                 sections[label_norm].append(rest)
-            active_item_key = label_norm
-            active_item_indent = indent
+            item_stack.append((indent, label_norm))
             continue
 
         if stripped:
+            cur_indent = len(line[: len(line) - len(line.lstrip(" \t"))].expandtabs(2))
+            while item_stack and item_stack[-1][0] >= cur_indent:
+                item_stack.pop()
             _append_to_headings(stripped)
-            if active_item_key is not None:
-                cur_indent = len(line[: len(line) - len(line.lstrip(" \t"))].expandtabs(2))
-                if cur_indent > active_item_indent:
-                    sections.setdefault(active_item_key, []).append(stripped)
-                else:
-                    active_item_key = None
-                    active_item_indent = -1
+            _append_to_items(stripped)
 
     section_text = {k: "\n".join(v).strip() for k, v in sections.items()}
     return metadata, owned_raw, denied_raw, section_text
 
 
 def _find_section_body(sections: dict[str, str], patterns: tuple[str, ...]) -> str | None:
+    matched: list[str] = []
     for title, body in sections.items():
         if any(re.search(pat, title, re.IGNORECASE) for pat in patterns):
-            if body.strip():
-                return body.strip()
-    return None
+            stripped = body.strip()
+            if stripped:
+                matched.append(stripped)
+    return "\n".join(matched) if matched else None
 
 
 def _load_policy(
     repo_root: Path,
     policy_path: Path | None,
-) -> tuple[tuple[str, ...], str | None, str | None]:
+) -> tuple[tuple[str, ...], str | None, str | None, str | None]:
     target = policy_path.resolve() if policy_path is not None else (repo_root / DEFAULT_POLICY_REL)
     if policy_path is not None and not target.is_file():
-        return DEFAULT_EXCLUDED_MODEL_PREFIXES, None, f"Policy file not found: {target}"
+        return DEFAULT_EXCLUDED_MODEL_PREFIXES, None, None, f"Policy file not found: {target}"
     if not target.is_file():
-        return DEFAULT_EXCLUDED_MODEL_PREFIXES, None, None
+        return DEFAULT_EXCLUDED_MODEL_PREFIXES, None, None, None
 
     try:
         raw_bytes = target.read_bytes()
         data = json.loads(raw_bytes.decode("utf-8"))
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
-        return DEFAULT_EXCLUDED_MODEL_PREFIXES, None, f"Invalid model policy JSON ({target}): {exc}"
+        return (
+            DEFAULT_EXCLUDED_MODEL_PREFIXES,
+            None,
+            None,
+            f"Invalid model policy JSON ({target}): {exc}",
+        )
 
     if not isinstance(data, dict):
-        return DEFAULT_EXCLUDED_MODEL_PREFIXES, None, "Model policy JSON must be an object."
+        return DEFAULT_EXCLUDED_MODEL_PREFIXES, None, None, "Model policy JSON must be an object."
 
     prefixes = data.get("excluded_model_prefixes", [])
     if not isinstance(prefixes, list) or not all(
@@ -472,6 +502,7 @@ def _load_policy(
     ):
         return (
             DEFAULT_EXCLUDED_MODEL_PREFIXES,
+            None,
             None,
             "Policy 'excluded_model_prefixes' must be a list of non-empty strings.",
         )
@@ -482,7 +513,7 @@ def _load_policy(
         if cleaned.lower() not in seen:
             merged.append(cleaned)
             seen.add(cleaned.lower())
-    return tuple(merged), _sha256_bytes(raw_bytes), None
+    return tuple(merged), _sha256_bytes(raw_bytes), target.as_posix(), None
 
 
 def _compute_peer_prompt_sha256(
@@ -525,6 +556,7 @@ def _build_readiness_payload(
     denied_paths: list[str],
     peer_prompt_sha256: str | None,
     policy_sha256: str | None,
+    policy_path: str | None,
     risk_flags: dict[str, bool],
     eligible_peer_models: list[str],
     status: str,
@@ -545,6 +577,7 @@ def _build_readiness_payload(
         "denied_paths": denied_paths,
         "peer_prompt_sha256": peer_prompt_sha256,
         "policy_sha256": policy_sha256,
+        "policy_path": policy_path,
         "risk_flags": risk_flags,
         "eligible_peer_models": eligible_peer_models,
         "status": status,
@@ -594,7 +627,9 @@ def validate_brief(
     blocked_errors: list[str] = []
     replan_errors: list[str] = []
 
-    excluded_prefixes, policy_sha256, policy_err = _load_policy(resolved_root, policy_path)
+    excluded_prefixes, policy_sha256, resolved_policy_path, policy_err = _load_policy(
+        resolved_root, policy_path
+    )
     if policy_err:
         blocked_errors.append(policy_err)
 
@@ -622,6 +657,7 @@ def validate_brief(
             denied_paths=[],
             peer_prompt_sha256=None,
             policy_sha256=policy_sha256,
+            policy_path=resolved_policy_path,
             risk_flags=default_flags,
             eligible_peer_models=[],
             status="BLOCKED_BRIEF",
@@ -647,6 +683,7 @@ def validate_brief(
             denied_paths=[],
             peer_prompt_sha256=None,
             policy_sha256=policy_sha256,
+            policy_path=resolved_policy_path,
             risk_flags=default_flags,
             eligible_peer_models=[],
             status="BLOCKED_BRIEF",
@@ -670,6 +707,7 @@ def validate_brief(
             denied_paths=[],
             peer_prompt_sha256=None,
             policy_sha256=policy_sha256,
+            policy_path=resolved_policy_path,
             risk_flags=default_flags,
             eligible_peer_models=[],
             status="BLOCKED_BRIEF",
@@ -728,7 +766,9 @@ def validate_brief(
         blocked_errors.append("Missing or invalid Budget USD (requires positive finite float).")
         budget_usd = 0.0
 
-    risk_tags = _parse_risk_tags(metadata.get("risk tags"))
+    risk_tags, risk_err = _parse_risk_tags(metadata.get("risk tags"))
+    if risk_err:
+        blocked_errors.append(risk_err)
 
     git_top: Path | None = None
     git_commit_ok = False
@@ -949,6 +989,7 @@ def validate_brief(
         denied_paths=denied_paths,
         peer_prompt_sha256=peer_prompt_sha256,
         policy_sha256=policy_sha256,
+        policy_path=resolved_policy_path,
         risk_flags=risk_flags,
         eligible_peer_models=eligible_peer_models,
         status=status,
