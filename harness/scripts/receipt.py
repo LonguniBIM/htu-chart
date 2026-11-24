@@ -40,6 +40,7 @@ ENV_OR_IMPORT_ERROR_MARKERS = (
 VALID_SEVERITIES = frozenset({"critical", "high", "medium", "low", "info"})
 BLOCKING_SEVERITIES = frozenset({"critical", "high", "medium"})
 EVIDENCE_REF_RE = re.compile(r"^(?P<path>[^\s:]+):(?P<start>\d+)(?:-(?P<end>\d+))?$")
+HEX_SHA64_RE = re.compile(r"^[0-9a-f]{64}$")
 
 
 def _sha256_file(path: Path | None) -> str | None:
@@ -424,9 +425,9 @@ def _evaluate_verifier_gate(
     required_steps: set[str] = {"arch_check", "harness_ruff", "harness_pytest"}
     if require_frozen or verifier_data.get("source_mode") == "frozen_commit_archive":
         required_steps.add("upstream_fork_clean")
-    if phase in {1, 2, 4, 5, 6}:
+    if phase >= 1:
         required_steps.update({"backend_ruff", "backend_pytest"})
-    if phase in {3, 4, 6}:
+    if phase >= 3:
         required_steps.update({"frontend_typecheck", "frontend_build"})
 
     passed_step_names = {str(s.get("name", "")) for s in steps}
@@ -446,15 +447,17 @@ def _evaluate_verifier_gate(
                 [f"Frozen archive required: verifier source_mode={verifier_data.get('source_mode')!r}."],
             )
         v_tree_hash = verifier_data.get("frozen_tree_sha256")
-        if not isinstance(v_tree_hash, str) or len(v_tree_hash) != 64:
-            return "BLOCKED", [], ["Frozen archive required: verifier missing frozen_tree_sha256."]
+        if not isinstance(v_tree_hash, str) or not HEX_SHA64_RE.fullmatch(v_tree_hash):
+            return "BLOCKED", [], ["Frozen archive required: verifier missing valid 64-hex frozen_tree_sha256."]
         if isinstance(review_data, dict):
             r_tree_hash = review_data.get("frozen_tree_sha256")
-            if r_tree_hash is not None and r_tree_hash != v_tree_hash:
+            if not isinstance(r_tree_hash, str) or not HEX_SHA64_RE.fullmatch(r_tree_hash):
+                return "BLOCKED", [], ["Frozen archive required: review missing valid 64-hex frozen_tree_sha256."]
+            if r_tree_hash != v_tree_hash:
                 return (
                     "BLOCKED",
                     [],
-                    [f"Frozen tree hash mismatch between verifier ({v_tree_hash[:12]}) and review ({str(r_tree_hash)[:12]})."],
+                    [f"Frozen tree hash mismatch between verifier ({v_tree_hash[:12]}) and review ({r_tree_hash[:12]})."],
                 )
 
     return "VERIFIED", [], []

@@ -444,3 +444,33 @@ def test_spawn_managed_process_attaches_job_before_resuming_process(monkeypatch)
     assert proc.pid == 4321
     assert job == 777
     assert events == ["Popen(CREATE_SUSPENDED)", "AssignProcessToJobObject", "NtResumeProcess"]
+
+
+def test_build_verifier_commit_blocks_uncommitted_module_leak_via_caller_pythonpath(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """P1-001: Dirty PYTHONPATH / live root modules missing from commit must NOT be importable in --commit mode."""
+    _setup_mini_repo(
+        tmp_path,
+        test_code="import uncommitted_helper\n\ndef test_uses_uncommitted():\n    assert uncommitted_helper.VAL == 1\n",
+    )
+    subprocess.run(["git", "init"], cwd=tmp_path, check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=tmp_path, check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.name", "Test User"], cwd=tmp_path, check=True, capture_output=True)
+    subprocess.run(["git", "add", "."], cwd=tmp_path, check=True, capture_output=True)
+    subprocess.run(["git", "commit", "-m", "missing helper"], cwd=tmp_path, check=True, capture_output=True)
+
+    # Create uncommitted_helper.py ONLY in dirty working tree + point caller PYTHONPATH to dirty root
+    (tmp_path / "uncommitted_helper.py").write_text("VAL = 1\n", encoding="utf-8")
+    monkeypatch.setenv("PYTHONPATH", str(tmp_path))
+
+    report = run_verifier(
+        tmp_path,
+        phase=0,
+        strict_clean=False,
+        commit_sha="HEAD",
+        frozen_dir=tmp_path / "out_leak" / "frozen" / "topstep-chart-app",
+    )
+    assert report["status"] == "FAILED"
+    pytest_step = next(s for s in report["steps"] if s["name"] == "harness_pytest")
+    assert pytest_step["status"] == "FAILED"

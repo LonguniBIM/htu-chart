@@ -182,14 +182,59 @@ def _git_snapshot(root: Path, *, timeout_sec: float = 60.0) -> dict[str, Any]:
     }
 
 
-def _isolated_python_env(target_root: Path) -> dict[str, str]:
+def _isolated_python_env(live_root: Path, target_root: Path) -> dict[str, str]:
     env = os.environ.copy()
-    prepends = [str(target_root)]
+    guard_dir = target_root.parent / "_site_guard"
+    guard_dir.mkdir(parents=True, exist_ok=True)
+    sitecustomize = guard_dir / "sitecustomize.py"
+    sitecustomize.write_text(
+        "\n".join(
+            [
+                "import os",
+                "import sys",
+                "from pathlib import Path",
+                "",
+                "_live = os.environ.get('TOPSTEP_LIVE_ROOT')",
+                "_frozen = os.environ.get('TOPSTEP_FROZEN_ROOT')",
+                "_venv = os.environ.get('TOPSTEP_VENV_ROOT')",
+                "if _live and _frozen:",
+                "    live_p = Path(_live).resolve()",
+                "    frozen_p = Path(_frozen).resolve()",
+                "    venv_p = Path(_venv).resolve() if _venv else None",
+                "",
+                "    def _allowed(entry: str) -> bool:",
+                "        try:",
+                "            p = Path(entry).resolve() if entry else Path.cwd().resolve()",
+                "        except OSError:",
+                "            return True",
+                "        if p == frozen_p or p.is_relative_to(frozen_p):",
+                "            return True",
+                "        if venv_p is not None and (p == venv_p or p.is_relative_to(venv_p)):",
+                "            return True",
+                "        if p == live_p or p.is_relative_to(live_p):",
+                "            return False",
+                "        return True",
+                "",
+                "    sys.path[:] = [e for e in sys.path if _allowed(e)]",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    py_paths = [str(guard_dir)]
     backend_dir = target_root / "backend"
     if backend_dir.is_dir():
-        prepends.insert(0, str(backend_dir))
-    existing = env.get("PYTHONPATH", "")
-    env["PYTHONPATH"] = os.pathsep.join([*prepends, existing]) if existing else os.pathsep.join(prepends)
+        py_paths.append(str(backend_dir))
+    py_paths.append(str(target_root))
+    env["PYTHONPATH"] = os.pathsep.join(py_paths)
+    env["TOPSTEP_LIVE_ROOT"] = str(live_root.resolve())
+    env["TOPSTEP_FROZEN_ROOT"] = str(target_root.resolve())
+    venv_root = live_root / "backend" / ".venv"
+    if venv_root.is_dir():
+        env["TOPSTEP_VENV_ROOT"] = str(venv_root.resolve())
+    else:
+        env.pop("TOPSTEP_VENV_ROOT", None)
     return env
 
 
@@ -402,7 +447,7 @@ def run_verifier(
             resolved_sha = mat["candidate_sha"]
             frozen_tree_sha256 = mat["frozen_tree_sha256"]
             source_mode = "frozen_commit_archive"
-            isolated_env = _isolated_python_env(target_root)
+            isolated_env = _isolated_python_env(root, target_root)
 
         if strict_clean and (not snapshot["initialized"] or snapshot["worktree_dirty"]):
             steps.append(

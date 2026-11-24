@@ -22,6 +22,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from datetime import datetime, timezone
@@ -31,6 +32,7 @@ from typing import Any
 try:
     from harness.scripts.codex_room_sync import EXPECTED_REVIEW_MODEL, verify_role
     from harness.scripts.schema_utils import (
+        cleanup_readonly_tree,
         close_job_handle,
         compute_tree_sha256,
         is_hex_sha40,
@@ -45,6 +47,7 @@ try:
 except ImportError:
     from codex_room_sync import EXPECTED_REVIEW_MODEL, verify_role
     from schema_utils import (
+        cleanup_readonly_tree,
         close_job_handle,
         compute_tree_sha256,
         is_hex_sha40,
@@ -443,13 +446,17 @@ def consolidate_reviews(
     blocking_open_count = sum(1 for f in findings_list if f["blocking"] and f["status"] == "OPEN")
     advisory_count = sum(1 for f in findings_list if not f["blocking"])
 
-    if (
-        pass1_data.get("verdict") == "CHANGES_REQUESTED"
-        or pass2_data.get("verdict") == "CHANGES_REQUESTED"
-    ) and blocking_open_count == 0:
-        errors.append(
-            "Contradictory pass verdict: reviewer reported CHANGES_REQUESTED without any blocking finding (critical/high/medium)."
-        )
+    for label, payload in (("Pass 1", pass1_data), ("Pass 2", pass2_data)):
+        if payload.get("verdict") == "CHANGES_REQUESTED":
+            p_findings = payload.get("findings", [])
+            has_blocking = any(
+                isinstance(f, dict) and str(f.get("severity", "")).lower() in BLOCKING_SEVERITIES
+                for f in p_findings
+            )
+            if not has_blocking:
+                errors.append(
+                    f"{label} reported CHANGES_REQUESTED without any blocking finding (critical/high/medium)."
+                )
 
     p1_tqi = pass1_data.get("test_quality_issues") if isinstance(pass1_data.get("test_quality_issues"), list) else []
     p2_tqi = pass2_data.get("test_quality_issues") if isinstance(pass2_data.get("test_quality_issues"), list) else []
@@ -995,6 +1002,20 @@ def main(argv: list[str] | None = None) -> int:
         p1_data = json.loads(p1_path.read_text(encoding="utf-8")) if p1_path.is_file() else None
         p2_data = json.loads(p2_path.read_text(encoding="utf-8")) if p2_path.is_file() else None
         report = consolidate_reviews(p1_data, p2_data, expected_sha=candidate_sha)
+        tmp_dir = tempfile.mkdtemp(prefix="crr-consolidate-")
+        try:
+            frozen_meta = materialize_frozen_tree(
+                git_top,
+                candidate_sha,
+                Path(tmp_dir) / "topstep-chart-app",
+                base_sha=info["base_sha"],
+            )
+            report["frozen_tree_sha256"] = frozen_meta["frozen_tree_sha256"]
+        except (ValueError, RuntimeError, TimeoutError) as exc:
+            report["errors"].append(f"Unable to compute frozen_tree_sha256: {exc}")
+            report["review_gate_status"] = "BLOCKED"
+        finally:
+            cleanup_readonly_tree(Path(tmp_dir))
         if not _write_once_outputs(out_dir, report):
             return 2
         print(f"[codex_room_review] status={report['review_gate_status']} out={out_dir}")

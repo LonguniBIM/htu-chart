@@ -23,14 +23,14 @@ def _verifier(sha: str, status: str = "VERIFIED", phase: int = 1, frozen: bool =
     ]
     if frozen:
         steps.append({"name": "upstream_fork_clean", "command": ["git", "status"], "status": "PASSED", "exit_code": 0})
-    if phase in {1, 2, 4, 5, 6}:
+    if phase >= 1:
         steps.extend(
             [
                 {"name": "backend_ruff", "command": ["ruff", "check", "backend"], "status": step_status, "exit_code": step_exit},
                 {"name": "backend_pytest", "command": ["pytest", "backend/tests", "-q"], "status": step_status, "exit_code": step_exit},
             ]
         )
-    if phase in {3, 4, 6}:
+    if phase >= 3:
         steps.extend(
             [
                 {"name": "frontend_typecheck", "command": ["pnpm", "--dir", "frontend", "typecheck"], "status": step_status, "exit_code": step_exit},
@@ -767,6 +767,65 @@ def test_receipt_blocks_when_mandatory_phase_steps_are_missing() -> None:
     )
     assert res_p1["conclusion"] == "BLOCKED"
     assert any("backend_pytest" in b for b in res_p1["blockers"])
+
+    phase3_missing_be = _verifier(cand, phase=3)
+    phase3_missing_be["steps"] = [s for s in phase3_missing_be["steps"] if s["name"] != "backend_pytest"]
+    res_p3 = evaluate_receipt(
+        task_id="P1-002-P3",
+        phase=3,
+        base_sha=base,
+        candidate_sha=cand,
+        verifier_data=phase3_missing_be,
+        review_data=_review(cand),
+    )
+    assert res_p3["conclusion"] == "BLOCKED"
+    assert any("backend_pytest" in b for b in res_p3["blockers"])
+
+    phase5_missing_fe = _verifier(cand, phase=5)
+    phase5_missing_fe["steps"] = [s for s in phase5_missing_fe["steps"] if s["name"] != "frontend_build"]
+    res_p5 = evaluate_receipt(
+        task_id="P1-002-P5",
+        phase=5,
+        base_sha=base,
+        candidate_sha=cand,
+        verifier_data=phase5_missing_fe,
+        review_data=_review(cand),
+    )
+    assert res_p5["conclusion"] == "BLOCKED"
+    assert any("frontend_build" in b for b in res_p5["blockers"])
+
+
+def test_receipt_require_frozen_blocks_missing_or_none_review_tree_hash() -> None:
+    """S2-001: require_frozen=True must block when review_data omits frozen_tree_sha256 or sets it to None."""
+    base = "1" * 40
+    cand = "2" * 40
+    frozen_v = _verifier(cand, phase=1, frozen=True)
+    frozen_v["frozen_tree_sha256"] = "a" * 64
+
+    review_missing = _review(cand)
+    res_missing = evaluate_receipt(
+        task_id="S2-001-MISSING",
+        phase=1,
+        base_sha=base,
+        candidate_sha=cand,
+        verifier_data=frozen_v,
+        review_data=review_missing,
+        require_frozen=True,
+    )
+    assert res_missing["conclusion"] == "BLOCKED"
+
+    review_none = _review(cand)
+    review_none["frozen_tree_sha256"] = None
+    res_none = evaluate_receipt(
+        task_id="S2-001-NONE",
+        phase=1,
+        base_sha=base,
+        candidate_sha=cand,
+        verifier_data=frozen_v,
+        review_data=review_none,
+        require_frozen=True,
+    )
+    assert res_none["conclusion"] == "BLOCKED"
 
 
 def test_receipt_blocks_none_verifier_steps_without_crashing() -> None:

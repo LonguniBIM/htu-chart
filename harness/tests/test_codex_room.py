@@ -1112,3 +1112,16 @@ def test_merge_prior_pass_findings_preserves_invalid_or_contradictory_prior_pass
     assert rc == 2
     report = json.loads((out_dir / "consolidated-review.json").read_text(encoding="utf-8"))
     assert report["review_gate_status"] == "BLOCKED"
+
+
+def test_consolidate_blocks_contradictory_pass_even_when_other_pass_has_blocking_finding() -> None:
+    """P1-003: Pass 1 CHANGES_REQUESTED with [] must block even when Pass 2 has a valid blocking finding."""
+    sha = "a" * 40
+    high_finding = _sample_finding("P2-10", "high", "Real security bug")
+    res = consolidate_reviews(
+        _sample_pass(sha, "correctness_and_tests", "CHANGES_REQUESTED", []),
+        _sample_pass(sha, "security_and_invariants", "CHANGES_REQUESTED", [high_finding]),
+        expected_sha=sha,
+    )
+    assert res["review_gate_status"] == "BLOCKED"
+    assert any("Pass 1" in e and "CHANGES_REQUESTED" in e for e in res["errors"])
