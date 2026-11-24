@@ -108,6 +108,37 @@ export function App() {
     };
   }, [coordinator, wsClient]);
 
+  const invalidateSessionLocally = useCallback(
+    (errorMessage?: string | null) => {
+      sessionEpochRef.current += 1;
+      contractResolveGenerationRef.current += 1;
+      activeAuthControllerRef.current?.abort();
+      activeAuthControllerRef.current = null;
+      retryAbortControllerRef.current?.abort();
+      retryAbortControllerRef.current = null;
+      layoutResolveControllerRef.current?.abort();
+      layoutResolveControllerRef.current = null;
+      contractsRetryNeededRef.current = false;
+      unresolvedModesRef.current.clear();
+      resolvedModesRef.current.clear();
+      prevFeedStateRef.current = "DISCONNECTED";
+      setIsRetryingContracts(false);
+      setRetrySchedule((prev) => ({ attempt: 0, nonce: prev.nonce + 1 }));
+      setContractsPendingRetry(false);
+      setLoadError(null);
+      wsClient.disconnect();
+      coordinator.dispose();
+      setActiveLayout(null);
+      activeLayoutRef.current = null;
+      setLayouts([]);
+      setContracts({});
+      setStatusData(null);
+      setAuthStage("unauthenticated");
+      setAuthError(errorMessage ?? null);
+    },
+    [coordinator, wsClient],
+  );
+
   const fetchContractsForModes = useCallback(
     async (
       modes: readonly boolean[],
@@ -207,20 +238,20 @@ export function App() {
 
   const applyContractResolutionError = useCallback(
     (err: unknown, attemptedModes: readonly boolean[]) => {
-      const isAuthError =
-        err instanceof ApiError && (err.status === 401 || err.status === 403);
-      if (!isAuthError) {
-        contractsRetryNeededRef.current = true;
-        for (const mode of attemptedModes) {
-          unresolvedModesRef.current.add(mode);
-        }
-        setContractsPendingRetry(true);
+      if (err instanceof ApiError && (err.status === 401 || err.status === 403)) {
+        invalidateSessionLocally(err.status === 403 ? err.message : null);
+        return;
       }
+      contractsRetryNeededRef.current = true;
+      for (const mode of attemptedModes) {
+        unresolvedModesRef.current.add(mode);
+      }
+      setContractsPendingRetry(true);
       if (!(err instanceof ApiError && err.status === 503)) {
         setLoadError(err instanceof Error ? err.message : "Failed to resolve contracts");
       }
     },
-    [],
+    [invalidateSessionLocally],
   );
 
   const retryUnresolvedContracts = useCallback(
@@ -263,6 +294,22 @@ export function App() {
           return;
         }
 
+        const statusErr: unknown =
+          statusResult.status === "rejected" ? statusResult.reason : null;
+        const contractsErr: unknown =
+          contractsResult.status === "rejected" ? contractsResult.reason : null;
+        const authErr =
+          statusErr instanceof ApiError && (statusErr.status === 401 || statusErr.status === 403)
+            ? statusErr
+            : contractsErr instanceof ApiError &&
+                (contractsErr.status === 401 || contractsErr.status === 403)
+              ? contractsErr
+              : null;
+        if (authErr !== null) {
+          invalidateSessionLocally(authErr.status === 403 ? authErr.message : null);
+          return;
+        }
+
         if (statusResult.status === "fulfilled") {
           const freshStatus = statusResult.value;
           setStatusData(freshStatus);
@@ -297,7 +344,12 @@ export function App() {
         }
       }
     },
-    [applyContractResolutionError, applyContractResolutionResult, fetchContractsForModes],
+    [
+      applyContractResolutionError,
+      applyContractResolutionResult,
+      fetchContractsForModes,
+      invalidateSessionLocally,
+    ],
   );
 
   useEffect(() => {
@@ -439,6 +491,9 @@ export function App() {
         if (err instanceof DOMException && err.name === "AbortError") {
           throw err;
         }
+        if (err instanceof ApiError && (err.status === 401 || err.status === 403)) {
+          throw err;
+        }
         if (isStale()) {
           return;
         }
@@ -475,8 +530,8 @@ export function App() {
         ) {
           return;
         }
-        if (err instanceof ApiError && err.status === 401) {
-          setAuthStage("unauthenticated");
+        if (err instanceof ApiError && (err.status === 401 || err.status === 403)) {
+          invalidateSessionLocally(err.status === 401 ? null : err.message);
           return;
         }
         setAuthStage("unauthenticated");
@@ -494,7 +549,7 @@ export function App() {
         activeAuthControllerRef.current = null;
       }
     };
-  }, [bootstrapWorkspace]);
+  }, [bootstrapWorkspace, invalidateSessionLocally]);
 
   const handleLogin = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
@@ -506,12 +561,14 @@ export function App() {
     activeAuthControllerRef.current?.abort();
     const controller = new AbortController();
     activeAuthControllerRef.current = controller;
+    let loginSucceeded = false;
 
     try {
       await login(passwordInput, controller.signal);
       if (controller.signal.aborted) {
         return;
       }
+      loginSucceeded = true;
       setPasswordInput("");
       await bootstrapWorkspace(controller.signal);
       if (controller.signal.aborted) {
@@ -525,6 +582,14 @@ export function App() {
       ) {
         return;
       }
+      if (
+        loginSucceeded &&
+        err instanceof ApiError &&
+        (err.status === 401 || err.status === 403)
+      ) {
+        invalidateSessionLocally(err.status === 401 ? null : err.message);
+        return;
+      }
       setAuthError(err instanceof Error ? err.message : "Login failed");
     } finally {
       if (activeAuthControllerRef.current === controller) {
@@ -534,35 +599,12 @@ export function App() {
   };
 
   const handleLogout = async () => {
-    sessionEpochRef.current += 1;
-    contractResolveGenerationRef.current += 1;
-    activeAuthControllerRef.current?.abort();
-    activeAuthControllerRef.current = null;
-    retryAbortControllerRef.current?.abort();
-    retryAbortControllerRef.current = null;
-    layoutResolveControllerRef.current?.abort();
-    layoutResolveControllerRef.current = null;
-    contractsRetryNeededRef.current = false;
-    unresolvedModesRef.current.clear();
-    prevFeedStateRef.current = "DISCONNECTED";
-    setIsRetryingContracts(false);
-    setRetrySchedule((prev) => ({ attempt: 0, nonce: prev.nonce + 1 }));
-    setContractsPendingRetry(false);
-    setLoadError(null);
-    wsClient.disconnect();
-    coordinator.dispose();
+    invalidateSessionLocally();
     try {
       await logout();
     } catch {
       // Clear local UI state even if session already expired
     }
-    setActiveLayout(null);
-    activeLayoutRef.current = null;
-    setLayouts([]);
-    setContracts({});
-    resolvedModesRef.current.clear();
-    setStatusData(null);
-    setAuthStage("unauthenticated");
   };
 
   const handlePaneSymbolChange = (paneId: string, nextSymbol: RootSymbol) => {

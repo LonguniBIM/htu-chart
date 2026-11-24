@@ -1106,4 +1106,112 @@ describe("ChartPane (F06, P1-R3-01, P1-R3-02)", () => {
     });
     expect(fetchBarsMock).toHaveBeenCalledTimes(4);
   });
+
+  it("displays BarsQuality warnings alongside valid bars and clears them on clean target switch (P2-R11-002)", async () => {
+    /**
+     * Contract: When GET /api/bars returns HTTP 200 with degraded quality flags
+     * ({ is_complete: false, truncated: true, provider_gap: true, quarantined_count: 2 }),
+     * ChartPane renders valid bars (candleSetData + bar count) AND renders a status warning pill
+     * ("Warning: truncated, provider gap, 2 quarantined"), and clears the warning immediately on
+     * target switch and when switching to a target with clean quality.
+     * Defect caught: ChartPane discarding response.quality or leaking stale warnings across switches.
+     */
+    const mesFetch = createDeferred<BarsResponse>();
+    const mnqFetch = createDeferred<BarsResponse>();
+    const incompleteFetch = createDeferred<BarsResponse>();
+    fetchBarsMock
+      .mockReturnValueOnce(mesFetch.promise)
+      .mockReturnValueOnce(mnqFetch.promise)
+      .mockReturnValueOnce(incompleteFetch.promise);
+
+    const coordinator = new PaneFetchCoordinator();
+    const fakeWs = createFakeWsClient();
+    const mesPane: PaneConfig = {
+      pane_id: "pane-1",
+      root_symbol: "MES",
+      timeframe: "5m",
+      live_mode: false,
+      playback_mode: "live",
+    };
+
+    const { rerender } = render(
+      <ChartPane
+        pane={mesPane}
+        contractId="CON.F.US.MES.H26"
+        activeFeedLive={false}
+        wsClient={fakeWs.client}
+        coordinator={coordinator}
+      />,
+    );
+
+    await act(async () => {
+      mesFetch.resolve({
+        ...makeBarsResponse("CON.F.US.MES.H26", [makeBar(1000, 5000), makeBar(1300, 5010)]),
+        quality: {
+          is_complete: false,
+          truncated: true,
+          provider_gap: true,
+          quarantined_count: 2,
+        },
+      });
+      await mesFetch.promise;
+    });
+
+    const lastCandleCall = candleSetData.mock.calls[candleSetData.mock.calls.length - 1]?.[0] as
+      | Array<{ time: number; close: number }>
+      | undefined;
+    expect(lastCandleCall?.map((b) => b.time)).toEqual([1000, 1300]);
+    expect(screen.getByText("2 bars")).toBeTruthy();
+    expect(screen.getByRole("status").textContent).toBe(
+      "Warning: truncated, provider gap, 2 quarantined",
+    );
+
+    const mnqPane: PaneConfig = { ...mesPane, root_symbol: "MNQ" };
+    rerender(
+      <ChartPane
+        pane={mnqPane}
+        contractId="CON.F.US.MNQ.H26"
+        activeFeedLive={false}
+        wsClient={fakeWs.client}
+        coordinator={coordinator}
+      />,
+    );
+
+    expect(screen.queryByRole("status")).toBeNull();
+
+    await act(async () => {
+      mnqFetch.resolve(makeBarsResponse("CON.F.US.MNQ.H26", [makeBar(2000, 18000)]));
+      await mnqFetch.promise;
+    });
+
+    expect(screen.getByText("1 bars")).toBeTruthy();
+    expect(screen.queryByRole("status")).toBeNull();
+
+    const mnq15mPane: PaneConfig = { ...mnqPane, timeframe: "15m" };
+    rerender(
+      <ChartPane
+        pane={mnq15mPane}
+        contractId="CON.F.US.MNQ.H26"
+        activeFeedLive={false}
+        wsClient={fakeWs.client}
+        coordinator={coordinator}
+      />,
+    );
+
+    await act(async () => {
+      incompleteFetch.resolve({
+        ...makeBarsResponse("CON.F.US.MNQ.H26", [makeBar(2000, 18000)]),
+        timeframe: "15m",
+        quality: {
+          is_complete: false,
+          truncated: false,
+          provider_gap: false,
+          quarantined_count: 0,
+        },
+      });
+      await incompleteFetch.promise;
+    });
+
+    expect(screen.getByRole("status").textContent).toBe("Warning: incomplete");
+  });
 });

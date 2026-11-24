@@ -19,6 +19,7 @@ import {
   ROOT_SYMBOLS,
   TIMEFRAMES,
   isLiveWsTimeframe,
+  type BarsQuality,
   type OhlcvBar,
   type PaneConfig,
   type RootSymbol,
@@ -80,6 +81,26 @@ function formatLegendText(
   );
 }
 
+function formatQualityWarning(quality: BarsQuality | null): string | null {
+  if (quality === null) {
+    return null;
+  }
+  const flags: string[] = [];
+  if (quality.truncated) {
+    flags.push("truncated");
+  }
+  if (quality.provider_gap) {
+    flags.push("provider gap");
+  }
+  if (quality.quarantined_count > 0) {
+    flags.push(`${quality.quarantined_count} quarantined`);
+  }
+  if (flags.length === 0 && !quality.is_complete) {
+    flags.push("incomplete");
+  }
+  return flags.length > 0 ? `Warning: ${flags.join(", ")}` : null;
+}
+
 export function ChartPane({
   pane,
   contractId,
@@ -106,6 +127,7 @@ export function ChartPane({
   const retryCancelRef = useRef<(() => void) | null>(null);
 
   const [loadStatus, setLoadStatus] = useState<string>("idle");
+  const [barsQuality, setBarsQuality] = useState<BarsQuality | null>(null);
   const [resyncNonce, setResyncNonce] = useState<number>(0);
 
   const currentTarget: PaneFetchTarget = {
@@ -262,7 +284,8 @@ export function ChartPane({
       playback_mode: pane.playback_mode,
     };
     const nextTargetKey = buildPaneTargetKey(target);
-    if (nextTargetKey !== lastTargetKeyRef.current) {
+    const isNewTarget = nextTargetKey !== lastTargetKeyRef.current;
+    if (isNewTarget) {
       lastTargetKeyRef.current = nextTargetKey;
       hasLoadedTargetKeyRef.current = "";
       snapshotRetryCountRef.current = 0;
@@ -272,6 +295,7 @@ export function ChartPane({
       volumeSeriesRef.current?.setData([]);
       latestBarRef.current = null;
       lastBarTimeRef.current = null;
+      setBarsQuality(null);
       if (legendRef.current !== null) {
         legendRef.current.textContent = formatLegendText(pane.root_symbol, pane.timeframe, null);
       }
@@ -286,6 +310,7 @@ export function ChartPane({
       activeGenerationRef.current += 1;
       pendingWsBarsRef.current = [];
       bufferOverflowRef.current = false;
+      setBarsQuality(null);
       if (legendRef.current !== null) {
         legendRef.current.textContent = formatLegendText(pane.root_symbol, pane.timeframe, null);
       }
@@ -342,6 +367,7 @@ export function ChartPane({
           );
         }
         chartRef.current?.timeScale().fitContent();
+        setBarsQuality(response.quality ?? null);
         setLoadStatus(`${mergedBars.length} bars`);
         if (didOverflow) {
           setResyncNonce((n) => n + 1);
@@ -453,6 +479,7 @@ export function ChartPane({
       ? `Hist only (feed: ${activeFeedLive ? "Live" : "Sim"})`
       : null;
   const statusText = histOnlyLabel !== null ? `${histOnlyLabel} · ${loadStatus}` : loadStatus;
+  const qualityWarning = formatQualityWarning(barsQuality);
   const showRetryButton =
     loadStatus.startsWith("error:") || loadStatus.startsWith("resync error:");
 
@@ -485,6 +512,11 @@ export function ChartPane({
           <span className="chart-pane__contract">{contractId ?? "Unresolved"}</span>
         </div>
         <div className="chart-pane__controls">
+          {qualityWarning !== null && (
+            <span className="chart-pane__quality-warning" role="status">
+              {qualityWarning}
+            </span>
+          )}
           <span className="chart-pane__status">{statusText}</span>
           {showRetryButton && (
             <button

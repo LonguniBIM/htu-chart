@@ -1427,4 +1427,136 @@ describe("App bootstrap and R03 503 recovery (P1-R3-03, P1-R3-04, P2-005)", () =
     expect(screen.queryByText(/Sim: Sim transport error/)).toBeNull();
     expect(screen.queryByRole("button", { name: "Retry Contracts" })).toBeNull();
   });
+
+  it("invalidates session without calling wsClient.connect or scheduling retries when bootstrap fetchContracts returns 401 (P1-R11-01)", async () => {
+    /**
+     * Contract: When fetchSession, fetchStatus, and listLayouts succeed during mount bootstrap
+     * but fetchContracts rejects with ApiError(401), App re-throws past wsClient.connect(),
+     * clears partial bootstrap state via invalidateSessionLocally, renders the login gate,
+     * and schedules zero further fetchContracts retries.
+     * Defect caught: bootstrapWorkspace swallowing 401 from fetchContracts and opening WS anyway.
+     */
+    vi.useFakeTimers();
+    fetchSessionMock.mockResolvedValue({
+      authenticated: true,
+      csrf_token: "csrf-token-1234567890",
+    });
+    fetchStatusMock.mockResolvedValue({
+      connected: true,
+      live: false,
+      feed_state: "LIVE",
+    });
+    listLayoutsMock.mockResolvedValue([SAMPLE_LAYOUT]);
+    fetchContractsMock.mockRejectedValueOnce(new ApiError(401, "Session expired"));
+
+    render(<App />);
+    await act(async () => {
+      await flushMicrotasks();
+    });
+
+    expect(screen.getByPlaceholderText("Enter terminal password")).toBeTruthy();
+    expect(mockWsConnect).not.toHaveBeenCalled();
+    expect(screen.queryByRole("button", { name: "Retry Contracts" })).toBeNull();
+    expect(fetchContractsMock).toHaveBeenCalledTimes(1);
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(20000);
+      await flushMicrotasks();
+    });
+    expect(fetchContractsMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("invalidates session and surfaces 403 error when handleLogin bootstrap fetchContracts returns 403 (P1-R11-01)", async () => {
+    /**
+     * Contract: When login() succeeds and bootstrapWorkspace fetchContracts rejects with
+     * ApiError(403), handleLogin calls invalidateSessionLocally(err.message), never calls
+     * wsClient.connect(), returns to the login gate with the 403 error, and schedules zero retries.
+     * Defect caught: handleLogin bootstrap swallowing 403 and leaving authenticated/retry state.
+     */
+    vi.useFakeTimers();
+    fetchSessionMock.mockRejectedValueOnce(new ApiError(401, "Authentication required"));
+    loginMock.mockResolvedValueOnce({
+      authenticated: true,
+      csrf_token: "csrf-token-login-123",
+    });
+    fetchStatusMock.mockResolvedValue({
+      connected: true,
+      live: false,
+      feed_state: "LIVE",
+    });
+    listLayoutsMock.mockResolvedValue([SAMPLE_LAYOUT]);
+    fetchContractsMock.mockRejectedValueOnce(new ApiError(403, "Invalid CSRF token"));
+
+    render(<App />);
+    await act(async () => {
+      await flushMicrotasks();
+    });
+
+    fireEvent.change(screen.getByLabelText("Terminal password"), {
+      target: { value: "terminal-secret" },
+    });
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Unlock Terminal" }));
+      await flushMicrotasks();
+    });
+
+    expect(screen.getByPlaceholderText("Enter terminal password")).toBeTruthy();
+    expect(screen.getByText(/Invalid CSRF token/)).toBeTruthy();
+    expect(mockWsConnect).not.toHaveBeenCalled();
+    expect(fetchContractsMock).toHaveBeenCalledTimes(1);
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(20000);
+      await flushMicrotasks();
+    });
+    expect(fetchContractsMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("stops auto-retry, disconnects WS, and returns to login when 503 retry receives 401 (P2-R11-001)", async () => {
+    /**
+     * Contract: When initial bootstrap receives 503 on fetchContracts (scheduling auto-retry)
+     * and the 2000ms retry attempt receives ApiError(401), App immediately calls
+     * invalidateSessionLocally, disconnects WS, clears retry state, returns to the login gate,
+     * and triggers zero further retry requests.
+     * Defect caught: retryUnresolvedContracts leaving authenticated workspace/retry loop on 401.
+     */
+    vi.useFakeTimers();
+    fetchSessionMock.mockResolvedValue({
+      authenticated: true,
+      csrf_token: "csrf-token-1234567890",
+    });
+    fetchStatusMock.mockResolvedValue({
+      connected: false,
+      live: false,
+      feed_state: "DISCONNECTED",
+    });
+    listLayoutsMock.mockResolvedValue([SAMPLE_LAYOUT]);
+    fetchContractsMock
+      .mockRejectedValueOnce(new ApiError(503, "TopstepX is not connected"))
+      .mockRejectedValueOnce(new ApiError(401, "Session expired"));
+
+    render(<App />);
+    await act(async () => {
+      await flushMicrotasks();
+    });
+
+    expect(fetchContractsMock).toHaveBeenCalledTimes(1);
+    expect(mockWsConnect).toHaveBeenCalledTimes(1);
+    expect(screen.getByRole("button", { name: "Retry Contracts" })).toBeTruthy();
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(2000);
+      await flushMicrotasks();
+    });
+
+    expect(fetchContractsMock).toHaveBeenCalledTimes(2);
+    expect(screen.getByPlaceholderText("Enter terminal password")).toBeTruthy();
+    expect(mockWsDisconnect).toHaveBeenCalledTimes(1);
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(60000);
+      await flushMicrotasks();
+    });
+    expect(fetchContractsMock).toHaveBeenCalledTimes(2);
+  });
 });

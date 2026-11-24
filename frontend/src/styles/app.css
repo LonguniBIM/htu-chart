@@ -133,6 +133,17 @@ body,
   color: #94a3b8;
 }
 
+.chart-pane__quality-warning {
+  padding: 2px 7px;
+  border-radius: 999px;
+  background: rgba(245, 158, 11, 0.14);
+  border: 1px solid rgba(245, 158, 11, 0.35);
+  color: #fbbf24;
+  font-size: 11px;
+  line-height: 1.3;
+  white-space: nowrap;
+}
+
 .chart-pane__canvas-wrap {
   position: relative;
   flex: 1;
