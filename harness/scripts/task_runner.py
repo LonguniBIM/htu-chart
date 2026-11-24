@@ -1,0 +1,1364 @@
+"""Durable Circuit-Breaker & Budget State Runner for S-L-P orchestration.
+
+Persists per-root-task state atomically in ``ledger.json``, enforces G0.5
+readiness hash & model policy checks before Peer dispatch, classifies Peer
+escalations vs 0-token infrastructure startup errors, enforces circuit breakers,
+and deduplicates cumulative conversation token usage for USD budgeting.
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import re
+import subprocess
+import sys
+import threading
+from datetime import UTC, datetime
+from pathlib import Path
+from typing import Any
+
+try:
+    from harness.scripts.brief_gate import (
+        DEFAULT_EXCLUDED_MODEL_PREFIXES,
+        _paths_overlap,
+    )
+    from harness.scripts.schema_utils import (
+        is_hex_sha40,
+        is_strict_int,
+        resolve_git_toplevel,
+        run_managed_cmd,
+    )
+except ImportError:
+    from brief_gate import (
+        DEFAULT_EXCLUDED_MODEL_PREFIXES,
+        _paths_overlap,
+    )
+    from schema_utils import (
+        is_hex_sha40,
+        is_strict_int,
+        resolve_git_toplevel,
+        run_managed_cmd,
+    )
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+
+DEFAULT_DEADLINES_SEC: dict[str, int] = {
+    "brief_generation": 300,
+    "peer_round": 600,
+    "verifier_step": 180,
+    "verifier_total": 420,
+    "reviewer_pass_total": 600,
+    "reviewer_pass_idle": 180,
+    "root_task_wall_clock": 3600,
+}
+
+DEFAULT_CIRCUIT_BREAKERS: dict[str, int] = {
+    "reassess_after_failed_candidates": 2,
+    "max_candidates_per_packet_version": 3,
+    "max_auto_replans_per_root_task": 1,
+    "max_total_candidates_per_root_task": 6,
+    "max_transient_retries_per_provider_pass": 1,
+}
+
+DEFAULT_PRICING_PER_1M: dict[str, dict[str, float]] = {
+    "gemini-4-neon-": {"input": 3.00, "output": 15.00, "cache_read": 0.30},
+    "gemini-4-carbon-": {"input": 2.50, "output": 15.00, "cache_read": 0.25},
+    "gemini-4-hydrogen-": {"input": 0.50, "output": 3.00, "cache_read": 0.05},
+    "claude-opus-5-5-": {"input": 5.00, "output": 25.00, "cache_read": 0.50},
+    "gpt-6.1-sol": {"input": 2.50, "output": 12.00, "cache_read": 0.25},
+}
+
+OPAQUE_MODEL_ALIASES = frozenset({"flash", "flash_lite", "pro", "inherit"})
+DISPATCH_ALLOWED_STATES = frozenset({"INTAKE_G0", "BRIEF_GATE_G05", "ACTIVE_PEER_G1"})
+PEER_ESCALATION_SIGNALS = frozenset({"REOPEN_REQUEST", "DEPENDENCY_REQUEST", "BLOCKED"})
+
+
+def _now_utc() -> datetime:
+    return datetime.now(UTC)
+
+
+def _sha256_bytes(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def default_ledger_path(root_task_id: str, repo_root: Path | None = None) -> Path:
+    root = (repo_root or REPO_ROOT).resolve()
+    return root / "harness" / "runs" / root_task_id / "ledger.json"
+
+
+def save_ledger(ledger_path: Path, ledger: dict[str, Any]) -> None:
+    """Atomically write ``ledger`` to ``ledger_path`` via fsync + os.replace."""
+    resolved = ledger_path.resolve()
+    ledger["updated_at_utc"] = _now_utc().isoformat()
+    payload = json.dumps(ledger, indent=2) + "\n"
+
+    resolved.parent.mkdir(parents=True, exist_ok=True)
+    tmp_name = f".ledger.{os.getpid()}.{threading.get_ident()}.tmp"
+    tmp_path = resolved.parent / tmp_name
+    try:
+        with tmp_path.open("w", encoding="utf-8") as fh:
+            fh.write(payload)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp_path, resolved)
+    except Exception:
+        if tmp_path.exists():
+            try:
+                tmp_path.unlink()
+            except OSError:
+                pass
+        raise
+
+
+def load_ledger(
+    ledger_path: Path,
+    *,
+    expected_root_task_id: str | None = None,
+) -> dict[str, Any]:
+    """Load and validate an existing ``ledger.json``."""
+    resolved = ledger_path.resolve()
+    if not resolved.is_file():
+        raise FileNotFoundError(f"Ledger not found: {resolved}")
+    data = json.loads(resolved.read_text(encoding="utf-8"))
+    if not isinstance(data, dict) or not data.get("root_task_id"):
+        raise ValueError(f"Invalid ledger payload at {resolved}")
+    if expected_root_task_id is not None and data["root_task_id"] != expected_root_task_id:
+        raise ValueError(
+            f"Root task mismatch: ledger belongs to {data['root_task_id']!r}, "
+            f"cannot bind {expected_root_task_id!r}."
+        )
+    return data
+
+
+def init_or_load_ledger(
+    ledger_path: Path,
+    *,
+    root_task_id: str,
+    task_id: str | None = None,
+    packet_version: int = 1,
+    base_sha: str = "",
+    budget_usd: float = 6.0,
+    deadlines_sec: dict[str, int] | None = None,
+    circuit_breakers: dict[str, int] | None = None,
+) -> dict[str, Any]:
+    """Create a new ledger keyed by ``root_task_id`` or load the existing one intact."""
+    if not root_task_id.strip():
+        raise ValueError("root_task_id must be a non-empty string.")
+    resolved = ledger_path.resolve()
+    if resolved.is_file():
+        return load_ledger(resolved, expected_root_task_id=root_task_id)
+
+    now_iso = _now_utc().isoformat()
+    merged_deadlines = dict(DEFAULT_DEADLINES_SEC)
+    if deadlines_sec:
+        merged_deadlines.update(deadlines_sec)
+    merged_breakers = dict(DEFAULT_CIRCUIT_BREAKERS)
+    if circuit_breakers:
+        merged_breakers.update(circuit_breakers)
+
+    ledger: dict[str, Any] = {
+        "schema_version": 2,
+        "root_task_id": root_task_id,
+        "task_id": task_id or root_task_id,
+        "packet_version": int(packet_version),
+        "base_sha": base_sha,
+        "candidate_sha": None,
+        "state": "INTAKE_G0",
+        "created_at_utc": now_iso,
+        "updated_at_utc": now_iso,
+        "deadlines_sec": merged_deadlines,
+        "circuit_breakers": merged_breakers,
+        "total_candidates": 0,
+        "candidates_in_packet": 0,
+        "consecutive_failed_candidates": 0,
+        "auto_replans_used": 0,
+        "transient_retries_in_stage": 0,
+        "budget_limit_usd": float(budget_usd),
+        "spent_api_equiv_usd": 0.0,
+        "active_reservations": {},
+        "budget_warning": False,
+        "usage_by_conversation": {},
+        "events": [],
+    }
+    save_ledger(resolved, ledger)
+    return ledger
+
+
+def _append_event(
+    ledger: dict[str, Any],
+    kind: str,
+    detail: dict[str, Any] | None = None,
+) -> None:
+    event: dict[str, Any] = {
+        "ts_utc": _now_utc().isoformat(),
+        "kind": kind,
+        "state": ledger.get("state"),
+    }
+    if detail:
+        event["detail"] = detail
+    ledger.setdefault("events", []).append(event)
+
+
+def run_managed_stage_cmd(
+    stage: str,
+    cmd: list[str],
+    *,
+    ledger: dict[str, Any] | None = None,
+    cwd: Path | None = None,
+    timeout_override: float | None = None,
+) -> subprocess.CompletedProcess[str]:
+    """Run a harness/git command under process-tree containment with stage timeout."""
+    deadlines = ledger.get("deadlines_sec", {}) if ledger else DEFAULT_DEADLINES_SEC
+    timeout_sec = float(
+        timeout_override
+        if timeout_override is not None
+        else deadlines.get(stage, DEFAULT_DEADLINES_SEC.get(stage, 180))
+    )
+    return run_managed_cmd(cmd, cwd=cwd, timeout_sec=timeout_sec, text=True)
+
+
+def run_brief_gate_step(
+    packet_path: Path,
+    readiness_out: Path,
+    *,
+    repo_root: Path | None = None,
+    policy_path: Path | None = None,
+    ledger: dict[str, Any] | None = None,
+) -> subprocess.CompletedProcess[str]:
+    """Execute ``brief_gate.py`` via managed subprocess with ``brief_generation`` deadline."""
+    root = (repo_root or REPO_ROOT).resolve()
+    script = Path(__file__).resolve().parent / "brief_gate.py"
+    cmd = [
+        sys.executable,
+        str(script),
+        "--packet",
+        str(packet_path),
+        "--repo-root",
+        str(root),
+        "--out",
+        str(readiness_out),
+        "--json",
+    ]
+    if policy_path is not None:
+        cmd.extend(["--policy", str(policy_path)])
+    return run_managed_stage_cmd("brief_generation", cmd, ledger=ledger, cwd=root)
+
+
+def run_verifier_gate_step(
+    *,
+    phase: int,
+    commit_sha: str,
+    out_json: Path,
+    repo_root: Path | None = None,
+    ledger: dict[str, Any] | None = None,
+) -> subprocess.CompletedProcess[str]:
+    """Execute ``build_verifier.py`` via managed subprocess with ``verifier_total`` deadline."""
+    root = (repo_root or REPO_ROOT).resolve()
+    script = Path(__file__).resolve().parent / "build_verifier.py"
+    step_timeout = int(
+        (ledger or {}).get("deadlines_sec", DEFAULT_DEADLINES_SEC).get("verifier_step", 180)
+    )
+    total_timeout = int(
+        (ledger or {}).get("deadlines_sec", DEFAULT_DEADLINES_SEC).get("verifier_total", 420)
+    )
+    cmd = [
+        sys.executable,
+        str(script),
+        "--root",
+        str(root),
+        "--phase",
+        str(phase),
+        "--strict-clean",
+        "--commit",
+        commit_sha,
+        "--step-timeout",
+        str(step_timeout),
+        "--total-timeout",
+        str(total_timeout),
+        "--out",
+        str(out_json),
+        "--json",
+    ]
+    return run_managed_stage_cmd("verifier_total", cmd, ledger=ledger, cwd=root)
+
+
+def run_review_gate_step(
+    *,
+    commit_sha: str,
+    task_id: str,
+    packet_path: Path,
+    out_dir: Path,
+    repo_root: Path | None = None,
+    ledger: dict[str, Any] | None = None,
+) -> subprocess.CompletedProcess[str]:
+    """Execute ``codex_room_review.py`` via managed subprocess with reviewer deadline."""
+    root = (repo_root or REPO_ROOT).resolve()
+    script = Path(__file__).resolve().parent / "codex_room_review.py"
+    cmd = [
+        sys.executable,
+        str(script),
+        "--commit",
+        commit_sha,
+        "--task-id",
+        task_id,
+        "--task-packet",
+        str(packet_path),
+        "--out-dir",
+        str(out_dir),
+        "--fail-on-blocking",
+    ]
+    return run_managed_stage_cmd("reviewer_pass_total", cmd, ledger=ledger, cwd=root)
+
+
+def run_receipt_gate_step(
+    *,
+    task_id: str,
+    phase: int,
+    base_sha: str,
+    candidate_sha: str,
+    verifier_json: Path,
+    review_json: Path,
+    readiness_json: Path,
+    out_dir: Path,
+    is_bugfix: bool = False,
+    red_proof_json: Path | None = None,
+    repo_root: Path | None = None,
+    ledger: dict[str, Any] | None = None,
+) -> subprocess.CompletedProcess[str]:
+    """Execute ``receipt.py`` via managed subprocess with ``verifier_step`` deadline."""
+    root = (repo_root or REPO_ROOT).resolve()
+    script = Path(__file__).resolve().parent / "receipt.py"
+    cmd = [
+        sys.executable,
+        str(script),
+        "--task-id",
+        task_id,
+        "--phase",
+        str(phase),
+        "--base-sha",
+        base_sha,
+        "--candidate-sha",
+        candidate_sha,
+        "--verifier-json",
+        str(verifier_json),
+        "--review-json",
+        str(review_json),
+        "--task-manifest",
+        str(readiness_json),
+        "--repo-root",
+        str(root),
+        "--out-dir",
+        str(out_dir),
+    ]
+    if is_bugfix:
+        cmd.append("--bugfix")
+    if red_proof_json is not None:
+        cmd.extend(["--red-proof-json", str(red_proof_json)])
+    return run_managed_stage_cmd("verifier_step", cmd, ledger=ledger, cwd=root)
+
+
+def _active_reserved_usd(ledger: dict[str, Any]) -> float:
+    reservations = ledger.get("active_reservations", {})
+    if not isinstance(reservations, dict):
+        return 0.0
+    return sum(float(v) for v in reservations.values())
+
+
+def _refresh_budget_warning(ledger: dict[str, Any]) -> float:
+    spent = float(ledger.get("spent_api_equiv_usd", 0.0))
+    reserved = _active_reserved_usd(ledger)
+    limit = float(ledger.get("budget_limit_usd", 0.0))
+    committed = round(spent + reserved, 8)
+    if limit > 0 and committed >= round(0.8 * limit, 8):
+        ledger["budget_warning"] = True
+    return committed
+
+
+def _is_model_excluded(
+    model_name: str,
+    excluded_prefixes: tuple[str, ...] = DEFAULT_EXCLUDED_MODEL_PREFIXES,
+) -> bool:
+    norm = model_name.strip().lower()
+    if not norm or norm in OPAQUE_MODEL_ALIASES:
+        return True
+    return any(norm.startswith(p.lower()) for p in excluded_prefixes)
+
+
+def _load_excluded_prefixes(repo_root: Path) -> tuple[str, ...]:
+    policy_file = repo_root / "harness" / "model-policy.json"
+    if not policy_file.is_file():
+        return DEFAULT_EXCLUDED_MODEL_PREFIXES
+    try:
+        data = json.loads(policy_file.read_text(encoding="utf-8"))
+        prefixes = data.get("excluded_model_prefixes")
+        if isinstance(prefixes, list) and all(isinstance(p, str) for p in prefixes):
+            return tuple(p.strip() for p in prefixes if p.strip())
+    except (OSError, json.JSONDecodeError):
+        pass
+    return DEFAULT_EXCLUDED_MODEL_PREFIXES
+
+
+def check_dispatch(
+    ledger_path: Path,
+    readiness_path: Path,
+    packet_path: Path,
+    peer_model: str,
+    *,
+    repo_root: Path | None = None,
+    reserve_usd: float = 0.0,
+    reservation_id: str | None = None,
+    now_utc: datetime | None = None,
+) -> tuple[bool, dict[str, Any], int, str]:
+    """Validate state, readiness hash, model policy, breakers, and budget before Peer launch."""
+    root = (repo_root or REPO_ROOT).resolve()
+    ledger = load_ledger(ledger_path)
+
+    if ledger["state"] not in DISPATCH_ALLOWED_STATES:
+        msg = f"Dispatch forbidden in state {ledger['state']!r}."
+        _append_event(ledger, "DISPATCH_REJECTED", {"reason": msg})
+        save_ledger(ledger_path, ledger)
+        return False, ledger, 2, msg
+
+    if not readiness_path.is_file():
+        ledger["state"] = "BLOCKED_BRIEF"
+        msg = f"Missing readiness.json at {readiness_path}."
+        _append_event(ledger, "DISPATCH_BLOCKED_BRIEF", {"reason": msg})
+        save_ledger(ledger_path, ledger)
+        return False, ledger, 2, msg
+
+    try:
+        readiness = json.loads(readiness_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        ledger["state"] = "BLOCKED_BRIEF"
+        msg = f"Invalid readiness.json: {exc}"
+        _append_event(ledger, "DISPATCH_BLOCKED_BRIEF", {"reason": msg})
+        save_ledger(ledger_path, ledger)
+        return False, ledger, 2, msg
+
+    if not isinstance(readiness, dict):
+        ledger["state"] = "BLOCKED_BRIEF"
+        msg = "readiness.json must be a JSON object."
+        _append_event(ledger, "DISPATCH_BLOCKED_BRIEF", {"reason": msg})
+        save_ledger(ledger_path, ledger)
+        return False, ledger, 2, msg
+
+    if readiness.get("root_task_id") != ledger["root_task_id"]:
+        ledger["state"] = "BLOCKED_BRIEF"
+        msg = (
+            f"readiness root_task_id ({readiness.get('root_task_id')!r}) != "
+            f"ledger root_task_id ({ledger['root_task_id']!r})."
+        )
+        _append_event(ledger, "DISPATCH_BLOCKED_BRIEF", {"reason": msg})
+        save_ledger(ledger_path, ledger)
+        return False, ledger, 2, msg
+
+    r_status = readiness.get("status")
+    if r_status != "VALID":
+        new_state = r_status if r_status in {"BLOCKED_BRIEF", "NEEDS_REPLAN"} else "BLOCKED_BRIEF"
+        ledger["state"] = new_state
+        msg = f"readiness status is {r_status!r}, expected 'VALID'."
+        _append_event(ledger, "DISPATCH_BLOCKED_BRIEF", {"reason": msg})
+        save_ledger(ledger_path, ledger)
+        return False, ledger, 2, msg
+
+    if not packet_path.is_file():
+        ledger["state"] = "BLOCKED_BRIEF"
+        msg = f"Task packet missing at {packet_path}."
+        _append_event(ledger, "DISPATCH_BLOCKED_BRIEF", {"reason": msg})
+        save_ledger(ledger_path, ledger)
+        return False, ledger, 2, msg
+
+    raw_packet = packet_path.read_bytes()
+    if len(raw_packet) == 0 or not raw_packet.decode("utf-8", errors="replace").strip():
+        ledger["state"] = "BLOCKED_BRIEF"
+        msg = f"Task packet at {packet_path} is empty."
+        _append_event(ledger, "DISPATCH_BLOCKED_BRIEF", {"reason": msg})
+        save_ledger(ledger_path, ledger)
+        return False, ledger, 2, msg
+
+    current_packet_sha = _sha256_bytes(raw_packet)
+    if current_packet_sha != readiness.get("packet_sha256"):
+        ledger["state"] = "BLOCKED_BRIEF"
+        msg = (
+            f"Stale readiness.json: packet SHA-256 mismatch "
+            f"({current_packet_sha[:12]} != {str(readiness.get('packet_sha256'))[:12]})."
+        )
+        _append_event(ledger, "DISPATCH_BLOCKED_BRIEF", {"reason": msg})
+        save_ledger(ledger_path, ledger)
+        return False, ledger, 2, msg
+
+    base_sha = readiness.get("base_sha", "")
+    if not is_hex_sha40(base_sha):
+        ledger["state"] = "BLOCKED_BRIEF"
+        msg = f"Invalid readiness base_sha {base_sha!r}."
+        _append_event(ledger, "DISPATCH_BLOCKED_BRIEF", {"reason": msg})
+        save_ledger(ledger_path, ledger)
+        return False, ledger, 2, msg
+
+    try:
+        git_top = resolve_git_toplevel(root, timeout_sec=30.0)
+        rev = run_managed_stage_cmd(
+            "brief_generation",
+            ["git", "-C", str(git_top), "rev-parse", "--verify", f"{base_sha}^{{commit}}"],
+            ledger=ledger,
+            timeout_override=30.0,
+        )
+    except (ValueError, TimeoutError, subprocess.TimeoutExpired) as exc:
+        ledger["state"] = "BLOCKED_BRIEF"
+        msg = f"Unable to verify base_sha {base_sha} in git: {exc}"
+        _append_event(ledger, "DISPATCH_BLOCKED_BRIEF", {"reason": msg})
+        save_ledger(ledger_path, ledger)
+        return False, ledger, 2, msg
+
+    if rev.returncode != 0:
+        ledger["state"] = "BLOCKED_BRIEF"
+        msg = f"Base SHA {base_sha} does not resolve in git."
+        _append_event(ledger, "DISPATCH_BLOCKED_BRIEF", {"reason": msg})
+        save_ledger(ledger_path, ledger)
+        return False, ledger, 2, msg
+
+    excluded_prefixes = _load_excluded_prefixes(root)
+    eligible = readiness.get("eligible_peer_models", [])
+    if (
+        _is_model_excluded(peer_model, excluded_prefixes)
+        or not isinstance(eligible, list)
+        or peer_model not in eligible
+    ):
+        ledger["state"] = "BLOCKED"
+        msg = (
+            f"Model policy violation: {peer_model!r} is excluded or not in "
+            f"eligible_peer_models={eligible!r}."
+        )
+        _append_event(ledger, "MODEL_POLICY_BLOCKED", {"peer_model": peer_model, "reason": msg})
+        save_ledger(ledger_path, ledger)
+        return False, ledger, 2, msg
+
+    breakers = ledger["circuit_breakers"]
+    if int(ledger["total_candidates"]) >= int(breakers["max_total_candidates_per_root_task"]):
+        ledger["state"] = "PAUSED_BUDGET"
+        msg = "Circuit breaker: max_total_candidates_per_root_task reached."
+        _append_event(ledger, "CIRCUIT_BREAKER_PAUSED", {"reason": msg})
+        save_ledger(ledger_path, ledger)
+        return False, ledger, 2, msg
+
+    if int(ledger["candidates_in_packet"]) >= int(breakers["max_candidates_per_packet_version"]):
+        ledger["state"] = "NEEDS_REPLAN"
+        msg = "Circuit breaker: max_candidates_per_packet_version reached."
+        _append_event(ledger, "CIRCUIT_BREAKER_REPLAN", {"reason": msg})
+        save_ledger(ledger_path, ledger)
+        return False, ledger, 2, msg
+
+    if int(ledger["consecutive_failed_candidates"]) >= int(
+        breakers["reassess_after_failed_candidates"]
+    ):
+        ledger["state"] = "NEEDS_REPLAN"
+        msg = "Circuit breaker: reassess_after_failed_candidates reached."
+        _append_event(ledger, "CIRCUIT_BREAKER_REPLAN", {"reason": msg})
+        save_ledger(ledger_path, ledger)
+        return False, ledger, 2, msg
+
+    current_time = now_utc or _now_utc()
+    created_at = datetime.fromisoformat(str(ledger["created_at_utc"]))
+    elapsed_sec = (current_time - created_at).total_seconds()
+    wall_limit = float(ledger["deadlines_sec"].get("root_task_wall_clock", 3600))
+    if elapsed_sec > wall_limit:
+        ledger["state"] = "PAUSED_BUDGET"
+        msg = f"Root task wall-clock deadline exceeded ({elapsed_sec:.1f}s > {wall_limit:.1f}s)."
+        _append_event(ledger, "WALL_CLOCK_EXCEEDED", {"reason": msg})
+        save_ledger(ledger_path, ledger)
+        return False, ledger, 2, msg
+
+    if reserve_usd < 0:
+        raise ValueError("reserve_usd must be non-negative.")
+    committed = _refresh_budget_warning(ledger)
+    limit = float(ledger["budget_limit_usd"])
+    if round(committed + reserve_usd, 8) > round(limit, 8):
+        ledger["state"] = "PAUSED_BUDGET"
+        msg = (
+            f"Budget exceeded: committed ${committed:.4f} + reserve ${reserve_usd:.4f} > "
+            f"limit ${limit:.4f}."
+        )
+        _append_event(ledger, "BUDGET_EXCEEDED", {"reason": msg})
+        save_ledger(ledger_path, ledger)
+        return False, ledger, 2, msg
+
+    if reservation_id and reserve_usd > 0:
+        ledger["active_reservations"][reservation_id] = float(reserve_usd)
+        _refresh_budget_warning(ledger)
+
+    ledger["state"] = "ACTIVE_PEER_G1"
+    _append_event(ledger, "DISPATCH_APPROVED", {"peer_model": peer_model})
+    save_ledger(ledger_path, ledger)
+    return True, ledger, 0, "Dispatch approved."
+
+
+def _apply_candidate_failure_breakers(ledger: dict[str, Any]) -> str:
+    breakers = ledger["circuit_breakers"]
+    if int(ledger["total_candidates"]) >= int(breakers["max_total_candidates_per_root_task"]):
+        ledger["state"] = "PAUSED_BUDGET"
+    elif int(ledger["consecutive_failed_candidates"]) >= int(
+        breakers["reassess_after_failed_candidates"]
+    ) or int(ledger["candidates_in_packet"]) >= int(breakers["max_candidates_per_packet_version"]):
+        ledger["state"] = "NEEDS_REPLAN"
+    else:
+        ledger["state"] = "ACTIVE_PEER_G1"
+    return str(ledger["state"])
+
+
+def _extract_peer_signal(raw_output: str | None) -> str | None:
+    if not raw_output:
+        return None
+    for sig in ("REOPEN_REQUEST", "DEPENDENCY_REQUEST", "CANDIDATE_READY", "BLOCKED"):
+        if re.search(rf"\b{sig}\b", raw_output):
+            return sig
+    return None
+
+
+def _normalize_owned_and_denied(
+    readiness: dict[str, Any] | None,
+    owned_paths: list[str] | None,
+    denied_paths: list[str] | None,
+) -> tuple[list[str], list[str]]:
+    owned: list[str] = []
+    if owned_paths is not None:
+        owned = [p.replace("\\", "/").lstrip("./") for p in owned_paths]
+    elif readiness and isinstance(readiness.get("owned_paths"), list):
+        for item in readiness["owned_paths"]:
+            if isinstance(item, dict) and item.get("path"):
+                owned.append(str(item["path"]).replace("\\", "/").lstrip("./"))
+            elif isinstance(item, str):
+                owned.append(item.replace("\\", "/").lstrip("./"))
+
+    denied: list[str] = []
+    if denied_paths is not None:
+        denied = [p.replace("\\", "/").lstrip("./") for p in denied_paths]
+    elif readiness and isinstance(readiness.get("denied_paths"), list):
+        denied = [str(p).replace("\\", "/").lstrip("./") for p in readiness["denied_paths"]]
+    return owned, denied
+
+
+def _check_write_scope(
+    changed_files: list[str],
+    owned_paths: list[str],
+    denied_paths: list[str],
+) -> list[str]:
+    violations: list[str] = []
+    if not changed_files:
+        violations.append("Candidate diff is empty (no files changed vs base_sha).")
+        return violations
+    for rel in changed_files:
+        norm = rel.replace("\\", "/").lstrip("./")
+        if any(_paths_overlap(norm, d) for d in denied_paths):
+            violations.append(f"Changed file {norm!r} matches Denied Paths.")
+            continue
+        if not any(_paths_overlap(norm, o) for o in owned_paths):
+            violations.append(f"Changed file {norm!r} is outside Owned Paths.")
+    return violations
+
+
+def record_peer_outcome(
+    ledger_path: Path,
+    *,
+    signal: str | None = None,
+    raw_output: str | None = None,
+    status: str | None = None,
+    exit_code: int = 0,
+    total_tokens: int | None = None,
+    error_message: str = "",
+    candidate_sha: str | None = None,
+    readiness_path: Path | None = None,
+    base_sha: str | None = None,
+    owned_paths: list[str] | None = None,
+    denied_paths: list[str] | None = None,
+    repo_root: Path | None = None,
+    signal_payload: dict[str, Any] | None = None,
+) -> tuple[str, dict[str, Any], int]:
+    """Classify and record Peer outcome, escalation, infra startup error, or candidate SHA."""
+    root = (repo_root or REPO_ROOT).resolve()
+    ledger = load_ledger(ledger_path)
+    if ledger["state"] not in DISPATCH_ALLOWED_STATES:
+        raise ValueError(
+            f"Cannot record Peer outcome while ledger is in state {ledger['state']!r}."
+        )
+
+    detected_signal = (signal or _extract_peer_signal(raw_output) or "").strip().upper()
+    norm_status = str(status or "").strip().upper()
+
+    is_infra_zero_tok = (
+        detected_signal not in PEER_ESCALATION_SIGNALS
+        and detected_signal != "CANDIDATE_READY"
+        and (exit_code != 0 or norm_status == "ERROR")
+        and total_tokens == 0
+    )
+    if detected_signal == "INFRA_STARTUP_ERROR" or is_infra_zero_tok:
+        max_retries = int(
+            ledger["circuit_breakers"]["max_transient_retries_per_provider_pass"]
+        )
+        retries = int(ledger.get("transient_retries_in_stage", 0))
+        detail = {
+            "classification": "INFRA_STARTUP_ERROR",
+            "exit_code": exit_code,
+            "total_tokens": total_tokens,
+            "error_message": error_message or (raw_output or ""),
+        }
+        if retries < max_retries:
+            ledger["transient_retries_in_stage"] = retries + 1
+            ledger["state"] = "ACTIVE_PEER_G1"
+            detail["retry_allowed"] = True
+            _append_event(ledger, "INFRA_STARTUP_ERROR", detail)
+            save_ledger(ledger_path, ledger)
+            return "INFRA_STARTUP_ERROR", ledger, 0
+
+        ledger["state"] = "BLOCKED_INFRA"
+        detail["retry_allowed"] = False
+        _append_event(ledger, "BLOCKED_INFRA", detail)
+        save_ledger(ledger_path, ledger)
+        return "INFRA_STARTUP_ERROR", ledger, 2
+
+    if detected_signal in PEER_ESCALATION_SIGNALS:
+        ledger["transient_retries_in_stage"] = 0
+        ledger["state"] = "NEEDS_REPLAN"
+        _append_event(
+            ledger,
+            detected_signal,
+            {"payload": signal_payload or {"raw": raw_output or error_message}},
+        )
+        save_ledger(ledger_path, ledger)
+        return detected_signal, ledger, 0
+
+    if detected_signal == "CANDIDATE_READY" or candidate_sha:
+        readiness: dict[str, Any] | None = None
+        if readiness_path is not None and readiness_path.is_file():
+            readiness = json.loads(readiness_path.read_text(encoding="utf-8"))
+
+        effective_base = base_sha or (
+            str(readiness.get("base_sha", "")) if readiness else str(ledger.get("base_sha", ""))
+        )
+        if candidate_sha is None or not is_hex_sha40(candidate_sha) or not is_hex_sha40(
+            effective_base
+        ):
+            raise ValueError(
+                f"CANDIDATE_READY requires 40-hex base_sha ({effective_base!r}) and "
+                f"candidate_sha ({candidate_sha!r})."
+            )
+        if candidate_sha == effective_base:
+            raise ValueError(f"candidate_sha must differ from base_sha ({candidate_sha}).")
+
+        git_top = resolve_git_toplevel(root, timeout_sec=30.0)
+        cat = run_managed_stage_cmd(
+            "peer_round",
+            ["git", "-C", str(git_top), "cat-file", "-t", candidate_sha],
+            ledger=ledger,
+            timeout_override=30.0,
+        )
+        if cat.returncode != 0 or cat.stdout.strip() != "commit":
+            raise ValueError(f"Unreachable candidate commit {candidate_sha} in git.")
+
+        ledger["transient_retries_in_stage"] = 0
+        ledger["total_candidates"] = int(ledger["total_candidates"]) + 1
+        ledger["candidates_in_packet"] = int(ledger["candidates_in_packet"]) + 1
+        ledger["candidate_sha"] = candidate_sha
+
+        diff_cmd = [
+            "git",
+            "-C",
+            str(git_top),
+            "diff",
+            "--name-only",
+            f"{effective_base}..{candidate_sha}",
+        ]
+        diff_proc = run_managed_stage_cmd(
+            "peer_round",
+            diff_cmd,
+            ledger=ledger,
+            timeout_override=30.0,
+        )
+        if diff_proc.returncode != 0:
+            raise RuntimeError(f"git diff failed: {diff_proc.stderr.strip()}")
+        changed_files = [ln.strip() for ln in diff_proc.stdout.splitlines() if ln.strip()]
+
+        owned_list, denied_list = _normalize_owned_and_denied(readiness, owned_paths, denied_paths)
+        scope_errors = _check_write_scope(changed_files, owned_list, denied_list)
+        if scope_errors:
+            ledger["consecutive_failed_candidates"] = (
+                int(ledger["consecutive_failed_candidates"]) + 1
+            )
+            new_state = _apply_candidate_failure_breakers(ledger)
+            _append_event(
+                ledger,
+                "SCOPE_VIOLATION",
+                {
+                    "candidate_sha": candidate_sha,
+                    "changed_files": changed_files,
+                    "violations": scope_errors,
+                },
+            )
+            save_ledger(ledger_path, ledger)
+            return "SCOPE_VIOLATION", ledger, (2 if new_state == "PAUSED_BUDGET" else 1)
+
+        ledger["state"] = "VERIFY_FROZEN_G3"
+        _append_event(
+            ledger,
+            "CANDIDATE_READY",
+            {"candidate_sha": candidate_sha, "changed_files": changed_files},
+        )
+        save_ledger(ledger_path, ledger)
+        return "CANDIDATE_READY", ledger, 0
+
+    raise ValueError(
+        f"Unable to classify Peer outcome (signal={signal!r}, status={status!r}, "
+        f"exit_code={exit_code}, total_tokens={total_tokens})."
+    )
+
+
+def record_gate_outcome(
+    ledger_path: Path,
+    *,
+    gate: str,
+    outcome: str,
+    candidate_sha: str | None = None,
+    details: dict[str, Any] | None = None,
+) -> tuple[dict[str, Any], int]:
+    """Record G3/G4/G5 gate verdict and enforce circuit-breaker transitions."""
+    ledger = load_ledger(ledger_path)
+    norm_gate = gate.strip().upper()
+    norm_outcome = outcome.strip().upper()
+    ledger["transient_retries_in_stage"] = 0
+
+    if norm_gate in {"G3", "G4"} and norm_outcome in {"FAILED", "CHANGES_REQUESTED"}:
+        ledger["consecutive_failed_candidates"] = int(ledger["consecutive_failed_candidates"]) + 1
+        new_state = _apply_candidate_failure_breakers(ledger)
+        _append_event(
+            ledger,
+            f"{norm_gate}_{norm_outcome}",
+            {"candidate_sha": candidate_sha, "details": details or {}},
+        )
+        save_ledger(ledger_path, ledger)
+        return ledger, (2 if new_state == "PAUSED_BUDGET" else 1)
+
+    if norm_gate == "G3" and norm_outcome in {"PASSED", "VERIFIED"}:
+        ledger["state"] = "REVIEW_G4"
+        _append_event(ledger, "G3_PASSED", {"candidate_sha": candidate_sha})
+        save_ledger(ledger_path, ledger)
+        return ledger, 0
+
+    if norm_gate == "G4":
+        if norm_outcome in {"BLOCKED_AUTH", "BLOCKED_INFRA", "BLOCKED"}:
+            ledger["state"] = norm_outcome
+            _append_event(ledger, f"G4_{norm_outcome}", {"details": details or {}})
+            save_ledger(ledger_path, ledger)
+            return ledger, 2
+        if norm_outcome == "PASSED":
+            ledger["state"] = "RECEIPT_G5"
+            _append_event(ledger, "G4_PASSED", {"candidate_sha": candidate_sha})
+            save_ledger(ledger_path, ledger)
+            return ledger, 0
+
+    if norm_gate == "G5":
+        if norm_outcome == "VERIFIED":
+            if candidate_sha and ledger.get("candidate_sha") and (
+                candidate_sha != ledger["candidate_sha"]
+            ):
+                ledger["state"] = "BLOCKED"
+                _append_event(
+                    ledger,
+                    "G5_SHA_MISMATCH",
+                    {"expected": ledger.get("candidate_sha"), "got": candidate_sha},
+                )
+                save_ledger(ledger_path, ledger)
+                return ledger, 2
+            ledger["consecutive_failed_candidates"] = 0
+            ledger["state"] = "VERIFIED"
+            _append_event(ledger, "G5_VERIFIED", {"candidate_sha": candidate_sha})
+            save_ledger(ledger_path, ledger)
+            return ledger, 0
+        if norm_outcome == "FAILED":
+            ledger["consecutive_failed_candidates"] = (
+                int(ledger["consecutive_failed_candidates"]) + 1
+            )
+            new_state = _apply_candidate_failure_breakers(ledger)
+            _append_event(ledger, "G5_FAILED", {"details": details or {}})
+            save_ledger(ledger_path, ledger)
+            return ledger, (2 if new_state == "PAUSED_BUDGET" else 1)
+        if norm_outcome == "BLOCKED":
+            ledger["state"] = "BLOCKED"
+            _append_event(ledger, "G5_BLOCKED", {"details": details or {}})
+            save_ledger(ledger_path, ledger)
+            return ledger, 2
+
+    raise ValueError(f"Unsupported gate/outcome combination: gate={gate!r}, outcome={outcome!r}")
+
+
+def record_replan(
+    ledger_path: Path,
+    readiness_path: Path,
+    *,
+    packet_path: Path | None = None,
+    human_approved: bool = False,
+) -> tuple[dict[str, Any], int, str]:
+    """Advance ledger to a bumped ``packet_version`` after validated ``readiness.json``."""
+    ledger = load_ledger(ledger_path)
+    if not readiness_path.is_file():
+        ledger["state"] = "BLOCKED_BRIEF"
+        save_ledger(ledger_path, ledger)
+        return ledger, 2, f"Missing readiness.json at {readiness_path}."
+
+    readiness = json.loads(readiness_path.read_text(encoding="utf-8"))
+    if readiness.get("root_task_id") != ledger["root_task_id"]:
+        raise ValueError(
+            f"Root task mismatch in readiness.json: {readiness.get('root_task_id')!r} != "
+            f"{ledger['root_task_id']!r}."
+        )
+    if readiness.get("status") != "VALID":
+        ledger["state"] = "BLOCKED_BRIEF"
+        save_ledger(ledger_path, ledger)
+        return ledger, 2, f"Cannot replan from non-VALID readiness ({readiness.get('status')!r})."
+
+    new_version = readiness.get("packet_version")
+    if not is_strict_int(new_version) or new_version <= int(ledger["packet_version"]):
+        return (
+            ledger,
+            2,
+            f"Replan requires bumped packet_version > {ledger['packet_version']} "
+            f"(got {new_version!r}).",
+        )
+
+    if packet_path is not None:
+        if not packet_path.is_file():
+            ledger["state"] = "BLOCKED_BRIEF"
+            save_ledger(ledger_path, ledger)
+            return ledger, 2, f"Packet missing at {packet_path}."
+        if _sha256_bytes(packet_path.read_bytes()) != readiness.get("packet_sha256"):
+            ledger["state"] = "BLOCKED_BRIEF"
+            save_ledger(ledger_path, ledger)
+            return ledger, 2, "Packet SHA-256 does not match readiness.json."
+
+    max_auto = int(ledger["circuit_breakers"]["max_auto_replans_per_root_task"])
+    if int(ledger["auto_replans_used"]) >= max_auto and not human_approved:
+        ledger["state"] = "PAUSED_BUDGET"
+        msg = "Auto-replan limit reached; human approval required."
+        _append_event(ledger, "AUTO_REPLAN_LIMIT_PAUSED", {"reason": msg})
+        save_ledger(ledger_path, ledger)
+        return ledger, 2, msg
+
+    if not human_approved:
+        ledger["auto_replans_used"] = int(ledger["auto_replans_used"]) + 1
+    ledger["packet_version"] = new_version
+    ledger["task_id"] = str(readiness.get("task_id", ledger["task_id"]))
+    ledger["base_sha"] = str(readiness.get("base_sha", ledger["base_sha"]))
+    ledger["candidates_in_packet"] = 0
+    ledger["consecutive_failed_candidates"] = 0
+    ledger["transient_retries_in_stage"] = 0
+    ledger["state"] = "ACTIVE_PEER_G1"
+    _append_event(
+        ledger,
+        "REPLAN_APPLIED",
+        {"packet_version": new_version, "human_approved": human_approved},
+    )
+    save_ledger(ledger_path, ledger)
+    return ledger, 0, f"Replan applied (packet_version={new_version})."
+
+
+def _resolve_pricing(
+    model: str,
+    pricing: dict[str, dict[str, float]] | None = None,
+) -> dict[str, float]:
+    table = pricing or DEFAULT_PRICING_PER_1M
+    norm = model.strip().lower()
+    if norm in table:
+        return table[norm]
+    for prefix, rates in table.items():
+        if norm == prefix.lower() or norm.startswith(prefix.lower()):
+            return rates
+    raise ValueError(f"Unknown model pricing for {model!r}.")
+
+
+def compute_usage_cost_usd(
+    model: str,
+    *,
+    input_tokens: int = 0,
+    output_tokens: int = 0,
+    thinking_tokens: int = 0,
+    cache_read_tokens: int = 0,
+    pricing: dict[str, dict[str, float]] | None = None,
+) -> float:
+    """Compute USD API-equivalent cost from token counts and pricing table."""
+    rates = _resolve_pricing(model, pricing=pricing)
+    in_cost = (input_tokens * float(rates["input"])) / 1_000_000.0
+    out_cost = ((output_tokens + thinking_tokens) * float(rates["output"])) / 1_000_000.0
+    cache_cost = (cache_read_tokens * float(rates["cache_read"])) / 1_000_000.0
+    return in_cost + out_cost + cache_cost
+
+
+def record_usage(
+    ledger_path: Path,
+    *,
+    model: str,
+    input_tokens: int = 0,
+    output_tokens: int = 0,
+    thinking_tokens: int = 0,
+    cache_read_tokens: int = 0,
+    conversation_id: str | None = None,
+    counter_mode: str = "cumulative",
+    pricing: dict[str, dict[str, float]] | None = None,
+) -> tuple[dict[str, Any], float, int]:
+    """Record token usage with high-water deduplication for cumulative sessions."""
+    for name, val in (
+        ("input_tokens", input_tokens),
+        ("output_tokens", output_tokens),
+        ("thinking_tokens", thinking_tokens),
+        ("cache_read_tokens", cache_read_tokens),
+    ):
+        if not is_strict_int(val) or val < 0:
+            raise ValueError(f"{name} must be a non-negative integer, got {val!r}.")
+    if counter_mode not in {"cumulative", "delta"}:
+        raise ValueError(f"counter_mode must be 'cumulative' or 'delta', got {counter_mode!r}.")
+
+    ledger = load_ledger(ledger_path)
+    usage_map = ledger.setdefault("usage_by_conversation", {})
+    conv_key = (conversation_id or "").strip()
+
+    if counter_mode == "cumulative" and conv_key:
+        prev = usage_map.get(
+            conv_key,
+            {
+                "model": model,
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "thinking_tokens": 0,
+                "cache_read_tokens": 0,
+                "billed_usd": 0.0,
+            },
+        )
+        d_in = max(0, input_tokens - int(prev["input_tokens"]))
+        d_out = max(0, output_tokens - int(prev["output_tokens"]))
+        d_think = max(0, thinking_tokens - int(prev["thinking_tokens"]))
+        d_cache = max(0, cache_read_tokens - int(prev["cache_read_tokens"]))
+
+        delta_usd = compute_usage_cost_usd(
+            model,
+            input_tokens=d_in,
+            output_tokens=d_out,
+            thinking_tokens=d_think,
+            cache_read_tokens=d_cache,
+            pricing=pricing,
+        )
+        usage_map[conv_key] = {
+            "model": model,
+            "input_tokens": max(int(prev["input_tokens"]), input_tokens),
+            "output_tokens": max(int(prev["output_tokens"]), output_tokens),
+            "thinking_tokens": max(int(prev["thinking_tokens"]), thinking_tokens),
+            "cache_read_tokens": max(int(prev["cache_read_tokens"]), cache_read_tokens),
+            "billed_usd": round(float(prev["billed_usd"]) + delta_usd, 8),
+        }
+    else:
+        delta_usd = compute_usage_cost_usd(
+            model,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            thinking_tokens=thinking_tokens,
+            cache_read_tokens=cache_read_tokens,
+            pricing=pricing,
+        )
+        if conv_key:
+            prev = usage_map.get(
+                conv_key,
+                {
+                    "model": model,
+                    "input_tokens": 0,
+                    "output_tokens": 0,
+                    "thinking_tokens": 0,
+                    "cache_read_tokens": 0,
+                    "billed_usd": 0.0,
+                },
+            )
+            usage_map[conv_key] = {
+                "model": model,
+                "input_tokens": int(prev["input_tokens"]) + input_tokens,
+                "output_tokens": int(prev["output_tokens"]) + output_tokens,
+                "thinking_tokens": int(prev["thinking_tokens"]) + thinking_tokens,
+                "cache_read_tokens": int(prev["cache_read_tokens"]) + cache_read_tokens,
+                "billed_usd": round(float(prev["billed_usd"]) + delta_usd, 8),
+            }
+
+    ledger["spent_api_equiv_usd"] = round(float(ledger["spent_api_equiv_usd"]) + delta_usd, 8)
+    committed = _refresh_budget_warning(ledger)
+    limit = float(ledger["budget_limit_usd"])
+    rc = 0
+    if round(committed, 8) > round(limit, 8):
+        ledger["state"] = "PAUSED_BUDGET"
+        _append_event(
+            ledger,
+            "BUDGET_EXCEEDED_USAGE",
+            {"committed_usd": committed, "limit_usd": limit},
+        )
+        rc = 2
+    save_ledger(ledger_path, ledger)
+    return ledger, delta_usd, rc
+
+
+def reserve_budget(
+    ledger_path: Path,
+    reservation_id: str,
+    amount_usd: float,
+) -> tuple[bool, dict[str, Any], int]:
+    """Atomically reserve USD against remaining budget; pause on >100% exhaustion."""
+    if not reservation_id.strip():
+        raise ValueError("reservation_id must be non-empty.")
+    if amount_usd < 0:
+        raise ValueError("amount_usd must be non-negative.")
+
+    ledger = load_ledger(ledger_path)
+    reservations = ledger.setdefault("active_reservations", {})
+    other_reserved = sum(
+        float(v) for k, v in reservations.items() if k != reservation_id
+    )
+    spent = float(ledger.get("spent_api_equiv_usd", 0.0))
+    limit = float(ledger.get("budget_limit_usd", 0.0))
+    projected = round(spent + other_reserved + float(amount_usd), 8)
+
+    if projected > round(limit, 8):
+        ledger["state"] = "PAUSED_BUDGET"
+        _append_event(
+            ledger,
+            "BUDGET_RESERVATION_REJECTED",
+            {"reservation_id": reservation_id, "projected_usd": projected, "limit_usd": limit},
+        )
+        save_ledger(ledger_path, ledger)
+        return False, ledger, 2
+
+    reservations[reservation_id] = float(amount_usd)
+    _refresh_budget_warning(ledger)
+    _append_event(
+        ledger,
+        "BUDGET_RESERVED",
+        {"reservation_id": reservation_id, "amount_usd": float(amount_usd)},
+    )
+    save_ledger(ledger_path, ledger)
+    return True, ledger, 0
+
+
+def release_reservation(ledger_path: Path, reservation_id: str) -> dict[str, Any]:
+    """Release an active budget reservation if present."""
+    ledger = load_ledger(ledger_path)
+    reservations = ledger.setdefault("active_reservations", {})
+    if reservation_id in reservations:
+        reservations.pop(reservation_id)
+        _append_event(ledger, "BUDGET_RELEASED", {"reservation_id": reservation_id})
+        save_ledger(ledger_path, ledger)
+    return ledger
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Durable S-L-P task state & budget runner.")
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    p_init = sub.add_parser("init", help="Initialize or load ledger by root_task_id.")
+    p_init.add_argument("--ledger", type=Path, required=True)
+    p_init.add_argument("--root-task-id", required=True)
+    p_init.add_argument("--task-id", default=None)
+    p_init.add_argument("--packet-version", type=int, default=1)
+    p_init.add_argument("--base-sha", default="")
+    p_init.add_argument("--budget-usd", type=float, default=6.0)
+    p_init.add_argument("--json", action="store_true")
+
+    p_disp = sub.add_parser("check-dispatch", help="Validate G0.5 + model + breakers + budget.")
+    p_disp.add_argument("--ledger", type=Path, required=True)
+    p_disp.add_argument("--readiness", type=Path, required=True)
+    p_disp.add_argument("--packet", type=Path, required=True)
+    p_disp.add_argument("--peer-model", required=True)
+    p_disp.add_argument("--repo-root", type=Path, default=REPO_ROOT)
+    p_disp.add_argument("--reserve-usd", type=float, default=0.0)
+    p_disp.add_argument("--reservation-id", default=None)
+    p_disp.add_argument("--json", action="store_true")
+
+    p_peer = sub.add_parser("record-peer", help="Record Peer signal, infra error, or SHA.")
+    p_peer.add_argument("--ledger", type=Path, required=True)
+    p_peer.add_argument("--signal", default=None)
+    p_peer.add_argument("--raw-output", default=None)
+    p_peer.add_argument("--status", default=None)
+    p_peer.add_argument("--exit-code", type=int, default=0)
+    p_peer.add_argument("--total-tokens", type=int, default=None)
+    p_peer.add_argument("--error-message", default="")
+    p_peer.add_argument("--candidate-sha", default=None)
+    p_peer.add_argument("--readiness", type=Path, default=None)
+    p_peer.add_argument("--base-sha", default=None)
+    p_peer.add_argument("--repo-root", type=Path, default=REPO_ROOT)
+    p_peer.add_argument("--json", action="store_true")
+
+    p_gate = sub.add_parser("record-gate", help="Record G3/G4/G5 gate outcome.")
+    p_gate.add_argument("--ledger", type=Path, required=True)
+    p_gate.add_argument("--gate", required=True)
+    p_gate.add_argument("--outcome", required=True)
+    p_gate.add_argument("--candidate-sha", default=None)
+    p_gate.add_argument("--json", action="store_true")
+
+    p_rep = sub.add_parser("record-replan", help="Apply bumped packet_version replan.")
+    p_rep.add_argument("--ledger", type=Path, required=True)
+    p_rep.add_argument("--readiness", type=Path, required=True)
+    p_rep.add_argument("--packet", type=Path, default=None)
+    p_rep.add_argument("--human-approved", action="store_true")
+    p_rep.add_argument("--json", action="store_true")
+
+    p_use = sub.add_parser("record-usage", help="Record model token usage with deduplication.")
+    p_use.add_argument("--ledger", type=Path, required=True)
+    p_use.add_argument("--model", required=True)
+    p_use.add_argument("--input-tokens", type=int, default=0)
+    p_use.add_argument("--output-tokens", type=int, default=0)
+    p_use.add_argument("--thinking-tokens", type=int, default=0)
+    p_use.add_argument("--cache-read-tokens", type=int, default=0)
+    p_use.add_argument("--conversation-id", default=None)
+    p_use.add_argument("--counter-mode", choices=["cumulative", "delta"], default="cumulative")
+    p_use.add_argument("--json", action="store_true")
+
+    p_res = sub.add_parser("reserve-budget", help="Reserve USD against task budget.")
+    p_res.add_argument("--ledger", type=Path, required=True)
+    p_res.add_argument("--reservation-id", required=True)
+    p_res.add_argument("--amount-usd", type=float, required=True)
+    p_res.add_argument("--json", action="store_true")
+
+    p_rel = sub.add_parser("release-reservation", help="Release an active budget reservation.")
+    p_rel.add_argument("--ledger", type=Path, required=True)
+    p_rel.add_argument("--reservation-id", required=True)
+    p_rel.add_argument("--json", action="store_true")
+
+    p_stat = sub.add_parser("status", help="Inspect current ledger state.")
+    p_stat.add_argument("--ledger", type=Path, required=True)
+    p_stat.add_argument("--json", action="store_true")
+
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = _build_parser().parse_args(argv)
+    cmd = args.command
+
+    if cmd == "init":
+        ledger = init_or_load_ledger(
+            args.ledger,
+            root_task_id=args.root_task_id,
+            task_id=args.task_id,
+            packet_version=args.packet_version,
+            base_sha=args.base_sha,
+            budget_usd=args.budget_usd,
+        )
+        if args.json:
+            print(json.dumps(ledger, indent=2))
+        else:
+            print(f"[task_runner] state={ledger['state']} root_task_id={ledger['root_task_id']}")
+        return 0
+
+    if cmd == "check-dispatch":
+        ok, ledger, rc, msg = check_dispatch(
+            args.ledger,
+            args.readiness,
+            args.packet,
+            args.peer_model,
+            repo_root=args.repo_root,
+            reserve_usd=args.reserve_usd,
+            reservation_id=args.reservation_id,
+        )
+        if args.json:
+            print(json.dumps({"allowed": ok, "message": msg, "ledger": ledger}, indent=2))
+        else:
+            print(f"[task_runner] allowed={ok} state={ledger['state']} msg={msg}")
+        return rc
+
+    if cmd == "record-peer":
+        outcome, ledger, rc = record_peer_outcome(
+            args.ledger,
+            signal=args.signal,
+            raw_output=args.raw_output,
+            status=args.status,
+            exit_code=args.exit_code,
+            total_tokens=args.total_tokens,
+            error_message=args.error_message,
+            candidate_sha=args.candidate_sha,
+            readiness_path=args.readiness,
+            base_sha=args.base_sha,
+            repo_root=args.repo_root,
+        )
+        if args.json:
+            print(json.dumps({"outcome": outcome, "ledger": ledger}, indent=2))
+        else:
+            print(f"[task_runner] outcome={outcome} state={ledger['state']}")
+        return rc
+
+    if cmd == "record-gate":
+        ledger, rc = record_gate_outcome(
+            args.ledger,
+            gate=args.gate,
+            outcome=args.outcome,
+            candidate_sha=args.candidate_sha,
+        )
+        if args.json:
+            print(json.dumps(ledger, indent=2))
+        else:
+            print(f"[task_runner] state={ledger['state']}")
+        return rc
+
+    if cmd == "record-replan":
+        ledger, rc, msg = record_replan(
+            args.ledger,
+            args.readiness,
+            packet_path=args.packet,
+            human_approved=args.human_approved,
+        )
+        if args.json:
+            print(json.dumps({"message": msg, "ledger": ledger}, indent=2))
+        else:
+            print(f"[task_runner] state={ledger['state']} msg={msg}")
+        return rc
+
+    if cmd == "record-usage":
+        ledger, delta_usd, rc = record_usage(
+            args.ledger,
+            model=args.model,
+            input_tokens=args.input_tokens,
+            output_tokens=args.output_tokens,
+            thinking_tokens=args.thinking_tokens,
+            cache_read_tokens=args.cache_read_tokens,
+            conversation_id=args.conversation_id,
+            counter_mode=args.counter_mode,
+        )
+        if args.json:
+            print(json.dumps({"delta_usd": delta_usd, "ledger": ledger}, indent=2))
+        else:
+            print(
+                f"[task_runner] delta_usd={delta_usd:.6f} "
+                f"spent={ledger['spent_api_equiv_usd']:.6f} state={ledger['state']}"
+            )
+        return rc
+
+    if cmd == "reserve-budget":
+        ok, ledger, rc = reserve_budget(args.ledger, args.reservation_id, args.amount_usd)
+        if args.json:
+            print(json.dumps({"reserved": ok, "ledger": ledger}, indent=2))
+        else:
+            print(f"[task_runner] reserved={ok} state={ledger['state']}")
+        return rc
+
+    if cmd == "release-reservation":
+        ledger = release_reservation(args.ledger, args.reservation_id)
+        if args.json:
+            print(json.dumps(ledger, indent=2))
+        else:
+            print(f"[task_runner] state={ledger['state']}")
+        return 0
+
+    if cmd == "status":
+        ledger = load_ledger(args.ledger)
+        if args.json:
+            print(json.dumps(ledger, indent=2))
+        else:
+            print(f"[task_runner] state={ledger['state']} root_task_id={ledger['root_task_id']}")
+        return 0
+
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())
