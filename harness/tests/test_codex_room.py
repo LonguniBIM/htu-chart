@@ -193,6 +193,22 @@ def _write_fake_codex_script(script_path: Path, body: str) -> list[str]:
     return [sys.executable, "-u", str(script_path)]
 
 
+def _init_mini_git_repo(repo_dir: Path) -> tuple[Path, str]:
+    import subprocess
+
+    repo_dir.mkdir(parents=True, exist_ok=True)
+    subprocess.run(["git", "init"], cwd=repo_dir, check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=repo_dir, check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.name", "Test User"], cwd=repo_dir, check=True, capture_output=True)
+    (repo_dir / "README.md").write_text("mini repo\n", encoding="utf-8")
+    subprocess.run(["git", "add", "README.md"], cwd=repo_dir, check=True, capture_output=True)
+    subprocess.run(["git", "commit", "-m", "init"], cwd=repo_dir, check=True, capture_output=True)
+    sha = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=repo_dir, check=True, capture_output=True, text=True
+    ).stdout.strip()
+    return repo_dir, sha
+
+
 def test_run_codex_pass_resets_idle_timeout_on_streaming_activity(tmp_path: Path) -> None:
     """When stdout streams events faster than idle_timeout_sec, total runtime > idle_timeout_sec succeeds."""
     out_dir = tmp_path / "run"
@@ -401,7 +417,7 @@ def test_run_agy_pass_passes_readonly_flags_and_writes_schema_json(tmp_path: Pat
 def test_auto_backend_prioritizes_codex_and_falls_back_to_agy_on_quota_exhaustion(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    head_sha = codex_room_review.resolve_commit_info(REPO_ROOT, "HEAD", None)["candidate_sha"]
+    repo_dir, head_sha = _init_mini_git_repo(tmp_path / "repo_a")
     agy_called = tmp_path / "agy_called.flag"
 
     codex_ok_script = tmp_path / "fake_codex_ok.py"
@@ -463,7 +479,7 @@ def test_auto_backend_prioritizes_codex_and_falls_back_to_agy_on_quota_exhaustio
     # Case A: Codex CLI healthy -> auto prioritizes Codex CLI and never calls agy.
     monkeypatch.setattr(codex_room_review, "resolve_codex_command", lambda: codex_ok_prefix)
     out_a = tmp_path / "out_codex_ok"
-    rc_a = codex_room_review.main(["--commit", "HEAD", "--out-dir", str(out_a), "--backend", "auto"])
+    rc_a = codex_room_review.main(["--commit", "HEAD", "--repo-root", str(repo_dir), "--out-dir", str(out_a), "--backend", "auto"])
     assert rc_a == 0
     report_a = json.loads((out_a / "consolidated-review.json").read_text(encoding="utf-8"))
     assert report_a["review_backend"] == "codex"
@@ -473,7 +489,7 @@ def test_auto_backend_prioritizes_codex_and_falls_back_to_agy_on_quota_exhaustio
     # Case B: Codex CLI hits quota limit -> auto falls back to agy Opus 5.5 and archives failed Codex logs.
     monkeypatch.setattr(codex_room_review, "resolve_codex_command", lambda: codex_quota_prefix)
     out_b = tmp_path / "out_auto_fallback"
-    rc_b = codex_room_review.main(["--commit", "HEAD", "--out-dir", str(out_b), "--backend", "auto"])
+    rc_b = codex_room_review.main(["--commit", "HEAD", "--repo-root", str(repo_dir), "--out-dir", str(out_b), "--backend", "auto"])
     assert rc_b == 0
     assert agy_called.exists()
     assert (out_b / "pass1.codex-failed.stderr.log").is_file()
@@ -487,7 +503,7 @@ def test_auto_backend_prioritizes_codex_and_falls_back_to_agy_on_quota_exhaustio
     # Case C: --backend codex never falls back even on quota exhaustion.
     agy_called.unlink()
     out_c = tmp_path / "out_strict_codex"
-    rc_c = codex_room_review.main(["--commit", "HEAD", "--out-dir", str(out_c), "--backend", "codex"])
+    rc_c = codex_room_review.main(["--commit", "HEAD", "--repo-root", str(repo_dir), "--out-dir", str(out_c), "--backend", "codex"])
     assert rc_c == 2
     assert not agy_called.exists()
     assert _detect_codex_quota_error(out_c) is not None
@@ -495,7 +511,7 @@ def test_auto_backend_prioritizes_codex_and_falls_back_to_agy_on_quota_exhaustio
     # Case D: --backend auto does NOT silently fall back on non-quota Codex failure.
     monkeypatch.setattr(codex_room_review, "resolve_codex_command", lambda: codex_crash_prefix)
     out_d = tmp_path / "out_non_quota_fail"
-    rc_d = codex_room_review.main(["--commit", "HEAD", "--out-dir", str(out_d), "--backend", "auto"])
+    rc_d = codex_room_review.main(["--commit", "HEAD", "--repo-root", str(repo_dir), "--out-dir", str(out_d), "--backend", "auto"])
     assert rc_d == 2
     assert not agy_called.exists()
 
@@ -504,7 +520,7 @@ def test_codex_partial_blocking_finding_preserved_across_agy_fallback(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """When one Codex pass returns a blocking finding and the other hits quota, fallback must not erase it."""
-    head_sha = codex_room_review.resolve_commit_info(REPO_ROOT, "HEAD", None)["candidate_sha"]
+    repo_dir, head_sha = _init_mini_git_repo(tmp_path / "repo_partial")
 
     codex_partial_script = tmp_path / "fake_codex_partial.py"
     codex_partial_prefix = _write_fake_codex_script(
@@ -550,7 +566,7 @@ def test_codex_partial_blocking_finding_preserved_across_agy_fallback(
 
     out_dir = tmp_path / "out_partial_fallback"
     rc = codex_room_review.main(
-        ["--commit", "HEAD", "--out-dir", str(out_dir), "--backend", "auto", "--fail-on-blocking"]
+        ["--commit", "HEAD", "--repo-root", str(repo_dir), "--out-dir", str(out_dir), "--backend", "auto", "--fail-on-blocking"]
     )
     assert rc == 1
     report = json.loads((out_dir / "consolidated-review.json").read_text(encoding="utf-8"))
@@ -630,8 +646,11 @@ def test_verify_role_rejects_tampered_model_and_auto_refuses_fallback_on_preflig
     )
     monkeypatch.setattr(codex_room_review, "resolve_agy_command", lambda: agy_prefix)
 
+    repo_dir, _ = _init_mini_git_repo(tmp_path / "repo_preflight")
     out_dir = tmp_path / "out_preflight_block"
-    rc = codex_room_review.main(["--commit", "HEAD", "--out-dir", str(out_dir), "--backend", "auto"])
+    rc = codex_room_review.main(
+        ["--commit", "HEAD", "--repo-root", str(repo_dir), "--out-dir", str(out_dir), "--backend", "auto"]
+    )
     assert rc == 2
     assert not agy_called.exists()
     report = json.loads((out_dir / "consolidated-review.json").read_text(encoding="utf-8"))
@@ -859,6 +878,7 @@ def test_dry_run_refuses_completed_out_dir_without_mutating_existing_files(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """P1-03 & S2-002: --dry-run must refuse overwrite and leave existing artifacts untouched."""
+    repo_dir, _ = _init_mini_git_repo(tmp_path / "repo_dry")
     out_dir = tmp_path / "completed_run"
     out_dir.mkdir()
     report_path = out_dir / "consolidated-review.json"
@@ -869,7 +889,7 @@ def test_dry_run_refuses_completed_out_dir_without_mutating_existing_files(
     prompt_bytes = prompt_path.read_bytes()
 
     rc = codex_room_review.main(
-        ["--commit", "HEAD", "--out-dir", str(out_dir), "--dry-run"]
+        ["--commit", "HEAD", "--repo-root", str(repo_dir), "--out-dir", str(out_dir), "--dry-run"]
     )
     assert rc == 2
     assert report_path.read_bytes() == report_bytes
@@ -885,10 +905,11 @@ def test_primary_reviewer_model_lock_blocks_unapproved_model_override(
     with pytest.raises(ValueError, match="gpt-6.1-sol"):
         apply_safety_locks({}, model_override="gemini-3.8-flash")
 
+    repo_dir, _ = _init_mini_git_repo(tmp_path / "repo_lock")
     monkeypatch.setattr(codex_room_review, "verify_role", lambda role, root: {"ok": True, "errors": []})
     out_dir = tmp_path / "wrong_model_out"
     rc = codex_room_review.main(
-        ["--commit", "HEAD", "--out-dir", str(out_dir), "--backend", "codex", "--model", "other-model"]
+        ["--commit", "HEAD", "--repo-root", str(repo_dir), "--out-dir", str(out_dir), "--backend", "codex", "--model", "other-model"]
     )
     assert rc == 2
     report = json.loads((out_dir / "consolidated-review.json").read_text(encoding="utf-8"))
