@@ -558,3 +558,229 @@ def test_codex_partial_blocking_finding_preserved_across_agy_fallback(
     assert report["blocking_open_count"] == 1
     assert any(f["id"] == "C-1" and f["status"] == "OPEN" for f in report["consolidated_findings"])
     assert "codex tqi" in report["test_quality_issues"]
+
+
+def test_consolidate_blocks_incomplete_payload_swapped_lenses_and_unknown_severity() -> None:
+    """NC-01 & NC-02: Incomplete schema, swapped lenses, or unknown severity must block consolidation."""
+    sha = "a" * 40
+    incomplete_p1 = {"revision_sha": sha, "lens": "correctness_and_tests"}
+    valid_p2 = _sample_pass(sha, "security_and_invariants")
+    res_incomplete = consolidate_reviews(incomplete_p1, valid_p2, expected_sha=sha)
+    assert res_incomplete["review_gate_status"] == "BLOCKED"
+    assert res_incomplete["errors"]
+
+    swapped = consolidate_reviews(
+        _sample_pass(sha, "security_and_invariants"),
+        _sample_pass(sha, "correctness_and_tests"),
+        expected_sha=sha,
+    )
+    assert swapped["review_gate_status"] == "BLOCKED"
+    assert swapped["independent_contexts"] is False
+
+    bad_sev_finding = _sample_finding("P1-77", "blocker", "Unknown severity label")
+    res_bad_sev = consolidate_reviews(
+        _sample_pass(sha, "correctness_and_tests", "CHANGES_REQUESTED", [bad_sev_finding]),
+        _sample_pass(sha, "security_and_invariants", "APPROVE", []),
+        expected_sha=sha,
+    )
+    assert res_bad_sev["review_gate_status"] == "BLOCKED"
+    assert res_bad_sev["errors"]
+
+
+def test_verify_role_rejects_tampered_model_and_auto_refuses_fallback_on_preflight_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """NC-07: Wrong model or reasoning effort fails verify_role and blocks --backend auto without agy fallback."""
+    base_home = tmp_path / "base"
+    runtime_root = tmp_path / "rt"
+    base_home.mkdir()
+    sync_role("pass1", base_home=base_home, runtime_root=runtime_root, overlays_dir=OVERLAYS_DIR)
+
+    cfg_path = runtime_root / "topstep-review-pass1" / "config.toml"
+    raw_cfg = cfg_path.read_text(encoding="utf-8")
+    if 'model = "gpt-6.1-sol"' in raw_cfg:
+        tampered_model = raw_cfg.replace('model = "gpt-6.1-sol"', 'model = "gemini-3.8-flash"')
+    else:
+        tampered_model = 'model = "gemini-3.8-flash"\n' + raw_cfg
+    cfg_path.write_text(tampered_model, encoding="utf-8")
+    res_model = verify_role("pass1", runtime_root)
+    assert res_model["ok"] is False
+    assert any("gpt-6.1-sol" in err for err in res_model["errors"])
+
+    sync_role("pass2", base_home=base_home, runtime_root=runtime_root, overlays_dir=OVERLAYS_DIR)
+    cfg2_path = runtime_root / "topstep-review-pass2" / "config.toml"
+    cfg2_path.write_text(
+        cfg2_path.read_text(encoding="utf-8").replace('model_reasoning_effort = "high"', 'model_reasoning_effort = "low"'),
+        encoding="utf-8",
+    )
+    res_effort = verify_role("pass2", runtime_root)
+    assert res_effort["ok"] is False
+    assert any("model_reasoning_effort" in err for err in res_effort["errors"])
+
+    agy_called = tmp_path / "agy_should_not_run.flag"
+    agy_script = tmp_path / "fake_agy.py"
+    agy_prefix = _write_fake_codex_script(
+        agy_script,
+        f"import pathlib\npathlib.Path({str(agy_called)!r}).write_text('ran', encoding='utf-8')\n",
+    )
+    monkeypatch.setattr(
+        codex_room_review,
+        "verify_role",
+        lambda role, root: {"ok": False, "errors": ["tampered model"]},
+    )
+    monkeypatch.setattr(codex_room_review, "resolve_agy_command", lambda: agy_prefix)
+
+    out_dir = tmp_path / "out_preflight_block"
+    rc = codex_room_review.main(["--commit", "HEAD", "--out-dir", str(out_dir), "--backend", "auto"])
+    assert rc == 2
+    assert not agy_called.exists()
+    report = json.loads((out_dir / "consolidated-review.json").read_text(encoding="utf-8"))
+    assert report["review_gate_status"] == "BLOCKED"
+
+
+def test_codex_room_review_inspects_frozen_commit_and_enforces_write_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """NC-09: Review subprocesses must see committed bytes in frozen-src/, not dirty worktree edits, and refuse overwrite."""
+    import subprocess
+
+    repo = tmp_path / "git_repo"
+    repo.mkdir()
+    subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=repo, check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.name", "Test User"], cwd=repo, check=True, capture_output=True)
+    target = repo / "sample.txt"
+    target.write_text("COMMITTED_V1\n", encoding="utf-8")
+    subprocess.run(["git", "add", "sample.txt"], cwd=repo, check=True, capture_output=True)
+    subprocess.run(["git", "commit", "-m", "init"], cwd=repo, check=True, capture_output=True)
+    committed_sha = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=repo, check=True, capture_output=True, text=True
+    ).stdout.strip()
+
+    # Dirty working tree edit after committed_sha
+    target.write_text("DIRTY_UNCOMMITTED\n", encoding="utf-8")
+
+    observed_file = tmp_path / "observed_pass1.txt"
+    codex_script = tmp_path / "fake_codex_read.py"
+    codex_prefix = _write_fake_codex_script(
+        codex_script,
+        (
+            "import json, pathlib, sys\n"
+            "args = sys.argv[1:]\n"
+            "cwd_arg = pathlib.Path(args[args.index('-C') + 1])\n"
+            "out_path = pathlib.Path(args[args.index('-o') + 1])\n"
+            "prompt = sys.stdin.read()\n"
+            "lens = 'security_and_invariants' if 'security_and_invariants' in prompt else 'correctness_and_tests'\n"
+            "content = (cwd_arg / 'sample.txt').read_text(encoding='utf-8').strip()\n"
+            "if lens == 'correctness_and_tests':\n"
+            f"    pathlib.Path({str(observed_file)!r}).write_text(content, encoding='utf-8')\n"
+            f"payload = {{'revision_sha': {committed_sha!r}, 'lens': lens, 'verdict': 'APPROVE', "
+            "'summary': content, 'findings': [], 'test_quality_issues': [], 'unverified_areas': []}\n"
+            "out_path.write_text(json.dumps(payload), encoding='utf-8')\n"
+        ),
+    )
+
+    monkeypatch.setattr(codex_room_review, "verify_role", lambda role, root: {"ok": True, "errors": []})
+    monkeypatch.setattr(codex_room_review, "resolve_codex_command", lambda: codex_prefix)
+
+    out_dir = tmp_path / "review_out"
+    rc = codex_room_review.main(
+        ["--commit", committed_sha, "--repo-root", str(repo), "--out-dir", str(out_dir), "--backend", "codex"]
+    )
+    assert rc == 0
+    assert observed_file.read_text(encoding="utf-8") == "COMMITTED_V1"
+    report = json.loads((out_dir / "consolidated-review.json").read_text(encoding="utf-8"))
+    assert "frozen_tree_sha256" in report and len(report["frozen_tree_sha256"]) == 64
+
+    # Write-once protection: running again on same out_dir must fail with exit 2
+    rc_dup = codex_room_review.main(
+        ["--commit", committed_sha, "--repo-root", str(repo), "--out-dir", str(out_dir), "--backend", "codex"]
+    )
+    assert rc_dup == 2
+
+
+def test_schema_utils_rejects_type_masquerading_and_extra_properties() -> None:
+    """NC-01: Strict schema validator rejects string booleans, bool-as-int, extra keys, and wrong item types."""
+    from harness.scripts.schema_utils import (
+        is_hex_sha40,
+        is_strict_bool,
+        is_strict_int,
+        validate_instance_against_schema,
+    )
+
+    assert is_strict_int(1) is True
+    assert is_strict_int(True) is False
+    assert is_strict_bool(False) is True
+    assert is_strict_bool("false") is False
+    assert is_hex_sha40("a" * 40) is True
+    assert is_hex_sha40("A" * 40) is False
+    assert is_hex_sha40("short") is False
+
+    schema = json.loads(SCHEMA_PATH.read_text(encoding="utf-8"))
+    bad_payload = _sample_pass("a" * 40, "correctness_and_tests")
+    bad_payload["extra_field"] = "unexpected"
+    bad_payload["test_quality_issues"] = [123]
+    bad_finding = _sample_finding("F1", "high", "Bug")
+    bad_finding["line_start"] = True
+    bad_payload["findings"] = [bad_finding]
+
+    errs = validate_instance_against_schema(bad_payload, schema)
+    assert any("additionalProperties" in e for e in errs)
+    assert any("test_quality_issues[0]" in e for e in errs)
+    assert any("findings[0].line_start" in e for e in errs)
+
+
+def test_agy_backend_runs_in_frozen_src_and_detects_candidate_patch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """NC-09: Direct --backend agy executes with cwd=frozen-src and provides candidate.patch + frozen bytes."""
+    import subprocess
+
+    repo = tmp_path / "git_repo"
+    repo.mkdir()
+    subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=repo, check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.name", "Test User"], cwd=repo, check=True, capture_output=True)
+    target = repo / "app.py"
+    target.write_text("V = 1\n", encoding="utf-8")
+    subprocess.run(["git", "add", "app.py"], cwd=repo, check=True, capture_output=True)
+    subprocess.run(["git", "commit", "-m", "v1"], cwd=repo, check=True, capture_output=True)
+    base_sha = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=repo, check=True, capture_output=True, text=True
+    ).stdout.strip()
+
+    target.write_text("V = 2\n", encoding="utf-8")
+    subprocess.run(["git", "add", "app.py"], cwd=repo, check=True, capture_output=True)
+    subprocess.run(["git", "commit", "-m", "v2"], cwd=repo, check=True, capture_output=True)
+    cand_sha = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=repo, check=True, capture_output=True, text=True
+    ).stdout.strip()
+
+    # Dirty edit after cand_sha must NOT be visible in agy cwd
+    target.write_text("V = 999\n", encoding="utf-8")
+
+    agy_script = tmp_path / "fake_agy_frozen.py"
+    agy_prefix = _write_fake_codex_script(
+        agy_script,
+        (
+            "import json, pathlib, sys\n"
+            "args = sys.argv[1:]\n"
+            "prompt = args[args.index('-p') + 1]\n"
+            "lens = 'security_and_invariants' if 'security_and_invariants' in prompt else 'correctness_and_tests'\n"
+            "content = pathlib.Path('app.py').read_text(encoding='utf-8').strip()\n"
+            f"payload = {{'revision_sha': {cand_sha!r}, 'lens': lens, 'verdict': 'APPROVE', "
+            "'summary': content, 'findings': [], 'test_quality_issues': [], 'unverified_areas': []}\n"
+            "print(json.dumps({'event': 'result', 'result': {'status': 'SUCCESS', 'structured_output': payload}}), flush=True)\n"
+        ),
+    )
+    monkeypatch.setattr(codex_room_review, "resolve_agy_command", lambda: agy_prefix)
+
+    out_dir = tmp_path / "agy_frozen_out"
+    rc = codex_room_review.main(
+        ["--commit", cand_sha, "--base", base_sha, "--repo-root", str(repo), "--out-dir", str(out_dir), "--backend", "agy"]
+    )
+    assert rc == 0
+    pass1_res = json.loads((out_dir / "pass1.json").read_text(encoding="utf-8"))
+    assert pass1_res["summary"] == "V = 2"
+    assert (out_dir / "candidate.patch").is_file()
+    assert "V = 2" in (out_dir / "candidate.patch").read_text(encoding="utf-8")

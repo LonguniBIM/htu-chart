@@ -242,3 +242,374 @@ def test_receipt_records_agy_fallback_provenance_in_json_and_markdown() -> None:
     assert receipt["review_summary"]["fallback_used"] is True
     md = render_receipt_markdown(receipt)
     assert "agy/claude-opus-5-5-medium, fallback" in md
+
+
+def test_receipt_blocks_non_bool_independent_contexts_failed_gate_and_nonblocking_critical() -> None:
+    """NC-03: String 'false' independent_contexts, FAILED gate status, or critical+blocking=False must never verify."""
+    base = "1" * 40
+    cand = "2" * 40
+
+    str_false_review = _review(cand)
+    str_false_review["independent_contexts"] = "false"
+    res_str = evaluate_receipt(
+        task_id="NC-03A",
+        phase=1,
+        base_sha=base,
+        candidate_sha=cand,
+        verifier_data=_verifier(cand),
+        review_data=str_false_review,
+    )
+    assert res_str["conclusion"] == "BLOCKED"
+
+    failed_gate_review = _review(cand)
+    failed_gate_review["review_gate_status"] = "FAILED"
+    res_failed_gate = evaluate_receipt(
+        task_id="NC-03B",
+        phase=1,
+        base_sha=base,
+        candidate_sha=cand,
+        verifier_data=_verifier(cand),
+        review_data=failed_gate_review,
+    )
+    assert res_failed_gate["conclusion"] == "BLOCKED"
+
+    critical_unblocked_review = _review(
+        cand,
+        findings=[{"id": "P2-99", "severity": "critical", "blocking": False, "title": "Critical bypass"}],
+    )
+    res_crit = evaluate_receipt(
+        task_id="NC-03C",
+        phase=1,
+        base_sha=base,
+        candidate_sha=cand,
+        verifier_data=_verifier(cand),
+        review_data=critical_unblocked_review,
+    )
+    assert res_crit["conclusion"] == "FAILED"
+
+
+def test_receipt_blocks_dirty_worktree_empty_steps_and_failed_step_despite_verified_status() -> None:
+    """NC-04: Contradictory verifier payloads (dirty worktree, empty steps, failed step) must block receipt."""
+    base = "1" * 40
+    cand = "2" * 40
+
+    dirty_verifier = _verifier(cand)
+    dirty_verifier["worktree_dirty"] = True
+    res_dirty = evaluate_receipt(
+        task_id="NC-04A",
+        phase=1,
+        base_sha=base,
+        candidate_sha=cand,
+        verifier_data=dirty_verifier,
+        review_data=_review(cand),
+    )
+    assert res_dirty["conclusion"] == "BLOCKED"
+
+    empty_steps = _verifier(cand)
+    empty_steps["steps"] = []
+    res_empty = evaluate_receipt(
+        task_id="NC-04B",
+        phase=1,
+        base_sha=base,
+        candidate_sha=cand,
+        verifier_data=empty_steps,
+        review_data=_review(cand),
+    )
+    assert res_empty["conclusion"] == "BLOCKED"
+
+    failed_step = _verifier(cand)
+    failed_step["steps"] = [{"command": ["pytest"], "status": "FAILED", "exit_code": 1}]
+    res_step = evaluate_receipt(
+        task_id="NC-04C",
+        phase=1,
+        base_sha=base,
+        candidate_sha=cand,
+        verifier_data=failed_step,
+        review_data=_review(cand),
+    )
+    assert res_step["conclusion"] == "FAILED"
+
+
+def test_receipt_rejects_refuted_disposition_with_nonexistent_file_or_line() -> None:
+    """NC-05: REFUTED_WITH_EVIDENCE must point to an existing file and valid line range."""
+    base = "1" * 40
+    cand = "2" * 40
+    finding = {"id": "P1-55", "severity": "high", "blocking": True, "title": "Real bug"}
+
+    bad_file_res = evaluate_receipt(
+        task_id="NC-05A",
+        phase=1,
+        base_sha=base,
+        candidate_sha=cand,
+        verifier_data=_verifier(cand),
+        review_data=_review(cand, findings=[finding]),
+        dispositions={
+            "dispositions": [
+                {
+                    "id": "P1-55",
+                    "status": "REFUTED_WITH_EVIDENCE",
+                    "rationale": "Claimed false positive",
+                    "evidence_ref": "nonexistent/file.py:999999",
+                }
+            ]
+        },
+    )
+    assert bad_file_res["conclusion"] != "VERIFIED"
+
+    bad_line_res = evaluate_receipt(
+        task_id="NC-05B",
+        phase=1,
+        base_sha=base,
+        candidate_sha=cand,
+        verifier_data=_verifier(cand),
+        review_data=_review(cand, findings=[finding]),
+        dispositions={
+            "dispositions": [
+                {
+                    "id": "P1-55",
+                    "status": "REFUTED_WITH_EVIDENCE",
+                    "rationale": "Line out of range",
+                    "evidence_ref": "backend/app/security.py:999999",
+                }
+            ]
+        },
+    )
+    assert bad_line_res["conclusion"] != "VERIFIED"
+
+
+def test_receipt_blocks_invalid_red_proof_shas_and_boolean_exit_codes() -> None:
+    """NC-06: red_sha must equal base_sha (40-hex), green_sha must equal candidate_sha, and exit codes must be strict ints."""
+    base = "1" * 40
+    cand = "2" * 40
+
+    bad_red_sha = evaluate_receipt(
+        task_id="NC-06A",
+        phase=1,
+        base_sha=base,
+        candidate_sha=cand,
+        verifier_data=_verifier(cand),
+        review_data=_review(cand),
+        is_bugfix=True,
+        red_proof={
+            "red_sha": "banana",
+            "red_exit_code": 1,
+            "red_failure_reason": "AssertionError: boom",
+            "green_sha": cand,
+            "green_exit_code": 0,
+        },
+    )
+    assert bad_red_sha["conclusion"] == "BLOCKED"
+
+    mismatched_red_sha = evaluate_receipt(
+        task_id="NC-06B",
+        phase=1,
+        base_sha=base,
+        candidate_sha=cand,
+        verifier_data=_verifier(cand),
+        review_data=_review(cand),
+        is_bugfix=True,
+        red_proof={
+            "red_sha": "3" * 40,
+            "red_exit_code": 1,
+            "red_failure_reason": "AssertionError: boom",
+            "green_sha": cand,
+            "green_exit_code": 0,
+        },
+    )
+    assert mismatched_red_sha["conclusion"] == "BLOCKED"
+
+    empty_green_sha = evaluate_receipt(
+        task_id="NC-06C",
+        phase=1,
+        base_sha=base,
+        candidate_sha=cand,
+        verifier_data=_verifier(cand),
+        review_data=_review(cand),
+        is_bugfix=True,
+        red_proof={
+            "red_sha": base,
+            "red_exit_code": 1,
+            "red_failure_reason": "AssertionError: boom",
+            "green_sha": "",
+            "green_exit_code": 0,
+        },
+    )
+    assert empty_green_sha["conclusion"] == "BLOCKED"
+
+    bool_exits = evaluate_receipt(
+        task_id="NC-06D",
+        phase=1,
+        base_sha=base,
+        candidate_sha=cand,
+        verifier_data=_verifier(cand),
+        review_data=_review(cand),
+        is_bugfix=True,
+        red_proof={
+            "red_sha": base,
+            "red_exit_code": True,
+            "red_failure_reason": "AssertionError: boom",
+            "green_sha": cand,
+            "green_exit_code": False,
+        },
+    )
+    assert bool_exits["conclusion"] == "BLOCKED"
+
+
+def test_receipt_cli_refuses_overwrite_write_once(tmp_path: Path) -> None:
+    """Write-once receipt output: re-running receipt.py into an existing out_dir must fail with exit 2."""
+    base = "1" * 40
+    cand = "2" * 40
+    v_path = tmp_path / "verifier.json"
+    r_path = tmp_path / "review.json"
+    out_dir = tmp_path / "out_once"
+    v_path.write_text(json.dumps(_verifier(cand)), encoding="utf-8")
+    r_path.write_text(json.dumps(_review(cand)), encoding="utf-8")
+
+    cmd = [
+        sys.executable,
+        str(REPO_ROOT / "harness" / "scripts" / "receipt.py"),
+        "--task-id",
+        "P1-ONCE",
+        "--phase",
+        "1",
+        "--base-sha",
+        base,
+        "--candidate-sha",
+        cand,
+        "--verifier-json",
+        str(v_path),
+        "--review-json",
+        str(r_path),
+        "--out-dir",
+        str(out_dir),
+    ]
+    first = subprocess.run(cmd, capture_output=True, text=True, check=False)
+    assert first.returncode == 0
+    original_bytes = (out_dir / "receipt.json").read_bytes()
+
+    second = subprocess.run(cmd, capture_output=True, text=True, check=False)
+    assert second.returncode == 2
+    assert (out_dir / "receipt.json").read_bytes() == original_bytes
+
+
+def test_receipt_task_manifest_require_frozen_and_git_commit_evidence(tmp_path: Path) -> None:
+    """Verify --task-manifest enforcement, --require-frozen hash check, and git-blob evidence_ref check."""
+    repo = tmp_path / "git_repo"
+    repo.mkdir()
+    subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=repo, check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.name", "Test User"], cwd=repo, check=True, capture_output=True)
+    src = repo / "mod.py"
+    src.write_text("line1 = 1\n", encoding="utf-8")
+    subprocess.run(["git", "add", "mod.py"], cwd=repo, check=True, capture_output=True)
+    subprocess.run(["git", "commit", "-m", "base"], cwd=repo, check=True, capture_output=True)
+    base_sha = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=repo, check=True, capture_output=True, text=True
+    ).stdout.strip()
+
+    src.write_text("line1 = 1\nline2 = 2\n", encoding="utf-8")
+    subprocess.run(["git", "add", "mod.py"], cwd=repo, check=True, capture_output=True)
+    subprocess.run(["git", "commit", "-m", "cand"], cwd=repo, check=True, capture_output=True)
+    cand_sha = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=repo, check=True, capture_output=True, text=True
+    ).stdout.strip()
+
+    # Add an untracked dirty file after cand_sha; REFUTED_WITH_EVIDENCE citing it must fail against cand_sha blob
+    (repo / "dirty_only.py").write_text("x = 1\n", encoding="utf-8")
+    finding = {"id": "P1-88", "severity": "high", "blocking": True, "title": "Bug"}
+    dirty_ref_res = evaluate_receipt(
+        task_id="NC-05-GIT",
+        phase=1,
+        base_sha=base_sha,
+        candidate_sha=cand_sha,
+        verifier_data=_verifier(cand_sha),
+        review_data=_review(cand_sha, findings=[finding]),
+        dispositions={
+            "dispositions": [
+                {
+                    "id": "P1-88",
+                    "status": "REFUTED_WITH_EVIDENCE",
+                    "rationale": "Claims dirty file proves innocence",
+                    "evidence_ref": "dirty_only.py:1",
+                }
+            ]
+        },
+        repo_root=repo,
+    )
+    assert dirty_ref_res["conclusion"] == "FAILED"
+
+    # Mismatched red_test_command / green_test_command must block
+    mismatch_cmd_res = evaluate_receipt(
+        task_id="NC-06-CMD",
+        phase=1,
+        base_sha=base_sha,
+        candidate_sha=cand_sha,
+        verifier_data=_verifier(cand_sha),
+        review_data=_review(cand_sha),
+        is_bugfix=True,
+        red_proof={
+            "red_sha": base_sha,
+            "red_exit_code": 1,
+            "red_failure_reason": "AssertionError: boom",
+            "green_sha": cand_sha,
+            "green_exit_code": 0,
+            "red_test_command": "pytest harness/tests/test_a.py",
+            "green_test_command": "pytest harness/tests/test_b.py",
+        },
+        repo_root=repo,
+    )
+    assert mismatch_cmd_res["conclusion"] == "BLOCKED"
+
+    # --require-frozen rejects worktree mode and mismatched hashes
+    frozen_v = _verifier(cand_sha)
+    frozen_v["source_mode"] = "frozen_commit_archive"
+    frozen_v["frozen_tree_sha256"] = "a" * 64
+    frozen_r = _review(cand_sha)
+    frozen_r["frozen_tree_sha256"] = "b" * 64
+    mismatch_frozen = evaluate_receipt(
+        task_id="NC-09-HASH",
+        phase=1,
+        base_sha=base_sha,
+        candidate_sha=cand_sha,
+        verifier_data=frozen_v,
+        review_data=frozen_r,
+        require_frozen=True,
+    )
+    assert mismatch_frozen["conclusion"] == "BLOCKED"
+
+    # --task-manifest prevents omitting --bugfix
+    v_path = tmp_path / "v.json"
+    r_path = tmp_path / "r.json"
+    m_path = tmp_path / "manifest.json"
+    v_path.write_text(json.dumps(_verifier(cand_sha)), encoding="utf-8")
+    r_path.write_text(json.dumps(_review(cand_sha)), encoding="utf-8")
+    m_path.write_text(
+        json.dumps({"task_id": "BUG-MAN", "is_bugfix": True, "base_sha": base_sha}),
+        encoding="utf-8",
+    )
+    proc_omit_bugfix = subprocess.run(
+        [
+            sys.executable,
+            str(REPO_ROOT / "harness" / "scripts" / "receipt.py"),
+            "--task-id",
+            "BUG-MAN",
+            "--phase",
+            "1",
+            "--base-sha",
+            base_sha,
+            "--candidate-sha",
+            cand_sha,
+            "--verifier-json",
+            str(v_path),
+            "--review-json",
+            str(r_path),
+            "--task-manifest",
+            str(m_path),
+            "--out-dir",
+            str(tmp_path / "out_man"),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert proc_omit_bugfix.returncode == 2

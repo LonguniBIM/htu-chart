@@ -2,9 +2,13 @@
 
 from __future__ import annotations
 
+import json
 import shutil
+import subprocess
+import sys
 from pathlib import Path
 
+from harness.scripts import build_verifier
 from harness.scripts.build_verifier import run_verifier
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -54,3 +58,53 @@ def test_build_verifier_blocks_phase1_when_backend_missing(tmp_path: Path) -> No
     assert report["status"] == "BLOCKED"
     backend_step = next(s for s in report["steps"] if s["name"] == "backend_suite")
     assert backend_step["status"] == "BLOCKED"
+
+
+def test_build_verifier_commit_runs_against_frozen_snapshot_not_dirty_worktree(tmp_path: Path) -> None:
+    """NC-09: build_verifier --commit <sha> must verify frozen commit archive, ignoring uncommitted edits."""
+    _setup_mini_repo(tmp_path, test_code="def test_ok():\n    assert 2 + 2 == 4\n")
+    subprocess.run(["git", "init"], cwd=tmp_path, check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=tmp_path, check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.name", "Test User"], cwd=tmp_path, check=True, capture_output=True)
+    subprocess.run(["git", "add", "."], cwd=tmp_path, check=True, capture_output=True)
+    subprocess.run(["git", "commit", "-m", "clean base"], cwd=tmp_path, check=True, capture_output=True)
+    sha = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=tmp_path, check=True, capture_output=True, text=True
+    ).stdout.strip()
+
+    # Dirty working tree after commit: break test and add SEC-001 violation
+    (tmp_path / "harness" / "tests" / "test_sample.py").write_text(
+        "def test_ok():\n    assert 2 + 2 == 5\n", encoding="utf-8"
+    )
+    bad = tmp_path / "backend" / "app" / "bad.py"
+    bad.parent.mkdir(parents=True, exist_ok=True)
+    bad.write_text('ENDPOINT = "/api/Order/create"\n', encoding="utf-8")
+
+    out_json = tmp_path / "out" / "verifier.json"
+    rc = build_verifier.main(["--root", str(tmp_path), "--phase", "0", "--commit", sha, "--out", str(out_json)])
+    assert rc == 0
+    report = json.loads(out_json.read_text(encoding="utf-8"))
+    assert report["status"] == "VERIFIED"
+    assert report["git_sha"] == sha
+    assert report["source_mode"] == "frozen_commit_archive"
+    assert report["worktree_dirty"] is True
+    assert len(report["frozen_tree_sha256"]) == 64
+
+
+def test_build_verifier_terminates_timed_out_subprocess_with_exit_124(tmp_path: Path, monkeypatch) -> None:
+    """Bounded subprocess execution: step exceeding step_timeout_sec must terminate and return exit_code 124."""
+    _setup_mini_repo(tmp_path)
+    sleeper = tmp_path / "sleep_cmd.py"
+    sleeper.write_text("import time\ntime.sleep(30)\n", encoding="utf-8")
+
+    monkeypatch.setattr(
+        build_verifier,
+        "_resolve_tool",
+        lambda name, python_module=None: [sys.executable, str(sleeper)] if name == "pytest" else [sys.executable, "-c", "pass"],
+    )
+    report = run_verifier(tmp_path, phase=0, strict_clean=False, step_timeout_sec=0.4, total_timeout_sec=5.0)
+    assert report["status"] == "FAILED"
+    pytest_step = next(s for s in report["steps"] if s["name"] == "harness_pytest")
+    assert pytest_step["status"] == "FAILED"
+    assert pytest_step["exit_code"] == 124
+    assert "TIMED_OUT" in pytest_step["summary"]

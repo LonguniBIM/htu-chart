@@ -3,6 +3,8 @@
 Review **strictly read-only** against immutable git commit:
 - **Candidate SHA**: `{{CANDIDATE_SHA}}`
 - **Base SHA**: `{{BASE_SHA}}`
+- **Frozen Snapshot Dir**: `{{FROZEN_SRC_DIR}}`
+- **Candidate Diff Patch**: `{{PATCH_PATH}}`
 
 ## Changed Files
 ```text
@@ -18,9 +20,9 @@ Review **strictly read-only** against immutable git commit:
 {{TASK_PACKET}}
 
 ## Mandatory Inspection Instructions
-1. Inspect the exact commit snapshot using read-only git commands:
-   - `git show {{CANDIDATE_SHA}}` (or `git diff {{BASE_SHA}} {{CANDIDATE_SHA}}` when `Base SHA != ROOT_COMMIT`)
-   - Check `implementation_plan.md` Audit Findings `F01–F08` and `R01–R06`, plus `AGENTS.md` and `docs/WORKSPACE_PROTOCOL.md`.
+1. Inspect ONLY the immutable frozen snapshot at `{{FROZEN_SRC_DIR}}` and the candidate patch at `{{PATCH_PATH}}` (never read dirty working-tree files outside the frozen snapshot):
+   - Read changed files inside `{{FROZEN_SRC_DIR}}` and review the diff in `{{PATCH_PATH}}` (or read-only git inspection if `.git` is available).
+   - Check `implementation_plan.md` Audit Findings `F01–F08` and `R01–R06`, plus `AGENTS.md` and `docs/WORKSPACE_PROTOCOL.md` inside `{{FROZEN_SRC_DIR}}`.
 2. Verify Prop Firm Hard Read-Only Compliance:
    - Confirm zero `/api/Order/*`, `/api/Position/*`, `/hubs/user`, or order placement paths in backend, frontend, or MCP tools.
 3. Verify Security & Reliability Boundaries:

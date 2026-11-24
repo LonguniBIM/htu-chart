@@ -30,8 +30,22 @@ from typing import Any
 
 try:
     from harness.scripts.codex_room_sync import verify_role
+    from harness.scripts.schema_utils import (
+        compute_tree_sha256,
+        is_hex_sha40,
+        is_strict_int,
+        materialize_frozen_tree,
+        validate_instance_against_schema,
+    )
 except ImportError:
     from codex_room_sync import verify_role
+    from schema_utils import (
+        compute_tree_sha256,
+        is_hex_sha40,
+        is_strict_int,
+        materialize_frozen_tree,
+        validate_instance_against_schema,
+    )
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 CODEX_ROOM_DIR = REPO_ROOT / "harness" / "codex-room"
@@ -254,6 +268,8 @@ def render_prompt(template_path: Path, info: dict[str, Any], task_packet_text: s
         "{{BASE_SHA}}": info["base_sha"],
         "{{DIFF_STAT}}": info["diff_stat"],
         "{{CHANGED_FILES}}": info["changed_files"],
+        "{{FROZEN_SRC_DIR}}": str(info.get("frozen_src_dir", "")),
+        "{{PATCH_PATH}}": str(info.get("patch_path") or "(none — ROOT_COMMIT)"),
         "{{TASK_PACKET}}": task_packet_text,
     }
     rendered = template
@@ -267,9 +283,11 @@ def _normalize_title(title: str) -> str:
 
 
 def _finding_dedup_key(f: dict[str, Any]) -> tuple[str, int, str, str]:
+    line_raw = f.get("line_start", 0)
+    line_num = line_raw if is_strict_int(line_raw) else 0
     return (
         str(f.get("file", "")).replace("\\", "/").strip(),
-        int(f.get("line_start", 0)),
+        line_num,
         str(f.get("category", "")).strip().lower(),
         _normalize_title(str(f.get("title", ""))),
     )
@@ -282,12 +300,14 @@ def consolidate_reviews(
 ) -> dict[str, Any]:
     """Consolidate two independent review passes on ``expected_sha``."""
     errors: list[str] = []
+    if not is_hex_sha40(expected_sha):
+        errors.append(f"Invalid expected_sha: must be 40-char lowercase hex, got {expected_sha!r}")
     if not isinstance(pass1_data, dict):
         errors.append("Pass 1 (correctness_and_tests) output is missing or invalid JSON.")
     if not isinstance(pass2_data, dict):
         errors.append("Pass 2 (security_and_invariants) output is missing or invalid JSON.")
 
-    if errors:
+    if not isinstance(pass1_data, dict) or not isinstance(pass2_data, dict):
         return {
             "revision_sha": expected_sha,
             "passes_completed": int(isinstance(pass1_data, dict)) + int(isinstance(pass2_data, dict)),
@@ -301,12 +321,22 @@ def consolidate_reviews(
             "errors": errors,
         }
 
-    assert pass1_data is not None and pass2_data is not None
-    p1_sha = str(pass1_data.get("revision_sha", "")).strip()
-    p2_sha = str(pass2_data.get("revision_sha", "")).strip()
-    if p1_sha != expected_sha:
+    schema = json.loads(SCHEMA_PATH.read_text(encoding="utf-8"))
+    p1_schema_errors = validate_instance_against_schema(pass1_data, schema, path="$.pass1")
+    p2_schema_errors = validate_instance_against_schema(pass2_data, schema, path="$.pass2")
+    errors.extend(p1_schema_errors)
+    errors.extend(p2_schema_errors)
+
+    p1_sha = pass1_data.get("revision_sha")
+    p2_sha = pass2_data.get("revision_sha")
+    if not is_hex_sha40(p1_sha):
+        errors.append(f"Pass 1 revision_sha is not a valid 40-char lowercase hex SHA: {p1_sha!r}")
+    elif p1_sha != expected_sha:
         errors.append(f"Pass 1 revision_sha mismatch: expected {expected_sha}, got {p1_sha!r}")
-    if p2_sha != expected_sha:
+
+    if not is_hex_sha40(p2_sha):
+        errors.append(f"Pass 2 revision_sha is not a valid 40-char lowercase hex SHA: {p2_sha!r}")
+    elif p2_sha != expected_sha:
         errors.append(f"Pass 2 revision_sha mismatch: expected {expected_sha}, got {p2_sha!r}")
 
     if pass1_data.get("verdict") == "BLOCKED":
@@ -314,16 +344,36 @@ def consolidate_reviews(
     if pass2_data.get("verdict") == "BLOCKED":
         errors.append(f"Pass 2 reported BLOCKED: {pass2_data.get('summary', '')}")
 
-    lens1 = str(pass1_data.get("lens", ""))
-    lens2 = str(pass2_data.get("lens", ""))
-    independent_contexts = bool(lens1 and lens2 and lens1 != lens2)
+    lens1 = pass1_data.get("lens")
+    lens2 = pass2_data.get("lens")
+    if lens1 != "correctness_and_tests":
+        errors.append(f"Pass 1 lens must be 'correctness_and_tests', got {lens1!r}")
+    if lens2 != "security_and_invariants":
+        errors.append(f"Pass 2 lens must be 'security_and_invariants', got {lens2!r}")
+
+    independent_contexts = bool(
+        lens1 == "correctness_and_tests"
+        and lens2 == "security_and_invariants"
+        and not p1_schema_errors
+        and not p2_schema_errors
+    )
 
     merged_by_key: dict[tuple[str, int, str, str], dict[str, Any]] = {}
     for pass_label, payload in (("pass1", pass1_data), ("pass2", pass2_data)):
-        for raw_finding in payload.get("findings", []):
+        raw_findings = payload.get("findings")
+        if not isinstance(raw_findings, list):
+            continue
+        for raw_finding in raw_findings:
+            if not isinstance(raw_finding, dict):
+                continue
+            sev = str(raw_finding.get("severity", "")).lower()
+            if sev not in SEVERITY_RANK:
+                errors.append(f"{pass_label} finding {raw_finding.get('id', '?')!r} has invalid severity {sev!r}")
+                continue
             key = _finding_dedup_key(raw_finding)
-            sev = str(raw_finding.get("severity", "medium")).lower()
             is_blocking = sev in BLOCKING_SEVERITIES
+            line_start = raw_finding.get("line_start") if is_strict_int(raw_finding.get("line_start")) else 0
+            line_end = raw_finding.get("line_end") if is_strict_int(raw_finding.get("line_end")) else 0
             if key not in merged_by_key:
                 merged_by_key[key] = {
                     "id": raw_finding.get("id", ""),
@@ -334,8 +384,8 @@ def consolidate_reviews(
                     "source_ids": [raw_finding.get("id", "")],
                     "category": raw_finding.get("category", ""),
                     "file": str(raw_finding.get("file", "")).replace("\\", "/"),
-                    "line_start": int(raw_finding.get("line_start", 0)),
-                    "line_end": int(raw_finding.get("line_end", 0)),
+                    "line_start": line_start,
+                    "line_end": line_end,
                     "title": raw_finding.get("title", ""),
                     "behavior_affected": raw_finding.get("behavior_affected", ""),
                     "trigger_condition": raw_finding.get("trigger_condition", ""),
@@ -353,7 +403,7 @@ def consolidate_reviews(
                 if SEVERITY_RANK.get(sev, 0) > SEVERITY_RANK.get(existing["severity"], 0):
                     existing["severity"] = sev
                     existing["blocking"] = sev in BLOCKING_SEVERITIES
-                existing["line_end"] = max(existing["line_end"], int(raw_finding.get("line_end", 0)))
+                existing["line_end"] = max(existing["line_end"], line_end)
                 ev = str(raw_finding.get("evidence", "")).strip()
                 if ev and ev not in existing["evidence"]:
                     existing["evidence"] = f"{existing['evidence']}\n[{pass_label}] {ev}".strip()
@@ -366,12 +416,13 @@ def consolidate_reviews(
     blocking_open_count = sum(1 for f in findings_list if f["blocking"] and f["status"] == "OPEN")
     advisory_count = sum(1 for f in findings_list if not f["blocking"])
 
-    test_issues = _dedup_ordered(
-        [*pass1_data.get("test_quality_issues", []), *pass2_data.get("test_quality_issues", [])]
-    )
-    unverified = _dedup_ordered(
-        [*pass1_data.get("unverified_areas", []), *pass2_data.get("unverified_areas", [])]
-    )
+    p1_tqi = pass1_data.get("test_quality_issues") if isinstance(pass1_data.get("test_quality_issues"), list) else []
+    p2_tqi = pass2_data.get("test_quality_issues") if isinstance(pass2_data.get("test_quality_issues"), list) else []
+    p1_unv = pass1_data.get("unverified_areas") if isinstance(pass1_data.get("unverified_areas"), list) else []
+    p2_unv = pass2_data.get("unverified_areas") if isinstance(pass2_data.get("unverified_areas"), list) else []
+
+    test_issues = _dedup_ordered([*p1_tqi, *p2_tqi])
+    unverified = _dedup_ordered([*p1_unv, *p2_unv])
 
     if errors:
         gate_status = "BLOCKED"
@@ -753,6 +804,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--commit", default="HEAD", help="Immutable commit SHA or ref to review.")
     parser.add_argument("--base", default=None, help="Optional base commit SHA for diff context.")
     parser.add_argument("--task-id", default="adhoc", help="Task identifier for run folder naming.")
+    parser.add_argument("--attempt-id", default=None, help="Optional unique attempt ID for write-once run dir.")
     parser.add_argument("--task-packet", type=Path, default=None, help="Path to Task Packet markdown.")
     parser.add_argument("--repo-root", type=Path, default=REPO_ROOT)
     parser.add_argument("--out-dir", type=Path, default=None)
@@ -834,6 +886,24 @@ def _merge_prior_pass_findings(
     return merged
 
 
+def _write_once_outputs(out_dir: Path, report: dict[str, Any]) -> bool:
+    """Write consolidated-review.json and .md exclusively, refusing overwrite."""
+    json_path = out_dir / "consolidated-review.json"
+    md_path = out_dir / "consolidated-review.md"
+    try:
+        with json_path.open("x", encoding="utf-8") as fh:
+            fh.write(json.dumps(report, indent=2) + "\n")
+    except FileExistsError:
+        print(
+            f"[codex_room_review] Write-once refusal: {json_path} already exists.",
+            file=sys.stderr,
+        )
+        return False
+    with md_path.open("x", encoding="utf-8") as fh:
+        fh.write(render_consolidated_markdown(report))
+    return True
+
+
 def main(argv: list[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
     repo_root = args.repo_root.resolve()
@@ -845,7 +915,19 @@ def main(argv: list[str] | None = None) -> int:
 
     info = resolve_commit_info(repo_root, args.commit, args.base)
     candidate_sha = info["candidate_sha"]
-    out_dir = args.out_dir or (repo_root / "harness" / "runs" / f"{args.task_id}-{candidate_sha[:8]}")
+    if args.out_dir is not None:
+        out_dir = args.out_dir
+    else:
+        attempt_id = args.attempt_id or datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        out_dir = repo_root / "harness" / "runs" / args.task_id / "attempts" / f"{attempt_id}-{candidate_sha[:12]}"
+
+    if not args.dry_run and (out_dir / "consolidated-review.json").exists():
+        print(
+            f"[codex_room_review] Write-once refusal: {out_dir / 'consolidated-review.json'} already exists.",
+            file=sys.stderr,
+        )
+        return 2
+
     out_dir.mkdir(parents=True, exist_ok=True)
 
     if args.consolidate_only:
@@ -853,14 +935,19 @@ def main(argv: list[str] | None = None) -> int:
         p1_data = json.loads(p1_path.read_text(encoding="utf-8")) if p1_path.is_file() else None
         p2_data = json.loads(p2_path.read_text(encoding="utf-8")) if p2_path.is_file() else None
         report = consolidate_reviews(p1_data, p2_data, expected_sha=candidate_sha)
-        (out_dir / "consolidated-review.json").write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
-        (out_dir / "consolidated-review.md").write_text(render_consolidated_markdown(report), encoding="utf-8")
+        if not _write_once_outputs(out_dir, report):
+            return 2
         print(f"[codex_room_review] status={report['review_gate_status']} out={out_dir}")
         if report["review_gate_status"] == "BLOCKED":
             return 2
         if args.fail_on_blocking and report["blocking_open_count"] > 0:
             return 1
         return 0
+
+    frozen_src_dir = out_dir / "frozen-src"
+    frozen_meta = materialize_frozen_tree(repo_root, candidate_sha, frozen_src_dir, base_sha=info["base_sha"])
+    info["frozen_src_dir"] = frozen_meta["dest_dir"]
+    info["patch_path"] = frozen_meta["patch_path"]
 
     task_text = (
         args.task_packet.read_text(encoding="utf-8")
@@ -884,6 +971,9 @@ def main(argv: list[str] | None = None) -> int:
             "dry_run": True,
             "candidate_sha": candidate_sha,
             "base_sha": info["base_sha"],
+            "frozen_src_dir": str(frozen_src_dir),
+            "patch_path": frozen_meta["patch_path"],
+            "frozen_tree_sha256": frozen_meta["frozen_tree_sha256"],
             "worktree_dirty": info["worktree_dirty"],
             "schema_valid": True,
             "backend": args.backend,
@@ -910,7 +1000,7 @@ def main(argv: list[str] | None = None) -> int:
         p1_kw = dict(
             agy_prefix=agy_prefix,
             role="pass1",
-            repo_root=repo_root,
+            repo_root=frozen_src_dir,
             schema_path=SCHEMA_PATH,
             prompt_text=prompt1,
             prompt_file=prompt1_path,
@@ -923,7 +1013,7 @@ def main(argv: list[str] | None = None) -> int:
         p2_kw = dict(
             agy_prefix=agy_prefix,
             role="pass2",
-            repo_root=repo_root,
+            repo_root=frozen_src_dir,
             schema_path=SCHEMA_PATH,
             prompt_text=prompt2,
             prompt_file=prompt2_path,
@@ -935,11 +1025,13 @@ def main(argv: list[str] | None = None) -> int:
         )
         res1, res2 = _execute_two_passes(_run_agy_pass, p1_kw, p2_kw, sequential=args.sequential)
         after_status = _git_output(repo_root, ["status", "--porcelain"]).stdout
-        violation = (
-            "Read-only violation: git worktree changed during agy review pass."
-            if after_status != before_status
-            else None
-        )
+        frozen_hash_after, _ = compute_tree_sha256(frozen_src_dir)
+        if after_status != before_status:
+            violation: str | None = "Read-only violation: git worktree changed during agy review pass."
+        elif frozen_hash_after != frozen_meta["frozen_tree_sha256"]:
+            violation = "Read-only violation: frozen-src snapshot modified during agy review pass."
+        else:
+            violation = None
         return res1, res2, violation
 
     if args.backend == "agy":
@@ -953,27 +1045,34 @@ def main(argv: list[str] | None = None) -> int:
     else:
         v1 = verify_role("pass1", args.runtime_root)
         v2 = verify_role("pass2", args.runtime_root)
+        if not (v1["ok"] and v2["ok"]):
+            preflight_err = (
+                "Codex Room runtime failed safety/model preflight: "
+                f"pass1={v1.get('errors', [])}; pass2={v2.get('errors', [])}"
+            )
+            print(f"[codex_room_review] {preflight_err}", file=sys.stderr)
+            report = consolidate_reviews(None, None, expected_sha=candidate_sha)
+            report["errors"] = [preflight_err]
+            report["frozen_tree_sha256"] = frozen_meta["frozen_tree_sha256"]
+            report["candidate_patch_path"] = frozen_meta["patch_path"]
+            report["worktree_dirty_at_review"] = info["worktree_dirty"]
+            report["review_backend"] = "codex"
+            report["review_model"] = args.model
+            report["fallback_used"] = False
+            report["fallback_reason"] = None
+            _write_once_outputs(out_dir, report)
+            return 2
+
         codex_prefix: list[str] | None = None
         codex_precheck_reason: str | None = None
-
-        if not (v1["ok"] and v2["ok"]):
-            codex_precheck_reason = "codex_runtime_not_ready"
-        else:
-            try:
-                codex_prefix = resolve_codex_command()
-            except FileNotFoundError:
-                codex_precheck_reason = "codex_cli_not_found"
+        try:
+            codex_prefix = resolve_codex_command()
+        except FileNotFoundError:
+            codex_precheck_reason = "codex_cli_not_found"
 
         if codex_precheck_reason is not None:
             if args.backend == "codex":
-                if codex_precheck_reason == "codex_runtime_not_ready":
-                    print(
-                        "[codex_room_review] Codex Room runtimes not ready. Run codex_room_sync.py --role all first.\n"
-                        f"  pass1: {v1['errors']}\n  pass2: {v2['errors']}",
-                        file=sys.stderr,
-                    )
-                else:
-                    print("[codex_room_review] Codex CLI (`codex`) not found on PATH.", file=sys.stderr)
+                print("[codex_room_review] Codex CLI (`codex`) not found on PATH.", file=sys.stderr)
                 return 2
             fallback_reason = codex_precheck_reason
         else:
@@ -982,7 +1081,7 @@ def main(argv: list[str] | None = None) -> int:
                 codex_prefix=codex_prefix,
                 role="pass1",
                 runtime_dir=args.runtime_root / "topstep-review-pass1",
-                repo_root=repo_root,
+                repo_root=frozen_src_dir,
                 schema_path=SCHEMA_PATH,
                 prompt_text=prompt1,
                 out_dir=out_dir,
@@ -995,7 +1094,7 @@ def main(argv: list[str] | None = None) -> int:
                 codex_prefix=codex_prefix,
                 role="pass2",
                 runtime_dir=args.runtime_root / "topstep-review-pass2",
-                repo_root=repo_root,
+                repo_root=frozen_src_dir,
                 schema_path=SCHEMA_PATH,
                 prompt_text=prompt2,
                 out_dir=out_dir,
@@ -1037,13 +1136,19 @@ def main(argv: list[str] | None = None) -> int:
     if readonly_violation:
         report["errors"].append(readonly_violation)
         report["review_gate_status"] = "BLOCKED"
+    frozen_hash_final, _ = compute_tree_sha256(frozen_src_dir)
+    if frozen_hash_final != frozen_meta["frozen_tree_sha256"]:
+        report["errors"].append("Read-only violation: frozen-src snapshot changed during review.")
+        report["review_gate_status"] = "BLOCKED"
+    report["frozen_tree_sha256"] = frozen_meta["frozen_tree_sha256"]
+    report["candidate_patch_path"] = frozen_meta["patch_path"]
     report["worktree_dirty_at_review"] = info["worktree_dirty"]
     report["review_backend"] = active_backend
     report["review_model"] = active_model
     report["fallback_used"] = fallback_used
     report["fallback_reason"] = fallback_reason
-    (out_dir / "consolidated-review.json").write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
-    (out_dir / "consolidated-review.md").write_text(render_consolidated_markdown(report), encoding="utf-8")
+    if not _write_once_outputs(out_dir, report):
+        return 2
 
     print(
         f"[codex_room_review] sha={candidate_sha[:12]} backend={active_backend} "

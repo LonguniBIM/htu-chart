@@ -26,6 +26,8 @@ ROLE_MAP: dict[str, tuple[str, str]] = {
     "pass1": ("topstep-review-pass1", "review-pass1-correctness.config.toml"),
     "pass2": ("topstep-review-pass2", "review-pass2-security.config.toml"),
 }
+EXPECTED_REVIEW_MODEL = "gpt-6.1-sol"
+EXPECTED_REASONING_EFFORT = "high"
 
 BARE_KEY_CHARS = frozenset("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-")
 
@@ -54,8 +56,8 @@ def deep_merge(base: dict[str, Any], overlay: dict[str, Any]) -> dict[str, Any]:
 def apply_safety_locks(cfg: dict[str, Any], model_override: str | None = None) -> dict[str, Any]:
     """Enforce non-overridable read-only Codex Room invariants."""
     locked = copy.deepcopy(cfg)
-    if model_override:
-        locked["model"] = model_override
+    locked["model"] = model_override or EXPECTED_REVIEW_MODEL
+    locked["model_reasoning_effort"] = EXPECTED_REASONING_EFFORT
     locked["sandbox_mode"] = "read-only"
     locked["approval_policy"] = "never"
     locked.pop("agents", None)
@@ -418,6 +420,12 @@ def verify_role(role: str, runtime_root: Path) -> dict[str, Any]:
     except tomllib.TOMLDecodeError as exc:
         return {"role": role, "runtime_dir": str(runtime_dir), "ok": False, "errors": [f"Invalid TOML: {exc}"]}
 
+    if cfg.get("model") != EXPECTED_REVIEW_MODEL:
+        errors.append(f"Expected model={EXPECTED_REVIEW_MODEL!r}, got {cfg.get('model')!r}")
+    if cfg.get("model_reasoning_effort") != EXPECTED_REASONING_EFFORT:
+        errors.append(
+            f"Expected model_reasoning_effort={EXPECTED_REASONING_EFFORT!r}, got {cfg.get('model_reasoning_effort')!r}"
+        )
     if cfg.get("sandbox_mode") != "read-only":
         errors.append(f"Expected sandbox_mode='read-only', got {cfg.get('sandbox_mode')!r}")
     if cfg.get("approval_policy") != "never":
