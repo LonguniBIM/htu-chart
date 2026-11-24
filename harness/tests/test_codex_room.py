@@ -1821,7 +1821,8 @@ def test_agy_typed_classifier_handles_auth_quota_and_zero_token_startup_race(
 
     # End-to-end 0-token startup race recovers on single retry.
     repo_dir, head_sha = _init_mini_git_repo(tmp_path / "repo_agy_race")
-    agy_calls = tmp_path / "agy_race_calls.txt"
+    calls_dir = tmp_path / "agy_race_calls"
+    calls_dir.mkdir()
     agy_script = tmp_path / "fake_agy_startup_race.py"
     agy_prefix = _write_fake_codex_script(
         agy_script,
@@ -1831,9 +1832,9 @@ def test_agy_typed_classifier_handles_auth_quota_and_zero_token_startup_race(
             "prompt = args[args.index('-p') + 1]\n"
             "lens = 'security_and_invariants' if 'security_and_invariants' in prompt "
             "else 'correctness_and_tests'\n"
-            f"p = pathlib.Path({str(agy_calls)!r})\n"
+            f"p = pathlib.Path({str(calls_dir)!r}) / f'{{lens}}.log'\n"
             "prev = p.read_text(encoding='utf-8') if p.is_file() else ''\n"
-            "seen = sum(1 for ln in prev.splitlines() if ln == lens)\n"
+            "seen = len(prev.splitlines())\n"
             "p.write_text(prev + lens + '\\n', encoding='utf-8')\n"
             "if lens == 'correctness_and_tests' and seen == 0:\n"
             "    err_ev = {'event': 'result', 'result': {'status': 'ERROR', "

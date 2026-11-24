@@ -134,8 +134,11 @@ def test_r06_ws_market_enforces_session_and_origin_before_accept(tmp_path: Path)
                 pong = ws.receive_json()
             assert pong == {"type": "pong"}
 
-            # Trigger bar broadcast directly via app's broadcaster
-            app.state.ws_broadcaster.publish_bar(
+            # Trigger bar broadcast directly via app's broadcaster on the portal loop
+            portal = client.portal
+            assert portal is not None
+            portal.call(
+                app.state.ws_broadcaster.publish_bar,
                 AggregatedBarEvent(
                     contract_id="CON.F.US.MES.Z26",
                     live_mode=False,
@@ -149,7 +152,7 @@ def test_r06_ws_market_enforces_session_and_origin_before_accept(tmp_path: Path)
                         volume=12.0,
                         is_closed=True,
                     ),
-                )
+                ),
             )
             pushed = ws.receive_json()
             assert pushed["type"] == "bar_update"
@@ -1054,7 +1057,7 @@ def test_r06_subscribe_ack_not_emitted_before_upstream_admission_mid_await_disco
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Contract (NC-12): No bar_update or subscribed is sent before upstream admission completes,
-    and mid-await disconnect cleans up upstream contracts.
+    and mid-await disconnect exercises _commit_local_sub liveness rollback cleanly.
 
     Defect caught: Committing broadcaster.subscribe before await live_feed.subscribe_ws_contract,
     delivering premature bars and leaving orphaned contracts if client disconnects mid-await.
@@ -1066,10 +1069,13 @@ def test_r06_subscribe_ack_not_emitted_before_upstream_admission_mid_await_disco
         signalr_enabled=False,
     )
     app = create_app(settings=settings)
-    entered_update = asyncio.Event()
-    release_update = asyncio.Event()
 
     with TestClient(app, base_url="http://127.0.0.1:8000") as client:
+        portal = client.portal
+        assert portal is not None
+        entered_update = portal.call(asyncio.Event)
+        release_update = portal.call(asyncio.Event)
+
         login_resp = client.post("/api/auth/login", json={"password": TEST_PASSWORD})
         assert login_resp.status_code == 200
         session_cookie = login_resp.cookies["topstep_session"]
@@ -1085,10 +1091,7 @@ def test_r06_subscribe_ack_not_emitted_before_upstream_admission_mid_await_disco
             await orig_update(contracts, live_mode=live_mode)
 
         monkeypatch.setattr(live_feed.hub, "update_contracts", gated_update)
-
         sent_during_await: list[dict[str, Any]] = []
-        portal = client.portal
-        assert portal is not None
 
         with client.websocket_connect("/ws/market", headers=_ws_headers(session_cookie)) as ws:
             initial = ws.receive_json()
@@ -1121,7 +1124,13 @@ def test_r06_subscribe_ack_not_emitted_before_upstream_admission_mid_await_disco
             )
             portal.call(asyncio.sleep, 0.05)
 
-        release_update.set()
+            # Unregister client while gated_update is suspended, then release so
+            # subscribe_ws_contract completes update_contracts and triggers _commit_local_sub
+            # liveness rollback before releasing _hub_lifecycle_lock.
+            portal.call(broadcaster.unregister, ws_sess.client_id)
+            portal.call(release_update.set)
+            portal.call(asyncio.sleep, 0.05)
+
         deadline = time.monotonic() + 2.0
         while time.monotonic() < deadline:
             if live_feed.active_contracts == () and broadcaster.client_count == 0:
@@ -1133,6 +1142,7 @@ def test_r06_subscribe_ack_not_emitted_before_upstream_admission_mid_await_disco
         ]
         assert premature_bars == []
         assert live_feed.active_contracts == ()
+        assert live_feed.hub.contracts == ()
         assert broadcaster.active_contract_ids() == set()
 
 
@@ -1195,10 +1205,13 @@ def test_r06_subscribe_ack_concurrent_slot_contention_and_ordering(
         signalr_enabled=False,
     )
     app = create_app(settings=settings)
-    entered_update = asyncio.Event()
-    release_update = asyncio.Event()
 
     with TestClient(app, base_url="http://127.0.0.1:8000") as client:
+        portal = client.portal
+        assert portal is not None
+        entered_update = portal.call(asyncio.Event)
+        release_update = portal.call(asyncio.Event)
+
         login_resp = client.post("/api/auth/login", json={"password": TEST_PASSWORD})
         assert login_resp.status_code == 200
         headers = _ws_headers(login_resp.cookies["topstep_session"])
@@ -1214,8 +1227,6 @@ def test_r06_subscribe_ack_concurrent_slot_contention_and_ordering(
             await orig_update(contracts, live_mode=live_mode)
 
         monkeypatch.setattr(live_feed.hub, "update_contracts", gated_update)
-        portal = client.portal
-        assert portal is not None
 
         with client.websocket_connect("/ws/market", headers=headers) as ws1:
             assert ws1.receive_json()["type"] == "feed_status"
@@ -1232,7 +1243,7 @@ def test_r06_subscribe_ack_concurrent_slot_contention_and_ordering(
                     {"type": "subscribe", "contract_id": "CON.F.US.MNQ.Z26", "timeframe": "1m"}
                 )
                 portal.call(asyncio.sleep, 0.03)
-                release_update.set()
+                portal.call(release_update.set)
 
                 ws1.send_json({"type": "ping"})
                 ws2.send_json({"type": "ping"})
@@ -1269,10 +1280,13 @@ def test_r06_subscribe_session_expired_mid_await_closes_1008_and_cleans_up(
         signalr_enabled=False,
     )
     app = create_app(settings=settings)
-    entered_update = asyncio.Event()
-    release_update = asyncio.Event()
 
     with TestClient(app, base_url="http://127.0.0.1:8000") as client:
+        portal = client.portal
+        assert portal is not None
+        entered_update = portal.call(asyncio.Event)
+        release_update = portal.call(asyncio.Event)
+
         login_resp = client.post("/api/auth/login", json={"password": TEST_PASSWORD})
         assert login_resp.status_code == 200
         csrf = login_resp.json()["csrf_token"]
@@ -1288,8 +1302,6 @@ def test_r06_subscribe_session_expired_mid_await_closes_1008_and_cleans_up(
             await orig_update(contracts, live_mode=live_mode)
 
         monkeypatch.setattr(live_feed.hub, "update_contracts", gated_update)
-        portal = client.portal
-        assert portal is not None
 
         with client.websocket_connect("/ws/market", headers=headers) as ws:
             assert ws.receive_json()["type"] == "feed_status"
@@ -1300,7 +1312,7 @@ def test_r06_subscribe_session_expired_mid_await_closes_1008_and_cleans_up(
 
             logout_resp = client.post("/api/auth/logout", headers={"X-CSRF-Token": csrf})
             assert logout_resp.status_code == 200
-            release_update.set()
+            portal.call(release_update.set)
 
             with pytest.raises(WebSocketDisconnect) as exc_expired:
                 msg = _receive_json_with_timeout(ws, 2.0)
@@ -1308,6 +1320,7 @@ def test_r06_subscribe_session_expired_mid_await_closes_1008_and_cleans_up(
             assert exc_expired.value.code == 1008
 
         assert live_feed.active_contracts == ()
+        assert live_feed.hub.contracts == ()
 
 
 def test_r06_ws_max_clients_cap_accept_failure_releases_slot_without_leaking_tasks(
@@ -1409,5 +1422,185 @@ async def test_r06_ws_broadcaster_capacity_and_deferred_sender_unit() -> None:
 
     await broadcaster.close_all()
     assert broadcaster.is_registered("c1") is False
+
+
+def test_r06_concurrent_disconnect_sync_does_not_evict_in_flight_subscribe(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Contract (NC-12 / P1-001): Concurrent client disconnect calling sync_ws_contracts()
+    while Client 1 is inside subscribe_ws_contract must never evict Client 1's newly admitted cid.
+    """
+    settings = Settings(
+        app_env="development",
+        app_password_hash=TEST_PASSWORD_HASH,
+        data_dir=tmp_path / "data",
+        signalr_enabled=False,
+    )
+    app = create_app(settings=settings)
+
+    with TestClient(app, base_url="http://127.0.0.1:8000") as client:
+        portal = client.portal
+        assert portal is not None
+        entered_update = portal.call(asyncio.Event)
+        release_update = portal.call(asyncio.Event)
+
+        login_resp = client.post("/api/auth/login", json={"password": TEST_PASSWORD})
+        assert login_resp.status_code == 200
+        headers = _ws_headers(login_resp.cookies["topstep_session"])
+
+        live_feed: LiveFeedService = app.state.live_feed_service
+        orig_update = live_feed.hub.update_contracts
+
+        async def gated_update(contracts: Any, *, live_mode: bool) -> None:
+            if "CON.F.US.MES.Z26" in contracts:
+                entered_update.set()
+                await asyncio.wait_for(release_update.wait(), timeout=5.0)
+            await orig_update(contracts, live_mode=live_mode)
+
+        monkeypatch.setattr(live_feed.hub, "update_contracts", gated_update)
+
+        with client.websocket_connect("/ws/market", headers=headers) as ws1:
+            assert ws1.receive_json()["type"] == "feed_status"
+            broadcaster: WsBroadcaster = app.state.ws_broadcaster
+            ws1_cid = next(iter(broadcaster._clients))
+            with client.websocket_connect("/ws/market", headers=headers) as ws2:
+                assert ws2.receive_json()["type"] == "feed_status"
+                ws2_cid = next(cid for cid in broadcaster._clients if cid != ws1_cid)
+
+                ws1.send_json(
+                    {"type": "subscribe", "contract_id": "CON.F.US.MES.Z26", "timeframe": "1m"}
+                )
+                portal.call(asyncio.wait_for, entered_update.wait(), 2.0)
+
+                # Simulate ws2 disconnecting while ws1 holds _hub_lifecycle_lock, so
+                # sync_ws_contracts() parks on _hub_lifecycle_lock before ws1 commits.
+                async def _disconnect_and_park_sync() -> asyncio.Task[None]:
+                    await broadcaster.unregister(ws2_cid)
+                    return asyncio.create_task(live_feed.sync_ws_contracts())
+
+                sync_task = portal.call(_disconnect_and_park_sync)
+                portal.call(asyncio.sleep, 0.03)
+                assert not sync_task.done()
+
+                portal.call(release_update.set)
+                portal.call(asyncio.wait_for, sync_task, 2.0)
+
+            ws1.send_json({"type": "ping"})
+            ws1_msgs: list[dict[str, Any]] = []
+            while True:
+                msg = _receive_json_with_timeout(ws1, 2.0)
+                if msg.get("type") == "pong":
+                    break
+                ws1_msgs.append(msg)
+
+            assert [m["type"] for m in ws1_msgs[:2]] == ["subscribed", "feed_status"]
+            assert "CON.F.US.MES.Z26" in live_feed.active_contracts
+            assert "CON.F.US.MES.Z26" in live_feed.hub.contracts
+
+
+async def test_r06_signalr_hub_cancel_rollback_resyncs_hub_contracts(
+    tmp_path: Path,
+) -> None:
+    """Contract (NC-12 / P1-002): Cancelling subscribe_ws_contract on a real SignalRMarketHub
+    while awaiting dynamic subscribe ACK rolls back both live_feed and hub.contracts.
+    """
+    shared_cid = "CON.F.US.MES.Z26"
+    new_cid = "CON.F.US.MNQ.Z26"
+    clock_now = BASE_T + 15
+    mnq_sub_sent = asyncio.Event()
+
+    class _WithholdMnqAckTransport(_MockSignalRTransport):
+        async def send(self, data: str) -> None:
+            for chunk in data.split(SIGNALR_RECORD_SEPARATOR):
+                if chunk.strip():
+                    frame = json.loads(chunk)
+                    self.sent_frames.append(frame)
+                    if frame.get("protocol") == "json":
+                        await self.incoming.put("{}" + SIGNALR_RECORD_SEPARATOR)
+                    elif frame.get("target") in {
+                        "SubscribeContractQuotes",
+                        "SubscribeContractTrades",
+                    }:
+                        args = [str(a) for a in frame.get("arguments", [])]
+                        for arg in args:
+                            self.subscribed_contracts.add(arg)
+                        if new_cid in args:
+                            mnq_sub_sent.set()
+                            continue
+                        if frame.get("invocationId") is not None:
+                            ack = {"type": 3, "invocationId": frame["invocationId"]}
+                            await self.incoming.put(json.dumps(ack) + SIGNALR_RECORD_SEPARATOR)
+                        self.subscribed_event.set()
+                    elif frame.get("target") in {
+                        "UnsubscribeContractQuotes",
+                        "UnsubscribeContractTrades",
+                    }:
+                        for arg in frame.get("arguments", []):
+                            self.subscribed_contracts.discard(str(arg))
+                        if frame.get("invocationId") is not None:
+                            ack = {"type": 3, "invocationId": frame["invocationId"]}
+                            await self.incoming.put(json.dumps(ack) + SIGNALR_RECORD_SEPARATOR)
+
+    async def ws_factory(_url: str, _headers: dict[str, str]) -> _WithholdMnqAckTransport:
+        return _WithholdMnqAckTransport()
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/Auth/loginKey":
+            return httpx.Response(200, json={"success": True, "token": "jwt-cancel-hub"})
+        if request.url.path == "/api/History/retrieveBars":
+            req_payload = json.loads(request.content.decode("utf-8"))
+            return httpx.Response(
+                200,
+                json={"success": True, "bars": _bars_for_history_payload(req_payload)},
+            )
+        return httpx.Response(404)
+
+    settings = Settings(data_dir=tmp_path / "data", signalr_enabled=True)
+    sqlite_store = SqliteStore(tmp_path / "meta.db")
+    sqlite_store.initialize()
+    try:
+        parquet_store = ParquetStore(settings.data_dir, sqlite_store=sqlite_store)
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            auth = TopstepAuthService(settings, client)
+            await auth.login("alice", "key-cancel-hub")
+            rest = TopstepRestClient(settings, auth, client)
+            from app.topstep.signalr_hub import SignalRMarketHub
+
+            hub = SignalRMarketHub(settings, auth_service=auth, ws_factory=ws_factory)
+            live_feed = LiveFeedService(
+                settings,
+                auth,
+                rest,
+                parquet_store,
+                sqlite_store,
+                signalr_hub=hub,
+                recovery_timeframes=("1m",),
+                clock=lambda: clock_now,
+            )
+            try:
+                await live_feed.set_active_contracts([shared_cid], live_mode=False)
+                await live_feed.start()
+                deadline = time.monotonic() + 2.0
+                while time.monotonic() < deadline:
+                    if live_feed.feed_state == "LIVE":
+                        break
+                    await asyncio.sleep(0.01)
+                assert live_feed.feed_state == "LIVE"
+                assert live_feed.hub.contracts == (shared_cid,)
+
+                with pytest.raises(TimeoutError):
+                    await asyncio.wait_for(
+                        live_feed.subscribe_ws_contract(new_cid),
+                        timeout=0.05,
+                    )
+                assert mnq_sub_sent.is_set()
+                assert live_feed.active_contracts == (shared_cid,)
+                assert new_cid not in live_feed._ws_contracts
+                assert live_feed.hub.contracts == (shared_cid,)
+            finally:
+                await live_feed.stop()
+    finally:
+        sqlite_store.close()
 
 

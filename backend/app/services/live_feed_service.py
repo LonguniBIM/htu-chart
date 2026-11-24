@@ -397,6 +397,7 @@ class LiveFeedService:
         *,
         live_mode: bool | None = None,
         broadcast_status: bool = True,
+        commit_callback: Callable[[], None] | None = None,
     ) -> None:
         """Register a contract subscribed via /ws/market and start/update upstream SignalR."""
         cid = self._validate_ws_contract_id(contract_id)
@@ -427,13 +428,15 @@ class LiveFeedService:
                     self._hub.is_connected or self._last_connected_utc is not None
                 ):
                     c_state.subscribed_at_utc = self._clock()
+                if commit_callback is not None:
+                    commit_callback()
 
                 if self._running and self._settings.signalr_enabled and self._auth.is_connected:
                     if not self._hub.is_connected:
                         self._hub.start()
                     elif newly_added and not self._hub.has_pending_subscription(cid):
                         self._bump_generation_and_cancel_live_tasks()
-                        self._transition_all_contracts("RECOVERING", broadcast=broadcast_status)
+                        self._transition_all_contracts("RECOVERING", broadcast=False)
                         self._start_recovery_task()
             except BaseException:
                 if not was_in_ws:
@@ -450,20 +453,43 @@ class LiveFeedService:
                     self._feed_state = prev_feed_state
                 else:
                     self._recompute_aggregate_state()
+                if set(self._hub.contracts) != set(self._contracts.keys()):
+                    remaining_cids = list(self._contracts.keys())
+                    restore_live = (
+                        next(iter(self._contracts.values())).live_mode
+                        if self._contracts
+                        else eff_live
+                    )
+                    with contextlib.suppress(Exception):
+                        await asyncio.shield(
+                            self._hub.update_contracts(
+                                remaining_cids,
+                                live_mode=restore_live,
+                            )
+                        )
                 raise
 
             self._recompute_aggregate_state()
             if broadcast_status:
                 self._broadcast_status()
 
-    async def sync_ws_contracts(self, active_ws_contracts: set[str]) -> None:
+    async def sync_ws_contracts(self, active_ws_contracts: set[str] | None = None) -> None:
         """Prune WS-only contracts when all WebSocket subscribers leave."""
         async with self._hub_lifecycle_lock:
+            if active_ws_contracts is None:
+                if self._broadcaster is not None:
+                    active_ws_contracts = self._broadcaster.active_contract_ids()
+                else:
+                    active_ws_contracts = set()
             norm_ws = {cid.strip().upper() for cid in active_ws_contracts if cid.strip()}
             self._ws_contracts = norm_ws
             keep = self._explicit_contracts | self._ws_contracts
             removed = [cid for cid in list(self._contracts) if cid not in keep]
-            if not removed and self._contracts:
+            if (
+                not removed
+                and self._contracts
+                and set(self._hub.contracts) == set(self._contracts.keys())
+            ):
                 return
             for old_cid in removed:
                 self._contracts.pop(old_cid, None)

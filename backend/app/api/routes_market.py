@@ -43,6 +43,10 @@ router = APIRouter(prefix="/api", tags=["market"])
 ws_router = APIRouter(tags=["market-ws"])
 
 
+class _ClientDisconnectedDuringSubscribeError(RuntimeError):
+    """Internal signal that a WS client disconnected or expired during upstream subscribe."""
+
+
 def _get_topstep_auth(request: Request) -> TopstepAuthService:
     return request.app.state.topstep_auth
 
@@ -375,6 +379,8 @@ async def market_websocket(websocket: WebSocket) -> None:
             elif op == "subscribe":
                 raw_cid = str(msg.get("contract_id") or msg.get("contractId") or "")
                 raw_tf = str(msg.get("timeframe") or "1m")
+                session_expired_during_sub = False
+                should_break = False
                 try:
                     cid, norm_tf = broadcaster.check_can_subscribe(
                         ws_session.client_id,
@@ -389,7 +395,51 @@ async def market_websocket(websocket: WebSocket) -> None:
                             f"Timeframe {norm_tf!r} is not enabled in BarAggregator "
                             f"(supported: {supported_str})"
                         )
-                    await live_feed.subscribe_ws_contract(cid, broadcast_status=False)
+
+                    def _commit_local_sub(
+                        target_cid: str = cid,
+                        target_tf: str = norm_tf,
+                    ) -> None:
+                        nonlocal session_expired_during_sub, should_break
+                        if ws_session.closed_event.is_set() or not broadcaster.is_registered(
+                            ws_session.client_id
+                        ):
+                            should_break = True
+                            raise _ClientDisconnectedDuringSubscribeError(
+                                "WebSocket client disconnected during subscribe"
+                            )
+                        if session_manager.get_session(session.session_id) is None:
+                            session_expired_during_sub = True
+                            should_break = True
+                            raise _ClientDisconnectedDuringSubscribeError(
+                                "Session expired during subscribe"
+                            )
+                        sub_cid, sub_tf = broadcaster.subscribe(
+                            ws_session.client_id,
+                            target_cid,
+                            target_tf,
+                        )
+                        broadcaster.send_to_client(
+                            ws_session.client_id,
+                            {"type": "subscribed", "contract_id": sub_cid, "timeframe": sub_tf},
+                        )
+
+                    await live_feed.subscribe_ws_contract(
+                        cid,
+                        broadcast_status=True,
+                        commit_callback=_commit_local_sub,
+                    )
+                except _ClientDisconnectedDuringSubscribeError:
+                    if session_expired_during_sub:
+                        await broadcaster.unregister(
+                            ws_session.client_id,
+                            close_transport=True,
+                            code=status.WS_1008_POLICY_VIOLATION,
+                            reason="Session expired",
+                        )
+                    if should_break:
+                        break
+                    continue
                 except Exception as exc:
                     broadcaster.send_to_client(
                         ws_session.client_id,
@@ -399,40 +449,6 @@ async def market_websocket(websocket: WebSocket) -> None:
                         },
                     )
                     continue
-
-                if ws_session.closed_event.is_set() or not broadcaster.is_registered(
-                    ws_session.client_id
-                ):
-                    await live_feed.sync_ws_contracts(broadcaster.active_contract_ids())
-                    break
-                if session_manager.get_session(session.session_id) is None:
-                    await broadcaster.unregister(
-                        ws_session.client_id,
-                        close_transport=True,
-                        code=status.WS_1008_POLICY_VIOLATION,
-                        reason="Session expired",
-                    )
-                    await live_feed.sync_ws_contracts(broadcaster.active_contract_ids())
-                    break
-
-                try:
-                    cid, tf = broadcaster.subscribe(ws_session.client_id, cid, norm_tf)
-                except ValueError as exc:
-                    await live_feed.sync_ws_contracts(broadcaster.active_contract_ids())
-                    broadcaster.send_to_client(
-                        ws_session.client_id,
-                        {
-                            "type": "error",
-                            "detail": redact_secrets(str(exc), _active_redaction_secrets()),
-                        },
-                    )
-                    continue
-
-                broadcaster.send_to_client(
-                    ws_session.client_id,
-                    {"type": "subscribed", "contract_id": cid, "timeframe": tf},
-                )
-                live_feed.emit_status_snapshot()
             elif op == "unsubscribe":
                 raw_cid = str(msg.get("contract_id") or msg.get("contractId") or "")
                 raw_tf = str(msg.get("timeframe") or "1m")
@@ -446,7 +462,7 @@ async def market_websocket(websocket: WebSocket) -> None:
                             "timeframe": normalize_timeframe(raw_tf),
                         },
                     )
-                    await live_feed.sync_ws_contracts(broadcaster.active_contract_ids())
+                    await live_feed.sync_ws_contracts()
                 except ValueError as exc:
                     broadcaster.send_to_client(
                         ws_session.client_id,
@@ -464,4 +480,4 @@ async def market_websocket(websocket: WebSocket) -> None:
         pass
     finally:
         await broadcaster.unregister(ws_session.client_id)
-        await live_feed.sync_ws_contracts(broadcaster.active_contract_ids())
+        await live_feed.sync_ws_contracts()
