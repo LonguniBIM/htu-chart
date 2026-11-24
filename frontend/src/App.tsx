@@ -119,36 +119,53 @@ export function App() {
       const failureParts: string[] = [];
 
       for (const liveMode of modes) {
-        const resolved = await fetchContracts(
-          DEFAULT_CONTRACT_SYMBOLS,
-          liveMode,
-          signal,
-        );
-        const effectiveLive = Boolean(resolved.live);
-        const modeLabel = effectiveLive ? "Live" : "Sim";
-        const entries = Object.entries(resolved.contracts);
-        const failedForMode: string[] = [];
+        try {
+          const resolved = await fetchContracts(
+            DEFAULT_CONTRACT_SYMBOLS,
+            liveMode,
+            signal,
+          );
+          const effectiveLive = Boolean(resolved.live);
+          const modeLabel = effectiveLive ? "Live" : "Sim";
+          const entries = Object.entries(resolved.contracts);
+          const failedForMode: string[] = [];
 
-        for (const [symbol, entry] of entries) {
-          updates[`${effectiveLive ? "live" : "sim"}:${symbol}`] = entry;
-          if (entry.selected === null) {
-            const reason = entry.error_type ?? entry.error ?? "unresolved";
-            failedForMode.push(`${symbol} (${reason})`);
+          for (const [symbol, entry] of entries) {
+            updates[`${effectiveLive ? "live" : "sim"}:${symbol}`] = entry;
+            if (entry.selected === null) {
+              const reason = entry.error_type ?? entry.error ?? "unresolved";
+              failedForMode.push(`${symbol} (${reason})`);
+            }
           }
-        }
 
-        if (entries.length > 0 && failedForMode.length === 0) {
-          resolvedModesSet.add(effectiveLive);
-          resolvedModesSet.add(liveMode);
-          incompleteModesSet.delete(liveMode);
-        } else {
-          resolvedModesSet.delete(effectiveLive);
-          resolvedModesSet.delete(liveMode);
-          incompleteModesSet.add(liveMode);
-          if (failedForMode.length > 0) {
-            failureParts.push(`${modeLabel}: ${failedForMode.join(", ")}`);
+          if (entries.length > 0 && failedForMode.length === 0) {
+            resolvedModesSet.add(effectiveLive);
+            resolvedModesSet.add(liveMode);
+            incompleteModesSet.delete(liveMode);
           } else {
-            failureParts.push(`${modeLabel}: no contracts returned`);
+            resolvedModesSet.delete(effectiveLive);
+            resolvedModesSet.delete(liveMode);
+            incompleteModesSet.add(liveMode);
+            if (failedForMode.length > 0) {
+              failureParts.push(`${modeLabel}: ${failedForMode.join(", ")}`);
+            } else {
+              failureParts.push(`${modeLabel}: no contracts returned`);
+            }
+          }
+        } catch (err: unknown) {
+          if (err instanceof DOMException && err.name === "AbortError") {
+            throw err;
+          }
+          if (err instanceof ApiError && (err.status === 401 || err.status === 403)) {
+            throw err;
+          }
+          incompleteModesSet.add(liveMode);
+          resolvedModesSet.delete(liveMode);
+          if (!(err instanceof ApiError && err.status === 503)) {
+            const modeLabel = liveMode ? "Live" : "Sim";
+            const reason =
+              err instanceof Error ? err.message : "Failed to resolve contracts";
+            failureParts.push(`${modeLabel}: ${reason}`);
           }
         }
       }
