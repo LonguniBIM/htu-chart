@@ -262,10 +262,16 @@ def _configure_kernel32() -> Any:
     return k32
 
 
-def attach_kill_on_close_job(pid: int) -> int | None:
-    """On Windows, bind ``pid`` to a Job Object with JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE."""
-    if os.name != "nt":
-        return None
+def _configure_ntdll() -> Any:
+    from ctypes import wintypes
+
+    ntdll = ctypes.WinDLL("ntdll", use_last_error=True)
+    ntdll.NtResumeProcess.argtypes = [wintypes.HANDLE]
+    ntdll.NtResumeProcess.restype = ctypes.c_long
+    return ntdll
+
+
+def _create_kill_on_close_job(k32: Any) -> int:
     from ctypes import wintypes
 
     class _IoCounters(ctypes.Structure):
@@ -301,28 +307,56 @@ def attach_kill_on_close_job(pid: int) -> int | None:
             ("PeakJobMemoryUsed", ctypes.c_size_t),
         ]
 
-    k32 = _configure_kernel32()
     job = k32.CreateJobObjectW(None, None)
     if not job:
-        return None
+        raise RuntimeError("Failed to attach Windows Job Object for process-tree containment")
 
     info = _ExtendedLimitInfo()
     info.BasicLimitInformation.LimitFlags = 0x00002000  # JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
     if not k32.SetInformationJobObject(job, 9, ctypes.byref(info), ctypes.sizeof(info)):
         k32.CloseHandle(job)
-        return None
-
-    proc_handle = k32.OpenProcess(0x0100 | 0x0001, False, pid)
-    if not proc_handle:
-        k32.CloseHandle(job)
-        return None
-    try:
-        if not k32.AssignProcessToJobObject(job, proc_handle):
-            k32.CloseHandle(job)
-            return None
-    finally:
-        k32.CloseHandle(proc_handle)
+        raise RuntimeError("Failed to attach Windows Job Object for process-tree containment")
     return int(job)
+
+
+def spawn_managed_process(cmd: list[str], **popen_kwargs: Any) -> tuple[subprocess.Popen[str], int | None]:
+    """Spawn a subprocess contained in a Win32 Job Object (from CREATE_SUSPENDED) or POSIX session."""
+    kwargs = dict(popen_kwargs)
+    if os.name != "nt":
+        kwargs.setdefault("start_new_session", True)
+        return subprocess.Popen(cmd, **kwargs), None
+
+    from ctypes import wintypes
+
+    kwargs["creationflags"] = int(kwargs.get("creationflags", 0)) | 0x00000004  # CREATE_SUSPENDED
+    proc = subprocess.Popen(cmd, **kwargs)
+    job: int | None = None
+    try:
+        k32 = _configure_kernel32()
+        ntdll = _configure_ntdll()
+        job = _create_kill_on_close_job(k32)
+        proc_handle = wintypes.HANDLE(int(proc._handle))
+        if not k32.AssignProcessToJobObject(wintypes.HANDLE(job), proc_handle):
+            raise RuntimeError("Failed to attach Windows Job Object for process-tree containment")
+        status = ntdll.NtResumeProcess(proc_handle)
+        if status != 0:
+            raise RuntimeError(f"Failed to attach Windows Job Object for process-tree containment (NtResumeProcess={status})")
+        return proc, job
+    except Exception:
+        try:
+            proc.kill()
+        except OSError:
+            pass
+        try:
+            proc.wait(timeout=2.0)
+        except subprocess.TimeoutExpired:
+            pass
+        if job is not None:
+            try:
+                _configure_kernel32().CloseHandle(wintypes.HANDLE(job))
+            except OSError:
+                pass
+        raise
 
 
 def close_job_handle(job_handle: int | None) -> None:
@@ -340,13 +374,12 @@ def terminate_process_tree(proc: subprocess.Popen[str], job_handle: int | None =
     try:
         if os.name == "nt":
             close_job_handle(job_handle)
-            if proc.poll() is None:
-                subprocess.run(
-                    ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
-                    capture_output=True,
-                    check=False,
-                    timeout=10,
-                )
+            subprocess.run(
+                ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                capture_output=True,
+                check=False,
+                timeout=10,
+            )
         else:
             try:
                 os.killpg(proc.pid, signal.SIGTERM)

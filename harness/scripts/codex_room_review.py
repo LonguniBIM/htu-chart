@@ -31,26 +31,26 @@ from typing import Any
 try:
     from harness.scripts.codex_room_sync import EXPECTED_REVIEW_MODEL, verify_role
     from harness.scripts.schema_utils import (
-        attach_kill_on_close_job,
         close_job_handle,
         compute_tree_sha256,
         is_hex_sha40,
         is_strict_int,
         materialize_frozen_tree,
         resolve_git_toplevel,
+        spawn_managed_process,
         terminate_process_tree,
         validate_instance_against_schema,
     )
 except ImportError:
     from codex_room_sync import EXPECTED_REVIEW_MODEL, verify_role
     from schema_utils import (
-        attach_kill_on_close_job,
         close_job_handle,
         compute_tree_sha256,
         is_hex_sha40,
         is_strict_int,
         materialize_frozen_tree,
         resolve_git_toplevel,
+        spawn_managed_process,
         terminate_process_tree,
         validate_instance_against_schema,
     )
@@ -567,20 +567,21 @@ def _run_subprocess_with_watchdog(
     cwd: Path | None = None,
 ) -> tuple[int, list[str], list[str], str | None]:
     """Run a review subprocess with activity-based idle timeout and hard ceiling."""
-    proc = subprocess.Popen(
-        cmd,
-        stdin=subprocess.PIPE if stdin_text is not None else subprocess.DEVNULL,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        bufsize=1,
-        env=env,
-        cwd=str(cwd) if cwd else None,
-        start_new_session=(os.name != "nt"),
-    )
-    job_handle = attach_kill_on_close_job(proc.pid)
+    try:
+        proc, job_handle = spawn_managed_process(
+            cmd,
+            stdin=subprocess.PIPE if stdin_text is not None else subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            bufsize=1,
+            env=env,
+            cwd=str(cwd) if cwd else None,
+        )
+    except RuntimeError as exc:
+        return 1, [], [f"{exc}\n"], str(exc)
 
     stdout_lines: list[str] = []
     stderr_lines: list[str] = []

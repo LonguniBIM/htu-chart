@@ -122,8 +122,26 @@ def test_open_blocking_finding_or_unreviewed_fix_claim_fails() -> None:
 
 
 def test_verified_when_all_gates_pass_and_cli_writes_markdown_table(tmp_path: Path) -> None:
-    base = "1" * 40
-    cand = "2" * 40
+    repo = tmp_path / "repo"
+    sec_file = repo / "backend" / "app" / "security.py"
+    sec_file.parent.mkdir(parents=True, exist_ok=True)
+    sec_file.write_text("\n".join(f"# line {i}" for i in range(1, 61)) + "\n", encoding="utf-8")
+    subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=repo, check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.name", "Test User"], cwd=repo, check=True, capture_output=True)
+    subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+    subprocess.run(["git", "commit", "-m", "base"], cwd=repo, check=True, capture_output=True)
+    base = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=repo, check=True, capture_output=True, text=True
+    ).stdout.strip()
+
+    sec_file.write_text("\n".join(f"# cand line {i}" for i in range(1, 61)) + "\n", encoding="utf-8")
+    subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+    subprocess.run(["git", "commit", "-m", "cand"], cwd=repo, check=True, capture_output=True)
+    cand = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=repo, check=True, capture_output=True, text=True
+    ).stdout.strip()
+
     v_path = tmp_path / "verifier.json"
     r_path = tmp_path / "review.json"
     red_path = tmp_path / "red.json"
@@ -189,6 +207,8 @@ def test_verified_when_all_gates_pass_and_cli_writes_markdown_table(tmp_path: Pa
             str(red_path),
             "--dispositions-json",
             str(disp_path),
+            "--repo-root",
+            str(repo),
             "--behavior",
             "Reject mutating requests without valid X-CSRF-Token.",
             "--out-dir",
@@ -532,6 +552,65 @@ def test_receipt_blocks_pytest_addopts_mismatch_in_red_green_commands() -> None:
         },
     )
     assert addopts_mismatch["conclusion"] == "BLOCKED"
+
+
+def test_receipt_blocks_uv_directory_mismatch_in_red_green_commands() -> None:
+    """P1-002: uv run --directory backend vs --directory frontend must not collapse to the same target."""
+    base = "1" * 40
+    cand = "2" * 40
+
+    dir_mismatch = evaluate_receipt(
+        task_id="P1-002-UVDIR",
+        phase=1,
+        base_sha=base,
+        candidate_sha=cand,
+        verifier_data=_verifier(cand),
+        review_data=_review(cand),
+        is_bugfix=True,
+        red_proof={
+            "red_sha": base,
+            "red_exit_code": 1,
+            "red_failure_reason": "AssertionError: backend failed",
+            "green_sha": cand,
+            "green_exit_code": 0,
+            "red_test_command": "uv run --directory backend pytest tests -q",
+            "green_test_command": "uv run --directory frontend pytest tests -q",
+        },
+    )
+    assert dir_mismatch["conclusion"] == "BLOCKED"
+
+
+def test_receipt_rejects_refuted_evidence_when_commit_missing_in_git_even_if_file_exists_on_disk(
+    tmp_path: Path,
+) -> None:
+    """P1-003 & S2-001: REFUTED_WITH_EVIDENCE must fail closed if candidate_sha is missing in git, never falling back to disk."""
+    base = "1" * 40
+    missing_cand = "f" * 40
+    disk_file = tmp_path / "backend" / "app" / "security.py"
+    disk_file.parent.mkdir(parents=True, exist_ok=True)
+    disk_file.write_text("\n".join(f"# line {i}" for i in range(1, 60)) + "\n", encoding="utf-8")
+
+    finding = {"id": "P1-DISK", "severity": "high", "blocking": True, "title": "Bug"}
+    res = evaluate_receipt(
+        task_id="P1-003-NODISK",
+        phase=1,
+        base_sha=base,
+        candidate_sha=missing_cand,
+        verifier_data=_verifier(missing_cand),
+        review_data=_review(missing_cand, findings=[finding]),
+        dispositions={
+            "dispositions": [
+                {
+                    "id": "P1-DISK",
+                    "status": "REFUTED_WITH_EVIDENCE",
+                    "rationale": "File exists on disk, not in missing git commit",
+                    "evidence_ref": "backend/app/security.py:10",
+                }
+            ]
+        },
+        repo_root=tmp_path,
+    )
+    assert res["conclusion"] != "VERIFIED"
 
 
 def test_receipt_blocks_none_verifier_steps_without_crashing() -> None:

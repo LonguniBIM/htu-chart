@@ -301,3 +301,68 @@ def test_build_verifier_kills_orphan_child_when_parent_exits_early(tmp_path: Pat
     assert pytest_step["exit_code"] == 124
     child_pid = int(child_pid_file.read_text(encoding="utf-8").strip())
     assert not _is_pid_alive(child_pid)
+
+
+def test_spawn_managed_process_kills_rapid_grandchild_and_fails_closed_on_job_error(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """P1-001 & S2-002: Suspended-spawn Job Object prevents pre-attach race on rapid grandchildren and fails closed."""
+    from harness.scripts import schema_utils
+
+    _setup_mini_repo(tmp_path)
+    grandchild_pid_file = tmp_path / "grandchild.pid"
+    grandchild_script = tmp_path / "grandchild.py"
+    grandchild_script.write_text(
+        (
+            "import pathlib, os, time\n"
+            f"pathlib.Path({str(grandchild_pid_file)!r}).write_text(str(os.getpid()), encoding='utf-8')\n"
+            "time.sleep(30)\n"
+        ),
+        encoding="utf-8",
+    )
+    child_script = tmp_path / "child_spawn.py"
+    child_script.write_text(
+        f"import subprocess, sys\nsubprocess.Popen([sys.executable, {str(grandchild_script)!r}])\nsys.exit(0)\n",
+        encoding="utf-8",
+    )
+    parent_script = tmp_path / "parent_fast.py"
+    parent_script.write_text(
+        f"import subprocess, sys\nsubprocess.Popen([sys.executable, {str(child_script)!r}])\nsys.exit(0)\n",
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(
+        build_verifier,
+        "_resolve_tool",
+        lambda name, python_module=None: [sys.executable, str(parent_script)] if name == "pytest" else [sys.executable, "-c", "pass"],
+    )
+    report = run_verifier(tmp_path, phase=0, strict_clean=False, step_timeout_sec=0.8, total_timeout_sec=5.0)
+    assert report["status"] == "FAILED"
+    pytest_step = next(s for s in report["steps"] if s["name"] == "harness_pytest")
+    assert pytest_step["exit_code"] == 124
+    if grandchild_pid_file.is_file():
+        gc_pid = int(grandchild_pid_file.read_text(encoding="utf-8").strip())
+        assert not _is_pid_alive(gc_pid)
+
+    # Part B: Simulate Win32 Job Object attach failure -> fail closed and kill suspended process
+    if sys.platform == "win32":
+        orig_cfg = schema_utils._configure_kernel32
+
+        class _FailingKernel32:
+            def __init__(self, real):
+                self._real = real
+
+            def __getattr__(self, name):
+                return getattr(self._real, name)
+
+            def AssignProcessToJobObject(self, _job, _proc):
+                return 0
+
+        monkeypatch.setattr(schema_utils, "_configure_kernel32", lambda: _FailingKernel32(orig_cfg()))
+        try:
+            proc, _ = schema_utils.spawn_managed_process([sys.executable, "-c", "import time; time.sleep(30)"])
+        except RuntimeError as exc:
+            assert "Job Object" in str(exc)
+        else:
+            schema_utils.terminate_process_tree(proc)
+            raise AssertionError("Expected RuntimeError when AssignProcessToJobObject fails")

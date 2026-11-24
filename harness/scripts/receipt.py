@@ -88,10 +88,18 @@ def _extract_test_target(command_text: str) -> str:
         idx += 1
         if idx < len(tokens) and tokens[idx] == "run":
             idx += 1
-        while idx < len(tokens) and tokens[idx] in {"--directory", "-C"}:
-            idx += 2
-        if idx < len(tokens) and tokens[idx].startswith("--directory="):
-            idx += 1
+        while idx < len(tokens):
+            if tokens[idx] in {"--directory", "-C"} and idx + 1 < len(tokens):
+                norm_dir = tokens[idx + 1].replace("\\", "/").rstrip("/") or "."
+                preserved_env.extend(["--directory", norm_dir])
+                idx += 2
+                continue
+            if tokens[idx].startswith(("--directory=", "-C=")):
+                dir_val = tokens[idx].split("=", 1)[1].replace("\\", "/").rstrip("/") or "."
+                preserved_env.extend(["--directory", dir_val])
+                idx += 1
+                continue
+            break
 
     if idx < len(tokens) and Path(tokens[idx]).name.lower() in {"python", "python3", "python.exe", "py", "py.exe"}:
         idx += 1
@@ -196,66 +204,53 @@ def _verify_evidence_ref(evidence_ref: str, candidate_sha: str, repo_root: Path)
     if raw_path.startswith("/") or ".." in rel_parts or ":" in raw_path:
         return False, f"unsafe evidence_ref path {raw_path!r}"
 
-    git_top: Path | None = None
     try:
         git_top = resolve_git_toplevel(repo_root, timeout_sec=60.0)
-    except ValueError:
-        git_top = None
-    except TimeoutError as exc:
-        return False, str(exc)
+    except (ValueError, TimeoutError) as exc:
+        return False, f"evidence_ref requires a valid git repository: {exc}"
 
-    if git_top is not None:
-        try:
-            cat = subprocess.run(
-                ["git", "-C", str(git_top), "cat-file", "-e", f"{candidate_sha}^{{commit}}"],
-                capture_output=True,
-                check=False,
-                timeout=60.0,
-            )
-        except subprocess.TimeoutExpired:
-            return False, f"git timed out checking commit {candidate_sha[:12]}"
-        if cat.returncode == 0:
-            try:
-                obj_type = subprocess.run(
-                    ["git", "-C", str(git_top), "cat-file", "-t", f"{candidate_sha}:{raw_path}"],
-                    capture_output=True,
-                    text=True,
-                    encoding="utf-8",
-                    errors="replace",
-                    check=False,
-                    timeout=60.0,
-                )
-            except subprocess.TimeoutExpired:
-                return False, f"git timed out checking object type for {raw_path!r}"
-            if obj_type.returncode != 0 or obj_type.stdout.strip() != "blob":
-                return False, f"evidence_ref {raw_path!r} does not point to a file blob at commit {candidate_sha[:12]}"
-            try:
-                blob = subprocess.run(
-                    ["git", "-C", str(git_top), "show", f"{candidate_sha}:{raw_path}"],
-                    capture_output=True,
-                    text=True,
-                    encoding="utf-8",
-                    errors="replace",
-                    check=False,
-                    timeout=60.0,
-                )
-            except subprocess.TimeoutExpired:
-                return False, f"git timed out reading {raw_path!r} at commit {candidate_sha[:12]}"
-            if blob.returncode != 0:
-                return False, f"evidence_ref file {raw_path!r} does not exist at commit {candidate_sha[:12]}"
-            total_lines = len(blob.stdout.splitlines())
-        else:
-            resolved_root = repo_root.resolve()
-            target = (resolved_root / raw_path).resolve()
-            if not target.is_relative_to(resolved_root) or not target.is_file():
-                return False, f"evidence_ref file {raw_path!r} does not exist"
-            total_lines = len(target.read_text(encoding="utf-8", errors="replace").splitlines())
-    else:
-        resolved_root = repo_root.resolve()
-        target = (resolved_root / raw_path).resolve()
-        if not target.is_relative_to(resolved_root) or not target.is_file():
-            return False, f"evidence_ref file {raw_path!r} does not exist"
-        total_lines = len(target.read_text(encoding="utf-8", errors="replace").splitlines())
+    try:
+        cat = subprocess.run(
+            ["git", "-C", str(git_top), "cat-file", "-e", f"{candidate_sha}^{{commit}}"],
+            capture_output=True,
+            check=False,
+            timeout=60.0,
+        )
+    except subprocess.TimeoutExpired:
+        return False, f"git timed out checking commit {candidate_sha[:12]}"
+    if cat.returncode != 0:
+        return False, f"evidence_ref commit {candidate_sha[:12]} does not exist in git repository"
+
+    try:
+        obj_type = subprocess.run(
+            ["git", "-C", str(git_top), "cat-file", "-t", f"{candidate_sha}:{raw_path}"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+            timeout=60.0,
+        )
+    except subprocess.TimeoutExpired:
+        return False, f"git timed out checking object type for {raw_path!r}"
+    if obj_type.returncode != 0 or obj_type.stdout.strip() != "blob":
+        return False, f"evidence_ref {raw_path!r} does not point to a file blob at commit {candidate_sha[:12]}"
+
+    try:
+        blob = subprocess.run(
+            ["git", "-C", str(git_top), "show", f"{candidate_sha}:{raw_path}"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+            timeout=60.0,
+        )
+    except subprocess.TimeoutExpired:
+        return False, f"git timed out reading {raw_path!r} at commit {candidate_sha[:12]}"
+    if blob.returncode != 0:
+        return False, f"evidence_ref file {raw_path!r} does not exist at commit {candidate_sha[:12]}"
+    total_lines = len(blob.stdout.splitlines())
 
     if line_end > total_lines:
         return False, f"evidence_ref line {line_end} exceeds {raw_path} line count ({total_lines})"

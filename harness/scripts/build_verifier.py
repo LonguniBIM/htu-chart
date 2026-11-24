@@ -23,18 +23,18 @@ from typing import Any
 
 try:
     from harness.scripts.schema_utils import (
-        attach_kill_on_close_job,
         cleanup_readonly_tree,
         close_job_handle,
         materialize_frozen_tree,
+        spawn_managed_process,
         terminate_process_tree,
     )
 except ImportError:
     from schema_utils import (
-        attach_kill_on_close_job,
         cleanup_readonly_tree,
         close_job_handle,
         materialize_frozen_tree,
+        spawn_managed_process,
         terminate_process_tree,
     )
 
@@ -77,18 +77,19 @@ def _run_cmd(
     timeout_sec: float | None = None,
     env: dict[str, str] | None = None,
 ) -> tuple[int, str, str, bool]:
-    proc = subprocess.Popen(
-        cmd,
-        cwd=str(cwd),
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        env=env,
-        start_new_session=(os.name != "nt"),
-    )
-    job_handle = attach_kill_on_close_job(proc.pid)
+    try:
+        proc, job_handle = spawn_managed_process(
+            cmd,
+            cwd=str(cwd),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            env=env,
+        )
+    except RuntimeError as exc:
+        return 1, "", str(exc), False
     try:
         stdout, stderr = proc.communicate(timeout=timeout_sec if timeout_sec and timeout_sec > 0 else None)
         return (proc.returncode if proc.returncode is not None else 1), stdout or "", stderr or "", False
