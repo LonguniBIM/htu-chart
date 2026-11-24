@@ -1041,3 +1041,15 @@ async def test_f01_auth_session_recovers_csrf_after_reload_and_enables_logout() 
             assert logout_resp.json() == {"authenticated": False}
             assert (await reloaded_client.get("/api/status")).status_code == 401
             assert (await reloaded_client.get("/api/auth/session")).status_code == 401
+
+        # Replay pre-logout session cookie in a brand-new client to prove server-side invalidation
+        asgi_replay = httpx.ASGITransport(app=app, client=("127.0.0.1", 54323))
+        async with httpx.AsyncClient(
+            transport=asgi_replay,
+            base_url="http://127.0.0.1:8000",
+            cookies={"topstep_session": session_cookie},
+        ) as replay_client:
+            replay_status = await replay_client.get("/api/status")
+            assert replay_status.status_code == 401
+            replay_session = await replay_client.get("/api/auth/session")
+            assert replay_session.status_code == 401

@@ -35,6 +35,7 @@ import {
 export interface ChartPaneProps {
   pane: PaneConfig;
   contractId: string | null;
+  activeFeedLive: boolean | null;
   wsClient: MarketWsClient;
   coordinator: PaneFetchCoordinator;
   onSymbolChange?: (paneId: string, symbol: RootSymbol) => void;
@@ -78,6 +79,7 @@ function formatLegendText(
 export function ChartPane({
   pane,
   contractId,
+  activeFeedLive,
   wsClient,
   coordinator,
   onSymbolChange,
@@ -93,6 +95,7 @@ export function ChartPane({
   const activeGenerationRef = useRef<number>(0);
   const snapshotReadyGenRef = useRef<number>(0);
   const pendingWsBarsRef = useRef<OhlcvBar[]>([]);
+  const bufferOverflowRef = useRef<boolean>(false);
   const lastTargetKeyRef = useRef<string>("");
 
   const [loadStatus, setLoadStatus] = useState<string>("idle");
@@ -242,6 +245,7 @@ export function ChartPane({
       coordinator.abortPane(pane.pane_id);
       activeGenerationRef.current += 1;
       pendingWsBarsRef.current = [];
+      bufferOverflowRef.current = false;
       if (legendRef.current !== null) {
         legendRef.current.textContent = formatLegendText(pane.root_symbol, pane.timeframe, null);
       }
@@ -252,6 +256,7 @@ export function ChartPane({
     const ticket = coordinator.beginFetch(target);
     activeGenerationRef.current = ticket.generation;
     pendingWsBarsRef.current = [];
+    bufferOverflowRef.current = false;
     setLoadStatus("loading");
 
     void fetchBars(
@@ -278,6 +283,8 @@ export function ChartPane({
         volumeSeriesRef.current?.setData(volumes);
         snapshotReadyGenRef.current = ticket.generation;
         pendingWsBarsRef.current = [];
+        const didOverflow = bufferOverflowRef.current;
+        bufferOverflowRef.current = false;
         const lastBar = mergedBars[mergedBars.length - 1] ?? null;
         latestBarRef.current = lastBar;
         lastBarTimeRef.current = lastBar?.time ?? null;
@@ -290,6 +297,9 @@ export function ChartPane({
         }
         chartRef.current?.timeScale().fitContent();
         setLoadStatus(`${mergedBars.length} bars`);
+        if (didOverflow) {
+          setResyncNonce((n) => n + 1);
+        }
       })
       .catch((err: unknown) => {
         if (err instanceof DOMException && err.name === "AbortError") {
@@ -316,9 +326,12 @@ export function ChartPane({
     resyncNonce,
   ]);
 
+  const isModeMismatch = activeFeedLive !== null && pane.live_mode !== activeFeedLive;
+  const canSubscribeWs = activeFeedLive !== null && pane.live_mode === activeFeedLive;
+
   useEffect(() => {
     const resolvedContractId = contractId?.trim() ?? "";
-    if (!resolvedContractId) {
+    if (!resolvedContractId || !canSubscribeWs) {
       return;
     }
 
@@ -328,7 +341,10 @@ export function ChartPane({
         return;
       }
       if (snapshotReadyGenRef.current !== activeGenerationRef.current) {
-        appendBoundedWsBar(pendingWsBarsRef.current, msg.bar);
+        const { overflowed } = appendBoundedWsBar(pendingWsBarsRef.current, msg.bar);
+        if (overflowed) {
+          bufferOverflowRef.current = true;
+        }
         return;
       }
       if (lastBarTimeRef.current !== null && msg.bar.time < lastBarTimeRef.current) {
@@ -360,7 +376,12 @@ export function ChartPane({
       removeResyncListener();
       unsubscribeWs();
     };
-  }, [contractId, pane.live_mode, pane.timeframe, wsClient]);
+  }, [canSubscribeWs, contractId, pane.live_mode, pane.timeframe, wsClient]);
+
+  const modeMismatchLabel = isModeMismatch
+    ? `Hist only (feed: ${activeFeedLive ? "Live" : "Sim"})`
+    : null;
+  const statusText = modeMismatchLabel !== null ? `${modeMismatchLabel} · ${loadStatus}` : loadStatus;
 
   return (
     <section className="chart-pane" data-pane-id={pane.pane_id}>
@@ -390,7 +411,7 @@ export function ChartPane({
           </select>
           <span className="chart-pane__contract">{contractId ?? "Unresolved"}</span>
         </div>
-        <span className="chart-pane__status">{loadStatus}</span>
+        <span className="chart-pane__status">{statusText}</span>
       </header>
       <div className="chart-pane__canvas-wrap">
         <div ref={legendRef} className="chart-pane__legend">

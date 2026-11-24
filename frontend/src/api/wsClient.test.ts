@@ -196,4 +196,78 @@ describe("MarketWsClient (P1-04, P1-05, P2-003)", () => {
       timeframe: "15m",
     });
   });
+
+  it("ignores stale open and bar_update/feed_status messages from a replaced socket", () => {
+    /**
+     * Contract: Late open and message events emitted on a replaced socket are completely ignored
+     * by onBarUpdate, onFeedStatus, and onResyncRequired listeners.
+     * Defect caught: Missing this.socket !== ws guard leaking stale socket bars or feed_status.
+     */
+    const client = new MarketWsClient(() => "ws://127.0.0.1:8000/ws/market");
+    const barListener = vi.fn();
+    const feedStatusListener = vi.fn();
+    const resyncListener = vi.fn();
+    client.onBarUpdate(barListener);
+    client.onFeedStatus(feedStatusListener);
+    client.onResyncRequired(resyncListener);
+
+    client.connect();
+    const ws1 = FakeWebSocket.instances[0];
+    expect(ws1).toBeDefined();
+    client.subscribe("CON.F.US.MES.H26", "5m");
+
+    client.disconnect();
+    client.connect();
+    const ws2 = FakeWebSocket.instances[1];
+    expect(ws2).toBeDefined();
+    ws2?.emitOpen();
+
+    // Stale socket fires late open and inbound bar_update/feed_status messages
+    ws1?.emitOpen();
+    ws1?.emitMessage({
+      type: "bar_update",
+      contract_id: "CON.F.US.MES.H26",
+      live_mode: false,
+      timeframe: "5m",
+      is_recovered_historical: false,
+      recovery_tag: null,
+      bar: {
+        time: 1000,
+        open: 5000,
+        high: 5002,
+        low: 4999,
+        close: 5001,
+        volume: 15,
+        is_closed: true,
+      },
+    });
+    ws1?.emitMessage({ type: "feed_status", feed_state: "DISCONNECTED" });
+
+    expect(barListener).not.toHaveBeenCalled();
+    expect(feedStatusListener).not.toHaveBeenCalled();
+    expect(resyncListener).not.toHaveBeenCalled();
+
+    // Active socket still delivers bar_update and feed_status cleanly
+    ws2?.emitMessage({
+      type: "bar_update",
+      contract_id: "CON.F.US.MES.H26",
+      live_mode: false,
+      timeframe: "5m",
+      is_recovered_historical: false,
+      recovery_tag: null,
+      bar: {
+        time: 2000,
+        open: 5001,
+        high: 5003,
+        low: 5000,
+        close: 5002,
+        volume: 20,
+        is_closed: false,
+      },
+    });
+    ws2?.emitMessage({ type: "feed_status", feed_state: "LIVE" });
+
+    expect(barListener).toHaveBeenCalledTimes(1);
+    expect(feedStatusListener).toHaveBeenCalledTimes(1);
+  });
 });

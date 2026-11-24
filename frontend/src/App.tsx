@@ -52,27 +52,22 @@ export function App() {
   const wsClient = useMemo(() => new MarketWsClient(), []);
   const coordinator = useMemo(() => new PaneFetchCoordinator(), []);
   const resolvedModesRef = useRef<Set<boolean>>(new Set());
+  const [contractsPendingRetry, setContractsPendingRetry] = useState<boolean>(false);
+  const contractsRetryNeededRef = useRef<boolean>(false);
+  const unresolvedModesRef = useRef<Set<boolean>>(new Set());
+  const prevFeedStateRef = useRef<string>("DISCONNECTED");
+  const retryAbortControllerRef = useRef<AbortController | null>(null);
+  const activeLayoutRef = useRef<LayoutRecord | null>(null);
+  activeLayoutRef.current = activeLayout;
 
   useEffect(() => {
     return () => {
+      retryAbortControllerRef.current?.abort();
+      retryAbortControllerRef.current = null;
       wsClient.disconnect();
       coordinator.dispose();
     };
   }, [coordinator, wsClient]);
-
-  useEffect(() => {
-    const removeStateListener = wsClient.onConnectionState(setWsState);
-    const removeStatusListener = wsClient.onFeedStatus((msg) => {
-      setStatusData((prev) => ({
-        ...(prev ?? {}),
-        ...(msg.feed_state !== undefined ? { feed_state: msg.feed_state } : {}),
-      }));
-    });
-    return () => {
-      removeStateListener();
-      removeStatusListener();
-    };
-  }, [wsClient]);
 
   const fetchContractsForModes = useCallback(
     async (modes: readonly boolean[], signal?: AbortSignal): Promise<Record<string, ContractResolutionEntry>> => {
@@ -94,33 +89,160 @@ export function App() {
     [],
   );
 
+  const retryUnresolvedContracts = useCallback(async () => {
+    retryAbortControllerRef.current?.abort();
+    const controller = new AbortController();
+    retryAbortControllerRef.current = controller;
+
+    const modes =
+      unresolvedModesRef.current.size > 0
+        ? Array.from(unresolvedModesRef.current)
+        : distinctPaneLiveModes(activeLayoutRef.current?.panes ?? []);
+
+    try {
+      const statusPromise = fetchStatus(controller.signal).then((freshStatus) => {
+        if (controller.signal.aborted) {
+          return;
+        }
+        setStatusData(freshStatus);
+        if (freshStatus.feed_state !== undefined) {
+          prevFeedStateRef.current = String(freshStatus.feed_state);
+        }
+      });
+
+      const resolvedMap = await fetchContractsForModes(modes, controller.signal);
+      await statusPromise.catch((err: unknown) => {
+        if (err instanceof DOMException && err.name === "AbortError") {
+          throw err;
+        }
+      });
+
+      if (controller.signal.aborted) {
+        return;
+      }
+
+      setContracts((prev) => ({ ...prev, ...resolvedMap }));
+      for (const mode of modes) {
+        unresolvedModesRef.current.delete(mode);
+      }
+      if (unresolvedModesRef.current.size === 0) {
+        contractsRetryNeededRef.current = false;
+        setContractsPendingRetry(false);
+      }
+      setLoadError(null);
+    } catch (err: unknown) {
+      if (err instanceof DOMException && err.name === "AbortError") {
+        return;
+      }
+      if (err instanceof ApiError && err.status === 503) {
+        contractsRetryNeededRef.current = true;
+        for (const mode of modes) {
+          unresolvedModesRef.current.add(mode);
+        }
+        setContractsPendingRetry(true);
+        return;
+      }
+      setLoadError(err instanceof Error ? err.message : "Failed to resolve contracts");
+    } finally {
+      if (retryAbortControllerRef.current === controller) {
+        retryAbortControllerRef.current = null;
+      }
+    }
+  }, [fetchContractsForModes]);
+
+  useEffect(() => {
+    const removeStateListener = wsClient.onConnectionState(setWsState);
+    const removeStatusListener = wsClient.onFeedStatus((msg) => {
+      const nextFeedState = typeof msg.feed_state === "string" ? msg.feed_state : undefined;
+      const prevFeedState = prevFeedStateRef.current;
+      if (nextFeedState !== undefined) {
+        prevFeedStateRef.current = nextFeedState;
+      }
+      setStatusData((prev) => ({
+        ...(prev ?? {}),
+        ...(nextFeedState !== undefined ? { feed_state: nextFeedState } : {}),
+      }));
+
+      const hasUnresolved =
+        contractsRetryNeededRef.current || unresolvedModesRef.current.size > 0;
+      const transitionedFromDisconnected =
+        prevFeedState === "DISCONNECTED" &&
+        nextFeedState !== undefined &&
+        nextFeedState !== "DISCONNECTED";
+      const isActiveFeedState =
+        nextFeedState === "RECOVERING" ||
+        nextFeedState === "LIVE" ||
+        nextFeedState === "DEGRADED";
+
+      if (hasUnresolved && (isActiveFeedState || transitionedFromDisconnected)) {
+        void retryUnresolvedContracts();
+      }
+    });
+    return () => {
+      removeStateListener();
+      removeStatusListener();
+    };
+  }, [retryUnresolvedContracts, wsClient]);
+
   const bootstrapWorkspace = useCallback(
     async (signal?: AbortSignal) => {
       setLoadError(null);
+      retryAbortControllerRef.current?.abort();
+      retryAbortControllerRef.current = null;
+      contractsRetryNeededRef.current = false;
+      unresolvedModesRef.current.clear();
+      setContractsPendingRetry(false);
+
       const statusOpts = signal !== undefined ? signal : undefined;
       await fetchSession(statusOpts);
+      if (signal?.aborted) {
+        return;
+      }
       const status = await fetchStatus(statusOpts);
+      if (signal?.aborted) {
+        return;
+      }
       setStatusData(status);
+      prevFeedStateRef.current = String(status.feed_state ?? "DISCONNECTED");
 
       const loadedLayouts = await listLayouts(statusOpts);
+      if (signal?.aborted) {
+        return;
+      }
       setLayouts(loadedLayouts);
       const defaultLayout =
         loadedLayouts.find((item) => item.is_default) ?? loadedLayouts[0] ?? null;
       setActiveLayout(defaultLayout);
+      activeLayoutRef.current = defaultLayout;
 
       resolvedModesRef.current.clear();
       const distinctModes = distinctPaneLiveModes(defaultLayout?.panes ?? []);
       try {
         const resolvedMap = await fetchContractsForModes(distinctModes, statusOpts);
+        if (signal?.aborted) {
+          return;
+        }
         setContracts(resolvedMap);
       } catch (err: unknown) {
+        if (err instanceof DOMException && err.name === "AbortError") {
+          throw err;
+        }
+        if (signal?.aborted) {
+          return;
+        }
         if (err instanceof ApiError && err.status === 503) {
           setContracts({});
-        } else if (!(err instanceof DOMException && err.name === "AbortError")) {
+          contractsRetryNeededRef.current = true;
+          unresolvedModesRef.current = new Set(distinctModes);
+          setContractsPendingRetry(true);
+        } else {
           setLoadError(err instanceof Error ? err.message : "Failed to resolve contracts");
         }
       }
 
+      if (signal?.aborted) {
+        return;
+      }
       wsClient.connect();
     },
     [fetchContractsForModes, wsClient],
@@ -130,10 +252,16 @@ export function App() {
     const controller = new AbortController();
     void bootstrapWorkspace(controller.signal)
       .then(() => {
+        if (controller.signal.aborted) {
+          return;
+        }
         setAuthStage("authenticated");
       })
       .catch((err: unknown) => {
-        if (err instanceof DOMException && err.name === "AbortError") {
+        if (
+          controller.signal.aborted ||
+          (err instanceof DOMException && err.name === "AbortError")
+        ) {
           return;
         }
         if (err instanceof ApiError && err.status === 401) {
@@ -162,6 +290,13 @@ export function App() {
   };
 
   const handleLogout = async () => {
+    retryAbortControllerRef.current?.abort();
+    retryAbortControllerRef.current = null;
+    contractsRetryNeededRef.current = false;
+    unresolvedModesRef.current.clear();
+    prevFeedStateRef.current = "DISCONNECTED";
+    setContractsPendingRetry(false);
+    setLoadError(null);
     wsClient.disconnect();
     coordinator.dispose();
     try {
@@ -170,6 +305,7 @@ export function App() {
       // Clear local UI state even if session already expired
     }
     setActiveLayout(null);
+    activeLayoutRef.current = null;
     setLayouts([]);
     setContracts({});
     resolvedModesRef.current.clear();
@@ -259,6 +395,7 @@ export function App() {
               onChange={(e) => {
                 const picked = layouts.find((item) => item.id === e.target.value) ?? null;
                 setActiveLayout(picked);
+                activeLayoutRef.current = picked;
                 if (picked !== null) {
                   const missingModes = distinctPaneLiveModes(picked.panes).filter(
                     (mode) => !resolvedModesRef.current.has(mode),
@@ -270,6 +407,11 @@ export function App() {
                       })
                       .catch((err: unknown) => {
                         if (err instanceof ApiError && err.status === 503) {
+                          contractsRetryNeededRef.current = true;
+                          for (const mode of missingModes) {
+                            unresolvedModesRef.current.add(mode);
+                          }
+                          setContractsPendingRetry(true);
                           return;
                         }
                         if (!(err instanceof DOMException && err.name === "AbortError")) {
@@ -293,6 +435,18 @@ export function App() {
         <div className="terminal-topbar__meta">
           <span>WS: {wsState}</span>
           <span>Feed: {String(statusData?.feed_state ?? "DISCONNECTED")}</span>
+          {contractsPendingRetry && (
+            <>
+              <span className="terminal-badge">Contracts pending</span>
+              <button
+                type="button"
+                className="terminal-button"
+                onClick={() => void retryUnresolvedContracts()}
+              >
+                Retry Contracts
+              </button>
+            </>
+          )}
           {loadError !== null && <span className="login-error">{loadError}</span>}
           <button type="button" className="terminal-button" onClick={() => void handleLogout()}>
             Logout
@@ -307,6 +461,7 @@ export function App() {
             contractId={resolveContractId(
               contracts[contractCacheKey(pane.live_mode, pane.root_symbol)],
             )}
+            activeFeedLive={statusData?.live ?? null}
             wsClient={wsClient}
             coordinator={coordinator}
             onSymbolChange={handlePaneSymbolChange}

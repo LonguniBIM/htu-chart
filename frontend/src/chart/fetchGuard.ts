@@ -118,14 +118,21 @@ export function appendBoundedWsBar(
   buffer: OhlcvBar[],
   bar: OhlcvBar,
   maxBars: number = MAX_PENDING_WS_BARS,
-): void {
+): { overflowed: boolean } {
   if (maxBars <= 0) {
-    return;
+    return { overflowed: false };
   }
-  if (buffer.length >= maxBars) {
-    buffer.shift();
+  const existingIndex = buffer.findIndex((entry) => entry.time === bar.time);
+  if (existingIndex !== -1) {
+    buffer[existingIndex] = bar;
+    return { overflowed: false };
   }
   buffer.push(bar);
+  if (buffer.length > maxBars) {
+    buffer.shift();
+    return { overflowed: true };
+  }
+  return { overflowed: false };
 }
 
 /**

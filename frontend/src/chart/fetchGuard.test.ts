@@ -224,9 +224,50 @@ describe("ChartPane dataset isolation and REST/WS reconciliation (P1-01, P1-02, 
     ).toBe(false);
 
     const buffer: OhlcvBar[] = [];
-    appendBoundedWsBar(buffer, makeBar(100, 1), 2);
-    appendBoundedWsBar(buffer, makeBar(200, 2), 2);
-    appendBoundedWsBar(buffer, makeBar(300, 3), 2);
+    expect(appendBoundedWsBar(buffer, makeBar(100, 1), 2)).toEqual({ overflowed: false });
+    expect(appendBoundedWsBar(buffer, makeBar(200, 2), 2)).toEqual({ overflowed: false });
+    expect(appendBoundedWsBar(buffer, makeBar(300, 3), 2)).toEqual({ overflowed: true });
     expect(buffer.map((b) => b.time)).toEqual([200, 300]);
+  });
+
+  it("coalesces intrabar updates by bar.time before capacity eviction during pending fetches", () => {
+    /**
+     * Contract: Hundreds of intrabar ticks on the same timestamp coalesce in place without
+     * consuming capacity or evicting earlier closed bars, preserving [60, 120, 180].
+     * Defect caught: Intrabar tick bursts overflowing MAX_PENDING_WS_BARS and dropping closed bars.
+     */
+    const buffer: OhlcvBar[] = [];
+    expect(appendBoundedWsBar(buffer, makeBar(120, 5002))).toEqual({ overflowed: false });
+
+    let anyOverflow = false;
+    for (let i = 0; i < 500; i += 1) {
+      const res = appendBoundedWsBar(buffer, makeBar(180, 5010 + i));
+      if (res.overflowed) {
+        anyOverflow = true;
+      }
+    }
+
+    expect(anyOverflow).toBe(false);
+    expect(buffer.length).toBe(2);
+
+    const reconciled = reconcileSnapshotWithBufferedBars([makeBar(60, 5000)], buffer);
+    expect(reconciled.map((b) => b.time)).toEqual([60, 120, 180]);
+    expect(reconciled[2]?.close).toBe(5509);
+  });
+
+  it("signals overflowed=true when distinct timestamps exceed maxBars", () => {
+    /**
+     * Contract: When distinct buffered bar timestamps exceed maxBars, the oldest bar is evicted
+     * and appendBoundedWsBar returns { overflowed: true } so ChartPane can trigger resync.
+     * Defect caught: Silent historical bar loss when pending WS queue exceeds capacity.
+     */
+    const buffer: OhlcvBar[] = [];
+    expect(appendBoundedWsBar(buffer, makeBar(100, 1), 3)).toEqual({ overflowed: false });
+    expect(appendBoundedWsBar(buffer, makeBar(200, 2), 3)).toEqual({ overflowed: false });
+    expect(appendBoundedWsBar(buffer, makeBar(200, 2.5), 3)).toEqual({ overflowed: false });
+    expect(appendBoundedWsBar(buffer, makeBar(300, 3), 3)).toEqual({ overflowed: false });
+    expect(appendBoundedWsBar(buffer, makeBar(400, 4), 3)).toEqual({ overflowed: true });
+    expect(buffer.map((b) => b.time)).toEqual([200, 300, 400]);
+    expect(buffer[0]?.close).toBe(2.5);
   });
 });
