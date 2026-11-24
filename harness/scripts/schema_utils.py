@@ -7,11 +7,13 @@ materialization of immutable git commits for verification and review.
 
 from __future__ import annotations
 
+import ctypes
 import hashlib
 import io
 import os
 import re
 import shutil
+import signal
 import stat
 import subprocess
 import sys
@@ -241,3 +243,139 @@ def materialize_frozen_tree(
         "file_count": file_count,
         "frozen_tree_sha256": frozen_tree_sha256,
     }
+
+
+def _configure_kernel32() -> Any:
+    from ctypes import wintypes
+
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    k32.CreateJobObjectW.argtypes = [wintypes.LPVOID, wintypes.LPCWSTR]
+    k32.CreateJobObjectW.restype = wintypes.HANDLE
+    k32.SetInformationJobObject.argtypes = [wintypes.HANDLE, ctypes.c_int, wintypes.LPVOID, wintypes.DWORD]
+    k32.SetInformationJobObject.restype = wintypes.BOOL
+    k32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    k32.OpenProcess.restype = wintypes.HANDLE
+    k32.AssignProcessToJobObject.argtypes = [wintypes.HANDLE, wintypes.HANDLE]
+    k32.AssignProcessToJobObject.restype = wintypes.BOOL
+    k32.CloseHandle.argtypes = [wintypes.HANDLE]
+    k32.CloseHandle.restype = wintypes.BOOL
+    return k32
+
+
+def attach_kill_on_close_job(pid: int) -> int | None:
+    """On Windows, bind ``pid`` to a Job Object with JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE."""
+    if os.name != "nt":
+        return None
+    from ctypes import wintypes
+
+    class _IoCounters(ctypes.Structure):
+        _fields_ = [
+            ("ReadOperationCount", ctypes.c_uint64),
+            ("WriteOperationCount", ctypes.c_uint64),
+            ("OtherOperationCount", ctypes.c_uint64),
+            ("ReadTransferCount", ctypes.c_uint64),
+            ("WriteTransferCount", ctypes.c_uint64),
+            ("OtherTransferCount", ctypes.c_uint64),
+        ]
+
+    class _BasicLimitInfo(ctypes.Structure):
+        _fields_ = [
+            ("PerProcessUserTimeLimit", wintypes.LARGE_INTEGER),
+            ("PerJobUserTimeLimit", wintypes.LARGE_INTEGER),
+            ("LimitFlags", wintypes.DWORD),
+            ("MinimumWorkingSetSize", ctypes.c_size_t),
+            ("MaximumWorkingSetSize", ctypes.c_size_t),
+            ("ActiveProcessLimit", wintypes.DWORD),
+            ("Affinity", ctypes.c_size_t),
+            ("PriorityClass", wintypes.DWORD),
+            ("SchedulingClass", wintypes.DWORD),
+        ]
+
+    class _ExtendedLimitInfo(ctypes.Structure):
+        _fields_ = [
+            ("BasicLimitInformation", _BasicLimitInfo),
+            ("IoInfo", _IoCounters),
+            ("ProcessMemoryLimit", ctypes.c_size_t),
+            ("JobMemoryLimit", ctypes.c_size_t),
+            ("PeakProcessMemoryUsed", ctypes.c_size_t),
+            ("PeakJobMemoryUsed", ctypes.c_size_t),
+        ]
+
+    k32 = _configure_kernel32()
+    job = k32.CreateJobObjectW(None, None)
+    if not job:
+        return None
+
+    info = _ExtendedLimitInfo()
+    info.BasicLimitInformation.LimitFlags = 0x00002000  # JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+    if not k32.SetInformationJobObject(job, 9, ctypes.byref(info), ctypes.sizeof(info)):
+        k32.CloseHandle(job)
+        return None
+
+    proc_handle = k32.OpenProcess(0x0100 | 0x0001, False, pid)
+    if not proc_handle:
+        k32.CloseHandle(job)
+        return None
+    try:
+        if not k32.AssignProcessToJobObject(job, proc_handle):
+            k32.CloseHandle(job)
+            return None
+    finally:
+        k32.CloseHandle(proc_handle)
+    return int(job)
+
+
+def close_job_handle(job_handle: int | None) -> None:
+    """Close a Win32 Job Object handle if open."""
+    if os.name != "nt" or not job_handle:
+        return
+    from ctypes import wintypes
+
+    k32 = _configure_kernel32()
+    k32.CloseHandle(wintypes.HANDLE(job_handle))
+
+
+def terminate_process_tree(proc: subprocess.Popen[str], job_handle: int | None = None) -> None:
+    """Terminate ``proc`` and all descendants, even if the immediate parent already exited."""
+    try:
+        if os.name == "nt":
+            close_job_handle(job_handle)
+            if proc.poll() is None:
+                subprocess.run(
+                    ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                    capture_output=True,
+                    check=False,
+                    timeout=10,
+                )
+        else:
+            try:
+                os.killpg(proc.pid, signal.SIGTERM)
+            except ProcessLookupError:
+                return
+            except OSError:
+                if proc.poll() is None:
+                    proc.terminate()
+            if proc.poll() is None:
+                try:
+                    proc.wait(timeout=3.0)
+                except subprocess.TimeoutExpired:
+                    pass
+            else:
+                time.sleep(0.15)
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            except OSError:
+                if proc.poll() is None:
+                    proc.kill()
+    except OSError:
+        if proc.poll() is None:
+            try:
+                proc.kill()
+            except OSError:
+                pass
+    try:
+        proc.wait(timeout=3.0)
+    except subprocess.TimeoutExpired:
+        pass

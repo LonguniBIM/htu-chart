@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import re
 import shlex
 import subprocess
@@ -47,6 +48,19 @@ def _sha256_file(path: Path | None) -> str | None:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+SAFE_STRIP_ENV_KEYS = frozenset(
+    {
+        "PYTHONPATH",
+        "VIRTUAL_ENV",
+        "PYTHONUNBUFFERED",
+        "PYTHONDONTWRITEBYTECODE",
+        "NO_COLOR",
+        "FORCE_COLOR",
+        "TERM",
+    }
+)
+
+
 def _strip_quotes(tok: str) -> str:
     if len(tok) >= 2 and ((tok[0] == '"' and tok[-1] == '"') or (tok[0] == "'" and tok[-1] == "'")):
         return tok[1:-1]
@@ -60,8 +74,14 @@ def _extract_test_target(command_text: str) -> str:
         raw_tokens = command_text.strip().split()
     tokens = [_strip_quotes(t) for t in raw_tokens if t.strip()]
 
+    preserved_env: list[str] = []
     idx = 0
-    while idx < len(tokens) and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=.*", tokens[idx]):
+    while idx < len(tokens):
+        env_match = re.fullmatch(r"([A-Za-z_][A-Za-z0-9_]*)=(.*)", tokens[idx])
+        if not env_match:
+            break
+        if env_match.group(1) not in SAFE_STRIP_ENV_KEYS:
+            preserved_env.append(tokens[idx])
         idx += 1
 
     if idx < len(tokens) and Path(tokens[idx]).name.lower() in {"uv", "uv.exe"}:
@@ -81,7 +101,7 @@ def _extract_test_target(command_text: str) -> str:
     if idx < len(tokens) and Path(tokens[idx]).name.lower() in {"pytest", "pytest.exe"}:
         idx += 1
 
-    kept: list[str] = []
+    kept: list[str] = [*preserved_env]
     verbosity_flags = {"-q", "--quiet", "-v", "-vv", "-vvv", "--verbose", "-s", "--no-header", "-ra", "-rx", "-rA"}
     while idx < len(tokens):
         tok = tokens[idx]
@@ -638,10 +658,12 @@ def main(argv: list[str] | None = None) -> int:
             return 2
 
     if args.out_dir is not None:
-        out_dir = args.out_dir
+        out_dir = args.out_dir.resolve()
     else:
-        attempt_stamp = args.attempt_id or datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-        out_dir = REPO_ROOT / "harness" / "runs" / args.task_id / "attempts" / f"{attempt_stamp}-{args.candidate_sha[:12]}"
+        attempt_stamp = args.attempt_id or f"{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S.%fZ')}-{os.getpid()}"
+        out_dir = (
+            REPO_ROOT / "harness" / "runs" / args.task_id / "attempts" / f"{attempt_stamp}-{args.candidate_sha[:12]}"
+        ).resolve()
 
     receipt_json_path = out_dir / "receipt.json"
     receipt_md_path = out_dir / "receipt.md"

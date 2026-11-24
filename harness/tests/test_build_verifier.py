@@ -213,3 +213,91 @@ def test_build_verifier_backend_isolation_uses_frozen_commit_not_dirty_worktree(
     assert report["status"] == "VERIFIED"
     backend_step = next(s for s in report["steps"] if s["name"] == "backend_pytest")
     assert backend_step["status"] == "PASSED"
+
+
+def _is_pid_alive(pid: int) -> bool:
+    import ctypes
+    import os
+
+    if os.name == "nt":
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        STILL_ACTIVE = 259
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        handle = k32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+        if not handle:
+            return False
+        try:
+            exit_code = ctypes.c_ulong(0)
+            if not k32.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
+                return False
+            return exit_code.value == STILL_ACTIVE
+        finally:
+            k32.CloseHandle(handle)
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+
+
+def test_build_verifier_commit_fails_when_sibling_lightweight_charts_is_dirty(tmp_path: Path) -> None:
+    """S2-001: build_verifier --commit must enforce ARCH-006 against real root.parent / 'lightweight-charts'."""
+    app_dir = tmp_path / "topstep-chart-app"
+    _setup_mini_repo(app_dir)
+    subprocess.run(["git", "init"], cwd=app_dir, check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=app_dir, check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.name", "Test User"], cwd=app_dir, check=True, capture_output=True)
+    subprocess.run(["git", "add", "."], cwd=app_dir, check=True, capture_output=True)
+    subprocess.run(["git", "commit", "-m", "clean app"], cwd=app_dir, check=True, capture_output=True)
+    sha = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=app_dir, check=True, capture_output=True, text=True
+    ).stdout.strip()
+
+    sibling = tmp_path / "lightweight-charts"
+    sibling.mkdir()
+    subprocess.run(["git", "init"], cwd=sibling, check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=sibling, check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.name", "Test User"], cwd=sibling, check=True, capture_output=True)
+    (sibling / "README.md").write_text("upstream\n", encoding="utf-8")
+    subprocess.run(["git", "add", "README.md"], cwd=sibling, check=True, capture_output=True)
+    subprocess.run(["git", "commit", "-m", "upstream"], cwd=sibling, check=True, capture_output=True)
+    # Dirty edit in sibling lightweight-charts
+    (sibling / "README.md").write_text("MODIFIED UPSTREAM\n", encoding="utf-8")
+
+    report = run_verifier(
+        app_dir,
+        phase=0,
+        strict_clean=False,
+        commit_sha=sha,
+        frozen_dir=tmp_path / "out" / "frozen" / "topstep-chart-app",
+    )
+    assert report["status"] == "FAILED"
+    assert any("ARCH-006" in s["summary"] or "lightweight-charts" in s["summary"] for s in report["steps"] if s["status"] == "FAILED")
+
+
+def test_build_verifier_kills_orphan_child_when_parent_exits_early(tmp_path: Path, monkeypatch) -> None:
+    """P1-02 & S2-002: Child holding stdout alive after parent exits early must be killed on timeout."""
+    _setup_mini_repo(tmp_path)
+    child_pid_file = tmp_path / "orphan_child.pid"
+    parent_script = tmp_path / "parent_exit_early.py"
+    parent_script.write_text(
+        (
+            "import subprocess, sys, time\n"
+            "child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)'])\n"
+            f"open({str(child_pid_file)!r}, 'w', encoding='utf-8').write(str(child.pid))\n"
+            "sys.exit(0)\n"
+        ),
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(
+        build_verifier,
+        "_resolve_tool",
+        lambda name, python_module=None: [sys.executable, str(parent_script)] if name == "pytest" else [sys.executable, "-c", "pass"],
+    )
+    report = run_verifier(tmp_path, phase=0, strict_clean=False, step_timeout_sec=0.6, total_timeout_sec=5.0)
+    assert report["status"] == "FAILED"
+    pytest_step = next(s for s in report["steps"] if s["name"] == "harness_pytest")
+    assert pytest_step["exit_code"] == 124
+    child_pid = int(child_pid_file.read_text(encoding="utf-8").strip())
+    assert not _is_pid_alive(child_pid)

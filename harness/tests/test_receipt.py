@@ -508,6 +508,32 @@ def test_receipt_blocks_mismatched_pytest_k_selector() -> None:
     assert k_mismatch["conclusion"] == "BLOCKED"
 
 
+def test_receipt_blocks_pytest_addopts_mismatch_in_red_green_commands() -> None:
+    """P1-01: Test-affecting env vars such as PYTEST_ADDOPTS must NOT be stripped during target comparison."""
+    base = "1" * 40
+    cand = "2" * 40
+
+    addopts_mismatch = evaluate_receipt(
+        task_id="P1-01-ADDOPTS",
+        phase=1,
+        base_sha=base,
+        candidate_sha=cand,
+        verifier_data=_verifier(cand),
+        review_data=_review(cand),
+        is_bugfix=True,
+        red_proof={
+            "red_sha": base,
+            "red_exit_code": 1,
+            "red_failure_reason": "AssertionError: real bug",
+            "green_sha": cand,
+            "green_exit_code": 0,
+            "red_test_command": "PYTHONPATH=. pytest harness/tests/test_x.py -q",
+            "green_test_command": "PYTEST_ADDOPTS=--ignore=harness/tests/test_x.py pytest harness/tests/test_x.py -q",
+        },
+    )
+    assert addopts_mismatch["conclusion"] == "BLOCKED"
+
+
 def test_receipt_blocks_none_verifier_steps_without_crashing() -> None:
     """P1-07: verifier_data with steps=None must return BLOCKED without TypeError."""
     base = "1" * 40

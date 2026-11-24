@@ -944,3 +944,114 @@ def test_consolidate_blocks_contradictory_changes_requested_without_blocking_fin
     )
     assert res_contradictory["review_gate_status"] == "BLOCKED"
     assert any("CHANGES_REQUESTED" in e for e in res_contradictory["errors"])
+
+
+def test_agy_relative_out_dir_with_large_prompt_passes_absolute_prompt_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """P1-03: Relative --out-dir must resolve to absolute path so agy in frozen cwd can read >16k prompt file."""
+    repo_dir, sha = _init_mini_git_repo(tmp_path / "repo_rel_out")
+    packet_file = tmp_path / "big_packet.md"
+    marker = "UNIQUE_PACKET_MARKER_P103"
+    packet_file.write_text(marker + "\n" + ("X" * 18000), encoding="utf-8")
+
+    agy_script = tmp_path / "fake_agy_read_prompt.py"
+    agy_prefix = _write_fake_codex_script(
+        agy_script,
+        (
+            "import json, pathlib, re, sys\n"
+            "args = sys.argv[1:]\n"
+            "cli_prompt = args[args.index('-p') + 1]\n"
+            "m = re.search(r'`([^`]+\\.prompt\\.md)`', cli_prompt)\n"
+            "assert m is not None, f'Expected prompt file ref in: {cli_prompt[:200]}'\n"
+            "p = pathlib.Path(m.group(1))\n"
+            "assert p.is_absolute(), f'Prompt path must be absolute, got {p}'\n"
+            "text = p.read_text(encoding='utf-8')\n"
+            f"assert {marker!r} in text\n"
+            "lens = 'security_and_invariants' if 'pass2' in p.name else 'correctness_and_tests'\n"
+            f"payload = {{'revision_sha': {sha!r}, 'lens': lens, 'verdict': 'APPROVE', "
+            "'summary': str(p), 'findings': [], 'test_quality_issues': [], 'unverified_areas': []}\n"
+            "print(json.dumps({'event': 'result', 'result': {'status': 'SUCCESS', 'structured_output': payload}}), flush=True)\n"
+        ),
+    )
+    monkeypatch.setattr(codex_room_review, "resolve_agy_command", lambda: agy_prefix)
+    monkeypatch.chdir(tmp_path)
+
+    rc = codex_room_review.main(
+        [
+            "--commit",
+            "HEAD",
+            "--repo-root",
+            str(repo_dir),
+            "--task-packet",
+            str(packet_file),
+            "--out-dir",
+            "rel_review_out",
+            "--backend",
+            "agy",
+        ]
+    )
+    assert rc == 0
+
+
+def test_codex_room_review_atomic_lock_blocks_concurrent_same_out_dir(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """P1-04 & S2-003: Atomic .review-attempt.lock must prevent concurrent runs and block before materialization."""
+    import concurrent.futures
+    import threading
+
+    repo_dir, sha = _init_mini_git_repo(tmp_path / "repo_lock_race")
+    out_dir = tmp_path / "shared_attempt"
+
+    # Part A: Pre-existing lock blocks BEFORE materialize_frozen_tree is called.
+    locked_dir = tmp_path / "prelocked_attempt"
+    locked_dir.mkdir()
+    (locked_dir / ".review-attempt.lock").write_text("existing lock\n", encoding="utf-8")
+
+    def _forbid_materialize(*_args, **_kwargs):
+        raise AssertionError("materialize_frozen_tree must not be called when lock already exists")
+
+    monkeypatch.setattr(codex_room_review, "materialize_frozen_tree", _forbid_materialize)
+    rc_pre = codex_room_review.main(
+        ["--commit", "HEAD", "--repo-root", str(repo_dir), "--out-dir", str(locked_dir), "--backend", "agy"]
+    )
+    assert rc_pre == 2
+    monkeypatch.undo()
+
+    # Part B: Two concurrent invocations racing on the exact same out_dir: exactly 1 wins (0), 1 loses (2).
+    barrier = threading.Barrier(2)
+    orig_resolve = codex_room_review.resolve_commit_info
+
+    def _sync_resolve(*args, **kwargs):
+        res = orig_resolve(*args, **kwargs)
+        barrier.wait(timeout=5.0)
+        return res
+
+    agy_script = tmp_path / "fake_agy_race.py"
+    agy_prefix = _write_fake_codex_script(
+        agy_script,
+        (
+            "import json, sys, time\n"
+            "args = sys.argv[1:]\n"
+            "prompt = args[args.index('-p') + 1]\n"
+            "time.sleep(0.15)\n"
+            "lens = 'security_and_invariants' if 'security_and_invariants' in prompt else 'correctness_and_tests'\n"
+            f"payload = {{'revision_sha': {sha!r}, 'lens': lens, 'verdict': 'APPROVE', "
+            "'summary': 'ok', 'findings': [], 'test_quality_issues': [], 'unverified_areas': []}\n"
+            "print(json.dumps({'event': 'result', 'result': {'status': 'SUCCESS', 'structured_output': payload}}), flush=True)\n"
+        ),
+    )
+    monkeypatch.setattr(codex_room_review, "resolve_commit_info", _sync_resolve)
+    monkeypatch.setattr(codex_room_review, "resolve_agy_command", lambda: agy_prefix)
+
+    argv = ["--commit", "HEAD", "--repo-root", str(repo_dir), "--out-dir", str(out_dir), "--backend", "agy"]
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+        f1 = pool.submit(codex_room_review.main, argv)
+        f2 = pool.submit(codex_room_review.main, argv)
+        results = sorted([f1.result(), f2.result()])
+
+    assert results == [0, 2]
+    assert (out_dir / ".review-attempt.lock").is_file()
+    report = json.loads((out_dir / "consolidated-review.json").read_text(encoding="utf-8"))
+    assert report["review_gate_status"] == "PASSED"

@@ -13,7 +13,6 @@ import json
 import os
 import re
 import shutil
-import signal
 import subprocess
 import sys
 import tempfile
@@ -23,9 +22,21 @@ from pathlib import Path
 from typing import Any
 
 try:
-    from harness.scripts.schema_utils import cleanup_readonly_tree, materialize_frozen_tree
+    from harness.scripts.schema_utils import (
+        attach_kill_on_close_job,
+        cleanup_readonly_tree,
+        close_job_handle,
+        materialize_frozen_tree,
+        terminate_process_tree,
+    )
 except ImportError:
-    from schema_utils import cleanup_readonly_tree, materialize_frozen_tree
+    from schema_utils import (
+        attach_kill_on_close_job,
+        cleanup_readonly_tree,
+        close_job_handle,
+        materialize_frozen_tree,
+        terminate_process_tree,
+    )
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 PYTEST_PASSED_RE = re.compile(r"(\d+)\s+passed")
@@ -59,44 +70,6 @@ def _resolve_backend_venv_python(root: Path) -> Path | None:
     return None
 
 
-def _terminate_process_tree(proc: subprocess.Popen[str]) -> None:
-    if proc.poll() is not None:
-        return
-    try:
-        if os.name == "nt":
-            subprocess.run(
-                ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
-                capture_output=True,
-                check=False,
-                timeout=10,
-            )
-        else:
-            try:
-                os.killpg(proc.pid, signal.SIGTERM)
-            except ProcessLookupError:
-                return
-            except OSError:
-                proc.terminate()
-            try:
-                proc.wait(timeout=3.0)
-            except subprocess.TimeoutExpired:
-                try:
-                    os.killpg(proc.pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
-                except OSError:
-                    proc.kill()
-    except OSError:
-        try:
-            proc.kill()
-        except OSError:
-            pass
-    try:
-        proc.wait(timeout=3.0)
-    except subprocess.TimeoutExpired:
-        pass
-
-
 def _run_cmd(
     cmd: list[str],
     cwd: Path,
@@ -115,16 +88,20 @@ def _run_cmd(
         env=env,
         start_new_session=(os.name != "nt"),
     )
+    job_handle = attach_kill_on_close_job(proc.pid)
     try:
         stdout, stderr = proc.communicate(timeout=timeout_sec if timeout_sec and timeout_sec > 0 else None)
         return (proc.returncode if proc.returncode is not None else 1), stdout or "", stderr or "", False
     except subprocess.TimeoutExpired:
-        _terminate_process_tree(proc)
+        terminate_process_tree(proc, job_handle=job_handle)
+        job_handle = None
         try:
             stdout, stderr = proc.communicate(timeout=2.0)
         except subprocess.TimeoutExpired:
             stdout, stderr = "", ""
         return 124, stdout or "", stderr or "", True
+    finally:
+        close_job_handle(job_handle)
 
 
 def _run_step(
@@ -232,6 +209,89 @@ def _remaining_budget(deadline: float | None, default: float = 60.0) -> float:
     if rem <= 0:
         raise TimeoutError("TIMED_OUT: total_timeout_sec exhausted.")
     return min(default, rem)
+
+
+def _check_sibling_upstream_fork(root: Path, deadline: float | None) -> dict[str, Any]:
+    """Enforce ARCH-006 against the real sibling ``../lightweight-charts`` even in ``--commit`` mode."""
+    sibling = root.parent / "lightweight-charts"
+    cmd = ["git", "-C", str(sibling), "status", "--porcelain"]
+    if not (sibling / ".git").exists():
+        return {
+            "name": "upstream_fork_clean",
+            "command": cmd,
+            "cwd": str(root),
+            "status": "PASSED",
+            "exit_code": 0,
+            "duration_ms": 0,
+            "stdout_sha256": _sha256_text(""),
+            "stderr_sha256": _sha256_text(""),
+            "summary": "No sibling ../lightweight-charts git worktree present.",
+        }
+
+    start = time.monotonic()
+    dirty: list[str] = []
+    checks = [
+        (["git", "-C", str(sibling), "diff", "--name-only"], "unstaged change"),
+        (["git", "-C", str(sibling), "diff", "--cached", "--name-only"], "staged change"),
+        (["git", "-C", str(sibling), "ls-files", "--others", "--exclude-standard"], "untracked file"),
+    ]
+    try:
+        for git_cmd, kind in checks:
+            rem = _remaining_budget(deadline)
+            proc = subprocess.run(git_cmd, capture_output=True, text=True, check=False, timeout=rem)
+            if proc.returncode != 0:
+                return {
+                    "name": "upstream_fork_clean",
+                    "command": git_cmd,
+                    "cwd": str(sibling),
+                    "status": "FAILED",
+                    "exit_code": 1,
+                    "duration_ms": int((time.monotonic() - start) * 1000),
+                    "stdout_sha256": _sha256_text(proc.stdout or ""),
+                    "stderr_sha256": _sha256_text(proc.stderr or ""),
+                    "summary": f"ARCH-006: Unable to verify ../lightweight-charts cleanliness ({kind}): {proc.stderr.strip()}",
+                }
+            for ln in proc.stdout.splitlines():
+                item = ln.strip()
+                if item:
+                    dirty.append(f"{kind}: {item}")
+    except (TimeoutError, subprocess.TimeoutExpired) as exc:
+        return {
+            "name": "upstream_fork_clean",
+            "command": cmd,
+            "cwd": str(sibling),
+            "status": "FAILED",
+            "exit_code": 124,
+            "duration_ms": int((time.monotonic() - start) * 1000),
+            "stdout_sha256": _sha256_text(""),
+            "stderr_sha256": _sha256_text(str(exc)),
+            "summary": f"TIMED_OUT checking ARCH-006 ../lightweight-charts cleanliness: {exc}",
+        }
+
+    duration_ms = int((time.monotonic() - start) * 1000)
+    if dirty:
+        return {
+            "name": "upstream_fork_clean",
+            "command": cmd,
+            "cwd": str(sibling),
+            "status": "FAILED",
+            "exit_code": 1,
+            "duration_ms": duration_ms,
+            "stdout_sha256": _sha256_text("\n".join(dirty)),
+            "stderr_sha256": _sha256_text(""),
+            "summary": f"ARCH-006: Upstream fork lightweight-charts/ has {len(dirty)} uncommitted change(s): {dirty[0]}",
+        }
+    return {
+        "name": "upstream_fork_clean",
+        "command": cmd,
+        "cwd": str(sibling),
+        "status": "PASSED",
+        "exit_code": 0,
+        "duration_ms": duration_ms,
+        "stdout_sha256": _sha256_text(""),
+        "stderr_sha256": _sha256_text(""),
+        "summary": "Upstream fork ../lightweight-charts is clean.",
+    }
 
 
 def run_verifier(
@@ -378,6 +438,8 @@ def run_verifier(
                 env=isolated_env,
             )
         )
+        if target_root != root:
+            steps.append(_check_sibling_upstream_fork(root, deadline))
 
         ruff_cmd = _resolve_tool("ruff", python_module="ruff")
         steps.append(

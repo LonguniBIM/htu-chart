@@ -20,7 +20,6 @@ import json
 import os
 import re
 import shutil
-import signal
 import subprocess
 import sys
 import threading
@@ -32,21 +31,27 @@ from typing import Any
 try:
     from harness.scripts.codex_room_sync import EXPECTED_REVIEW_MODEL, verify_role
     from harness.scripts.schema_utils import (
+        attach_kill_on_close_job,
+        close_job_handle,
         compute_tree_sha256,
         is_hex_sha40,
         is_strict_int,
         materialize_frozen_tree,
         resolve_git_toplevel,
+        terminate_process_tree,
         validate_instance_against_schema,
     )
 except ImportError:
     from codex_room_sync import EXPECTED_REVIEW_MODEL, verify_role
     from schema_utils import (
+        attach_kill_on_close_job,
+        close_job_handle,
         compute_tree_sha256,
         is_hex_sha40,
         is_strict_int,
         materialize_frozen_tree,
         resolve_git_toplevel,
+        terminate_process_tree,
         validate_instance_against_schema,
     )
 
@@ -551,45 +556,6 @@ def render_consolidated_markdown(report: dict[str, Any]) -> str:
     return "\n".join(lines).rstrip() + "\n"
 
 
-def _terminate_process_tree(proc: subprocess.Popen[str]) -> None:
-    """Best-effort cross-platform termination of a timed-out Codex process tree."""
-    if proc.poll() is not None:
-        return
-    try:
-        if os.name == "nt":
-            subprocess.run(
-                ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
-                capture_output=True,
-                check=False,
-                timeout=10,
-            )
-        else:
-            try:
-                os.killpg(proc.pid, signal.SIGTERM)
-            except ProcessLookupError:
-                return
-            except OSError:
-                proc.terminate()
-            try:
-                proc.wait(timeout=3.0)
-            except subprocess.TimeoutExpired:
-                try:
-                    os.killpg(proc.pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
-                except OSError:
-                    proc.kill()
-    except OSError:
-        try:
-            proc.kill()
-        except OSError:
-            pass
-    try:
-        proc.wait(timeout=3.0)
-    except subprocess.TimeoutExpired:
-        pass
-
-
 def _run_subprocess_with_watchdog(
     cmd: list[str],
     *,
@@ -614,6 +580,7 @@ def _run_subprocess_with_watchdog(
         cwd=str(cwd) if cwd else None,
         start_new_session=(os.name != "nt"),
     )
+    job_handle = attach_kill_on_close_job(proc.pid)
 
     stdout_lines: list[str] = []
     stderr_lines: list[str] = []
@@ -664,32 +631,37 @@ def _run_subprocess_with_watchdog(
     stderr_thread.start()
 
     termination_reason: str | None = None
-    while proc.poll() is None:
-        now = time.monotonic()
-        with activity_lock:
-            idle_elapsed = now - last_activity
-        total_elapsed = now - started_at
+    try:
+        while proc.poll() is None or stdout_thread.is_alive() or stderr_thread.is_alive():
+            now = time.monotonic()
+            with activity_lock:
+                idle_elapsed = now - last_activity
+            total_elapsed = now - started_at
 
-        if idle_timeout_sec > 0 and idle_elapsed >= idle_timeout_sec:
-            termination_reason = (
-                f"[codex_room_review] pass={pass_name} terminated: "
-                f"idle_timeout={idle_timeout_sec:.1f}s (total={total_elapsed:.1f}s)\n"
-            )
-            _terminate_process_tree(proc)
-            break
-        if timeout_sec > 0 and total_elapsed >= timeout_sec:
-            termination_reason = (
-                f"[codex_room_review] pass={pass_name} terminated: "
-                f"total_timeout={timeout_sec:.1f}s (idle={idle_elapsed:.1f}s)\n"
-            )
-            _terminate_process_tree(proc)
-            break
-        time.sleep(0.05)
+            if idle_timeout_sec > 0 and idle_elapsed >= idle_timeout_sec:
+                termination_reason = (
+                    f"[codex_room_review] pass={pass_name} terminated: "
+                    f"idle_timeout={idle_timeout_sec:.1f}s (total={total_elapsed:.1f}s)\n"
+                )
+                terminate_process_tree(proc, job_handle=job_handle)
+                job_handle = None
+                break
+            if timeout_sec > 0 and total_elapsed >= timeout_sec:
+                termination_reason = (
+                    f"[codex_room_review] pass={pass_name} terminated: "
+                    f"total_timeout={timeout_sec:.1f}s (idle={idle_elapsed:.1f}s)\n"
+                )
+                terminate_process_tree(proc, job_handle=job_handle)
+                job_handle = None
+                break
+            time.sleep(0.05)
 
-    if writer_thread is not None:
-        writer_thread.join(timeout=2.0)
-    stdout_thread.join(timeout=2.0)
-    stderr_thread.join(timeout=2.0)
+        if writer_thread is not None:
+            writer_thread.join(timeout=2.0)
+        stdout_thread.join(timeout=2.0)
+        stderr_thread.join(timeout=2.0)
+    finally:
+        close_job_handle(job_handle)
 
     if termination_reason:
         stderr_lines.append(termination_reason)
@@ -967,22 +939,46 @@ def main(argv: list[str] | None = None) -> int:
     git_top = Path(info["git_top"])
     candidate_sha = info["candidate_sha"]
     if args.out_dir is not None:
-        out_dir = args.out_dir
+        out_dir = args.out_dir.resolve()
     else:
-        attempt_id = args.attempt_id or datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-        out_dir = git_top / "harness" / "runs" / args.task_id / "attempts" / f"{attempt_id}-{candidate_sha[:12]}"
+        attempt_id = args.attempt_id or f"{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S.%fZ')}-{os.getpid()}"
+        out_dir = (
+            git_top / "harness" / "runs" / args.task_id / "attempts" / f"{attempt_id}-{candidate_sha[:12]}"
+        ).resolve()
 
-    if (out_dir / "consolidated-review.json").exists() or (
-        args.dry_run
-        and any((out_dir / marker).exists() for marker in ("pass1.prompt.md", "pass2.prompt.md", "frozen"))
+    if any(
+        (out_dir / marker).exists()
+        for marker in (".review-attempt.lock", "consolidated-review.json", "pass1.prompt.md", "pass2.prompt.md", "frozen")
     ):
         print(
-            f"[codex_room_review] Write-once refusal: {out_dir} already contains review artifacts.",
+            f"[codex_room_review] Write-once refusal: {out_dir} already contains review artifacts or attempt lock.",
             file=sys.stderr,
         )
         return 2
 
     out_dir.mkdir(parents=True, exist_ok=True)
+    lock_path = out_dir / ".review-attempt.lock"
+    try:
+        with lock_path.open("x", encoding="utf-8") as lock_fh:
+            lock_fh.write(
+                json.dumps(
+                    {
+                        "pid": os.getpid(),
+                        "candidate_sha": candidate_sha,
+                        "task_id": args.task_id,
+                        "dry_run": bool(args.dry_run),
+                        "created_at_utc": datetime.now(timezone.utc).isoformat(),
+                    },
+                    indent=2,
+                )
+                + "\n"
+            )
+    except FileExistsError:
+        print(
+            f"[codex_room_review] Write-once refusal: concurrent or duplicate attempt lock exists at {lock_path}.",
+            file=sys.stderr,
+        )
+        return 2
 
     if args.consolidate_only:
         p1_path, p2_path = args.consolidate_only
