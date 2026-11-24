@@ -238,6 +238,41 @@ def _isolated_python_env(live_root: Path, target_root: Path) -> dict[str, str]:
     return env
 
 
+def _attach_dir_link(link_path: Path, target_path: Path) -> bool:
+    """Attach a temporary directory junction (Windows) or symlink (POSIX) if absent."""
+    if link_path.exists() or link_path.is_symlink() or not target_path.is_dir():
+        return False
+    link_path.parent.mkdir(parents=True, exist_ok=True)
+    if os.name == "nt":
+        proc = subprocess.run(
+            ["cmd", "/c", "mklink", "/J", str(link_path), str(target_path.resolve())],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if proc.returncode != 0:
+            raise RuntimeError(
+                f"Failed to create directory junction '{link_path}' -> '{target_path}': "
+                f"{(proc.stderr or proc.stdout).strip()}"
+            )
+    else:
+        os.symlink(str(target_path.resolve()), str(link_path), target_is_directory=True)
+    return True
+
+
+def _detach_dir_link(link_path: Path) -> None:
+    """Detach only the junction/symlink itself without mutating or deleting target contents."""
+    try:
+        if link_path.is_symlink():
+            link_path.unlink(missing_ok=True)
+        elif os.name == "nt" and link_path.exists():
+            os.rmdir(link_path)
+        elif link_path.exists():
+            link_path.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
 def _remaining_budget(deadline: float | None, default: float = 60.0) -> float:
     if deadline is None:
         return default
@@ -378,6 +413,7 @@ def run_verifier(
     source_mode = "worktree"
     frozen_tree_sha256: str | None = None
     isolated_env: dict[str, str] | None = None
+    attached_links: list[Path] = []
 
     try:
         if commit_sha is not None:
@@ -568,6 +604,16 @@ def run_verifier(
         frontend_dir = target_root / "frontend"
         pkg_json = frontend_dir / "package.json"
         if pkg_json.is_file():
+            if target_root != root:
+                live_node_modules = root / "frontend" / "node_modules"
+                frozen_node_modules = frontend_dir / "node_modules"
+                if _attach_dir_link(frozen_node_modules, live_node_modules):
+                    attached_links.append(frozen_node_modules)
+                live_lwc = root.parent / "lightweight-charts"
+                frozen_lwc = target_root.parent / "lightweight-charts"
+                if _attach_dir_link(frozen_lwc, live_lwc):
+                    attached_links.append(frozen_lwc)
+
             pnpm_cmd = _resolve_tool("pnpm")
             pkg_data = json.loads(pkg_json.read_text(encoding="utf-8"))
             scripts = pkg_data.get("scripts", {})
@@ -576,6 +622,7 @@ def run_verifier(
                     "frontend_typecheck",
                     [*pnpm_cmd, "--dir", str(frontend_dir), "typecheck"],
                     cwd=target_root,
+                    check_pytest=False,
                     step_timeout_sec=step_timeout_sec,
                     deadline=deadline,
                     env=isolated_env,
@@ -586,6 +633,7 @@ def run_verifier(
                     "frontend_build",
                     [*pnpm_cmd, "--dir", str(frontend_dir), "build"],
                     cwd=target_root,
+                    check_pytest=False,
                     step_timeout_sec=step_timeout_sec,
                     deadline=deadline,
                     env=isolated_env,
@@ -598,6 +646,7 @@ def run_verifier(
                             f"frontend_{optional_script}",
                             [*pnpm_cmd, "--dir", str(frontend_dir), optional_script],
                             cwd=target_root,
+                            check_pytest=False,
                             step_timeout_sec=step_timeout_sec,
                             deadline=deadline,
                             env=isolated_env,
@@ -618,6 +667,8 @@ def run_verifier(
                 }
             )
     finally:
+        for link_path in reversed(attached_links):
+            _detach_dir_link(link_path)
         if temp_holder is not None:
             cleanup_readonly_tree(Path(temp_holder.name))
 

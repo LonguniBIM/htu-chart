@@ -15,7 +15,7 @@ from fastapi import FastAPI, Request, status
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
-from app.api import routes_alerts, routes_market, routes_status
+from app.api import routes_alerts, routes_layout, routes_market, routes_status
 from app.config import Settings, load_settings
 from app.engine.alert_engine import AlertEngine
 from app.engine.bar_aggregator import BarAggregator
@@ -265,6 +265,7 @@ def create_app(
 
     application.include_router(routes_status.router)
     application.include_router(routes_alerts.router)
+    application.include_router(routes_layout.router)
     application.include_router(routes_market.router)
     application.include_router(routes_market.ws_router)
     return application

@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import sqlite3
 import threading
-from collections.abc import Collection, Sequence
+import uuid
+from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -22,6 +24,47 @@ _MAX_RAW_PAYLOAD_CHARS = 2048
 _MAX_ALERT_ERROR_CHARS = 512
 _SQLITE_INT64_MIN = -(2**63)
 _SQLITE_INT64_MAX = 2**63 - 1
+_LAYOUT_ID_RE = re.compile(r"^[A-Za-z0-9._-]{1,80}$")
+DEFAULT_LAYOUT_ID = "layout-4-future"
+DEFAULT_LAYOUT_NAME = "4 Future"
+DEFAULT_LAYOUT_TEMPLATE_ID = "4-grid-2x2"
+DEFAULT_LAYOUT_PANES: tuple[dict[str, Any], ...] = (
+    {
+        "pane_id": "pane-1",
+        "root_symbol": "MES",
+        "timeframe": "5m",
+        "live_mode": False,
+        "playback_mode": "live",
+    },
+    {
+        "pane_id": "pane-2",
+        "root_symbol": "MNQ",
+        "timeframe": "5m",
+        "live_mode": False,
+        "playback_mode": "live",
+    },
+    {
+        "pane_id": "pane-3",
+        "root_symbol": "MYM",
+        "timeframe": "5m",
+        "live_mode": False,
+        "playback_mode": "live",
+    },
+    {
+        "pane_id": "pane-4",
+        "root_symbol": "MGC",
+        "timeframe": "5m",
+        "live_mode": False,
+        "playback_mode": "live",
+    },
+)
+DEFAULT_LAYOUT_SYNC_CONFIG: dict[str, bool] = {
+    "symbol": False,
+    "interval": True,
+    "crosshair": True,
+    "time": False,
+    "dateRange": False,
+}
 
 
 def _clamp_sqlite_int64(value: int | None) -> int | None:
@@ -118,6 +161,20 @@ class EnqueueAlertResult:
 
     inserted: bool
     record: AlertOutboxRecord
+
+
+@dataclass(frozen=True)
+class LayoutRecord:
+    """Persisted named multi-pane layout configuration."""
+
+    id: str
+    name: str
+    template_id: str
+    panes: list[dict[str, Any]]
+    sync_config: dict[str, bool]
+    is_default: bool
+    created_at_utc: int
+    updated_at_utc: int
 
 
 def _subtract_interval(
@@ -282,6 +339,20 @@ class SqliteStore:
 
             CREATE INDEX IF NOT EXISTS idx_alert_outbox_status_next
                 ON alert_outbox (status, next_attempt_at_utc, id);
+
+            CREATE TABLE IF NOT EXISTS layouts (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                template_id TEXT NOT NULL,
+                panes_json TEXT NOT NULL,
+                sync_config_json TEXT NOT NULL,
+                is_default INTEGER NOT NULL DEFAULT 0,
+                created_at_utc INTEGER NOT NULL,
+                updated_at_utc INTEGER NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_layouts_default_created
+                ON layouts (is_default DESC, created_at_utc ASC, id ASC);
             """
         )
         conn.commit()
@@ -1562,3 +1633,367 @@ class SqliteStore:
     async def get_outbox_summary(self) -> dict[str, int]:
         """Return aggregate alert_outbox row counts by status."""
         return await asyncio.to_thread(self._get_outbox_summary_sync)
+
+    _LAYOUT_SELECT = """
+        SELECT id, name, template_id, panes_json, sync_config_json,
+               is_default, created_at_utc, updated_at_utc
+        FROM layouts
+    """
+
+    @staticmethod
+    def _validate_layout_id(layout_id: str) -> str:
+        if not isinstance(layout_id, str):
+            raise ValueError("layout_id must be a string")
+        cleaned = layout_id.strip()
+        if not cleaned or cleaned in {".", ".."} or ".." in cleaned:
+            raise ValueError(f"Invalid layout_id: {layout_id!r}")
+        if not _LAYOUT_ID_RE.fullmatch(cleaned):
+            raise ValueError(f"Invalid layout_id characters/length: {layout_id!r}")
+        return cleaned
+
+    @staticmethod
+    def _row_to_layout_record(row: sqlite3.Row) -> LayoutRecord:
+        raw_panes = json.loads(str(row["panes_json"]))
+        raw_sync = json.loads(str(row["sync_config_json"]))
+        return LayoutRecord(
+            id=str(row["id"]),
+            name=str(row["name"]),
+            template_id=str(row["template_id"]),
+            panes=[dict(p) for p in raw_panes],
+            sync_config={str(k): bool(v) for k, v in raw_sync.items()},
+            is_default=bool(row["is_default"]),
+            created_at_utc=int(row["created_at_utc"]),
+            updated_at_utc=int(row["updated_at_utc"]),
+        )
+
+    @staticmethod
+    def _begin_tx(conn: sqlite3.Connection) -> None:
+        if not conn.in_transaction:
+            conn.execute("BEGIN")
+
+    def _ensure_default_layout_sync(self) -> LayoutRecord:
+        now_ts = self._now_utc()
+        with self._lock:
+            conn = self._ensure_conn_locked()
+            try:
+                self._begin_tx(conn)
+                row = conn.execute(
+                    f"""
+                    {self._LAYOUT_SELECT}
+                    ORDER BY is_default DESC, created_at_utc ASC, id ASC
+                    LIMIT 1
+                    """
+                ).fetchone()
+                if row is None:
+                    panes_json = json.dumps([dict(p) for p in DEFAULT_LAYOUT_PANES])
+                    sync_json = json.dumps(dict(DEFAULT_LAYOUT_SYNC_CONFIG))
+                    conn.execute(
+                        """
+                        INSERT INTO layouts (
+                            id, name, template_id, panes_json, sync_config_json,
+                            is_default, created_at_utc, updated_at_utc
+                        ) VALUES (?, ?, ?, ?, ?, 1, ?, ?)
+                        """,
+                        (
+                            DEFAULT_LAYOUT_ID,
+                            DEFAULT_LAYOUT_NAME,
+                            DEFAULT_LAYOUT_TEMPLATE_ID,
+                            panes_json,
+                            sync_json,
+                            now_ts,
+                            now_ts,
+                        ),
+                    )
+                    row = conn.execute(
+                        f"{self._LAYOUT_SELECT} WHERE id = ?",
+                        (DEFAULT_LAYOUT_ID,),
+                    ).fetchone()
+                elif not bool(row["is_default"]):
+                    conn.execute(
+                        "UPDATE layouts SET is_default = 1, updated_at_utc = ? WHERE id = ?",
+                        (now_ts, str(row["id"])),
+                    )
+                    row = conn.execute(
+                        f"{self._LAYOUT_SELECT} WHERE id = ?",
+                        (str(row["id"]),),
+                    ).fetchone()
+                conn.commit()
+            except BaseException:
+                if conn.in_transaction:
+                    conn.rollback()
+                raise
+            if row is None:
+                raise RuntimeError("Failed to read default layout after seeding")
+            return self._row_to_layout_record(row)
+
+    async def ensure_default_layout(self) -> LayoutRecord:
+        """Idempotently seed the default '4 Future' layout when layouts table is empty."""
+        return await asyncio.to_thread(self._ensure_default_layout_sync)
+
+    def _list_layouts_sync(self) -> list[LayoutRecord]:
+        with self._lock:
+            conn = self._ensure_conn_locked()
+            rows = conn.execute(
+                f"""
+                {self._LAYOUT_SELECT}
+                ORDER BY is_default DESC, created_at_utc ASC, id ASC
+                """
+            ).fetchall()
+            return [self._row_to_layout_record(row) for row in rows]
+
+    async def list_layouts(self) -> list[LayoutRecord]:
+        """Return all layouts ordered by is_default DESC, created_at_utc ASC, id ASC."""
+        return await asyncio.to_thread(self._list_layouts_sync)
+
+    def _get_layout_sync(self, layout_id: str) -> LayoutRecord | None:
+        if not isinstance(layout_id, str) or not layout_id.strip():
+            return None
+        clean_id = layout_id.strip()
+        with self._lock:
+            conn = self._ensure_conn_locked()
+            row = conn.execute(
+                f"{self._LAYOUT_SELECT} WHERE id = ?",
+                (clean_id,),
+            ).fetchone()
+            return self._row_to_layout_record(row) if row is not None else None
+
+    async def get_layout(self, layout_id: str) -> LayoutRecord | None:
+        """Fetch a single layout by ID, or None if absent."""
+        return await asyncio.to_thread(self._get_layout_sync, layout_id)
+
+    def _create_layout_sync(
+        self,
+        *,
+        name: str,
+        template_id: str,
+        panes: Sequence[Mapping[str, Any]],
+        sync_config: Mapping[str, bool],
+        is_default: bool = False,
+        layout_id: str | None = None,
+    ) -> LayoutRecord:
+        clean_name = _validate_non_empty_str(name, "name")
+        clean_template = _validate_non_empty_str(template_id, "template_id")
+        clean_id = (
+            self._validate_layout_id(layout_id)
+            if layout_id is not None
+            else uuid.uuid4().hex
+        )
+        panes_json = json.dumps([dict(p) for p in panes])
+        sync_json = json.dumps({str(k): bool(v) for k, v in sync_config.items()})
+        now_ts = self._now_utc()
+
+        with self._lock:
+            conn = self._ensure_conn_locked()
+            try:
+                self._begin_tx(conn)
+                existing = conn.execute(
+                    "SELECT 1 FROM layouts WHERE id = ?",
+                    (clean_id,),
+                ).fetchone()
+                if existing is not None:
+                    raise ValueError(f"Layout id {clean_id!r} already exists")
+                if is_default:
+                    conn.execute("UPDATE layouts SET is_default = 0 WHERE is_default != 0")
+                conn.execute(
+                    """
+                    INSERT INTO layouts (
+                        id, name, template_id, panes_json, sync_config_json,
+                        is_default, created_at_utc, updated_at_utc
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        clean_id,
+                        clean_name,
+                        clean_template,
+                        panes_json,
+                        sync_json,
+                        int(bool(is_default)),
+                        now_ts,
+                        now_ts,
+                    ),
+                )
+                row = conn.execute(
+                    f"{self._LAYOUT_SELECT} WHERE id = ?",
+                    (clean_id,),
+                ).fetchone()
+                conn.commit()
+            except BaseException:
+                if conn.in_transaction:
+                    conn.rollback()
+                raise
+            if row is None:
+                raise RuntimeError("Failed to read created layout")
+            return self._row_to_layout_record(row)
+
+    async def create_layout(
+        self,
+        *,
+        name: str,
+        template_id: str,
+        panes: Sequence[Mapping[str, Any]],
+        sync_config: Mapping[str, bool],
+        is_default: bool = False,
+        layout_id: str | None = None,
+    ) -> LayoutRecord:
+        """Create and persist a named layout atomically inside a SQLite transaction."""
+        return await asyncio.to_thread(
+            self._create_layout_sync,
+            name=name,
+            template_id=template_id,
+            panes=panes,
+            sync_config=sync_config,
+            is_default=is_default,
+            layout_id=layout_id,
+        )
+
+    def _update_layout_sync(
+        self,
+        layout_id: str,
+        *,
+        name: str,
+        template_id: str,
+        panes: Sequence[Mapping[str, Any]],
+        sync_config: Mapping[str, bool],
+        is_default: bool | None = None,
+    ) -> LayoutRecord | None:
+        if not isinstance(layout_id, str) or not layout_id.strip():
+            return None
+        clean_id = layout_id.strip()
+        clean_name = _validate_non_empty_str(name, "name")
+        clean_template = _validate_non_empty_str(template_id, "template_id")
+        panes_json = json.dumps([dict(p) for p in panes])
+        sync_json = json.dumps({str(k): bool(v) for k, v in sync_config.items()})
+        now_ts = self._now_utc()
+
+        with self._lock:
+            conn = self._ensure_conn_locked()
+            try:
+                self._begin_tx(conn)
+                existing = conn.execute(
+                    "SELECT is_default FROM layouts WHERE id = ?",
+                    (clean_id,),
+                ).fetchone()
+                if existing is None:
+                    conn.rollback()
+                    return None
+                target_default = (
+                    bool(existing["is_default"]) if is_default is None else bool(is_default)
+                )
+                if target_default:
+                    conn.execute(
+                        "UPDATE layouts SET is_default = 0 WHERE id != ? AND is_default != 0",
+                        (clean_id,),
+                    )
+                conn.execute(
+                    """
+                    UPDATE layouts
+                    SET name = ?,
+                        template_id = ?,
+                        panes_json = ?,
+                        sync_config_json = ?,
+                        is_default = ?,
+                        updated_at_utc = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        clean_name,
+                        clean_template,
+                        panes_json,
+                        sync_json,
+                        int(target_default),
+                        now_ts,
+                        clean_id,
+                    ),
+                )
+                if not target_default and bool(existing["is_default"]):
+                    oldest_other = conn.execute(
+                        """
+                        SELECT id FROM layouts
+                        WHERE id != ?
+                        ORDER BY created_at_utc ASC, id ASC
+                        LIMIT 1
+                        """,
+                        (clean_id,),
+                    ).fetchone()
+                    if oldest_other is not None:
+                        conn.execute(
+                            "UPDATE layouts SET is_default = 1, updated_at_utc = ? WHERE id = ?",
+                            (now_ts, str(oldest_other["id"])),
+                        )
+                row = conn.execute(
+                    f"{self._LAYOUT_SELECT} WHERE id = ?",
+                    (clean_id,),
+                ).fetchone()
+                conn.commit()
+            except BaseException:
+                if conn.in_transaction:
+                    conn.rollback()
+                raise
+            return self._row_to_layout_record(row) if row is not None else None
+
+    async def update_layout(
+        self,
+        layout_id: str,
+        *,
+        name: str,
+        template_id: str,
+        panes: Sequence[Mapping[str, Any]],
+        sync_config: Mapping[str, bool],
+        is_default: bool | None = None,
+    ) -> LayoutRecord | None:
+        """Update an existing named layout atomically, or return None if absent."""
+        return await asyncio.to_thread(
+            self._update_layout_sync,
+            layout_id,
+            name=name,
+            template_id=template_id,
+            panes=panes,
+            sync_config=sync_config,
+            is_default=is_default,
+        )
+
+    def _delete_layout_sync(self, layout_id: str) -> bool:
+        if not isinstance(layout_id, str) or not layout_id.strip():
+            return False
+        clean_id = layout_id.strip()
+        now_ts = self._now_utc()
+        with self._lock:
+            conn = self._ensure_conn_locked()
+            try:
+                self._begin_tx(conn)
+                existing = conn.execute(
+                    "SELECT id, is_default FROM layouts WHERE id = ?",
+                    (clean_id,),
+                ).fetchone()
+                if existing is None:
+                    conn.rollback()
+                    return False
+                count_row = conn.execute("SELECT COUNT(*) AS cnt FROM layouts").fetchone()
+                total_count = int(count_row["cnt"]) if count_row is not None else 0
+                if total_count <= 1:
+                    raise ValueError("Cannot delete the last remaining layout")
+                was_default = bool(existing["is_default"])
+                conn.execute("DELETE FROM layouts WHERE id = ?", (clean_id,))
+                if was_default:
+                    oldest_row = conn.execute(
+                        """
+                        SELECT id FROM layouts
+                        ORDER BY created_at_utc ASC, id ASC
+                        LIMIT 1
+                        """
+                    ).fetchone()
+                    if oldest_row is not None:
+                        conn.execute(
+                            "UPDATE layouts SET is_default = 1, updated_at_utc = ? WHERE id = ?",
+                            (now_ts, str(oldest_row["id"])),
+                        )
+                conn.commit()
+            except BaseException:
+                if conn.in_transaction:
+                    conn.rollback()
+                raise
+            return True
+
+    async def delete_layout(self, layout_id: str) -> bool:
+        """Delete a layout, promoting oldest remaining if default; guard last layout."""
+        return await asyncio.to_thread(self._delete_layout_sync, layout_id)
