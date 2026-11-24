@@ -853,3 +853,73 @@ def test_materialize_frozen_tree_from_gitignored_nested_subdir_and_codex_skip_gi
     captured = json.loads(args_capture.read_text(encoding="utf-8"))
     assert "--skip-git-repo-check" in captured
     assert captured[captured.index("-C") + 1] == str(dest)
+
+
+def test_dry_run_refuses_completed_out_dir_without_mutating_existing_files(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """P1-03 & S2-002: --dry-run must refuse overwrite and leave existing artifacts untouched."""
+    out_dir = tmp_path / "completed_run"
+    out_dir.mkdir()
+    report_path = out_dir / "consolidated-review.json"
+    prompt_path = out_dir / "pass1.prompt.md"
+    report_path.write_text('{"review_gate_status": "PASSED"}\n', encoding="utf-8")
+    prompt_path.write_text("original prompt\n", encoding="utf-8")
+    report_bytes = report_path.read_bytes()
+    prompt_bytes = prompt_path.read_bytes()
+
+    rc = codex_room_review.main(
+        ["--commit", "HEAD", "--out-dir", str(out_dir), "--dry-run"]
+    )
+    assert rc == 2
+    assert report_path.read_bytes() == report_bytes
+    assert prompt_path.read_bytes() == prompt_bytes
+
+
+def test_primary_reviewer_model_lock_blocks_unapproved_model_override(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """P1-01 & S2-001: apply_safety_locks and codex backend must lock primary model to gpt-6.1-sol."""
+    from harness.scripts.codex_room_sync import apply_safety_locks
+
+    with pytest.raises(ValueError, match="gpt-6.1-sol"):
+        apply_safety_locks({}, model_override="gemini-3.8-flash")
+
+    monkeypatch.setattr(codex_room_review, "verify_role", lambda role, root: {"ok": True, "errors": []})
+    out_dir = tmp_path / "wrong_model_out"
+    rc = codex_room_review.main(
+        ["--commit", "HEAD", "--out-dir", str(out_dir), "--backend", "codex", "--model", "other-model"]
+    )
+    assert rc == 2
+    report = json.loads((out_dir / "consolidated-review.json").read_text(encoding="utf-8"))
+    assert report["review_gate_status"] == "BLOCKED"
+    assert any("gpt-6.1-sol" in err for err in report["errors"])
+
+
+def test_consolidate_short_circuits_schema_invalid_duplicate() -> None:
+    """P1-06: Schema errors must short-circuit before finding dedup so malformed field types never TypeError."""
+    sha = "a" * 40
+    bad_f1 = _sample_finding("P1-1", "high", "Dup title")
+    bad_f1["evidence"] = 123
+    bad_f2 = _sample_finding("P2-1", "high", "Dup title")
+    bad_f2["evidence"] = "valid"
+    res_bad = consolidate_reviews(
+        _sample_pass(sha, "correctness_and_tests", "CHANGES_REQUESTED", [bad_f1]),
+        _sample_pass(sha, "security_and_invariants", "CHANGES_REQUESTED", [bad_f2]),
+        expected_sha=sha,
+    )
+    assert res_bad["review_gate_status"] == "BLOCKED"
+    assert res_bad["consolidated_findings"] == []
+    assert res_bad["errors"]
+
+
+def test_consolidate_blocks_contradictory_changes_requested_without_blocking_findings() -> None:
+    """S2-003: CHANGES_REQUESTED verdict with 0 blocking findings must block instead of passing."""
+    sha = "a" * 40
+    res_contradictory = consolidate_reviews(
+        _sample_pass(sha, "correctness_and_tests", "CHANGES_REQUESTED", []),
+        _sample_pass(sha, "security_and_invariants", "APPROVE", []),
+        expected_sha=sha,
+    )
+    assert res_contradictory["review_gate_status"] == "BLOCKED"
+    assert any("CHANGES_REQUESTED" in e for e in res_contradictory["errors"])

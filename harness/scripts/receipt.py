@@ -11,6 +11,7 @@ import argparse
 import hashlib
 import json
 import re
+import shlex
 import subprocess
 import sys
 from datetime import datetime, timezone
@@ -18,9 +19,9 @@ from pathlib import Path
 from typing import Any
 
 try:
-    from harness.scripts.schema_utils import is_hex_sha40, is_strict_bool, is_strict_int
+    from harness.scripts.schema_utils import is_hex_sha40, is_strict_bool, is_strict_int, resolve_git_toplevel
 except ImportError:
-    from schema_utils import is_hex_sha40, is_strict_bool, is_strict_int
+    from schema_utils import is_hex_sha40, is_strict_bool, is_strict_int, resolve_git_toplevel
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
@@ -46,12 +47,59 @@ def _sha256_file(path: Path | None) -> str | None:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def _strip_quotes(tok: str) -> str:
+    if len(tok) >= 2 and ((tok[0] == '"' and tok[-1] == '"') or (tok[0] == "'" and tok[-1] == "'")):
+        return tok[1:-1]
+    return tok
+
+
 def _extract_test_target(command_text: str) -> str:
-    tokens = command_text.strip().split()
-    targets = [tok for tok in tokens if ("test_" in tok or "/tests" in tok or "\\tests" in tok or ".py" in tok)]
-    if targets:
-        return " ".join(tok.replace("\\", "/") for tok in targets)
-    return " ".join(tokens)
+    try:
+        raw_tokens = shlex.split(command_text.strip(), posix=False)
+    except ValueError:
+        raw_tokens = command_text.strip().split()
+    tokens = [_strip_quotes(t) for t in raw_tokens if t.strip()]
+
+    idx = 0
+    while idx < len(tokens) and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=.*", tokens[idx]):
+        idx += 1
+
+    if idx < len(tokens) and Path(tokens[idx]).name.lower() in {"uv", "uv.exe"}:
+        idx += 1
+        if idx < len(tokens) and tokens[idx] == "run":
+            idx += 1
+        while idx < len(tokens) and tokens[idx] in {"--directory", "-C"}:
+            idx += 2
+        if idx < len(tokens) and tokens[idx].startswith("--directory="):
+            idx += 1
+
+    if idx < len(tokens) and Path(tokens[idx]).name.lower() in {"python", "python3", "python.exe", "py", "py.exe"}:
+        idx += 1
+        if idx + 1 < len(tokens) and tokens[idx] == "-m":
+            idx += 1
+
+    if idx < len(tokens) and Path(tokens[idx]).name.lower() in {"pytest", "pytest.exe"}:
+        idx += 1
+
+    kept: list[str] = []
+    verbosity_flags = {"-q", "--quiet", "-v", "-vv", "-vvv", "--verbose", "-s", "--no-header", "-ra", "-rx", "-rA"}
+    while idx < len(tokens):
+        tok = tokens[idx]
+        if tok in verbosity_flags or tok.startswith(("--tb=", "--capture=", "--color=")):
+            idx += 1
+            continue
+        if tok in {"--tb", "--capture", "--color"}:
+            idx += 2
+            continue
+        if tok in {"-k", "-m"} and idx + 1 < len(tokens):
+            kept.append(tok)
+            kept.append(tokens[idx + 1])
+            idx += 2
+            continue
+        kept.append(tok.replace("\\", "/"))
+        idx += 1
+
+    return " ".join(kept) if kept else " ".join(tokens)
 
 
 def _validate_red_proof(
@@ -84,7 +132,9 @@ def _validate_red_proof(
         return False, f"BLOCKED — missing or invalid green_sha ({green_sha!r})."
     if green_sha != candidate_sha:
         return False, f"BLOCKED — GREEN test ran on mismatched SHA ({green_sha} != {candidate_sha})."
-    if not is_strict_int(green_exit) or green_exit != 0:
+    if not is_strict_int(green_exit):
+        return False, f"BLOCKED — green_exit_code must be an integer, got {green_exit!r}."
+    if green_exit != 0:
         return False, f"FAILED — regression test failed after fix (green_exit_code={green_exit})."
 
     if "red_test_command" in red_proof or "green_test_command" in red_proof:
@@ -126,23 +176,60 @@ def _verify_evidence_ref(evidence_ref: str, candidate_sha: str, repo_root: Path)
     if raw_path.startswith("/") or ".." in rel_parts or ":" in raw_path:
         return False, f"unsafe evidence_ref path {raw_path!r}"
 
-    cat = subprocess.run(
-        ["git", "-C", str(repo_root), "cat-file", "-e", f"{candidate_sha}^{{commit}}"],
-        capture_output=True,
-        check=False,
-    )
-    if cat.returncode == 0:
-        blob = subprocess.run(
-            ["git", "-C", str(repo_root), "show", f"{candidate_sha}:{raw_path}"],
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            check=False,
-        )
-        if blob.returncode != 0:
-            return False, f"evidence_ref file {raw_path!r} does not exist at commit {candidate_sha[:12]}"
-        total_lines = len(blob.stdout.splitlines())
+    git_top: Path | None = None
+    try:
+        git_top = resolve_git_toplevel(repo_root, timeout_sec=60.0)
+    except ValueError:
+        git_top = None
+    except TimeoutError as exc:
+        return False, str(exc)
+
+    if git_top is not None:
+        try:
+            cat = subprocess.run(
+                ["git", "-C", str(git_top), "cat-file", "-e", f"{candidate_sha}^{{commit}}"],
+                capture_output=True,
+                check=False,
+                timeout=60.0,
+            )
+        except subprocess.TimeoutExpired:
+            return False, f"git timed out checking commit {candidate_sha[:12]}"
+        if cat.returncode == 0:
+            try:
+                obj_type = subprocess.run(
+                    ["git", "-C", str(git_top), "cat-file", "-t", f"{candidate_sha}:{raw_path}"],
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    check=False,
+                    timeout=60.0,
+                )
+            except subprocess.TimeoutExpired:
+                return False, f"git timed out checking object type for {raw_path!r}"
+            if obj_type.returncode != 0 or obj_type.stdout.strip() != "blob":
+                return False, f"evidence_ref {raw_path!r} does not point to a file blob at commit {candidate_sha[:12]}"
+            try:
+                blob = subprocess.run(
+                    ["git", "-C", str(git_top), "show", f"{candidate_sha}:{raw_path}"],
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    check=False,
+                    timeout=60.0,
+                )
+            except subprocess.TimeoutExpired:
+                return False, f"git timed out reading {raw_path!r} at commit {candidate_sha[:12]}"
+            if blob.returncode != 0:
+                return False, f"evidence_ref file {raw_path!r} does not exist at commit {candidate_sha[:12]}"
+            total_lines = len(blob.stdout.splitlines())
+        else:
+            resolved_root = repo_root.resolve()
+            target = (resolved_root / raw_path).resolve()
+            if not target.is_relative_to(resolved_root) or not target.is_file():
+                return False, f"evidence_ref file {raw_path!r} does not exist"
+            total_lines = len(target.read_text(encoding="utf-8", errors="replace").splitlines())
     else:
         resolved_root = repo_root.resolve()
         target = (resolved_root / raw_path).resolve()
@@ -409,7 +496,8 @@ def evaluate_receipt(
     else:
         conclusion = "VERIFIED"
 
-    verifier_steps = verifier_data.get("steps", []) if isinstance(verifier_data, dict) else []
+    raw_steps = verifier_data.get("steps") if isinstance(verifier_data, dict) else None
+    verifier_steps = raw_steps if isinstance(raw_steps, list) else []
     commands_summary = [
         f"`{' '.join(s.get('command', []))}` -> {s.get('status')} (exit={s.get('exit_code')})"
         for s in verifier_steps

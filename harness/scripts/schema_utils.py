@@ -16,6 +16,7 @@ import stat
 import subprocess
 import sys
 import tarfile
+import time
 from pathlib import Path
 from typing import Any
 
@@ -139,15 +140,28 @@ def compute_tree_sha256(root_dir: Path) -> tuple[str, int]:
     return tree_hasher.hexdigest(), len(files)
 
 
-def resolve_git_toplevel(repo_root: Path) -> Path:
+def _run_git(
+    cmd: list[str],
+    *,
+    timeout_sec: float = 60.0,
+    binary: bool = False,
+) -> subprocess.CompletedProcess[Any]:
+    try:
+        return subprocess.run(
+            cmd,
+            capture_output=True,
+            text=not binary,
+            check=False,
+            timeout=timeout_sec if timeout_sec > 0 else None,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise TimeoutError(f"Git command timed out after {timeout_sec:.1f}s: {' '.join(cmd)}") from exc
+
+
+def resolve_git_toplevel(repo_root: Path, *, timeout_sec: float = 60.0) -> Path:
     """Resolve the git repository root even when ``repo_root`` is a nested/gitignored subdir."""
     resolved = repo_root.resolve()
-    top = subprocess.run(
-        ["git", "-C", str(resolved), "rev-parse", "--show-toplevel"],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
+    top = _run_git(["git", "-C", str(resolved), "rev-parse", "--show-toplevel"], timeout_sec=timeout_sec)
     if top.returncode != 0 or not top.stdout.strip():
         raise ValueError(f"Cannot resolve git repository root from '{resolved}': {top.stderr.strip()}")
     return Path(top.stdout.strip()).resolve()
@@ -158,17 +172,24 @@ def materialize_frozen_tree(
     candidate_sha: str,
     dest_dir: Path,
     base_sha: str | None = None,
+    *,
+    timeout_sec: float = 60.0,
 ) -> dict[str, Any]:
     """Extract an immutable ``git archive`` snapshot into ``dest_dir`` and mark files read-only."""
-    git_top = resolve_git_toplevel(repo_root)
+    deadline = (time.monotonic() + timeout_sec) if timeout_sec > 0 else None
+
+    def _rem() -> float:
+        if deadline is None:
+            return 60.0
+        rem = deadline - time.monotonic()
+        if rem <= 0:
+            raise TimeoutError(f"materialize_frozen_tree timed out after {timeout_sec:.1f}s")
+        return rem
+
+    git_top = resolve_git_toplevel(repo_root, timeout_sec=_rem())
     dest_dir = dest_dir.resolve()
 
-    rev = subprocess.run(
-        ["git", "-C", str(git_top), "rev-parse", "--verify", f"{candidate_sha}^{{commit}}"],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
+    rev = _run_git(["git", "-C", str(git_top), "rev-parse", "--verify", f"{candidate_sha}^{{commit}}"], timeout_sec=_rem())
     if rev.returncode != 0:
         raise ValueError(f"Cannot resolve commit '{candidate_sha}': {rev.stderr.strip()}")
     resolved_sha = rev.stdout.strip()
@@ -176,11 +197,7 @@ def materialize_frozen_tree(
     cleanup_readonly_tree(dest_dir)
     dest_dir.mkdir(parents=True, exist_ok=True)
 
-    arch = subprocess.run(
-        ["git", "-C", str(git_top), "archive", "--format=tar", resolved_sha],
-        capture_output=True,
-        check=False,
-    )
+    arch = _run_git(["git", "-C", str(git_top), "archive", "--format=tar", resolved_sha], timeout_sec=_rem(), binary=True)
     if arch.returncode != 0:
         err_msg = arch.stderr.decode("utf-8", errors="replace").strip()
         raise RuntimeError(f"git archive failed for {resolved_sha}: {err_msg}")
@@ -196,19 +213,17 @@ def materialize_frozen_tree(
     resolved_base: str | None = None
     patch_path: Path | None = None
     if base_sha and base_sha != "ROOT_COMMIT":
-        base_rev = subprocess.run(
+        base_rev = _run_git(
             ["git", "-C", str(git_top), "rev-parse", "--verify", f"{base_sha}^{{commit}}"],
-            capture_output=True,
-            text=True,
-            check=False,
+            timeout_sec=_rem(),
         )
         if base_rev.returncode != 0:
             raise ValueError(f"Cannot resolve base commit '{base_sha}': {base_rev.stderr.strip()}")
         resolved_base = base_rev.stdout.strip()
-        diff_proc = subprocess.run(
+        diff_proc = _run_git(
             ["git", "-C", str(git_top), "diff", "--binary", f"{resolved_base}..{resolved_sha}"],
-            capture_output=True,
-            check=False,
+            timeout_sec=_rem(),
+            binary=True,
         )
         if diff_proc.returncode != 0:
             err_msg = diff_proc.stderr.decode("utf-8", errors="replace").strip()

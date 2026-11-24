@@ -436,7 +436,11 @@ def test_receipt_blocks_invalid_red_proof_shas_and_boolean_exit_codes() -> None:
     )
     assert empty_green_sha["conclusion"] == "BLOCKED"
 
-    bool_exits = evaluate_receipt(
+def test_receipt_blocks_bool_red_exit_code_with_valid_green() -> None:
+    """NC-06: Boolean red_exit_code=True must be rejected even when green_exit_code=0."""
+    base = "1" * 40
+    cand = "2" * 40
+    res = evaluate_receipt(
         task_id="NC-06D",
         phase=1,
         base_sha=base,
@@ -449,10 +453,116 @@ def test_receipt_blocks_invalid_red_proof_shas_and_boolean_exit_codes() -> None:
             "red_exit_code": True,
             "red_failure_reason": "AssertionError: boom",
             "green_sha": cand,
+            "green_exit_code": 0,
+        },
+    )
+    assert res["conclusion"] == "BLOCKED"
+
+
+def test_receipt_blocks_bool_green_exit_code_with_valid_red() -> None:
+    """NC-06: Boolean green_exit_code=False must be rejected even when red_exit_code=1."""
+    base = "1" * 40
+    cand = "2" * 40
+    res = evaluate_receipt(
+        task_id="NC-06E",
+        phase=1,
+        base_sha=base,
+        candidate_sha=cand,
+        verifier_data=_verifier(cand),
+        review_data=_review(cand),
+        is_bugfix=True,
+        red_proof={
+            "red_sha": base,
+            "red_exit_code": 1,
+            "red_failure_reason": "AssertionError: boom",
+            "green_sha": cand,
             "green_exit_code": False,
         },
     )
-    assert bool_exits["conclusion"] == "BLOCKED"
+    assert res["conclusion"] == "BLOCKED"
+
+
+def test_receipt_blocks_mismatched_pytest_k_selector() -> None:
+    """P1-04: red_test_command and green_test_command differing only by -k selector must block."""
+    base = "1" * 40
+    cand = "2" * 40
+
+    k_mismatch = evaluate_receipt(
+        task_id="P1-04-K",
+        phase=1,
+        base_sha=base,
+        candidate_sha=cand,
+        verifier_data=_verifier(cand),
+        review_data=_review(cand),
+        is_bugfix=True,
+        red_proof={
+            "red_sha": base,
+            "red_exit_code": 1,
+            "red_failure_reason": "AssertionError: broken",
+            "green_sha": cand,
+            "green_exit_code": 0,
+            "red_test_command": "pytest harness/tests/test_x.py -k broken -q",
+            "green_test_command": "pytest harness/tests/test_x.py -k healthy -q",
+        },
+    )
+    assert k_mismatch["conclusion"] == "BLOCKED"
+
+
+def test_receipt_blocks_none_verifier_steps_without_crashing() -> None:
+    """P1-07: verifier_data with steps=None must return BLOCKED without TypeError."""
+    base = "1" * 40
+    cand = "2" * 40
+    none_steps_v = _verifier(cand)
+    none_steps_v["steps"] = None
+    none_steps_res = evaluate_receipt(
+        task_id="P1-07-NONE",
+        phase=1,
+        base_sha=base,
+        candidate_sha=cand,
+        verifier_data=none_steps_v,
+        review_data=_review(cand),
+    )
+    assert none_steps_res["conclusion"] == "BLOCKED"
+
+
+def test_receipt_rejects_git_tree_object_in_evidence_ref(tmp_path: Path) -> None:
+    """P1-02: REFUTED_WITH_EVIDENCE pointing to a git directory tree (e.g. backend:1) must fail."""
+    base = "1" * 40
+    repo = tmp_path / "git_tree_ref"
+    repo.mkdir()
+    subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=repo, check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.name", "Test User"], cwd=repo, check=True, capture_output=True)
+    pkg = repo / "backend"
+    pkg.mkdir()
+    (pkg / "mod.py").write_text("a = 1\n", encoding="utf-8")
+    subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+    subprocess.run(["git", "commit", "-m", "init"], cwd=repo, check=True, capture_output=True)
+    real_sha = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=repo, check=True, capture_output=True, text=True
+    ).stdout.strip()
+
+    finding = {"id": "P1-TREE", "severity": "high", "blocking": True, "title": "Bug"}
+    tree_ref_res = evaluate_receipt(
+        task_id="P1-02-TREE",
+        phase=1,
+        base_sha=base,
+        candidate_sha=real_sha,
+        verifier_data=_verifier(real_sha),
+        review_data=_review(real_sha, findings=[finding]),
+        dispositions={
+            "dispositions": [
+                {
+                    "id": "P1-TREE",
+                    "status": "REFUTED_WITH_EVIDENCE",
+                    "rationale": "Citing directory instead of file blob",
+                    "evidence_ref": "backend:1",
+                }
+            ]
+        },
+        repo_root=repo,
+    )
+    assert tree_ref_res["conclusion"] == "FAILED"
 
 
 def test_receipt_cli_refuses_overwrite_write_once(tmp_path: Path) -> None:

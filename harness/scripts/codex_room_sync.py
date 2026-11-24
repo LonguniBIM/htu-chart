@@ -55,8 +55,12 @@ def deep_merge(base: dict[str, Any], overlay: dict[str, Any]) -> dict[str, Any]:
 
 def apply_safety_locks(cfg: dict[str, Any], model_override: str | None = None) -> dict[str, Any]:
     """Enforce non-overridable read-only Codex Room invariants."""
+    if model_override is not None and model_override != EXPECTED_REVIEW_MODEL:
+        raise ValueError(
+            f"Primary Codex Room reviewer model is locked to {EXPECTED_REVIEW_MODEL!r}, got {model_override!r}"
+        )
     locked = copy.deepcopy(cfg)
-    locked["model"] = model_override or EXPECTED_REVIEW_MODEL
+    locked["model"] = EXPECTED_REVIEW_MODEL
     locked["model_reasoning_effort"] = EXPECTED_REASONING_EFFORT
     locked["sandbox_mode"] = "read-only"
     locked["approval_policy"] = "never"

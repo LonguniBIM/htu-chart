@@ -13,6 +13,7 @@ import json
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -70,11 +71,21 @@ def _terminate_process_tree(proc: subprocess.Popen[str]) -> None:
                 timeout=10,
             )
         else:
-            proc.terminate()
+            try:
+                os.killpg(proc.pid, signal.SIGTERM)
+            except ProcessLookupError:
+                return
+            except OSError:
+                proc.terminate()
             try:
                 proc.wait(timeout=3.0)
             except subprocess.TimeoutExpired:
-                proc.kill()
+                try:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                except OSError:
+                    proc.kill()
     except OSError:
         try:
             proc.kill()
@@ -102,6 +113,7 @@ def _run_cmd(
         encoding="utf-8",
         errors="replace",
         env=env,
+        start_new_session=(os.name != "nt"),
     )
     try:
         stdout, stderr = proc.communicate(timeout=timeout_sec if timeout_sec and timeout_sec > 0 else None)
@@ -178,18 +190,20 @@ def _run_step(
     }
 
 
-def _git_snapshot(root: Path) -> dict[str, Any]:
+def _git_snapshot(root: Path, *, timeout_sec: float = 60.0) -> dict[str, Any]:
     rev = subprocess.run(
         ["git", "-C", str(root), "rev-parse", "HEAD"],
         capture_output=True,
         text=True,
         check=False,
+        timeout=timeout_sec if timeout_sec > 0 else None,
     )
     status_proc = subprocess.run(
         ["git", "-C", str(root), "status", "--porcelain"],
         capture_output=True,
         text=True,
         check=False,
+        timeout=timeout_sec if timeout_sec > 0 else None,
     )
     dirty_files = [ln for ln in status_proc.stdout.splitlines() if ln.strip()] if status_proc.returncode == 0 else []
     return {
@@ -211,6 +225,15 @@ def _isolated_python_env(target_root: Path) -> dict[str, str]:
     return env
 
 
+def _remaining_budget(deadline: float | None, default: float = 60.0) -> float:
+    if deadline is None:
+        return default
+    rem = deadline - time.monotonic()
+    if rem <= 0:
+        raise TimeoutError("TIMED_OUT: total_timeout_sec exhausted.")
+    return min(default, rem)
+
+
 def run_verifier(
     root: Path,
     phase: int = 0,
@@ -223,9 +246,35 @@ def run_verifier(
 ) -> dict[str, Any]:
     """Execute all deterministic verification gates on ``root`` or frozen ``commit_sha``."""
     root = root.resolve()
-    snapshot = _git_snapshot(root)
-    steps: list[dict[str, Any]] = []
     deadline = (time.monotonic() + total_timeout_sec) if total_timeout_sec > 0 else None
+    steps: list[dict[str, Any]] = []
+
+    try:
+        snapshot = _git_snapshot(root, timeout_sec=_remaining_budget(deadline))
+    except (TimeoutError, subprocess.TimeoutExpired) as exc:
+        return {
+            "verified_at_utc": datetime.now(timezone.utc).isoformat(),
+            "root": str(root),
+            "phase": phase,
+            "git_sha": None,
+            "source_mode": "frozen_commit_archive" if commit_sha is not None else "worktree",
+            "worktree_dirty": False,
+            "dirty_files": [],
+            "status": "FAILED",
+            "steps": [
+                {
+                    "name": "git_snapshot",
+                    "command": ["git", "-C", str(root), "rev-parse", "HEAD"],
+                    "cwd": str(root),
+                    "status": "FAILED",
+                    "exit_code": 124,
+                    "duration_ms": 0,
+                    "stdout_sha256": _sha256_text(""),
+                    "stderr_sha256": _sha256_text(str(exc)),
+                    "summary": f"TIMED_OUT during git snapshot: {exc}",
+                }
+            ],
+        }
 
     temp_holder: tempfile.TemporaryDirectory[str] | None = None
     target_root = root
@@ -242,7 +291,37 @@ def run_verifier(
                 temp_holder = tempfile.TemporaryDirectory(prefix="bv-frozen-")
                 dest_dir = Path(temp_holder.name) / "topstep-chart-app"
             try:
-                mat = materialize_frozen_tree(root, commit_sha, dest_dir)
+                mat = materialize_frozen_tree(
+                    root,
+                    commit_sha,
+                    dest_dir,
+                    timeout_sec=_remaining_budget(deadline),
+                )
+            except (TimeoutError, subprocess.TimeoutExpired) as exc:
+                steps.append(
+                    {
+                        "name": "git_commit_archive",
+                        "command": ["git", "-C", str(root), "archive", "--format=tar", commit_sha],
+                        "cwd": str(root),
+                        "status": "FAILED",
+                        "exit_code": 124,
+                        "duration_ms": 0,
+                        "stdout_sha256": _sha256_text(""),
+                        "stderr_sha256": _sha256_text(str(exc)),
+                        "summary": f"TIMED_OUT materializing frozen commit '{commit_sha}': {exc}",
+                    }
+                )
+                return {
+                    "verified_at_utc": datetime.now(timezone.utc).isoformat(),
+                    "root": str(root),
+                    "phase": phase,
+                    "git_sha": None,
+                    "source_mode": "frozen_commit_archive",
+                    "worktree_dirty": snapshot["worktree_dirty"],
+                    "dirty_files": snapshot["dirty_files"],
+                    "status": "FAILED",
+                    "steps": steps,
+                }
             except (ValueError, RuntimeError) as exc:
                 steps.append(
                     {

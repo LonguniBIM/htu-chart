@@ -132,3 +132,84 @@ def test_build_verifier_terminates_timed_out_subprocess_with_exit_124(tmp_path: 
     assert pytest_step["status"] == "FAILED"
     assert pytest_step["exit_code"] == 124
     assert "TIMED_OUT" in pytest_step["summary"]
+
+
+def test_build_verifier_handles_hung_git_and_kills_child_process_tree(tmp_path: Path, monkeypatch) -> None:
+    """P1-05 & S2-004: Hung git command and child-spawning step must terminate cleanly with exit 124."""
+    _setup_mini_repo(tmp_path)
+    child_pid_file = tmp_path / "child.pid"
+    spawner = tmp_path / "spawn_child.py"
+    spawner.write_text(
+        (
+            "import subprocess, sys, time\n"
+            f"p = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)'])\n"
+            f"open({str(child_pid_file)!r}, 'w', encoding='utf-8').write(str(p.pid))\n"
+            "time.sleep(30)\n"
+        ),
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(
+        build_verifier,
+        "_resolve_tool",
+        lambda name, python_module=None: [sys.executable, str(spawner)] if name == "pytest" else [sys.executable, "-c", "pass"],
+    )
+    report = run_verifier(tmp_path, phase=0, strict_clean=False, step_timeout_sec=0.8, total_timeout_sec=5.0)
+    assert report["status"] == "FAILED"
+    pytest_step = next(s for s in report["steps"] if s["name"] == "harness_pytest")
+    assert pytest_step["exit_code"] == 124
+    assert "TIMED_OUT" in pytest_step["summary"]
+
+    # Hung git subprocess must time out cleanly instead of blocking indefinitely
+    def _hung_git(*_args, **_kwargs):
+        raise subprocess.TimeoutExpired(cmd=["git", "rev-parse", "HEAD"], timeout=0.1)
+
+    monkeypatch.setattr(build_verifier.subprocess, "run", _hung_git)
+    git_timeout_report = run_verifier(tmp_path, phase=0, strict_clean=False, total_timeout_sec=0.5)
+    assert git_timeout_report["status"] == "FAILED"
+    assert any(s["exit_code"] == 124 and "TIMED_OUT" in s["summary"] for s in git_timeout_report["steps"])
+
+
+def test_build_verifier_backend_isolation_uses_frozen_commit_not_dirty_worktree(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Frozen backend import isolation: PYTHONPATH prepends frozen backend so dirty worktree app edits are ignored."""
+    _setup_mini_repo(tmp_path)
+    backend_dir = tmp_path / "backend"
+    app_pkg = backend_dir / "app"
+    tests_dir = backend_dir / "tests"
+    app_pkg.mkdir(parents=True)
+    tests_dir.mkdir(parents=True)
+    (backend_dir / "pyproject.toml").write_text('[project]\nname = "mini"\nversion = "0.1.0"\n', encoding="utf-8")
+    (app_pkg / "__init__.py").write_text("", encoding="utf-8")
+    (app_pkg / "val.py").write_text("VALUE = 'COMMITTED'\n", encoding="utf-8")
+    (tests_dir / "test_val.py").write_text(
+        "from app.val import VALUE\n\ndef test_committed_value():\n    assert VALUE == 'COMMITTED'\n",
+        encoding="utf-8",
+    )
+
+    subprocess.run(["git", "init"], cwd=tmp_path, check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=tmp_path, check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.name", "Test User"], cwd=tmp_path, check=True, capture_output=True)
+    subprocess.run(["git", "add", "."], cwd=tmp_path, check=True, capture_output=True)
+    subprocess.run(["git", "commit", "-m", "backend v1"], cwd=tmp_path, check=True, capture_output=True)
+    sha = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=tmp_path, check=True, capture_output=True, text=True
+    ).stdout.strip()
+
+    # Dirty worktree edit after commit + dirty PYTHONPATH pointing to mutable worktree
+    (app_pkg / "val.py").write_text("VALUE = 'DIRTY'\n", encoding="utf-8")
+    monkeypatch.setenv("PYTHONPATH", str(backend_dir))
+    monkeypatch.setattr(build_verifier, "_resolve_backend_venv_python", lambda _root: Path(sys.executable))
+
+    out_json = tmp_path / "out_iso" / "verifier.json"
+    report = run_verifier(
+        tmp_path,
+        phase=1,
+        strict_clean=False,
+        commit_sha=sha,
+        frozen_dir=out_json.parent / "frozen" / "topstep-chart-app",
+    )
+    assert report["status"] == "VERIFIED"
+    backend_step = next(s for s in report["steps"] if s["name"] == "backend_pytest")
+    assert backend_step["status"] == "PASSED"

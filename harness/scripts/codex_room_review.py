@@ -20,6 +20,7 @@ import json
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import threading
@@ -29,7 +30,7 @@ from pathlib import Path
 from typing import Any
 
 try:
-    from harness.scripts.codex_room_sync import verify_role
+    from harness.scripts.codex_room_sync import EXPECTED_REVIEW_MODEL, verify_role
     from harness.scripts.schema_utils import (
         compute_tree_sha256,
         is_hex_sha40,
@@ -39,7 +40,7 @@ try:
         validate_instance_against_schema,
     )
 except ImportError:
-    from codex_room_sync import verify_role
+    from codex_room_sync import EXPECTED_REVIEW_MODEL, verify_role
     from schema_utils import (
         compute_tree_sha256,
         is_hex_sha40,
@@ -211,13 +212,17 @@ def _archive_failed_codex_logs(out_dir: Path, pass_names: tuple[str, ...] = ("pa
                 src.replace(dst)
 
 
-def _git_output(repo_root: Path, args: list[str]) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(
-        ["git", "-C", str(repo_root), *args],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
+def _git_output(repo_root: Path, args: list[str], *, timeout_sec: float = 60.0) -> subprocess.CompletedProcess[str]:
+    try:
+        return subprocess.run(
+            ["git", "-C", str(repo_root), *args],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=timeout_sec if timeout_sec > 0 else None,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise TimeoutError(f"Git command timed out after {timeout_sec:.1f}s: git {' '.join(args)}") from exc
 
 
 def resolve_commit_info(repo_root: Path, commit_ref: str, base_ref: str | None) -> dict[str, Any]:
@@ -362,6 +367,23 @@ def consolidate_reviews(
         and not p2_schema_errors
     )
 
+    if p1_schema_errors or p2_schema_errors:
+        return {
+            "revision_sha": expected_sha,
+            "generated_at_utc": datetime.now(timezone.utc).isoformat(),
+            "passes_completed": 2,
+            "independent_contexts": False,
+            "pass1_verdict": pass1_data.get("verdict"),
+            "pass2_verdict": pass2_data.get("verdict"),
+            "review_gate_status": "BLOCKED",
+            "blocking_open_count": 0,
+            "advisory_count": 0,
+            "consolidated_findings": [],
+            "test_quality_issues": [],
+            "unverified_areas": [],
+            "errors": errors,
+        }
+
     merged_by_key: dict[tuple[str, int, str, str], dict[str, Any]] = {}
     for pass_label, payload in (("pass1", pass1_data), ("pass2", pass2_data)):
         raw_findings = payload.get("findings")
@@ -419,6 +441,14 @@ def consolidate_reviews(
 
     blocking_open_count = sum(1 for f in findings_list if f["blocking"] and f["status"] == "OPEN")
     advisory_count = sum(1 for f in findings_list if not f["blocking"])
+
+    if (
+        pass1_data.get("verdict") == "CHANGES_REQUESTED"
+        or pass2_data.get("verdict") == "CHANGES_REQUESTED"
+    ) and blocking_open_count == 0:
+        errors.append(
+            "Contradictory pass verdict: reviewer reported CHANGES_REQUESTED without any blocking finding (critical/high/medium)."
+        )
 
     p1_tqi = pass1_data.get("test_quality_issues") if isinstance(pass1_data.get("test_quality_issues"), list) else []
     p2_tqi = pass2_data.get("test_quality_issues") if isinstance(pass2_data.get("test_quality_issues"), list) else []
@@ -534,11 +564,21 @@ def _terminate_process_tree(proc: subprocess.Popen[str]) -> None:
                 timeout=10,
             )
         else:
-            proc.terminate()
+            try:
+                os.killpg(proc.pid, signal.SIGTERM)
+            except ProcessLookupError:
+                return
+            except OSError:
+                proc.terminate()
             try:
                 proc.wait(timeout=3.0)
             except subprocess.TimeoutExpired:
-                proc.kill()
+                try:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                except OSError:
+                    proc.kill()
     except OSError:
         try:
             proc.kill()
@@ -572,6 +612,7 @@ def _run_subprocess_with_watchdog(
         bufsize=1,
         env=env,
         cwd=str(cwd) if cwd else None,
+        start_new_session=(os.name != "nt"),
     )
 
     stdout_lines: list[str] = []
@@ -918,7 +959,11 @@ def main(argv: list[str] | None = None) -> int:
         print(f"[codex_room_review] Invalid review-output.schema.json: {schema_errors}", file=sys.stderr)
         return 2
 
-    info = resolve_commit_info(repo_root, args.commit, args.base)
+    try:
+        info = resolve_commit_info(repo_root, args.commit, args.base)
+    except (ValueError, TimeoutError) as exc:
+        print(f"[codex_room_review] {exc}", file=sys.stderr)
+        return 2
     git_top = Path(info["git_top"])
     candidate_sha = info["candidate_sha"]
     if args.out_dir is not None:
@@ -927,9 +972,12 @@ def main(argv: list[str] | None = None) -> int:
         attempt_id = args.attempt_id or datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
         out_dir = git_top / "harness" / "runs" / args.task_id / "attempts" / f"{attempt_id}-{candidate_sha[:12]}"
 
-    if not args.dry_run and (out_dir / "consolidated-review.json").exists():
+    if (out_dir / "consolidated-review.json").exists() or (
+        args.dry_run
+        and any((out_dir / marker).exists() for marker in ("pass1.prompt.md", "pass2.prompt.md", "frozen"))
+    ):
         print(
-            f"[codex_room_review] Write-once refusal: {out_dir / 'consolidated-review.json'} already exists.",
+            f"[codex_room_review] Write-once refusal: {out_dir} already contains review artifacts.",
             file=sys.stderr,
         )
         return 2
@@ -951,7 +999,11 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     frozen_src_dir = out_dir / "frozen" / "topstep-chart-app"
-    frozen_meta = materialize_frozen_tree(git_top, candidate_sha, frozen_src_dir, base_sha=info["base_sha"])
+    try:
+        frozen_meta = materialize_frozen_tree(git_top, candidate_sha, frozen_src_dir, base_sha=info["base_sha"])
+    except (ValueError, RuntimeError, TimeoutError) as exc:
+        print(f"[codex_room_review] {exc}", file=sys.stderr)
+        return 2
     info["frozen_src_dir"] = frozen_meta["dest_dir"]
     info["patch_path"] = frozen_meta["patch_path"]
 
@@ -1002,7 +1054,10 @@ def main(argv: list[str] | None = None) -> int:
 
     def _run_agy_review_pair(agy_model: str) -> tuple[dict[str, Any] | None, dict[str, Any] | None, str | None]:
         agy_prefix = resolve_agy_command()
-        before_status = _git_output(git_top, ["status", "--porcelain"]).stdout
+        try:
+            before_status = _git_output(git_top, ["status", "--porcelain"]).stdout
+        except TimeoutError as exc:
+            return None, None, f"Read-only check failed before agy pass: {exc}"
         p1_kw = dict(
             agy_prefix=agy_prefix,
             role="pass1",
@@ -1030,7 +1085,10 @@ def main(argv: list[str] | None = None) -> int:
             idle_timeout_sec=args.idle_timeout,
         )
         res1, res2 = _execute_two_passes(_run_agy_pass, p1_kw, p2_kw, sequential=args.sequential)
-        after_status = _git_output(git_top, ["status", "--porcelain"]).stdout
+        try:
+            after_status = _git_output(git_top, ["status", "--porcelain"]).stdout
+        except TimeoutError as exc:
+            return res1, res2, f"Read-only check failed after agy pass: {exc}"
         frozen_hash_after, _ = compute_tree_sha256(frozen_src_dir)
         if after_status != before_status:
             violation: str | None = "Read-only violation: git worktree changed during agy review pass."
@@ -1049,6 +1107,22 @@ def main(argv: list[str] | None = None) -> int:
             print(f"[codex_room_review] {exc}", file=sys.stderr)
             return 2
     else:
+        if args.model is not None and args.model != EXPECTED_REVIEW_MODEL:
+            model_err = f"Primary codex reviewer model is locked to {EXPECTED_REVIEW_MODEL!r}, got {args.model!r}"
+            print(f"[codex_room_review] {model_err}", file=sys.stderr)
+            report = consolidate_reviews(None, None, expected_sha=candidate_sha)
+            report["errors"] = [model_err]
+            report["frozen_tree_sha256"] = frozen_meta["frozen_tree_sha256"]
+            report["candidate_patch_path"] = frozen_meta["patch_path"]
+            report["worktree_dirty_at_review"] = info["worktree_dirty"]
+            report["review_backend"] = "codex"
+            report["review_model"] = args.model
+            report["fallback_used"] = False
+            report["fallback_reason"] = None
+            _write_once_outputs(out_dir, report)
+            return 2
+
+        active_model = EXPECTED_REVIEW_MODEL
         v1 = verify_role("pass1", args.runtime_root)
         v2 = verify_role("pass2", args.runtime_root)
         if not (v1["ok"] and v2["ok"]):
@@ -1063,7 +1137,7 @@ def main(argv: list[str] | None = None) -> int:
             report["candidate_patch_path"] = frozen_meta["patch_path"]
             report["worktree_dirty_at_review"] = info["worktree_dirty"]
             report["review_backend"] = "codex"
-            report["review_model"] = args.model
+            report["review_model"] = active_model
             report["fallback_used"] = False
             report["fallback_reason"] = None
             _write_once_outputs(out_dir, report)
@@ -1092,7 +1166,7 @@ def main(argv: list[str] | None = None) -> int:
                 prompt_text=prompt1,
                 out_dir=out_dir,
                 pass_name="pass1",
-                model=args.model,
+                model=active_model,
                 timeout_sec=args.timeout,
                 idle_timeout_sec=args.idle_timeout,
             )
@@ -1105,7 +1179,7 @@ def main(argv: list[str] | None = None) -> int:
                 prompt_text=prompt2,
                 out_dir=out_dir,
                 pass_name="pass2",
-                model=args.model,
+                model=active_model,
                 timeout_sec=args.timeout,
                 idle_timeout_sec=args.idle_timeout,
             )
