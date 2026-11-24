@@ -690,7 +690,7 @@ def test_codex_room_review_inspects_frozen_commit_and_enforces_write_once(
             "out_path = pathlib.Path(args[args.index('-o') + 1])\n"
             "prompt = sys.stdin.read()\n"
             "lens = 'security_and_invariants' if 'security_and_invariants' in prompt else 'correctness_and_tests'\n"
-            "content = (cwd_arg / 'sample.txt').read_text(encoding='utf-8').strip()\n"
+            "content = (cwd_arg / 'topstep-chart-app' / 'sample.txt').read_text(encoding='utf-8').strip()\n"
             "if lens == 'correctness_and_tests':\n"
             f"    pathlib.Path({str(observed_file)!r}).write_text(content, encoding='utf-8')\n"
             f"payload = {{'revision_sha': {committed_sha!r}, 'lens': lens, 'verdict': 'APPROVE', "
@@ -786,7 +786,7 @@ def test_agy_backend_runs_in_frozen_src_and_detects_candidate_patch(
             "args = sys.argv[1:]\n"
             "prompt = args[args.index('-p') + 1]\n"
             "lens = 'security_and_invariants' if 'security_and_invariants' in prompt else 'correctness_and_tests'\n"
-            "content = pathlib.Path('app.py').read_text(encoding='utf-8').strip()\n"
+            "content = pathlib.Path('topstep-chart-app/app.py').read_text(encoding='utf-8').strip()\n"
             f"payload = {{'revision_sha': {cand_sha!r}, 'lens': lens, 'verdict': 'APPROVE', "
             "'summary': content, 'findings': [], 'test_quality_issues': [], 'unverified_areas': []}\n"
             "print(json.dumps({'event': 'result', 'result': {'status': 'SUCCESS', 'structured_output': payload}}), flush=True)\n"
@@ -1125,3 +1125,99 @@ def test_consolidate_blocks_contradictory_pass_even_when_other_pass_has_blocking
     )
     assert res["review_gate_status"] == "BLOCKED"
     assert any("Pass 1" in e and "CHANGES_REQUESTED" in e for e in res["errors"])
+
+
+def test_agy_sandbox_paths_are_strictly_inside_cwd(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """NC-09b: Both candidate.patch and large prompt_file must live inside the agy/codex sandbox cwd."""
+    import subprocess
+
+    repo = tmp_path / "git_repo"
+    repo.mkdir()
+    subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=repo, check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.name", "Test User"], cwd=repo, check=True, capture_output=True)
+    target = repo / "app.py"
+    target.write_text("X = 1\n", encoding="utf-8")
+    subprocess.run(["git", "add", "app.py"], cwd=repo, check=True, capture_output=True)
+    subprocess.run(["git", "commit", "-m", "v1"], cwd=repo, check=True, capture_output=True)
+    base_sha = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=repo, check=True, capture_output=True, text=True
+    ).stdout.strip()
+
+    target.write_text("X = 2\n", encoding="utf-8")
+    subprocess.run(["git", "add", "app.py"], cwd=repo, check=True, capture_output=True)
+    subprocess.run(["git", "commit", "-m", "v2"], cwd=repo, check=True, capture_output=True)
+    cand_sha = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=repo, check=True, capture_output=True, text=True
+    ).stdout.strip()
+
+    packet_file = tmp_path / "large_packet.md"
+    packet_file.write_text("LARGE_PACKET_NC09B\n" + ("P" * 18000), encoding="utf-8")
+
+    observed_calls: list[dict[str, Path]] = []
+    orig_watchdog = codex_room_review._run_subprocess_with_watchdog
+
+    def _spy_watchdog(*args, **kwargs):
+        observed_calls.append({"cwd": Path(kwargs["cwd"]).resolve()})
+        return orig_watchdog(*args, **kwargs)
+
+    orig_run_agy = codex_room_review._run_agy_pass
+    observed_prompts: list[Path] = []
+
+    def _spy_run_agy(*args, **kwargs):
+        observed_prompts.append(Path(kwargs["prompt_file"]).resolve())
+        return orig_run_agy(*args, **kwargs)
+
+    agy_script = tmp_path / "fake_agy_sandbox.py"
+    agy_prefix = _write_fake_codex_script(
+        agy_script,
+        (
+            "import json, pathlib, re, sys\n"
+            "args = sys.argv[1:]\n"
+            "cli_prompt = args[args.index('-p') + 1]\n"
+            "m = re.search(r'`([^`]+\\.prompt\\.md)`', cli_prompt)\n"
+            "assert m is not None\n"
+            "p_path = pathlib.Path(m.group(1)).resolve()\n"
+            "cwd_path = pathlib.Path.cwd().resolve()\n"
+            "assert p_path.is_relative_to(cwd_path), f'{p_path} not inside {cwd_path}'\n"
+            "patch_path = cwd_path / 'candidate.patch'\n"
+            "assert patch_path.is_file() and patch_path.resolve().is_relative_to(cwd_path)\n"
+            "lens = 'security_and_invariants' if 'pass2' in p_path.name else 'correctness_and_tests'\n"
+            f"payload = {{'revision_sha': {cand_sha!r}, 'lens': lens, 'verdict': 'APPROVE', "
+            "'summary': 'sandbox ok', 'findings': [], 'test_quality_issues': [], 'unverified_areas': []}\n"
+            "print(json.dumps({'event': 'result', 'result': {'status': 'SUCCESS', 'structured_output': payload}}), flush=True)\n"
+        ),
+    )
+
+    monkeypatch.setattr(codex_room_review, "_run_subprocess_with_watchdog", _spy_watchdog)
+    monkeypatch.setattr(codex_room_review, "_run_agy_pass", _spy_run_agy)
+    monkeypatch.setattr(codex_room_review, "resolve_agy_command", lambda: agy_prefix)
+
+    out_dir = tmp_path / "out_nc09b"
+    rc = codex_room_review.main(
+        [
+            "--commit",
+            cand_sha,
+            "--base",
+            base_sha,
+            "--repo-root",
+            str(repo),
+            "--task-packet",
+            str(packet_file),
+            "--out-dir",
+            str(out_dir),
+            "--backend",
+            "agy",
+        ]
+    )
+    assert rc == 0
+    assert len(observed_calls) == 2
+    assert len(observed_prompts) == 2
+    patch_file = (out_dir / "frozen" / "candidate.patch").resolve()
+    for call_meta, p_file in zip(observed_calls, observed_prompts, strict=True):
+        cwd = call_meta["cwd"]
+        assert patch_file.is_relative_to(cwd)
+        assert p_file.is_relative_to(cwd)
+        assert (cwd / "topstep-chart-app").is_dir()

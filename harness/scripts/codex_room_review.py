@@ -16,10 +16,12 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures
+import hashlib
 import json
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -1025,7 +1027,8 @@ def main(argv: list[str] | None = None) -> int:
             return 1
         return 0
 
-    frozen_src_dir = out_dir / "frozen" / "topstep-chart-app"
+    frozen_dir = out_dir / "frozen"
+    frozen_src_dir = frozen_dir / "topstep-chart-app"
     try:
         frozen_meta = materialize_frozen_tree(git_top, candidate_sha, frozen_src_dir, base_sha=info["base_sha"])
     except (ValueError, RuntimeError, TimeoutError) as exc:
@@ -1033,6 +1036,19 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     info["frozen_src_dir"] = frozen_meta["dest_dir"]
     info["patch_path"] = frozen_meta["patch_path"]
+    patch_file_path = Path(frozen_meta["patch_path"]) if frozen_meta["patch_path"] else None
+    patch_sha_before = (
+        hashlib.sha256(patch_file_path.read_bytes()).hexdigest()
+        if patch_file_path and patch_file_path.is_file()
+        else None
+    )
+
+    def _patch_modified() -> bool:
+        if patch_file_path is None:
+            return False
+        if not patch_file_path.is_file():
+            return True
+        return hashlib.sha256(patch_file_path.read_bytes()).hexdigest() != patch_sha_before
 
     task_text = (
         args.task_packet.read_text(encoding="utf-8")
@@ -1045,6 +1061,15 @@ def main(argv: list[str] | None = None) -> int:
     prompt2_path = out_dir / "pass2.prompt.md"
     prompt1_path.write_text(prompt1, encoding="utf-8")
     prompt2_path.write_text(prompt2, encoding="utf-8")
+
+    frozen_prompts_dir = frozen_dir / "prompts"
+    frozen_prompts_dir.mkdir(parents=True, exist_ok=True)
+    frozen_prompt1_path = frozen_prompts_dir / "pass1.prompt.md"
+    frozen_prompt2_path = frozen_prompts_dir / "pass2.prompt.md"
+    frozen_prompt1_path.write_text(prompt1, encoding="utf-8")
+    frozen_prompt2_path.write_text(prompt2, encoding="utf-8")
+    os.chmod(frozen_prompt1_path, stat.S_IREAD | stat.S_IRGRP | stat.S_IROTH)
+    os.chmod(frozen_prompt2_path, stat.S_IREAD | stat.S_IRGRP | stat.S_IROTH)
 
     if args.dry_run:
         try:
@@ -1088,10 +1113,10 @@ def main(argv: list[str] | None = None) -> int:
         p1_kw = dict(
             agy_prefix=agy_prefix,
             role="pass1",
-            repo_root=frozen_src_dir,
+            repo_root=frozen_dir,
             schema_path=SCHEMA_PATH,
             prompt_text=prompt1,
-            prompt_file=prompt1_path,
+            prompt_file=frozen_prompt1_path,
             out_dir=out_dir,
             pass_name="pass1",
             model=agy_model,
@@ -1101,10 +1126,10 @@ def main(argv: list[str] | None = None) -> int:
         p2_kw = dict(
             agy_prefix=agy_prefix,
             role="pass2",
-            repo_root=frozen_src_dir,
+            repo_root=frozen_dir,
             schema_path=SCHEMA_PATH,
             prompt_text=prompt2,
-            prompt_file=prompt2_path,
+            prompt_file=frozen_prompt2_path,
             out_dir=out_dir,
             pass_name="pass2",
             model=agy_model,
@@ -1121,6 +1146,8 @@ def main(argv: list[str] | None = None) -> int:
             violation: str | None = "Read-only violation: git worktree changed during agy review pass."
         elif frozen_hash_after != frozen_meta["frozen_tree_sha256"]:
             violation = "Read-only violation: frozen-src snapshot modified during agy review pass."
+        elif _patch_modified():
+            violation = "Read-only violation: candidate.patch modified during agy review pass."
         else:
             violation = None
         return res1, res2, violation
@@ -1188,7 +1215,7 @@ def main(argv: list[str] | None = None) -> int:
                 codex_prefix=codex_prefix,
                 role="pass1",
                 runtime_dir=args.runtime_root / "topstep-review-pass1",
-                repo_root=frozen_src_dir,
+                repo_root=frozen_dir,
                 schema_path=SCHEMA_PATH,
                 prompt_text=prompt1,
                 out_dir=out_dir,
@@ -1201,7 +1228,7 @@ def main(argv: list[str] | None = None) -> int:
                 codex_prefix=codex_prefix,
                 role="pass2",
                 runtime_dir=args.runtime_root / "topstep-review-pass2",
-                repo_root=frozen_src_dir,
+                repo_root=frozen_dir,
                 schema_path=SCHEMA_PATH,
                 prompt_text=prompt2,
                 out_dir=out_dir,
@@ -1246,6 +1273,9 @@ def main(argv: list[str] | None = None) -> int:
     frozen_hash_final, _ = compute_tree_sha256(frozen_src_dir)
     if frozen_hash_final != frozen_meta["frozen_tree_sha256"]:
         report["errors"].append("Read-only violation: frozen-src snapshot changed during review.")
+        report["review_gate_status"] = "BLOCKED"
+    if _patch_modified():
+        report["errors"].append("Read-only violation: candidate.patch changed during review.")
         report["review_gate_status"] = "BLOCKED"
     report["frozen_tree_sha256"] = frozen_meta["frozen_tree_sha256"]
     report["candidate_patch_path"] = frozen_meta["patch_path"]
