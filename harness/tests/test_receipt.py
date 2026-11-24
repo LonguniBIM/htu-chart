@@ -1042,3 +1042,313 @@ def test_receipt_task_manifest_require_frozen_and_git_commit_evidence(tmp_path: 
         check=False,
     )
     assert proc_omit_bugfix.returncode == 2
+
+
+def test_g5_receipt_blocks_paused_halted_or_over_cap_ledger_and_attempts(
+    tmp_path: Path,
+) -> None:
+    """G5 receipt.py refuses VERIFIED (BLOCKED, rc=2) for halted/over-cap ledger or attempts."""
+    from harness.scripts import task_runner
+
+    repo = tmp_path / "repo_g5_cap"
+    repo.mkdir()
+    subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+    subprocess.run(
+        ["git", "config", "user.email", "test@example.com"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.name", "Test User"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+    )
+    src = repo / "mod.py"
+    src.write_text("x = 1\n", encoding="utf-8")
+    subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+    subprocess.run(["git", "commit", "-m", "base"], cwd=repo, check=True, capture_output=True)
+    base_sha = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=repo, check=True, capture_output=True, text=True
+    ).stdout.strip()
+    src.write_text("x = 2\n", encoding="utf-8")
+    subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+    subprocess.run(["git", "commit", "-m", "cand"], cwd=repo, check=True, capture_output=True)
+    cand_sha = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=repo, check=True, capture_output=True, text=True
+    ).stdout.strip()
+
+    v_path = tmp_path / "v_g5.json"
+    r_path = tmp_path / "r_g5.json"
+    v_path.write_text(json.dumps(_verifier(cand_sha)), encoding="utf-8")
+    r_path.write_text(json.dumps(_review(cand_sha)), encoding="utf-8")
+
+    # 1. Ledger in PAUSED_BUDGET -> receipt must BLOCK (rc=2, conclusion=BLOCKED).
+    paused_ledger = repo / "harness" / "runs" / "T-G5-PAUSED" / "ledger.json"
+    l_paused = task_runner.init_or_load_ledger(
+        paused_ledger, root_task_id="T-G5-PAUSED", base_sha=base_sha, budget_usd=6.0
+    )
+    l_paused["state"] = "PAUSED_BUDGET"
+    l_paused["candidate_sha"] = cand_sha
+    task_runner.save_ledger(paused_ledger, l_paused)
+
+    out_paused = tmp_path / "out_g5_paused"
+    proc_paused = subprocess.run(
+        [
+            sys.executable,
+            str(REPO_ROOT / "harness" / "scripts" / "receipt.py"),
+            "--task-id",
+            "T-G5-PAUSED",
+            "--phase",
+            "1",
+            "--base-sha",
+            base_sha,
+            "--candidate-sha",
+            cand_sha,
+            "--verifier-json",
+            str(v_path),
+            "--review-json",
+            str(r_path),
+            "--repo-root",
+            str(repo),
+            "--out-dir",
+            str(out_paused),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    receipt_paused = json.loads((out_paused / "receipt.json").read_text(encoding="utf-8"))
+    assert proc_paused.returncode == 2
+    assert receipt_paused["conclusion"] == "BLOCKED"
+
+    # 2. Ledgerless task whose attempts/ dir exceeds max_g4_rounds_per_root_task (7 > 6).
+    attempts_root = repo / "harness" / "runs" / "T-G5-ATTEMPTS" / "attempts"
+    for idx in range(7):
+        att = attempts_root / f"20261124T00000{idx}Z-{cand_sha[:12]}"
+        att.mkdir(parents=True, exist_ok=True)
+        (att / "consolidated-review.json").write_text(
+            json.dumps(
+                {
+                    "revision_sha": cand_sha,
+                    "passes_completed": 2,
+                    "independent_contexts": True,
+                    "review_gate_status": "CHANGES_REQUESTED",
+                }
+            ),
+            encoding="utf-8",
+        )
+
+    out_att = tmp_path / "out_g5_attempts"
+    proc_att = subprocess.run(
+        [
+            sys.executable,
+            str(REPO_ROOT / "harness" / "scripts" / "receipt.py"),
+            "--task-id",
+            "T-G5-ATTEMPTS",
+            "--phase",
+            "1",
+            "--base-sha",
+            base_sha,
+            "--candidate-sha",
+            cand_sha,
+            "--verifier-json",
+            str(v_path),
+            "--review-json",
+            str(r_path),
+            "--repo-root",
+            str(repo),
+            "--out-dir",
+            str(out_att),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    receipt_att = json.loads((out_att / "receipt.json").read_text(encoding="utf-8"))
+    assert proc_att.returncode == 2
+    assert receipt_att["conclusion"] == "BLOCKED"
+
+    # 3. --require-ledger without ledger.json blocks; skipped G4 (ACTIVE_PEER_G1 w/o G4) blocks.
+    out_req = tmp_path / "out_g5_req"
+    proc_req = subprocess.run(
+        [
+            sys.executable,
+            str(REPO_ROOT / "harness" / "scripts" / "receipt.py"),
+            "--task-id",
+            "T-G5-NO-LEDGER",
+            "--phase",
+            "1",
+            "--base-sha",
+            base_sha,
+            "--candidate-sha",
+            cand_sha,
+            "--verifier-json",
+            str(v_path),
+            "--review-json",
+            str(r_path),
+            "--require-ledger",
+            "--repo-root",
+            str(repo),
+            "--out-dir",
+            str(out_req),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert proc_req.returncode == 2
+    rec_req = json.loads((out_req / "receipt.json").read_text(encoding="utf-8"))
+    assert rec_req["conclusion"] == "BLOCKED"
+
+    skipped_ledger = repo / "harness" / "runs" / "T-G5-SKIP" / "ledger.json"
+    l_skip = task_runner.init_or_load_ledger(
+        skipped_ledger, root_task_id="T-G5-SKIP", base_sha=base_sha, budget_usd=6.0
+    )
+    l_skip["state"] = "ACTIVE_PEER_G1"
+    l_skip["candidate_sha"] = cand_sha
+    task_runner.save_ledger(skipped_ledger, l_skip)
+    out_skip = tmp_path / "out_g5_skip"
+    proc_skip = subprocess.run(
+        [
+            sys.executable,
+            str(REPO_ROOT / "harness" / "scripts" / "receipt.py"),
+            "--task-id",
+            "T-G5-SKIP",
+            "--phase",
+            "1",
+            "--base-sha",
+            base_sha,
+            "--candidate-sha",
+            cand_sha,
+            "--verifier-json",
+            str(v_path),
+            "--review-json",
+            str(r_path),
+            "--ledger",
+            str(skipped_ledger),
+            "--repo-root",
+            str(repo),
+            "--out-dir",
+            str(out_skip),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert proc_skip.returncode == 2
+    rec_skip = json.loads((out_skip / "receipt.json").read_text(encoding="utf-8"))
+    assert rec_skip["conclusion"] == "BLOCKED"
+
+    # 4. Happy path READY_FOR_ACCEPTANCE transitions ledger -> VERIFIED and hashes ledger.json.
+    ok_ledger = repo / "harness" / "runs" / "T-G5-OK" / "ledger.json"
+    l_ok = task_runner.init_or_load_ledger(
+        ok_ledger, root_task_id="T-G5-OK", base_sha=base_sha, budget_usd=6.0
+    )
+    l_ok["state"] = "READY_FOR_ACCEPTANCE"
+    l_ok["candidate_sha"] = cand_sha
+    l_ok["g4_rounds_total"] = 1
+    task_runner.save_ledger(ok_ledger, l_ok)
+    out_ok = tmp_path / "out_g5_ok"
+    proc_ok = subprocess.run(
+        [
+            sys.executable,
+            str(REPO_ROOT / "harness" / "scripts" / "receipt.py"),
+            "--task-id",
+            "T-G5-OK",
+            "--phase",
+            "1",
+            "--base-sha",
+            base_sha,
+            "--candidate-sha",
+            cand_sha,
+            "--verifier-json",
+            str(v_path),
+            "--review-json",
+            str(r_path),
+            "--repo-root",
+            str(repo),
+            "--out-dir",
+            str(out_ok),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert proc_ok.returncode == 0
+    ok_receipt = json.loads((out_ok / "receipt.json").read_text(encoding="utf-8"))
+    assert ok_receipt["conclusion"] == "VERIFIED"
+    assert len(ok_receipt["artifact_hashes"]["ledger_json_sha256"]) == 64
+    assert json.loads(ok_ledger.read_text(encoding="utf-8"))["state"] == "VERIFIED"
+
+    # 5. Valid dispositions from ACTIVE_PEER_G1 with last_g4_candidate_sha == cand_sha -> VERIFIED.
+    disp_ledger = repo / "harness" / "runs" / "T-G5-DISP" / "ledger.json"
+    l_disp = task_runner.init_or_load_ledger(
+        disp_ledger, root_task_id="T-G5-DISP", base_sha=base_sha, budget_usd=6.0
+    )
+    l_disp["state"] = "ACTIVE_PEER_G1"
+    l_disp["last_g4_candidate_sha"] = cand_sha
+    l_disp["consecutive_failed_candidates"] = 1
+    task_runner.save_ledger(disp_ledger, l_disp)
+    r_disp = tmp_path / "r_disp.json"
+    r_disp.write_text(
+        json.dumps(
+            _review(
+                cand_sha,
+                findings=[{"id": "P1-77", "severity": "medium", "blocking": True, "title": "FP"}],
+            )
+        ),
+        encoding="utf-8",
+    )
+    d_path = tmp_path / "disp_ok.json"
+    d_path.write_text(
+        json.dumps(
+            {
+                "dispositions": [
+                    {
+                        "id": "P1-77",
+                        "status": "REFUTED_WITH_EVIDENCE",
+                        "rationale": "Line 1 sets constant x = 2 safely.",
+                        "evidence_ref": "mod.py:1",
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    out_disp = tmp_path / "out_g5_disp"
+    proc_disp = subprocess.run(
+        [
+            sys.executable,
+            str(REPO_ROOT / "harness" / "scripts" / "receipt.py"),
+            "--task-id",
+            "T-G5-DISP",
+            "--phase",
+            "1",
+            "--base-sha",
+            base_sha,
+            "--candidate-sha",
+            cand_sha,
+            "--verifier-json",
+            str(v_path),
+            "--review-json",
+            str(r_disp),
+            "--dispositions-json",
+            str(d_path),
+            "--repo-root",
+            str(repo),
+            "--out-dir",
+            str(out_disp),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert proc_disp.returncode == 0
+    disp_after = json.loads(disp_ledger.read_text(encoding="utf-8"))
+    assert disp_after["state"] == "VERIFIED"
+    assert disp_after["candidate_sha"] == cand_sha
+    assert disp_after["consecutive_failed_candidates"] == 0
+
+

@@ -86,15 +86,24 @@ stateDiagram-v2
     VERIFY_G3 --> PAUSED_BUDGET: "Candidate cap (3/version or 6/root) or USD budget exhausted"
     VERIFY_G3 --> REVIEW_G4: "build_verifier.py (frozen-src) VERIFIED on exact candidate SHA"
     REVIEW_G4 --> BLOCKED_INFRA: Primary + canary-qualified fallback reviewers unavailable/quota-exhausted
-    REVIEW_G4 --> ACTIVE_PEER_G1: Independent Reviewer Pass 1 or Pass 2 finds OPEN blocking issue
+    REVIEW_G4 --> ACTIVE_PEER_G1: Independent Reviewer Pass 1 or Pass 2 finds OPEN blocking issue (within G4 caps)
+    REVIEW_G4 --> NEEDS_REPLAN: "max_g4_rounds_per_packet_version (3) or failed-candidate cap reached"
+    REVIEW_G4 --> PAUSED_BUDGET: "max_g4_rounds_per_root_task (6), USD budget, or max_total_candidates (6) reached"
+    REVIEW_G4 --> BLOCKED: "Duplicate same-SHA re-roll or max_g4_invocations_per_candidate_sha (2) exceeded"
     REVIEW_G4 --> ACCEPT_G5: Both passes PASSED (or blocking findings REFUTED_WITH_EVIDENCE)
-    ACCEPT_G5 --> VERIFIED: "receipt.py (write-once) exits 0"
+    ACCEPT_G5 --> BLOCKED: "Ledger halted (PAUSED_BUDGET/BLOCKED*), G4 skipped, or attempts/ exceeds cap"
+    ACCEPT_G5 --> VERIFIED: "receipt.py (write-once) exits 0 and transitions ledger.json -> VERIFIED"
     BLOCKED_BRIEF --> [*]
     BLOCKED_INFRA --> [*]
     BLOCKED_AUTH --> [*]
     PAUSED_BUDGET --> [*]
     VERIFIED --> [*]
 ```
+
+**Invariants (`G4 ↔ ledger.json ↔ G5` Hard Round Caps)**:
+- `codex_room_review.py` enforces `max_g4_rounds_per_root_task = 6`, `max_g4_rounds_per_packet_version = 3`, and `max_g4_invocations_per_candidate_sha = 2` (plus ledgerless `attempts/` ceiling checks) preflight before creating `out_dir`/`.review-attempt.lock`/`frozen/` or spawning any reviewer CLI, and records non-reused token usage and gate state transitions into `ledger.json`.
+- `record_replan` resets `g4_rounds_in_packet = 0` while keeping `g4_rounds_total` monotonic across replans.
+- `receipt.py` (`G5`) refuses `VERIFIED` (`BLOCKED`, `exit 2`) if `ledger.json` is halted/skipped or `attempts/` exceeds `max_g4_rounds_per_root_task`.
 
 ---
 

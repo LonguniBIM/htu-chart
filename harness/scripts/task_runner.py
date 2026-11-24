@@ -68,8 +68,119 @@ DEFAULT_CIRCUIT_BREAKERS: dict[str, int] = {
     "max_candidates_per_packet_version": 3,
     "max_auto_replans_per_root_task": 1,
     "max_total_candidates_per_root_task": 6,
+    "max_g4_rounds_per_root_task": 6,
+    "max_g4_rounds_per_packet_version": 3,
+    "max_g4_invocations_per_candidate_sha": 2,
     "max_transient_retries_per_provider_pass": 1,
 }
+
+
+def load_circuit_breakers(
+    repo_root: Path | None = None,
+    policy_path: Path | None = None,
+) -> dict[str, int]:
+    """Load integer circuit-breaker caps from model-policy.json with safe defaults."""
+    breakers = dict(DEFAULT_CIRCUIT_BREAKERS)
+    policy_file = (
+        policy_path.resolve()
+        if policy_path is not None
+        else ((repo_root or REPO_ROOT).resolve() / "harness" / "model-policy.json")
+    )
+    if not policy_file.is_file():
+        return breakers
+    try:
+        data = json.loads(policy_file.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return breakers
+    raw_cb = data.get("circuit_breakers") if isinstance(data, dict) else None
+    if not isinstance(raw_cb, dict):
+        return breakers
+    for key in DEFAULT_CIRCUIT_BREAKERS:
+        val = raw_cb.get(key)
+        if is_strict_int(val) and val >= 0:
+            breakers[key] = int(val)
+    return breakers
+
+
+def _read_optional_json_dict(path: Path) -> dict[str, Any] | None:
+    if not path.is_file():
+        return None
+    try:
+        loaded = json.loads(path.read_text(encoding="utf-8"))
+        return loaded if isinstance(loaded, dict) else {}
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return {}
+
+
+def count_review_attempts(
+    attempts_dirs: list[Path],
+    *,
+    candidate_sha: str | None = None,
+) -> tuple[int, int]:
+    """Count completed/locked G4 attempts and prior invocations for ``candidate_sha``."""
+    seen_dirs: set[Path] = set()
+    prior_rounds = 0
+    same_sha = 0
+    completed_statuses = {"PASSED", "CHANGES_REQUESTED", "BLOCKED"}
+
+    for raw_dir in attempts_dirs:
+        resolved_dir = raw_dir.resolve()
+        if resolved_dir in seen_dirs or not resolved_dir.is_dir():
+            continue
+        seen_dirs.add(resolved_dir)
+
+        for child in sorted(resolved_dir.iterdir()):
+            if not child.is_dir():
+                continue
+            lock_data = _read_optional_json_dict(child / ".review-attempt.lock")
+            rev_data = _read_optional_json_dict(child / "consolidated-review.json")
+            if lock_data is None and rev_data is None:
+                continue
+            if rev_data is None and lock_data is not None and lock_data.get("dry_run") is True:
+                continue
+
+            if rev_data is not None:
+                status = rev_data.get("review_gate_status")
+                if status in completed_statuses or not rev_data:
+                    prior_rounds += 1
+            elif lock_data is not None:
+                prior_rounds += 1
+
+            if candidate_sha:
+                lock_sha = lock_data.get("candidate_sha") if lock_data is not None else None
+                rev_sha = rev_data.get("revision_sha") if rev_data is not None else None
+                matched_sha = (
+                    lock_sha == candidate_sha
+                    or rev_sha == candidate_sha
+                    or (
+                        lock_sha is None
+                        and rev_sha is None
+                        and child.name.endswith(f"-{candidate_sha[:12]}")
+                    )
+                )
+                if matched_sha:
+                    same_sha += 1
+
+    return prior_rounds, same_sha
+
+
+def _ensure_ledger_defaults(
+    data: dict[str, Any],
+    *,
+    policy_breakers: dict[str, int] | None = None,
+) -> dict[str, Any]:
+    defaults = policy_breakers or DEFAULT_CIRCUIT_BREAKERS
+    breakers = data.setdefault("circuit_breakers", {})
+    if isinstance(breakers, dict):
+        for key, val in defaults.items():
+            breakers.setdefault(key, val)
+    data.setdefault("g4_rounds_total", 0)
+    data.setdefault("g4_rounds_in_packet", 0)
+    if not isinstance(data.get("g4_invocations_by_sha"), dict):
+        data["g4_invocations_by_sha"] = {}
+    data.setdefault("last_g4_candidate_sha", None)
+    data.setdefault("last_g4_status", None)
+    return data
 
 DEFAULT_PRICING_PER_1M: dict[str, dict[str, float]] = {
     "gemini-4-neon-": {"input": 3.00, "output": 15.00, "cache_read": 0.30},
@@ -260,8 +371,10 @@ def load_ledger(
     ledger_path: Path,
     *,
     expected_root_task_id: str | None = None,
+    repo_root: Path | None = None,
+    policy_path: Path | None = None,
 ) -> dict[str, Any]:
-    """Load and validate an existing ``ledger.json``."""
+    """Load, backfill schema defaults, and validate an existing ``ledger.json``."""
     resolved = ledger_path.resolve()
     if not resolved.is_file():
         raise FileNotFoundError(f"Ledger not found: {resolved}")
@@ -274,7 +387,8 @@ def load_ledger(
             f"Root task mismatch: ledger belongs to {data['root_task_id']!r}, "
             f"cannot bind {expected_root_task_id!r}."
         )
-    return data
+    policy_breakers = load_circuit_breakers(repo_root=repo_root, policy_path=policy_path)
+    return _ensure_ledger_defaults(data, policy_breakers=policy_breakers)
 
 
 def init_or_load_ledger(
@@ -287,6 +401,8 @@ def init_or_load_ledger(
     budget_usd: float = 6.0,
     deadlines_sec: dict[str, int] | None = None,
     circuit_breakers: dict[str, int] | None = None,
+    repo_root: Path | None = None,
+    policy_path: Path | None = None,
 ) -> dict[str, Any]:
     """Create a new ledger keyed by ``root_task_id`` or load the existing one intact."""
     safe_root_id = _validate_safe_task_id(root_task_id, "root_task_id")
@@ -299,13 +415,18 @@ def init_or_load_ledger(
     resolved = ledger_path.resolve()
     with _ledger_lock(resolved):
         if resolved.is_file():
-            return load_ledger(resolved, expected_root_task_id=safe_root_id)
+            return load_ledger(
+                resolved,
+                expected_root_task_id=safe_root_id,
+                repo_root=repo_root,
+                policy_path=policy_path,
+            )
 
         now_iso = _now_utc().isoformat()
         merged_deadlines = dict(DEFAULT_DEADLINES_SEC)
         if deadlines_sec:
             merged_deadlines.update(deadlines_sec)
-        merged_breakers = dict(DEFAULT_CIRCUIT_BREAKERS)
+        merged_breakers = load_circuit_breakers(repo_root=repo_root, policy_path=policy_path)
         if circuit_breakers:
             merged_breakers.update(circuit_breakers)
 
@@ -324,6 +445,11 @@ def init_or_load_ledger(
             "total_candidates": 0,
             "candidates_in_packet": 0,
             "consecutive_failed_candidates": 0,
+            "g4_rounds_total": 0,
+            "g4_rounds_in_packet": 0,
+            "g4_invocations_by_sha": {},
+            "last_g4_candidate_sha": None,
+            "last_g4_status": None,
             "auto_replans_used": 0,
             "transient_retries_in_stage": 0,
             "budget_limit_usd": valid_budget,
@@ -497,6 +623,7 @@ def run_receipt_gate_step(
     red_proof_json: Path | None = None,
     repo_root: Path | None = None,
     ledger: dict[str, Any] | None = None,
+    ledger_path: Path | None = None,
 ) -> subprocess.CompletedProcess[str]:
     """Execute ``receipt.py`` via managed subprocess with ``verifier_step`` deadline."""
     root = (repo_root or REPO_ROOT).resolve()
@@ -527,6 +654,13 @@ def run_receipt_gate_step(
         cmd.append("--bugfix")
     if red_proof_json is not None:
         cmd.extend(["--red-proof-json", str(red_proof_json)])
+    effective_ledger = ledger_path
+    if effective_ledger is None:
+        candidate_ledger = root / "harness" / "runs" / task_id / "ledger.json"
+        if candidate_ledger.is_file():
+            effective_ledger = candidate_ledger
+    if effective_ledger is not None:
+        cmd.extend(["--ledger", str(effective_ledger)])
     return run_managed_stage_cmd("verifier_step", cmd, ledger=ledger, cwd=root)
 
 
@@ -817,9 +951,25 @@ def _check_dispatch_locked(
         save_ledger(ledger_path, ledger)
         return False, ledger, 2, msg
 
+    max_g4_root = int(breakers.get("max_g4_rounds_per_root_task", 6))
+    if int(ledger.get("g4_rounds_total", 0)) >= max_g4_root:
+        ledger["state"] = "PAUSED_BUDGET"
+        msg = "Circuit breaker: max_g4_rounds_per_root_task reached."
+        _append_event(ledger, "CIRCUIT_BREAKER_PAUSED", {"reason": msg})
+        save_ledger(ledger_path, ledger)
+        return False, ledger, 2, msg
+
     if int(ledger["candidates_in_packet"]) >= int(breakers["max_candidates_per_packet_version"]):
         ledger["state"] = "NEEDS_REPLAN"
         msg = "Circuit breaker: max_candidates_per_packet_version reached."
+        _append_event(ledger, "CIRCUIT_BREAKER_REPLAN", {"reason": msg})
+        save_ledger(ledger_path, ledger)
+        return False, ledger, 2, msg
+
+    max_g4_pkt = int(breakers.get("max_g4_rounds_per_packet_version", 3))
+    if int(ledger.get("g4_rounds_in_packet", 0)) >= max_g4_pkt:
+        ledger["state"] = "NEEDS_REPLAN"
+        msg = "Circuit breaker: max_g4_rounds_per_packet_version reached."
         _append_event(ledger, "CIRCUIT_BREAKER_REPLAN", {"reason": msg})
         save_ledger(ledger_path, ledger)
         return False, ledger, 2, msg
@@ -874,11 +1024,19 @@ def _check_dispatch_locked(
 
 def _apply_candidate_failure_breakers(ledger: dict[str, Any]) -> str:
     breakers = ledger["circuit_breakers"]
-    if int(ledger["total_candidates"]) >= int(breakers["max_total_candidates_per_root_task"]):
+    max_g4_root = int(breakers.get("max_g4_rounds_per_root_task", 6))
+    max_g4_pkt = int(breakers.get("max_g4_rounds_per_packet_version", 3))
+    if (
+        int(ledger["total_candidates"]) >= int(breakers["max_total_candidates_per_root_task"])
+        or int(ledger.get("g4_rounds_total", 0)) >= max_g4_root
+    ):
         ledger["state"] = "PAUSED_BUDGET"
-    elif int(ledger["consecutive_failed_candidates"]) >= int(
-        breakers["reassess_after_failed_candidates"]
-    ) or int(ledger["candidates_in_packet"]) >= int(breakers["max_candidates_per_packet_version"]):
+    elif (
+        int(ledger["consecutive_failed_candidates"])
+        >= int(breakers["reassess_after_failed_candidates"])
+        or int(ledger["candidates_in_packet"]) >= int(breakers["max_candidates_per_packet_version"])
+        or int(ledger.get("g4_rounds_in_packet", 0)) >= max_g4_pkt
+    ):
         ledger["state"] = "NEEDS_REPLAN"
     else:
         ledger["state"] = "ACTIVE_PEER_G1"
@@ -1277,6 +1435,22 @@ def record_gate_outcome(
 
     with _ledger_lock(ledger_path):
         ledger = load_ledger(ledger_path)
+        if (
+            norm_gate == "G4"
+            and norm_outcome == "PASSED"
+            and ledger["state"] == "READY_FOR_ACCEPTANCE"
+            and is_hex_sha40(candidate_sha)
+            and ledger.get("candidate_sha") == candidate_sha
+        ):
+            return ledger, 0
+        if (
+            norm_gate == "G5"
+            and norm_outcome == "VERIFIED"
+            and ledger["state"] == "VERIFIED"
+            and is_hex_sha40(candidate_sha)
+            and ledger.get("candidate_sha") == candidate_sha
+        ):
+            return ledger, 0
         if ledger["state"] != expected_state:
             return ledger, 2
 
@@ -1291,6 +1465,11 @@ def record_gate_outcome(
         ledger["transient_retries_in_stage"] = 0
 
         if norm_gate in {"G3", "G4"} and norm_outcome in {"FAILED", "CHANGES_REQUESTED"}:
+            if norm_gate == "G4":
+                ledger["g4_rounds_total"] = int(ledger.get("g4_rounds_total", 0)) + 1
+                ledger["g4_rounds_in_packet"] = int(ledger.get("g4_rounds_in_packet", 0)) + 1
+                ledger["last_g4_candidate_sha"] = candidate_sha
+                ledger["last_g4_status"] = norm_outcome
             ledger["candidate_sha"] = None
             ledger["consecutive_failed_candidates"] = (
                 int(ledger["consecutive_failed_candidates"]) + 1
@@ -1318,11 +1497,17 @@ def record_gate_outcome(
 
         if norm_gate == "G4":
             if norm_outcome in {"BLOCKED_AUTH", "BLOCKED_INFRA", "BLOCKED"}:
+                ledger["last_g4_candidate_sha"] = candidate_sha
+                ledger["last_g4_status"] = norm_outcome
                 ledger["state"] = norm_outcome
                 _append_event(ledger, f"G4_{norm_outcome}", {"details": details or {}})
                 save_ledger(ledger_path, ledger)
                 return ledger, 2
             if norm_outcome == "PASSED":
+                ledger["g4_rounds_total"] = int(ledger.get("g4_rounds_total", 0)) + 1
+                ledger["g4_rounds_in_packet"] = int(ledger.get("g4_rounds_in_packet", 0)) + 1
+                ledger["last_g4_candidate_sha"] = candidate_sha
+                ledger["last_g4_status"] = "PASSED"
                 ledger["state"] = "READY_FOR_ACCEPTANCE"
                 _append_event(ledger, "G4_PASSED", {"candidate_sha": candidate_sha})
                 save_ledger(ledger_path, ledger)
@@ -1471,6 +1656,7 @@ def record_replan(
         ledger["base_sha"] = new_base_sha
         ledger["candidate_sha"] = None
         ledger["candidates_in_packet"] = 0
+        ledger["g4_rounds_in_packet"] = 0
         ledger["consecutive_failed_candidates"] = 0
         ledger["transient_retries_in_stage"] = 0
         ledger["state"] = "ACTIVE_PEER_G1"

@@ -2067,4 +2067,536 @@ def test_live_model_policy_promotes_canary_qualified_carbon_high() -> None:
     )
 
 
+def _setup_ledger_for_g4_test(
+    repo_dir: Path,
+    task_id: str,
+    *,
+    state: str,
+    candidate_sha: str | None = None,
+    last_g4_candidate_sha: str | None = None,
+    g4_rounds_total: int = 0,
+    g4_rounds_in_packet: int = 0,
+    g4_invocations_by_sha: dict[str, int] | None = None,
+) -> Path:
+    from harness.scripts import task_runner
+
+    ledger_path = repo_dir / "harness" / "runs" / task_id / "ledger.json"
+    ledger = task_runner.init_or_load_ledger(
+        ledger_path,
+        root_task_id=task_id,
+        base_sha="0" * 40,
+        budget_usd=6.0,
+    )
+    ledger["state"] = state
+    ledger["candidate_sha"] = candidate_sha
+    ledger["last_g4_candidate_sha"] = last_g4_candidate_sha
+    ledger["g4_rounds_total"] = g4_rounds_total
+    ledger["g4_rounds_in_packet"] = g4_rounds_in_packet
+    ledger["g4_invocations_by_sha"] = dict(g4_invocations_by_sha or {})
+    task_runner.save_ledger(ledger_path, ledger)
+    return ledger_path
+
+
+def _install_counting_codex_stub(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    sha: str,
+    *,
+    pass1_verdict: str = "APPROVE",
+    pass1_findings: list[dict] | None = None,
+    emit_usage: bool = False,
+) -> Path:
+    calls_dir = tmp_path / f"cli_calls_{sha[:8]}"
+    calls_dir.mkdir(parents=True, exist_ok=True)
+    script_path = tmp_path / f"fake_codex_{sha[:8]}.py"
+    findings_json = json.dumps(pass1_findings or [])
+    usage_line = (
+        'print(json.dumps({"type": "turn.completed", "usage": '
+        '{"input_tokens": 10000, "cached_input_tokens": 2000, '
+        '"output_tokens": 1500}}), flush=True)\n'
+        if emit_usage
+        else ""
+    )
+    prefix = _write_fake_codex_script(
+        script_path,
+        (
+            "import json, pathlib, sys\n"
+            "args = sys.argv[1:]\n"
+            "out_path = pathlib.Path(args[args.index('-o') + 1])\n"
+            "prompt = sys.stdin.read()\n"
+            f"cd = pathlib.Path({str(calls_dir)!r})\n"
+            "cf = cd / f'{out_path.stem}.log'\n"
+            "prev = cf.read_text(encoding='utf-8') if cf.is_file() else ''\n"
+            "cf.write_text(prev + out_path.name + '\\n', encoding='utf-8')\n"
+            "is_p2 = 'security_and_invariants' in prompt\n"
+            "lens = 'security_and_invariants' if is_p2 else 'correctness_and_tests'\n"
+            f"verdict = 'APPROVE' if is_p2 else {pass1_verdict!r}\n"
+            f"findings = [] if is_p2 else {findings_json}\n"
+            f"payload = {{'revision_sha': {sha!r}, 'lens': lens, 'verdict': verdict, "
+            "'summary': 'stub review', 'findings': findings, "
+            "'test_quality_issues': [], 'unverified_areas': []}\n"
+            "out_path.write_text(json.dumps(payload), encoding='utf-8')\n"
+            f"{usage_line}"
+        ),
+    )
+    monkeypatch.setattr(
+        codex_room_review, "verify_role", lambda role, root: {"ok": True, "errors": []}
+    )
+    monkeypatch.setattr(codex_room_review, "resolve_codex_command", lambda: prefix)
+    return calls_dir
+
+
+def _count_calls(calls_dir: Path) -> int:
+    if not calls_dir.is_dir():
+        return 0
+    total = 0
+    for lf in calls_dir.glob("*.log"):
+        total += len([ln for ln in lf.read_text(encoding="utf-8").splitlines() if ln.strip()])
+    return total
+
+
+def test_g4_hard_cap_blocks_paused_budget_and_root_ceiling_without_spawning_cli(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """PAUSED_BUDGET or g4_rounds_total == 6 halts preflight with rc=2 and 0 CLI spawns."""
+    repo_dir, sha1 = _init_policy_repo(tmp_path / "repo_root_cap", qualified_routes=[])
+    calls_file = _install_counting_codex_stub(tmp_path, monkeypatch, sha1)
+
+    ledger_paused = _setup_ledger_for_g4_test(
+        repo_dir,
+        "T-G4-PAUSED",
+        state="PAUSED_BUDGET",
+        candidate_sha=sha1,
+    )
+    rc_paused = codex_room_review.main(
+        [
+            "--commit",
+            sha1,
+            "--task-id",
+            "T-G4-PAUSED",
+            "--repo-root",
+            str(repo_dir),
+            "--backend",
+            "codex",
+        ]
+    )
+    paused_data = json.loads(ledger_paused.read_text(encoding="utf-8"))
+    assert rc_paused == 2
+    assert _count_calls(calls_file) == 0
+    assert paused_data["state"] == "PAUSED_BUDGET"
+    assert not (repo_dir / "harness" / "runs" / "T-G4-PAUSED" / "attempts").exists()
+
+    ledger_cap = _setup_ledger_for_g4_test(
+        repo_dir,
+        "T-G4-ROOT-CAP",
+        state="REVIEW_FROZEN_G4",
+        candidate_sha=sha1,
+        g4_rounds_total=6,
+        g4_rounds_in_packet=1,
+    )
+    rc_cap = codex_room_review.main(
+        [
+            "--commit",
+            sha1,
+            "--task-id",
+            "T-G4-ROOT-CAP",
+            "--repo-root",
+            str(repo_dir),
+            "--backend",
+            "codex",
+        ]
+    )
+    cap_data = json.loads(ledger_cap.read_text(encoding="utf-8"))
+    assert rc_cap == 2
+    assert _count_calls(calls_file) == 0
+    assert cap_data["state"] == "PAUSED_BUDGET"
+    assert not (repo_dir / "harness" / "runs" / "T-G4-ROOT-CAP" / "attempts").exists()
+
+
+def test_g4_hard_cap_blocks_packet_ceiling_and_needs_replan_without_spawning_cli(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """g4_rounds_in_packet == 3 or state=NEEDS_REPLAN halts preflight with rc=2 and 0 CLI."""
+    repo_dir, sha1 = _init_policy_repo(tmp_path / "repo_pkt_cap", qualified_routes=[])
+    calls_file = _install_counting_codex_stub(tmp_path, monkeypatch, sha1)
+
+    ledger_pkt = _setup_ledger_for_g4_test(
+        repo_dir,
+        "T-G4-PKT-CAP",
+        state="REVIEW_FROZEN_G4",
+        candidate_sha=sha1,
+        g4_rounds_total=3,
+        g4_rounds_in_packet=3,
+    )
+    rc_pkt = codex_room_review.main(
+        [
+            "--commit",
+            sha1,
+            "--task-id",
+            "T-G4-PKT-CAP",
+            "--repo-root",
+            str(repo_dir),
+            "--backend",
+            "codex",
+        ]
+    )
+    pkt_data = json.loads(ledger_pkt.read_text(encoding="utf-8"))
+    assert rc_pkt == 2
+    assert _count_calls(calls_file) == 0
+    assert pkt_data["state"] == "NEEDS_REPLAN"
+
+    ledger_replan = _setup_ledger_for_g4_test(
+        repo_dir,
+        "T-G4-REPLAN",
+        state="NEEDS_REPLAN",
+        candidate_sha=sha1,
+        g4_rounds_total=2,
+        g4_rounds_in_packet=2,
+    )
+    rc_replan = codex_room_review.main(
+        [
+            "--commit",
+            sha1,
+            "--task-id",
+            "T-G4-REPLAN",
+            "--repo-root",
+            str(repo_dir),
+            "--backend",
+            "codex",
+        ]
+    )
+    replan_data = json.loads(ledger_replan.read_text(encoding="utf-8"))
+    assert rc_replan == 2
+    assert _count_calls(calls_file) == 0
+    assert replan_data["state"] == "NEEDS_REPLAN"
+
+
+def test_g4_hard_cap_blocks_duplicate_same_sha_and_third_resume(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Reject 2nd invocation on same SHA without --resume-from and 3rd even with --resume-from."""
+    repo_dir, sha1 = _init_policy_repo(tmp_path / "repo_dup_sha", qualified_routes=[])
+    calls_file = _install_counting_codex_stub(tmp_path, monkeypatch, sha1)
+
+    ledger_dup = _setup_ledger_for_g4_test(
+        repo_dir,
+        "T-G4-DUP",
+        state="REVIEW_FROZEN_G4",
+        candidate_sha=sha1,
+    )
+    rc_first = codex_room_review.main(
+        [
+            "--commit",
+            sha1,
+            "--task-id",
+            "T-G4-DUP",
+            "--attempt-id",
+            "att-1",
+            "--repo-root",
+            str(repo_dir),
+            "--backend",
+            "codex",
+        ]
+    )
+    assert rc_first == 0
+    assert _count_calls(calls_file) == 2
+
+    # Force state back to REVIEW_FROZEN_G4 to verify per-SHA guard blocks re-roll independently.
+    data_dup = json.loads(ledger_dup.read_text(encoding="utf-8"))
+    data_dup["state"] = "REVIEW_FROZEN_G4"
+    ledger_dup.write_text(json.dumps(data_dup, indent=2) + "\n", encoding="utf-8")
+
+    rc_second = codex_room_review.main(
+        [
+            "--commit",
+            sha1,
+            "--task-id",
+            "T-G4-DUP",
+            "--attempt-id",
+            "att-2",
+            "--repo-root",
+            str(repo_dir),
+            "--backend",
+            "codex",
+        ]
+    )
+    assert rc_second == 2
+    assert _count_calls(calls_file) == 2
+
+    # Resume case: 2 invocations already spent on sha2 -> 3rd with --resume-from must fail rc=2.
+    (repo_dir / "file2.txt").write_text("v2\n", encoding="utf-8")
+    sha2 = _commit_repo_change(repo_dir, "commit sha2")
+    calls_file2 = _install_counting_codex_stub(tmp_path, monkeypatch, sha2)
+    prior_dir = repo_dir / "harness" / "runs" / "T-G4-RES" / "attempts" / f"att-1-{sha2[:12]}"
+    prior_dir.mkdir(parents=True, exist_ok=True)
+    (prior_dir / ".review-attempt.lock").write_text(
+        json.dumps({"candidate_sha": sha2, "task_id": "T-G4-RES"}),
+        encoding="utf-8",
+    )
+    _setup_ledger_for_g4_test(
+        repo_dir,
+        "T-G4-RES",
+        state="BLOCKED_INFRA",
+        candidate_sha=sha2,
+        last_g4_candidate_sha=sha2,
+        g4_invocations_by_sha={sha2: 2},
+    )
+    rc_third = codex_room_review.main(
+        [
+            "--commit",
+            sha2,
+            "--task-id",
+            "T-G4-RES",
+            "--attempt-id",
+            "att-3",
+            "--resume-from",
+            str(prior_dir),
+            "--repo-root",
+            str(repo_dir),
+            "--backend",
+            "codex",
+        ]
+    )
+    assert rc_third == 2
+    assert _count_calls(calls_file2) == 0
+
+
+def test_g4_hard_cap_blocks_ledgerless_attempts_ceiling(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Without ledger.json, 6 existing attempt dirs under attempts/ block the 7th G4 call."""
+    repo_dir, sha1 = _init_policy_repo(tmp_path / "repo_nolog", qualified_routes=[])
+    calls_file = _install_counting_codex_stub(tmp_path, monkeypatch, sha1)
+
+    attempts_root = repo_dir / "harness" / "runs" / "T-NOLOG" / "attempts"
+    for idx in range(6):
+        prior_sha = f"{idx + 1}" * 40
+        att_dir = attempts_root / f"20261124T00000{idx}Z-{prior_sha[:12]}"
+        att_dir.mkdir(parents=True, exist_ok=True)
+        (att_dir / "consolidated-review.json").write_text(
+            json.dumps(
+                {
+                    "revision_sha": prior_sha,
+                    "passes_completed": 2,
+                    "independent_contexts": True,
+                    "review_gate_status": "CHANGES_REQUESTED",
+                    "blocking_open_count": 1,
+                    "consolidated_findings": [],
+                }
+            ),
+            encoding="utf-8",
+        )
+
+    rc = codex_room_review.main(
+        [
+            "--commit",
+            sha1,
+            "--task-id",
+            "T-NOLOG",
+            "--repo-root",
+            str(repo_dir),
+            "--backend",
+            "codex",
+        ]
+    )
+    assert rc == 2
+    assert _count_calls(calls_file) == 0
+
+
+def test_g4_updates_ledger_usage_rounds_and_breakers_on_changes_requested(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """CHANGES_REQUESTED increments g4_rounds_total/in_packet, spend, and failure counters."""
+    repo_dir, sha1 = _init_policy_repo(tmp_path / "repo_usage", qualified_routes=[])
+    finding = _sample_finding("P1-10", "high", "Missing lock around shared buffer")
+    _install_counting_codex_stub(
+        tmp_path,
+        monkeypatch,
+        sha1,
+        pass1_verdict="CHANGES_REQUESTED",
+        pass1_findings=[finding],
+        emit_usage=True,
+    )
+    ledger_path = _setup_ledger_for_g4_test(
+        repo_dir,
+        "T-G4-USAGE",
+        state="REVIEW_FROZEN_G4",
+        candidate_sha=sha1,
+    )
+
+    rc = codex_room_review.main(
+        [
+            "--commit",
+            sha1,
+            "--task-id",
+            "T-G4-USAGE",
+            "--repo-root",
+            str(repo_dir),
+            "--backend",
+            "codex",
+            "--fail-on-blocking",
+        ]
+    )
+    updated = json.loads(ledger_path.read_text(encoding="utf-8"))
+    assert rc == 1
+    assert updated["spent_api_equiv_usd"] > 0
+    assert updated["g4_rounds_total"] == 1
+    assert updated["g4_rounds_in_packet"] == 1
+    assert updated["last_g4_candidate_sha"] == sha1
+    assert updated["last_g4_status"] == "CHANGES_REQUESTED"
+    assert updated["consecutive_failed_candidates"] == 1
+    assert updated["candidate_sha"] is None
+    assert updated["state"] == "ACTIVE_PEER_G1"
+
+
+def test_g4_require_ledger_agy_dedup_and_resume_reuse_no_double_charge(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Verify --require-ledger, AGY cumulative usage dedup, and no double-charge on reuse."""
+    repo_dir, sha1 = _init_policy_repo(tmp_path / "repo_agy_led", qualified_routes=[])
+    calls_file = _install_counting_codex_stub(tmp_path, monkeypatch, sha1)
+
+    # --require-ledger without ledger.json must fail closed before spawning any CLI.
+    rc_req = codex_room_review.main(
+        [
+            "--commit",
+            sha1,
+            "--task-id",
+            "T-NO-LEDGER-REQ",
+            "--require-ledger",
+            "--repo-root",
+            str(repo_dir),
+            "--backend",
+            "codex",
+        ]
+    )
+    assert rc_req == 2
+    assert _count_calls(calls_file) == 0
+
+    # canary-* tasks bypass ledger/attempts enforcement cleanly.
+    rc_canary = codex_room_review.main(
+        [
+            "--commit",
+            sha1,
+            "--task-id",
+            "canary-case1",
+            "--out-dir",
+            str(tmp_path / "canary_out"),
+            "--repo-root",
+            str(repo_dir),
+            "--backend",
+            "codex",
+        ]
+    )
+    assert rc_canary == 0
+
+    # AGY resume-from reuse: pass1 reused, pass2 runs with cumulative usage -> no double charge.
+    prior_dir = repo_dir / "harness" / "runs" / "T-AGY-DEDUP" / "attempts" / f"att1-{sha1[:12]}"
+    prior_dir.mkdir(parents=True, exist_ok=True)
+    frozen_meta_dir = tmp_path / "probe_frozen"
+    from harness.scripts.schema_utils import materialize_frozen_tree
+
+    c_info = codex_room_review.resolve_commit_info(repo_dir, sha1, None)
+    fmeta = materialize_frozen_tree(
+        repo_dir, sha1, frozen_meta_dir, base_sha=c_info["base_sha"]
+    )
+    policy_sha = hashlib.sha256(
+        (repo_dir / "harness" / "model-policy.json").read_bytes()
+    ).hexdigest()
+    schema_sha = hashlib.sha256(codex_room_review.SCHEMA_PATH.read_bytes()).hexdigest()
+    default_pkt_sha = hashlib.sha256(
+        b"No Task Packet file supplied; review candidate commit against AGENTS.md, "
+        b"implementation_plan.md, and docs/WORKSPACE_PROTOCOL.md."
+    ).hexdigest()
+    p1_payload = _sample_pass(sha1, "correctness_and_tests", "APPROVE", [])
+    (prior_dir / "pass1.json").write_text(json.dumps(p1_payload), encoding="utf-8")
+    # Put high token usage in prior_dir/pass1.raw.jsonl to prove reused pass1 is not re-billed.
+    (prior_dir / "pass1.raw.jsonl").write_text(
+        json.dumps(
+            {
+                "event": "result",
+                "conversation_id": "conv-old-p1",
+                "result": {
+                    "status": "SUCCESS",
+                    "usage": {"input_tokens": 500000, "output_tokens": 50000},
+                },
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    (prior_dir / "pass1.provenance.json").write_text(
+        json.dumps(
+            {
+                "candidate_sha": sha1,
+                "base_sha": c_info["base_sha"],
+                "packet_sha256": default_pkt_sha,
+                "policy_sha256": policy_sha,
+                "schema_sha256": schema_sha,
+                "lens": "correctness_and_tests",
+                "frozen_tree_sha256": fmeta["frozen_tree_sha256"],
+                "backend": "agy",
+                "model": "gemini-4-carbon-high",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    agy_script = tmp_path / "fake_agy_dedup.py"
+    agy_prefix = _write_fake_codex_script(
+        agy_script,
+        (
+            "import json, sys\n"
+            "args = sys.argv[1:]\n"
+            f"payload = {{'revision_sha': {sha1!r}, 'lens': 'security_and_invariants', "
+            "'verdict': 'APPROVE', 'summary': 'ok', 'findings': [], "
+            "'test_quality_issues': [], 'unverified_areas': []}\n"
+            "print(json.dumps({'event': 'result', 'conversation_id': 'conv-agy-1', "
+            "'result': {'status': 'SUCCESS', 'conversation_id': 'conv-agy-1', "
+            "'structured_output': payload, "
+            "'usage': {'input_tokens': 100000, 'cache_read_tokens': 0, "
+            "'output_tokens': 10000, 'thinking_tokens': 4000}}}), flush=True)\n"
+        ),
+    )
+    monkeypatch.setattr(codex_room_review, "resolve_agy_command", lambda: agy_prefix)
+
+    ledger_agy = _setup_ledger_for_g4_test(
+        repo_dir,
+        "T-AGY-DEDUP",
+        state="BLOCKED_INFRA",
+        candidate_sha=sha1,
+        last_g4_candidate_sha=sha1,
+        g4_invocations_by_sha={sha1: 1},
+    )
+    rc_agy = codex_room_review.main(
+        [
+            "--commit",
+            sha1,
+            "--task-id",
+            "T-AGY-DEDUP",
+            "--attempt-id",
+            "att2",
+            "--resume-from",
+            str(prior_dir),
+            "--ledger",
+            str(ledger_agy),
+            "--repo-root",
+            str(repo_dir),
+            "--backend",
+            "agy",
+            "--model",
+            "gemini-4-carbon-high",
+        ]
+    )
+    assert rc_agy == 0
+    led_after = json.loads(ledger_agy.read_text(encoding="utf-8"))
+    assert led_after["state"] == "READY_FOR_ACCEPTANCE"
+    assert led_after["g4_rounds_total"] == 1
+    assert led_after["last_g4_status"] == "PASSED"
+    # gemini-4-carbon-: 100k*$2.50/1M ($0.25) + 10k*$15/1M ($0.15) = $0.40 (no thinking dup)
+    assert led_after["spent_api_equiv_usd"] == pytest.approx(0.40)
+
+
+
+
 

@@ -942,3 +942,115 @@ def test_a4_redos_crash_renames_policy_e2e_and_missing_ledger_cli(tmp_path: Path
     )
     assert out_mv == "SCOPE_VIOLATION" and rc_mv == 1
     assert l_mv["candidate_sha"] is None
+
+
+def test_g4_circuit_breakers_ledger_backfill_replan_and_idempotent_gates(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Verify G4 cap defaults/backfill, dispatch/replan counters, idempotent gates, and --ledger."""
+    base_sha, pkt1, r1 = _setup_repo_with_valid_packet(tmp_path, packet_version=1, budget_usd=6.0)
+    ledger_path = tmp_path / "harness" / "runs" / "T-RUN-01" / "ledger.json"
+    ledger = task_runner.init_or_load_ledger(
+        ledger_path, root_task_id="T-RUN-01", base_sha=base_sha, budget_usd=6.0
+    )
+    assert ledger["g4_rounds_total"] == 0
+    assert ledger["g4_rounds_in_packet"] == 0
+    assert ledger["g4_invocations_by_sha"] == {}
+    assert ledger["circuit_breakers"]["max_g4_rounds_per_root_task"] == 6
+    assert ledger["circuit_breakers"]["max_g4_rounds_per_packet_version"] == 3
+    assert ledger["circuit_breakers"]["max_g4_invocations_per_candidate_sha"] == 2
+
+    # Legacy ledger missing new G4 fields must backfill cleanly on load_ledger.
+    legacy = json.loads(ledger_path.read_text(encoding="utf-8"))
+    for k in (
+        "g4_rounds_total",
+        "g4_rounds_in_packet",
+        "g4_invocations_by_sha",
+        "last_g4_candidate_sha",
+        "last_g4_status",
+    ):
+        legacy.pop(k, None)
+    for k in (
+        "max_g4_rounds_per_root_task",
+        "max_g4_rounds_per_packet_version",
+        "max_g4_invocations_per_candidate_sha",
+    ):
+        legacy["circuit_breakers"].pop(k, None)
+    ledger_path.write_text(json.dumps(legacy, indent=2) + "\n", encoding="utf-8")
+    backfilled = task_runner.load_ledger(ledger_path)
+    assert backfilled["g4_rounds_total"] == 0
+    assert backfilled["circuit_breakers"]["max_g4_rounds_per_root_task"] == 6
+
+    # check_dispatch enforces g4_rounds_in_packet >= 3 -> NEEDS_REPLAN; replan resets packet cap.
+    backfilled["g4_rounds_total"] = 3
+    backfilled["g4_rounds_in_packet"] = 3
+    task_runner.save_ledger(ledger_path, backfilled)
+    ok_pkt, l_pkt, rc_pkt, _ = task_runner.check_dispatch(
+        ledger_path, r1, pkt1, "gemini-4-hydrogen-high", repo_root=tmp_path
+    )
+    assert not ok_pkt and rc_pkt == 2 and l_pkt["state"] == "NEEDS_REPLAN"
+
+    _, pkt2, r2 = _setup_repo_with_valid_packet(tmp_path, packet_version=2, budget_usd=6.0)
+    l_rep, rc_rep, _ = task_runner.record_replan(
+        ledger_path, r2, packet_path=pkt2, human_approved=False, repo_root=tmp_path
+    )
+    assert rc_rep == 0
+    assert l_rep["g4_rounds_in_packet"] == 0
+    assert l_rep["g4_rounds_total"] == 3
+
+    # check_dispatch enforces g4_rounds_total >= 6 -> PAUSED_BUDGET.
+    l_rep["g4_rounds_total"] = 6
+    task_runner.save_ledger(ledger_path, l_rep)
+    ok_root, l_root, rc_root, _ = task_runner.check_dispatch(
+        ledger_path, r2, pkt2, "gemini-4-hydrogen-high", repo_root=tmp_path
+    )
+    assert not ok_root and rc_root == 2 and l_root["state"] == "PAUSED_BUDGET"
+
+    # Idempotent record_gate_outcome for G4 PASSED and G5 VERIFIED on same SHA only.
+    cand_sha = "a" * 40
+    l_root["state"] = "READY_FOR_ACCEPTANCE"
+    l_root["candidate_sha"] = cand_sha
+    task_runner.save_ledger(ledger_path, l_root)
+    l_g4_idem, rc_g4_idem = task_runner.record_gate_outcome(
+        ledger_path, gate="G4", outcome="PASSED", candidate_sha=cand_sha
+    )
+    assert rc_g4_idem == 0 and l_g4_idem["state"] == "READY_FOR_ACCEPTANCE"
+    _, rc_g4_bad = task_runner.record_gate_outcome(
+        ledger_path, gate="G4", outcome="PASSED", candidate_sha="b" * 40
+    )
+    assert rc_g4_bad == 2
+
+    l_g5, rc_g5 = task_runner.record_gate_outcome(
+        ledger_path, gate="G5", outcome="VERIFIED", candidate_sha=cand_sha
+    )
+    assert rc_g5 == 0 and l_g5["state"] == "VERIFIED"
+    l_g5_idem, rc_g5_idem = task_runner.record_gate_outcome(
+        ledger_path, gate="G5", outcome="VERIFIED", candidate_sha=cand_sha
+    )
+    assert rc_g5_idem == 0 and l_g5_idem["state"] == "VERIFIED"
+
+    # run_receipt_gate_step includes --ledger when available.
+    seen_cmds: list[list[str]] = []
+    monkeypatch.setattr(
+        task_runner,
+        "run_managed_cmd",
+        lambda cmd, **_kw: (
+            seen_cmds.append(cmd)
+            or subprocess.CompletedProcess(args=cmd, returncode=0, stdout="", stderr="")
+        ),
+    )
+    task_runner.run_receipt_gate_step(
+        task_id="T-RUN-01",
+        phase=2,
+        base_sha=base_sha,
+        candidate_sha=cand_sha,
+        verifier_json=tmp_path / "v.json",
+        review_json=tmp_path / "r.json",
+        readiness_json=r2,
+        out_dir=tmp_path / "rec_out",
+        repo_root=tmp_path,
+        ledger=l_g5_idem,
+    )
+    assert "--ledger" in seen_cmds[0]
+    assert str(ledger_path) in seen_cmds[0]
+

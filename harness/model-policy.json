@@ -72,6 +72,9 @@
     "reassess_after_failed_candidates": 2,
     "max_auto_replans_per_root_task": 1,
     "max_total_candidates_per_root_task": 6,
+    "max_g4_rounds_per_root_task": 6,
+    "max_g4_rounds_per_packet_version": 3,
+    "max_g4_invocations_per_candidate_sha": 2,
     "max_transient_retries_per_provider_pass": 1,
     "api_equiv_budget_usd": {
       "low_risk": 4.0,

@@ -693,6 +693,16 @@ If Pass 1 succeeds on primary `codex` and Pass 2 hits `CONFIRMED_QUOTA_EXHAUSTED
 
 If any of the 7 fields differs (for example, the Peer made a one-line amend commit), reuse is rejected and both passes run fresh.
 
+### 8.4a Hard `G4 ↔ ledger.json ↔ G5` Round Caps & Automatic Usage Accounting
+
+To prevent unbounded review loops or ledgerless bypasses, enforce three `G4` circuit-breaker caps in `harness/model-policy.json` and `task_runner.py`:
+
+- `max_g4_rounds_per_root_task = 6` (`PAUSED_BUDGET`, monotonic across replans)
+- `max_g4_rounds_per_packet_version = 3` (`NEEDS_REPLAN`, reset to `0` on `record_replan`)
+- `max_g4_invocations_per_candidate_sha = 2` (blocks duplicate same-SHA invocations without `--resume-from`, and blocks 3rd invocation even with `--resume-from`)
+
+`codex_room_review.py` (`--ledger` / `--require-ledger` / auto-discovered `ledger.json`) checks both OS-locked `ledger.json` state/caps and filesystem `attempts/` round counts **before** creating `out_dir`, `.review-attempt.lock`, or `frozen/`, or spawning any CLI (`exit 2`, `0` tokens spent). After review completion, it extracts non-reused `pass{1,2}.raw.jsonl` token usage (Codex `delta`, AGY `cumulative`, `thinking_tokens=0` to avoid double-counting) and updates `ledger.json` atomically. `receipt.py` (`G5`) couples to `ledger.json` and `attempts/` so halted (`PAUSED_BUDGET`, `BLOCKED*`), skipped-`G4`, or over-cap tasks are refused with `BLOCKED` (`exit 2`).
+
 ### 8.5 Four-Case `reviewer_canary.py` Qualification and Degraded/Blocked Honesty
 
 No fallback model may be placed in `roles.reviewer.qualified_routes` based on vendor benchmarks or intuition. `reviewer_canary.py` builds 4 disposable temporary Git repositories and requires **`4/4 PASS`**:
@@ -892,6 +902,9 @@ SUMMARY: <1-3 sentence technical summary and test evidence>
     "reassess_after_failed_candidates": 2,
     "max_auto_replans_per_root_task": 1,
     "max_total_candidates_per_root_task": 6,
+    "max_g4_rounds_per_root_task": 6,
+    "max_g4_rounds_per_packet_version": 3,
+    "max_g4_invocations_per_candidate_sha": 2,
     "max_transient_retries_per_provider_pass": 1,
     "api_equiv_budget_usd": {
       "low_risk": 4.0,
@@ -1095,7 +1108,8 @@ Before certifying a destination harness as `tested`, execute these seven negativ
 | **NC-4** | **Malformed reviewer output** | Feed `--consolidate-only` a JSON file with `"severity": "urgent"`, `"line_start": true`, or an extra undeclared key | `schema_utils.py` rejects payload as `SCHEMA_OR_SHA_OR_POLICY_ERROR` (`exit 2`), never coerced to `PASS` |
 | **NC-5** | **Exhausted quota vs. diff text false positive** | (a) Include literal `"insufficient_quota"` inside a diff file -> verify classifier ignores tool-output text; (b) Simulate structured provider quota exhaustion on Pass 2 after Pass 1 `PASS` | (a) Does **not** trigger false fallback; (b) Marks primary `quota_pool` exhausted, reuses Pass 1 via 7-tuple check, and routes Pass 2 to `qualified_routes` (or `BLOCKED_INFRA` if none configured) |
 | **NC-6** | **Preserved single-pass blocking finding** | Consolidate `pass1` (`1` `high` finding, `CHANGES_REQUESTED`) + `pass2` (`0` findings, `PASS`) via `codex_room_review.py --consolidate-only` | `consolidated-review.json` emits `verdict: "CHANGES_REQUESTED"`, `blocking_open: 1`; `receipt.py` refuses `VERIFIED` (`exit 1`) |
-| **NC-7** | **Restarted / replanned task retains root counters** | Run `task_runner.py init --root-task-id T-NEG`, record `1` failed Peer attempt + `cumulative` token usage (`conv-1`), run `record-replan` (`packet_version: 2`), then re-run `status` in a fresh shell | `ledger.json` preserves `total_candidate_attempts == 1`, `replan_count == 1`, and deduplicated `spent_usd` (re-reporting `conv-1` with identical cumulative tokens adds `$0.00`, never double-charging) |
+| **NC-7** | **Restarted / replanned task retains root counters** | Run `task_runner.py init --root-task-id T-NEG`, record `1` failed Peer attempt + `cumulative` token usage (`conv-1`), run `record-replan` (`packet_version: 2`), then re-run `status` in a fresh shell | `ledger.json` preserves `total_candidate_attempts == 1`, `g4_rounds_total`, `replan_count == 1` (resetting `g4_rounds_in_packet` to `0`), and deduplicated `spent_usd` (re-reporting `conv-1` with identical cumulative tokens adds `$0.00`, never double-charging) |
+| **NC-8** | **G4 hard round/attempt cap & G5 halted-ledger block** | Run `codex_room_review.py` when `ledger.json` is `PAUSED_BUDGET` / `g4_rounds_total == 6` / `g4_rounds_in_packet == 3`, on a duplicate `candidate_sha`, or without `ledger.json` when `attempts/` already has `6` rounds; then run `receipt.py` against a `PAUSED_BUDGET` ledger or `7`-attempt `attempts/` dir | `codex_room_review.py` exits `2` preflight with `0` CLI subprocesses and `0` `.review-attempt.lock` / `frozen/` writes; `receipt.py` exits `2` with `conclusion == "BLOCKED"` |
 
 ### 10.3 Cross-Platform Troubleshooting Playbook
 

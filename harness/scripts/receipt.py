@@ -20,9 +20,11 @@ from pathlib import Path
 from typing import Any
 
 try:
+    from harness.scripts import task_runner
     from harness.scripts.codex_room_sync import is_excluded_model, load_model_policy
     from harness.scripts.schema_utils import is_hex_sha40, is_strict_bool, is_strict_int, resolve_git_toplevel, run_managed_cmd
 except ImportError:
+    import task_runner
     from codex_room_sync import is_excluded_model, load_model_policy
     from schema_utils import is_hex_sha40, is_strict_bool, is_strict_int, resolve_git_toplevel, run_managed_cmd
 
@@ -476,6 +478,77 @@ def _evaluate_verifier_gate(
     return "VERIFIED", [], []
 
 
+def _evaluate_ledger_and_attempts(
+    *,
+    task_id: str,
+    candidate_sha: str,
+    dispositions: dict[str, Any] | None,
+    active_root: Path,
+    ledger_data: dict[str, Any] | None,
+    require_ledger: bool,
+) -> list[str]:
+    """Enforce G4/candidate ceilings and ledger state/SHA invariants for G5."""
+    blockers: list[str] = []
+    breakers = task_runner.load_circuit_breakers(repo_root=active_root)
+    max_g4_root = int(breakers.get("max_g4_rounds_per_root_task", 6))
+    max_total_cand = int(breakers.get("max_total_candidates_per_root_task", 6))
+
+    attempts_dir = active_root / "harness" / "runs" / task_id / "attempts"
+    fs_rounds, _ = task_runner.count_review_attempts([attempts_dir])
+    if fs_rounds > max_g4_root:
+        blockers.append(
+            f"Review attempts ({fs_rounds}) exceed max_g4_rounds_per_root_task ({max_g4_root})."
+        )
+
+    if require_ledger and ledger_data is None:
+        blockers.append("Missing required ledger.json for G5 verification.")
+        return blockers
+
+    if ledger_data is None:
+        return blockers
+
+    state = ledger_data.get("state")
+    halted_states = {"PAUSED_BUDGET", "BLOCKED", "BLOCKED_BRIEF", "BLOCKED_AUTH", "BLOCKED_INFRA"}
+    if state in halted_states:
+        blockers.append(
+            f"Task ledger is halted in state {state!r}; cannot issue VERIFIED receipt."
+        )
+
+    g4_total = int(ledger_data.get("g4_rounds_total", 0))
+    total_cand = int(ledger_data.get("total_candidates", 0))
+    if g4_total > max_g4_root or total_cand > max_total_cand:
+        blockers.append(
+            f"Task ledger exceeds ceiling (g4_rounds_total={g4_total}/{max_g4_root}, "
+            f"total_candidates={total_cand}/{max_total_cand})."
+        )
+
+    budget_limit = float(ledger_data.get("budget_limit_usd", 0.0) or 0.0)
+    spent_usd = float(ledger_data.get("spent_api_equiv_usd", 0.0) or 0.0)
+    if budget_limit > 0 and round(spent_usd, 8) > round(budget_limit, 8):
+        blockers.append(
+            f"Task ledger spent_api_equiv_usd (${spent_usd:.4f}) exceeds "
+            f"budget_limit_usd (${budget_limit:.4f})."
+        )
+
+    has_dispositions = isinstance(dispositions, dict) and bool(dispositions.get("dispositions"))
+    ready_or_verified = (
+        state in {"READY_FOR_ACCEPTANCE", "VERIFIED"}
+        and ledger_data.get("candidate_sha") == candidate_sha
+    )
+    resolved_via_disp = (
+        has_dispositions
+        and state in {"ACTIVE_PEER_G1", "NEEDS_REPLAN"}
+        and ledger_data.get("last_g4_candidate_sha") == candidate_sha
+    )
+    if not (ready_or_verified or resolved_via_disp):
+        blockers.append(
+            f"Task ledger state/SHA mismatch for G5 (state={state!r}, "
+            f"candidate_sha={ledger_data.get('candidate_sha')!r}, "
+            f"last_g4_candidate_sha={ledger_data.get('last_g4_candidate_sha')!r})."
+        )
+    return blockers
+
+
 def evaluate_receipt(
     *,
     task_id: str,
@@ -492,6 +565,8 @@ def evaluate_receipt(
     artifact_hashes: dict[str, str | None] | None = None,
     repo_root: Path | None = None,
     require_frozen: bool = False,
+    ledger_data: dict[str, Any] | None = None,
+    require_ledger: bool = False,
 ) -> dict[str, Any]:
     """Evaluate all gates and build the immutable receipt payload."""
     active_root = repo_root or REPO_ROOT
@@ -543,6 +618,18 @@ def evaluate_receipt(
         failures.extend(review_reasons)
     elif review_gate == "BLOCKED":
         blockers.extend(review_reasons)
+
+    # 4. Ledger & filesystem G4/candidate ceiling verification
+    blockers.extend(
+        _evaluate_ledger_and_attempts(
+            task_id=task_id,
+            candidate_sha=candidate_sha,
+            dispositions=dispositions,
+            active_root=active_root,
+            ledger_data=ledger_data,
+            require_ledger=require_ledger,
+        )
+    )
 
     if failures:
         conclusion = "FAILED"
@@ -676,6 +763,17 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--dispositions-json", type=Path, default=None)
     parser.add_argument("--debate-json", type=Path, default=None)
     parser.add_argument("--task-manifest", type=Path, default=None, help="Optional task manifest JSON verifying is_bugfix and base_sha.")
+    parser.add_argument(
+        "--ledger",
+        type=Path,
+        default=None,
+        help="Optional task ledger.json path for G5 ceiling and state checks.",
+    )
+    parser.add_argument(
+        "--require-ledger",
+        action="store_true",
+        help="Require a valid ledger.json and fail closed (BLOCKED) if missing.",
+    )
     parser.add_argument("--require-frozen", action="store_true", help="Require frozen_commit_archive verification evidence.")
     parser.add_argument("--attempt-id", type=str, default=None, help="Optional attempt identifier for default write-once path.")
     parser.add_argument("--repo-root", type=Path, default=REPO_ROOT)
@@ -708,6 +806,24 @@ def main(argv: list[str] | None = None) -> int:
 
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    active_root = args.repo_root.resolve()
+    auto_ledger = active_root / "harness" / "runs" / args.task_id / "ledger.json"
+    ledger_path: Path | None
+    if args.ledger is not None:
+        ledger_path = args.ledger.resolve()
+    elif auto_ledger.is_file():
+        ledger_path = auto_ledger.resolve()
+    else:
+        ledger_path = None
+
+    ledger_data: dict[str, Any] | None = None
+    ledger_load_err: str | None = None
+    if ledger_path is not None and ledger_path.is_file():
+        try:
+            ledger_data = task_runner.load_ledger(ledger_path, repo_root=active_root)
+        except (OSError, UnicodeDecodeError, ValueError, json.JSONDecodeError) as exc:
+            ledger_load_err = f"Invalid ledger.json at {ledger_path}: {exc}"
+
     artifact_hashes = {
         "verifier_json_sha256": _sha256_file(args.verifier_json),
         "review_json_sha256": _sha256_file(args.review_json),
@@ -716,7 +832,13 @@ def main(argv: list[str] | None = None) -> int:
         "debate_json_sha256": _sha256_file(args.debate_json),
         "task_manifest_json_sha256": _sha256_file(args.task_manifest),
     }
+    if ledger_path is not None and ledger_path.is_file():
+        artifact_hashes["ledger_json_sha256"] = _sha256_file(ledger_path)
 
+    dispositions_obj = _load_optional_json(args.dispositions_json)
+    explicit_missing = args.ledger is not None and (
+        ledger_path is None or not ledger_path.is_file()
+    )
     receipt = evaluate_receipt(
         task_id=args.task_id,
         phase=args.phase,
@@ -726,13 +848,19 @@ def main(argv: list[str] | None = None) -> int:
         review_data=_load_optional_json(args.review_json),
         is_bugfix=args.bugfix,
         red_proof=_load_optional_json(args.red_proof_json),
-        dispositions=_load_optional_json(args.dispositions_json),
+        dispositions=dispositions_obj,
         debate_data=_load_optional_json(args.debate_json),
         behavior_summary=args.behavior,
         artifact_hashes=artifact_hashes,
-        repo_root=args.repo_root.resolve(),
+        repo_root=active_root,
         require_frozen=args.require_frozen,
+        ledger_data=ledger_data,
+        require_ledger=bool(args.require_ledger or explicit_missing),
     )
+    if ledger_load_err and ledger_load_err not in receipt["blockers"]:
+        receipt["blockers"].append(ledger_load_err)
+        if not receipt["failures"]:
+            receipt["conclusion"] = "BLOCKED"
 
     try:
         with receipt_json_path.open("x", encoding="utf-8") as fh:
@@ -742,6 +870,37 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     with receipt_md_path.open("x", encoding="utf-8") as fh:
         fh.write(render_receipt_markdown(receipt))
+
+    if (
+        receipt["conclusion"] == "VERIFIED"
+        and ledger_path is not None
+        and ledger_path.is_file()
+    ):
+        with task_runner._ledger_lock(ledger_path):
+            cur_ledger = task_runner.load_ledger(ledger_path, repo_root=active_root)
+            if cur_ledger["state"] == "READY_FOR_ACCEPTANCE":
+                task_runner.record_gate_outcome(
+                    ledger_path,
+                    gate="G5",
+                    outcome="VERIFIED",
+                    candidate_sha=args.candidate_sha,
+                )
+            elif (
+                isinstance(dispositions_obj, dict)
+                and dispositions_obj.get("dispositions")
+                and cur_ledger["state"] in {"ACTIVE_PEER_G1", "NEEDS_REPLAN"}
+                and cur_ledger.get("last_g4_candidate_sha") == args.candidate_sha
+            ):
+                cur_ledger["state"] = "VERIFIED"
+                cur_ledger["candidate_sha"] = args.candidate_sha
+                cur_ledger["consecutive_failed_candidates"] = 0
+                cur_ledger["transient_retries_in_stage"] = 0
+                task_runner._append_event(
+                    cur_ledger,
+                    "G5_VERIFIED",
+                    {"candidate_sha": args.candidate_sha, "via_dispositions": True},
+                )
+                task_runner.save_ledger(ledger_path, cur_ledger)
 
     print(f"[receipt] conclusion={receipt['conclusion']} out={out_dir}")
 

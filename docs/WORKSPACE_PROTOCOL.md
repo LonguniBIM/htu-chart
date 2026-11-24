@@ -83,8 +83,13 @@ G0.5 (Brief Gate)  -> brief_gate.py validates Packet, model eligibility & write-
 G1   (Dispatch)    -> Peer (swarm workspace="share", gemini-4-hydrogen-high) executes; may debate
 G2   (RED Proof)   -> [Bugfix only] Peer proves real RED on pre-fix base_sha before fixing
 G3   (Hard Gate)   -> build_verifier.py --commit <sha> runs gates inside frozen-src snapshot
-G4   (Review)      -> codex_room_review.py runs 2 independent passes on identical frozen-src SHA
-G5   (Acceptance)  -> Coordinator adjudicates findings + generates write-once receipt.py (VERIFIED/FAILED/BLOCKED)
+G4   (Review)      -> codex_room_review.py runs 2 independent passes on identical frozen-src SHA (capped by ledger.json + attempts/: max_g4_rounds_per_root_task=6, max_g4_rounds_per_packet_version=3, max_g4_invocations_per_candidate_sha=2)
+G5   (Acceptance)  -> Coordinator adjudicates findings + generates write-once receipt.py (VERIFIED/FAILED/BLOCKED; verifies ledger.json + attempts/ ceilings and transitions ledger to VERIFIED)
 ```
+
+`G4 ↔ ledger.json ↔ G5` Hard Round-Cap Invariants (`R03`):
+- `harness/model-policy.json` (`circuit_breakers`) and `task_runner.py` enforce `max_g4_rounds_per_root_task = 6` (`PAUSED_BUDGET`), `max_g4_rounds_per_packet_version = 3` (`NEEDS_REPLAN`, reset on `record_replan` while preserving `g4_rounds_total`), and `max_g4_invocations_per_candidate_sha = 2`.
+- `codex_room_review.py` enforces both OS-locked `ledger.json` caps and ledgerless `attempts/` filesystem caps **before** creating `out_dir`, `.review-attempt.lock`, or `frozen/`, or spawning any CLI subprocess, and accounts non-reused `pass{1,2}.raw.jsonl` token usage + `G4` state transitions back into `ledger.json`.
+- `receipt.py` (`G5`) blocks (`exit 2`, `conclusion="BLOCKED"`) whenever `ledger.json` is halted (`PAUSED_BUDGET`, `BLOCKED*`), skipped `G4`, or `g4_rounds_total` / `attempts/` exceeds policy caps.
 
 Only **`VERIFIED`** from `receipt.py` allows Coordinator to mark a task complete in `task.md`.

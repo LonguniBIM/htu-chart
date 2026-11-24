@@ -34,6 +34,7 @@ from pathlib import Path
 from typing import Any
 
 try:
+    from harness.scripts import task_runner
     from harness.scripts.codex_room_sync import (
         EXPECTED_REVIEW_MODEL,
         is_excluded_model,
@@ -54,6 +55,7 @@ try:
         validate_instance_against_schema,
     )
 except ImportError:
+    import task_runner
     from codex_room_sync import (
         EXPECTED_REVIEW_MODEL,
         is_excluded_model,
@@ -1443,6 +1445,17 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Optional unique attempt ID for write-once run dir.",
     )
     parser.add_argument("--task-packet", type=Path, default=None, help="Path to Task Packet md.")
+    parser.add_argument(
+        "--ledger",
+        type=Path,
+        default=None,
+        help="Optional task ledger.json path for G4 cap & budget enforcement.",
+    )
+    parser.add_argument(
+        "--require-ledger",
+        action="store_true",
+        help="Fail closed (BLOCKED, exit 2) if ledger.json cannot be resolved.",
+    )
     parser.add_argument("--repo-root", type=Path, default=REPO_ROOT)
     parser.add_argument("--out-dir", type=Path, default=None)
     parser.add_argument(
@@ -1582,6 +1595,394 @@ def _call_verify_role(role: str, runtime_root: Path, repo_root: Path) -> dict[st
     return verify_role(role, runtime_root)
 
 
+def _should_enforce_g4_caps(
+    args: argparse.Namespace,
+    out_dir: Path,
+    git_top: Path,
+) -> bool:
+    if args.dry_run or args.consolidate_only is not None:
+        return False
+    if str(args.task_id).startswith("canary-"):
+        return False
+    adhoc_ledger = git_top / "harness" / "runs" / "adhoc" / "ledger.json"
+    if (
+        args.ledger is None
+        and not args.require_ledger
+        and args.task_id == "adhoc"
+        and out_dir.parent.name != "attempts"
+        and not adhoc_ledger.is_file()
+    ):
+        return False
+    return True
+
+
+def _resolve_g4_ledger_path(args: argparse.Namespace, git_top: Path) -> Path | None:
+    if args.ledger is not None:
+        return args.ledger.resolve()
+    auto_path = git_top / "harness" / "runs" / args.task_id / "ledger.json"
+    return auto_path.resolve() if auto_path.is_file() else None
+
+
+def _preflight_g4_caps(
+    args: argparse.Namespace,
+    out_dir: Path,
+    git_top: Path,
+    candidate_sha: str,
+    ledger_path: Path | None,
+) -> int | None:
+    """Enforce filesystem attempts/ and ledger.json G4 ceilings before lock/frozen/CLI."""
+    if args.require_ledger and (ledger_path is None or not ledger_path.is_file()):
+        print(
+            f"[codex_room_review] BLOCKED: Missing required ledger.json for {args.task_id!r}.",
+            file=sys.stderr,
+        )
+        return 2
+    if args.ledger is not None and (ledger_path is None or not ledger_path.is_file()):
+        print(
+            f"[codex_room_review] BLOCKED: Ledger not found at {args.ledger}.",
+            file=sys.stderr,
+        )
+        return 2
+
+    policy_cb = task_runner.load_circuit_breakers(repo_root=git_top)
+    max_g4_root = int(policy_cb["max_g4_rounds_per_root_task"])
+    max_g4_sha = int(policy_cb["max_g4_invocations_per_candidate_sha"])
+
+    attempt_roots = [git_top / "harness" / "runs" / args.task_id / "attempts"]
+    if out_dir.parent.name == "attempts":
+        attempt_roots.append(out_dir.parent)
+    fs_rounds, fs_sha = task_runner.count_review_attempts(
+        attempt_roots, candidate_sha=candidate_sha
+    )
+    if fs_rounds >= max_g4_root:
+        if ledger_path is not None and ledger_path.is_file():
+            with task_runner._ledger_lock(ledger_path):
+                led = task_runner.load_ledger(ledger_path, repo_root=git_top)
+                if led["state"] != "VERIFIED":
+                    led["state"] = "PAUSED_BUDGET"
+                    task_runner._append_event(
+                        led,
+                        "G4_ROUND_CAP_PAUSED",
+                        {"attempts_rounds": fs_rounds, "cap": max_g4_root},
+                    )
+                    task_runner.save_ledger(ledger_path, led)
+        print(
+            f"[codex_room_review] PAUSED_BUDGET: G4 round cap reached "
+            f"({fs_rounds} >= {max_g4_root}).",
+            file=sys.stderr,
+        )
+        return 2
+    if fs_sha >= max_g4_sha or (fs_sha >= 1 and args.resume_from is None):
+        print(
+            f"[codex_room_review] BLOCKED: Duplicate G4 invocation for candidate_sha "
+            f"{candidate_sha[:12]} (attempts={fs_sha}).",
+            file=sys.stderr,
+        )
+        return 2
+
+    if ledger_path is None:
+        return None
+
+    halted_states = {
+        "PAUSED_BUDGET",
+        "NEEDS_REPLAN",
+        "BLOCKED",
+        "BLOCKED_BRIEF",
+        "BLOCKED_AUTH",
+        "BLOCKED_INFRA",
+        "VERIFIED",
+    }
+    with task_runner._ledger_lock(ledger_path):
+        ledger = task_runner.load_ledger(ledger_path, repo_root=git_top)
+        cb = ledger.get("circuit_breakers", {})
+        l_max_root = int(cb.get("max_g4_rounds_per_root_task", max_g4_root))
+        l_max_pkt = int(
+            cb.get(
+                "max_g4_rounds_per_packet_version",
+                policy_cb["max_g4_rounds_per_packet_version"],
+            )
+        )
+        l_max_sha = int(cb.get("max_g4_invocations_per_candidate_sha", max_g4_sha))
+
+        g4_total = int(ledger.get("g4_rounds_total", 0))
+        if g4_total >= l_max_root:
+            if ledger["state"] != "VERIFIED":
+                ledger["state"] = "PAUSED_BUDGET"
+                task_runner._append_event(
+                    ledger,
+                    "G4_ROUND_CAP_PAUSED",
+                    {"g4_rounds_total": g4_total, "cap": l_max_root},
+                )
+                task_runner.save_ledger(ledger_path, ledger)
+            print(
+                f"[codex_room_review] PAUSED_BUDGET: G4 round cap reached "
+                f"({g4_total} >= {l_max_root}).",
+                file=sys.stderr,
+            )
+            return 2
+
+        g4_pkt = int(ledger.get("g4_rounds_in_packet", 0))
+        if g4_pkt >= l_max_pkt:
+            if ledger["state"] not in {"PAUSED_BUDGET", "VERIFIED"}:
+                ledger["state"] = "NEEDS_REPLAN"
+                task_runner._append_event(
+                    ledger,
+                    "G4_PACKET_CAP_REPLAN",
+                    {"g4_rounds_in_packet": g4_pkt, "cap": l_max_pkt},
+                )
+                task_runner.save_ledger(ledger_path, ledger)
+            print(
+                f"[codex_room_review] NEEDS_REPLAN: G4 packet cap reached "
+                f"({g4_pkt} >= {l_max_pkt}).",
+                file=sys.stderr,
+            )
+            return 2
+
+        inv_map = ledger.setdefault("g4_invocations_by_sha", {})
+        sha_count = int(inv_map.get(candidate_sha, 0))
+        allow_resume = (
+            ledger["state"] == "BLOCKED_INFRA"
+            and args.resume_from is not None
+            and ledger.get("last_g4_candidate_sha") == candidate_sha
+            and sha_count < l_max_sha
+        )
+        if ledger["state"] in halted_states and not allow_resume:
+            print(
+                f"[codex_room_review] BLOCKED: Ledger state is {ledger['state']!r}; G4 refused.",
+                file=sys.stderr,
+            )
+            return 2
+        if not allow_resume and (
+            ledger["state"] != "REVIEW_FROZEN_G4" or ledger.get("candidate_sha") != candidate_sha
+        ):
+            print(
+                f"[codex_room_review] BLOCKED: Ledger state/SHA mismatch "
+                f"(state={ledger['state']!r}, expected={ledger.get('candidate_sha')!r}).",
+                file=sys.stderr,
+            )
+            return 2
+
+        if sha_count >= l_max_sha or (sha_count >= 1 and args.resume_from is None):
+            print(
+                f"[codex_room_review] BLOCKED: Duplicate G4 invocation for candidate_sha "
+                f"{candidate_sha[:12]} (count={sha_count}).",
+                file=sys.stderr,
+            )
+            return 2
+
+        spent = float(ledger.get("spent_api_equiv_usd", 0.0))
+        limit = float(ledger.get("budget_limit_usd", 0.0))
+        if limit > 0 and round(spent, 8) > round(limit, 8):
+            ledger["state"] = "PAUSED_BUDGET"
+            task_runner._append_event(
+                ledger,
+                "BUDGET_EXCEEDED_G4_PREFLIGHT",
+                {"spent_usd": spent, "limit_usd": limit},
+            )
+            task_runner.save_ledger(ledger_path, ledger)
+            print(
+                f"[codex_room_review] PAUSED_BUDGET: Budget exceeded "
+                f"(${spent:.4f} > ${limit:.4f}).",
+                file=sys.stderr,
+            )
+            return 2
+
+        inv_map[candidate_sha] = sha_count + 1
+        ledger["last_g4_candidate_sha"] = candidate_sha
+        task_runner._append_event(
+            ledger,
+            "G4_INVOCATION_RESERVED",
+            {"candidate_sha": candidate_sha, "invocation": sha_count + 1},
+        )
+        task_runner.save_ledger(ledger_path, ledger)
+    return None
+
+
+def _extract_codex_usage_deltas(raw_path: Path) -> list[tuple[int, int, int]]:
+    """Extract per-turn (uncached_in, cache_read, output_tokens) deltas from Codex JSONL."""
+    if not raw_path.is_file():
+        return []
+    deltas: list[tuple[int, int, int]] = []
+    for line in raw_path.read_text(encoding="utf-8", errors="replace").splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        try:
+            ev = json.loads(stripped)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(ev, dict) or ev.get("type") != "turn.completed":
+            continue
+        usage = ev.get("usage")
+        if not isinstance(usage, dict):
+            continue
+        raw_in = max(0, int(usage.get("input_tokens") or 0))
+        cache_in = max(
+            0,
+            int(usage.get("cached_input_tokens") or usage.get("cache_read_tokens") or 0),
+        )
+        uncached_in = max(0, raw_in - cache_in)
+        out_tok = max(0, int(usage.get("output_tokens") or 0))
+        if uncached_in or cache_in or out_tok:
+            deltas.append((uncached_in, cache_in, out_tok))
+    return deltas
+
+
+def _extract_agy_cumulative_usage(raw_path: Path) -> tuple[str | None, int, int, int]:
+    """Extract (conversation_id, input_tokens, cache_read_tokens, output_tokens) from AGY JSONL."""
+    if not raw_path.is_file():
+        return None, 0, 0, 0
+    conv_id: str | None = None
+    max_in = 0
+    max_cache = 0
+    max_out = 0
+    for line in raw_path.read_text(encoding="utf-8", errors="replace").splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        try:
+            ev = json.loads(stripped)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(ev, dict):
+            continue
+        if isinstance(ev.get("conversation_id"), str) and ev["conversation_id"].strip():
+            conv_id = ev["conversation_id"].strip()
+        res = ev.get("result") if isinstance(ev.get("result"), dict) else None
+        if res and isinstance(res.get("conversation_id"), str) and res["conversation_id"].strip():
+            conv_id = res["conversation_id"].strip()
+        usage = (
+            res.get("usage")
+            if (res and isinstance(res.get("usage"), dict))
+            else ev.get("usage")
+        )
+        if not isinstance(usage, dict):
+            continue
+        max_in = max(max_in, max(0, int(usage.get("input_tokens") or 0)))
+        max_cache = max(
+            max_cache,
+            max(0, int(usage.get("cache_read_tokens") or usage.get("cached_input_tokens") or 0)),
+        )
+        max_out = max(max_out, max(0, int(usage.get("output_tokens") or 0)))
+    return conv_id, max_in, max_cache, max_out
+
+
+def _record_g4_ledger_outcome(
+    ledger_path: Path,
+    *,
+    git_top: Path,
+    out_dir: Path,
+    candidate_sha: str,
+    report: dict[str, Any],
+    states: dict[str, PassState],
+    reused_passes: list[str],
+    active_backend: str,
+    active_model: str | None,
+) -> None:
+    """Record non-reused G4 pass token spend and transition ledger state atomically."""
+    for pass_name in ("pass1", "pass2"):
+        if pass_name in reused_passes:
+            continue
+        p_state = states[pass_name]
+        p_backend = p_state.backend or active_backend
+        p_model = p_state.model or active_model
+        if not p_model:
+            continue
+        try:
+            task_runner._resolve_pricing(p_model)
+        except ValueError:
+            continue
+        raw_path = out_dir / f"{pass_name}.raw.jsonl"
+        if p_backend == "codex":
+            for u_in, u_cache, u_out in _extract_codex_usage_deltas(raw_path):
+                task_runner.record_usage(
+                    ledger_path,
+                    model=p_model,
+                    input_tokens=u_in,
+                    output_tokens=u_out,
+                    thinking_tokens=0,
+                    cache_read_tokens=u_cache,
+                    counter_mode="delta",
+                )
+        else:
+            conv_id, a_in, a_cache, a_out = _extract_agy_cumulative_usage(raw_path)
+            if a_in or a_cache or a_out:
+                task_runner.record_usage(
+                    ledger_path,
+                    model=p_model,
+                    input_tokens=a_in,
+                    output_tokens=a_out,
+                    thinking_tokens=0,
+                    cache_read_tokens=a_cache,
+                    conversation_id=conv_id,
+                    counter_mode="cumulative",
+                )
+
+    gate_status = str(report.get("review_gate_status", "BLOCKED"))
+    with task_runner._ledger_lock(ledger_path):
+        ledger = task_runner.load_ledger(ledger_path, repo_root=git_top)
+        if gate_status in {"PASSED", "CHANGES_REQUESTED"}:
+            ledger["g4_rounds_total"] = int(ledger.get("g4_rounds_total", 0)) + 1
+            ledger["g4_rounds_in_packet"] = int(ledger.get("g4_rounds_in_packet", 0)) + 1
+        ledger["last_g4_candidate_sha"] = candidate_sha
+        ledger["last_g4_status"] = gate_status
+        ledger["transient_retries_in_stage"] = 0
+
+        spent = float(ledger.get("spent_api_equiv_usd", 0.0))
+        limit = float(ledger.get("budget_limit_usd", 0.0))
+        if limit > 0 and round(spent, 8) > round(limit, 8):
+            ledger["state"] = "PAUSED_BUDGET"
+            task_runner._append_event(
+                ledger,
+                "G4_BUDGET_PAUSED",
+                {"candidate_sha": candidate_sha, "spent_usd": spent, "limit_usd": limit},
+            )
+        elif gate_status == "PASSED":
+            ledger["candidate_sha"] = candidate_sha
+            ledger["state"] = "READY_FOR_ACCEPTANCE"
+            task_runner._append_event(ledger, "G4_PASSED", {"candidate_sha": candidate_sha})
+        elif gate_status == "CHANGES_REQUESTED":
+            ledger["candidate_sha"] = None
+            ledger["consecutive_failed_candidates"] = (
+                int(ledger.get("consecutive_failed_candidates", 0)) + 1
+            )
+            task_runner._apply_candidate_failure_breakers(ledger)
+            task_runner._append_event(
+                ledger,
+                "G4_CHANGES_REQUESTED",
+                {"candidate_sha": candidate_sha},
+            )
+        else:
+            ledger["state"] = gate_status
+            task_runner._append_event(
+                ledger,
+                f"G4_{gate_status}",
+                {"candidate_sha": candidate_sha, "errors": report.get("errors", [])},
+            )
+        task_runner.save_ledger(ledger_path, ledger)
+
+
+def _mark_ledger_infra_blocked(
+    ledger_path: Path | None,
+    git_top: Path,
+    candidate_sha: str,
+    reason: str,
+) -> None:
+    if ledger_path is None or not ledger_path.is_file():
+        return
+    with task_runner._ledger_lock(ledger_path):
+        ledger = task_runner.load_ledger(ledger_path, repo_root=git_top)
+        ledger["state"] = "BLOCKED_INFRA"
+        ledger["last_g4_candidate_sha"] = candidate_sha
+        ledger["last_g4_status"] = "BLOCKED_INFRA"
+        task_runner._append_event(
+            ledger,
+            "G4_BLOCKED_INFRA",
+            {"candidate_sha": candidate_sha, "reason": reason},
+        )
+        task_runner.save_ledger(ledger_path, ledger)
+
+
 def main(argv: list[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
     repo_root = args.repo_root.resolve()
@@ -1698,6 +2099,15 @@ def main(argv: list[str] | None = None) -> int:
             file=sys.stderr,
         )
         return 2
+
+    active_ledger_path: Path | None = None
+    if _should_enforce_g4_caps(args, out_dir, git_top):
+        active_ledger_path = _resolve_g4_ledger_path(args, git_top)
+        preflight_rc = _preflight_g4_caps(
+            args, out_dir, git_top, candidate_sha, active_ledger_path
+        )
+        if preflight_rc is not None:
+            return preflight_rc
 
     out_dir.mkdir(parents=True, exist_ok=True)
     lock_path = out_dir / ".review-attempt.lock"
@@ -1931,6 +2341,19 @@ def main(argv: list[str] | None = None) -> int:
         if not _write_once_outputs(out_dir, report):
             return 2
 
+        if active_ledger_path is not None and active_ledger_path.is_file():
+            _record_g4_ledger_outcome(
+                active_ledger_path,
+                git_top=git_top,
+                out_dir=out_dir,
+                candidate_sha=candidate_sha,
+                report=report,
+                states=states,
+                reused_passes=reused_passes,
+                active_backend=active_backend,
+                active_model=active_model,
+            )
+
         print(
             f"[codex_room_review] sha={candidate_sha[:12]} backend={active_backend} "
             f"model={active_model or 'default'} fallback={fallback_used} "
@@ -2150,6 +2573,7 @@ def main(argv: list[str] | None = None) -> int:
             agy_prefix = resolve_agy_command()
         except FileNotFoundError as exc:
             print(f"[codex_room_review] {exc}", file=sys.stderr)
+            _mark_ledger_infra_blocked(active_ledger_path, git_top, candidate_sha, str(exc))
             return 2
         outcome, st_errs, _ = _run_provider_stage("agy", agy_prefix, active_model)
         if outcome == "QUOTA_EXHAUSTED":
@@ -2192,7 +2616,9 @@ def main(argv: list[str] | None = None) -> int:
         codex_prefix = resolve_codex_command()
     except FileNotFoundError:
         if args.backend == "codex":
-            print("[codex_room_review] Codex CLI (`codex`) not found on PATH.", file=sys.stderr)
+            msg = "[codex_room_review] Codex CLI (`codex`) not found on PATH."
+            print(msg, file=sys.stderr)
+            _mark_ledger_infra_blocked(active_ledger_path, git_top, candidate_sha, msg)
             return 2
         fallback_reason = "codex_cli_not_found"
         _mark_pool_exhausted(EXPECTED_REVIEW_MODEL)
@@ -2254,6 +2680,7 @@ def main(argv: list[str] | None = None) -> int:
                 agy_prefix = resolve_agy_command()
             except FileNotFoundError as exc:
                 print(f"[codex_room_review] Fallback failed: {exc}", file=sys.stderr)
+                _mark_ledger_infra_blocked(active_ledger_path, git_top, candidate_sha, str(exc))
                 return 2
 
             print(
