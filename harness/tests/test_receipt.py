@@ -1820,6 +1820,178 @@ def test_g5_receipt_blocks_per_sha_cap_and_verifies_ledger_hash_exact(
     assert rec_ok["artifact_hashes"]["ledger_json_sha256"] == expected_ledger_sha
 
 
+def test_g5_root_discovery_foreign_ledger_paused_with_findings_and_human_override(
+    tmp_path: Path,
+) -> None:
+    """Verify root discovery, foreign ledger rejection, PAUSED+findings -> BLOCKED, and cap=7."""
+    from harness.scripts import receipt as receipt_mod
+    from harness.scripts import task_runner
+
+    repo = tmp_path / "repo_g5_a6"
+    repo.mkdir()
+    subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+    subprocess.run(
+        ["git", "config", "user.email", "test@example.com"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.name", "Test User"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+    )
+    src = repo / "mod.py"
+    src.write_text("x = 1\n", encoding="utf-8")
+    subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+    subprocess.run(["git", "commit", "-m", "base"], cwd=repo, check=True, capture_output=True)
+    base_sha = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=repo, check=True, capture_output=True, text=True
+    ).stdout.strip()
+    src.write_text("x = 2\n", encoding="utf-8")
+    subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+    subprocess.run(["git", "commit", "-m", "cand"], cwd=repo, check=True, capture_output=True)
+    cand_sha = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=repo, check=True, capture_output=True, text=True
+    ).stdout.strip()
+
+    v_path = tmp_path / "v_a6.json"
+    r_ok_path = tmp_path / "r_a6_ok.json"
+    v_path.write_text(json.dumps(_verifier(cand_sha)), encoding="utf-8")
+    r_ok_path.write_text(json.dumps(_review(cand_sha)), encoding="utf-8")
+
+    # 1. Root discovery + PAUSED_BUDGET with CHANGES_REQUESTED (1 open finding) -> BLOCKED (rc=2).
+    r_cr_path = tmp_path / "r_a6_cr.json"
+    cr_review = _review(
+        cand_sha,
+        findings=[
+            {
+                "id": "P1-01",
+                "severity": "high",
+                "blocking": True,
+                "file": "mod.py",
+                "line_start": 1,
+                "line_end": 1,
+                "title": "Open blocking finding",
+                "status": "OPEN",
+            }
+        ],
+    )
+    cr_review["blocking_open_count"] = 1
+    r_cr_path.write_text(json.dumps(cr_review), encoding="utf-8")
+
+    root_led_path = repo / "harness" / "runs" / "ROOT" / "ledger.json"
+    l_root = task_runner.init_or_load_ledger(
+        root_led_path, root_task_id="ROOT", task_id="CHILD-V2", base_sha=base_sha, budget_usd=6.0
+    )
+    l_root["state"] = "PAUSED_BUDGET"
+    l_root["candidate_sha"] = cand_sha
+    task_runner.save_ledger(root_led_path, l_root)
+
+    out_root = tmp_path / "out_g5_root_paused"
+    rc_root = receipt_mod.main(
+        [
+            "--task-id",
+            "CHILD-V2",
+            "--phase",
+            "1",
+            "--base-sha",
+            base_sha,
+            "--candidate-sha",
+            cand_sha,
+            "--verifier-json",
+            str(v_path),
+            "--review-json",
+            str(r_cr_path),
+            "--repo-root",
+            str(repo),
+            "--out-dir",
+            str(out_root),
+        ]
+    )
+    assert rc_root == 2
+    rec_root = json.loads((out_root / "receipt.json").read_text(encoding="utf-8"))
+    assert rec_root["conclusion"] == "BLOCKED"
+    assert rec_root["failures"]
+
+    # 2. Foreign --ledger OTHER/ledger.json with --task-id CHILD-V2 -> BLOCKED (rc=2).
+    other_led_path = repo / "harness" / "runs" / "OTHER" / "ledger.json"
+    l_other = task_runner.init_or_load_ledger(
+        other_led_path, root_task_id="OTHER", base_sha=base_sha, budget_usd=6.0
+    )
+    l_other["state"] = "READY_FOR_ACCEPTANCE"
+    l_other["candidate_sha"] = cand_sha
+    task_runner.save_ledger(other_led_path, l_other)
+
+    out_foreign = tmp_path / "out_g5_foreign"
+    rc_foreign = receipt_mod.main(
+        [
+            "--task-id",
+            "CHILD-V2",
+            "--phase",
+            "1",
+            "--base-sha",
+            base_sha,
+            "--candidate-sha",
+            cand_sha,
+            "--verifier-json",
+            str(v_path),
+            "--review-json",
+            str(r_ok_path),
+            "--ledger",
+            str(other_led_path),
+            "--repo-root",
+            str(repo),
+            "--out-dir",
+            str(out_foreign),
+        ]
+    )
+    assert rc_foreign == 2
+    rec_foreign = json.loads((out_foreign / "receipt.json").read_text(encoding="utf-8"))
+    assert rec_foreign["conclusion"] == "BLOCKED"
+    assert any("Ledger task mismatch" in b for b in rec_foreign["blockers"])
+
+    # 3. Human-approved extended circuit_breakers (max_total_candidates=7, max_g4_rounds=7) -> OK.
+    ext_led_path = repo / "harness" / "runs" / "T-G5-EXT" / "ledger.json"
+    l_ext = task_runner.init_or_load_ledger(
+        ext_led_path, root_task_id="T-G5-EXT", base_sha=base_sha, budget_usd=6.0
+    )
+    l_ext["state"] = "READY_FOR_ACCEPTANCE"
+    l_ext["candidate_sha"] = cand_sha
+    l_ext["total_candidates"] = 7
+    l_ext["g4_rounds_total"] = 7
+    l_ext["circuit_breakers"]["max_total_candidates_per_root_task"] = 7
+    l_ext["circuit_breakers"]["max_g4_rounds_per_root_task"] = 7
+    task_runner.save_ledger(ext_led_path, l_ext)
+
+    out_ext = tmp_path / "out_g5_ext"
+    rc_ext = receipt_mod.main(
+        [
+            "--task-id",
+            "T-G5-EXT",
+            "--phase",
+            "1",
+            "--base-sha",
+            base_sha,
+            "--candidate-sha",
+            cand_sha,
+            "--verifier-json",
+            str(v_path),
+            "--review-json",
+            str(r_ok_path),
+            "--repo-root",
+            str(repo),
+            "--out-dir",
+            str(out_ext),
+        ]
+    )
+    assert rc_ext == 0
+    rec_ext = json.loads((out_ext / "receipt.json").read_text(encoding="utf-8"))
+    assert rec_ext["conclusion"] == "VERIFIED"
+
+
+
 
 
 

@@ -3757,6 +3757,159 @@ def test_g4_pauses_budget_when_committed_spend_with_active_reservations_exceeds_
     assert any("committed spend" in b for b in rec_g5["blockers"])
 
 
+def test_g4_root_discovery_foreign_ledger_monotonic_counter_and_reused_billing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Verify root discovery, foreign ledger rejection, monotonic legacy_untracked_rounds, reuse."""
+    from harness.scripts import task_runner
+
+    repo_dir, sha1 = _init_policy_repo(tmp_path / "repo_a6_cov", qualified_routes=[])
+    calls = _install_counting_codex_stub(tmp_path, monkeypatch, sha1)
+
+    # 1. Root ledger ROOT paused while child task_id=CHILD-V2 runs without --ledger.
+    root_ledger = _setup_ledger_for_g4_test(
+        repo_dir, "ROOT", state="PAUSED_BUDGET", candidate_sha=sha1
+    )
+    r_data = task_runner.load_ledger(root_ledger)
+    r_data["task_id"] = "CHILD-V2"
+    task_runner.save_ledger(root_ledger, r_data)
+    rc_root = codex_room_review.main(
+        [
+            "--commit",
+            sha1,
+            "--task-id",
+            "CHILD-V2",
+            "--repo-root",
+            str(repo_dir),
+            "--backend",
+            "codex",
+        ]
+    )
+    assert rc_root == 2
+    assert _count_calls(calls) == 0
+
+    # 2. Foreign --ledger OTHER/ledger.json with --task-id PAUSED-TASK must be rejected (rc == 2).
+    _setup_ledger_for_g4_test(
+        repo_dir, "PAUSED-TASK", state="PAUSED_BUDGET", candidate_sha=sha1
+    )
+    other_ledger = _setup_ledger_for_g4_test(
+        repo_dir, "OTHER", state="REVIEW_FROZEN_G4", candidate_sha=sha1
+    )
+    rc_foreign = codex_room_review.main(
+        [
+            "--commit",
+            sha1,
+            "--task-id",
+            "PAUSED-TASK",
+            "--ledger",
+            str(other_ledger),
+            "--repo-root",
+            str(repo_dir),
+            "--backend",
+            "codex",
+        ]
+    )
+    assert rc_foreign == 2
+    assert _count_calls(calls) == 0
+
+    # 3. Counter-only tracker (completed_rounds=5) + 1 filesystem dir across 2 consecutive calls.
+    mono_tracker_path = task_runner.default_g4_tracker_path("T-MONO-CNT", repo_root=repo_dir)
+    mono_tracker = task_runner.load_g4_tracker(mono_tracker_path, task_id="T-MONO-CNT")
+    mono_tracker["completed_rounds"] = 5
+    mono_tracker.pop("legacy_untracked_rounds", None)
+    task_runner.save_g4_tracker(mono_tracker_path, mono_tracker)
+
+    mono_att1 = (
+        repo_dir / "harness" / "runs" / "T-MONO-CNT" / "attempts" / f"att1-{sha1[:12]}"
+    )
+    mono_att1.mkdir(parents=True, exist_ok=True)
+    (mono_att1 / "consolidated-review.json").write_text(
+        json.dumps(
+            {
+                "revision_sha": sha1,
+                "passes_completed": 2,
+                "independent_contexts": True,
+                "review_gate_status": "CHANGES_REQUESTED",
+                "blocking_open_count": 1,
+                "consolidated_findings": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    (repo_dir / "mono2.txt").write_text("m2\n", encoding="utf-8")
+    sha2 = _commit_repo_change(repo_dir, "mono commit 2")
+    calls2 = _install_counting_codex_stub(tmp_path, monkeypatch, sha2)
+    for idx in range(2):
+        rc_m = codex_room_review.main(
+            [
+                "--commit",
+                sha2,
+                "--task-id",
+                "T-MONO-CNT",
+                "--out-dir",
+                str(tmp_path / f"mono_out_{idx}"),
+                "--repo-root",
+                str(repo_dir),
+                "--backend",
+                "codex",
+            ]
+        )
+        assert rc_m == 2
+        assert _count_calls(calls2) == 0
+        t_cur = task_runner.load_g4_tracker(mono_tracker_path, task_id="T-MONO-CNT")
+        u_cur = task_runner.collect_g4_attempt_union(
+            [repo_dir / "harness" / "runs" / "T-MONO-CNT" / "attempts"], t_cur
+        )
+        assert u_cur["total_rounds"] == 6
+
+    # 4. Direct _bill_pass_raw_logs(..., reused_passes=["pass1"]) skips billing pass1.raw.jsonl.
+    bill_dir = tmp_path / "direct_bill_dir"
+    bill_dir.mkdir()
+    (bill_dir / "pass1.raw.jsonl").write_text(
+        json.dumps(
+            {
+                "type": "turn.completed",
+                "usage": {"input_tokens": 10000, "cached_input_tokens": 0, "output_tokens": 1000},
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    p1 = codex_room_review.PassState(
+        pass_name="pass1", lens="correctness_and_tests", backend="codex", model="gpt-6.1-sol"
+    )
+    p2 = codex_room_review.PassState(
+        pass_name="pass2", lens="security_and_invariants", backend="codex", model="gpt-6.1-sol"
+    )
+    led_reused = _setup_ledger_for_g4_test(
+        repo_dir, "T-BILL-REUSE", state="REVIEW_FROZEN_G4", candidate_sha=sha1
+    )
+    codex_room_review._bill_pass_raw_logs(
+        led_reused,
+        out_dir=bill_dir,
+        states={"pass1": p1, "pass2": p2},
+        reused_passes=["pass1"],
+        active_backend="codex",
+        active_model="gpt-6.1-sol",
+        primary_model="gpt-6.1-sol",
+        route_models_by_tag={},
+    )
+    assert json.loads(led_reused.read_text(encoding="utf-8"))["spent_api_equiv_usd"] == 0.0
+    codex_room_review._bill_pass_raw_logs(
+        led_reused,
+        out_dir=bill_dir,
+        states={"pass1": p1, "pass2": p2},
+        reused_passes=[],
+        active_backend="codex",
+        active_model="gpt-6.1-sol",
+        primary_model="gpt-6.1-sol",
+        route_models_by_tag={},
+    )
+    assert json.loads(led_reused.read_text(encoding="utf-8"))["spent_api_equiv_usd"] > 0.0
+
+
+
 
 
 

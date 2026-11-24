@@ -182,7 +182,7 @@ def collect_g4_attempt_union(
                     if status_str:
                         sha_statuses[norm_dir] = status_str
 
-    tracker_completed_round_dirs: set[str] = set()
+    native_tracker_round_dirs: set[str] = set()
     if isinstance(tracker, dict):
         comp_map = tracker.get("completed_attempts", {})
         if isinstance(comp_map, dict):
@@ -193,7 +193,8 @@ def collect_g4_attempt_union(
                 st = str(entry.get("status") or "")
                 if st in completed_statuses or st == "IN_PROGRESS":
                     round_dirs.add(norm_dir)
-                    tracker_completed_round_dirs.add(norm_dir)
+                    if not entry.get("seeded_from_fs"):
+                        native_tracker_round_dirs.add(norm_dir)
                 if candidate_sha and entry.get("candidate_sha") == candidate_sha:
                     sha_dirs.add(norm_dir)
                     if st:
@@ -209,7 +210,7 @@ def collect_g4_attempt_union(
                 st = str(entry.get("status") or "")
                 if st in completed_statuses:
                     round_dirs.add(norm_dir)
-                    tracker_completed_round_dirs.add(norm_dir)
+                    native_tracker_round_dirs.add(norm_dir)
                 if candidate_sha and entry.get("candidate_sha") == candidate_sha:
                     sha_dirs.add(norm_dir)
                     if norm_dir not in sha_statuses and st:
@@ -230,7 +231,7 @@ def collect_g4_attempt_union(
     seeded_legacy = 0
     if isinstance(tracker, dict):
         raw_comp = int(tracker.get("completed_rounds", 0))
-        seeded_legacy = max(0, raw_comp - len(tracker_completed_round_dirs))
+        seeded_legacy = max(0, raw_comp - len(native_tracker_round_dirs))
 
     seeded_sha = 0
     if candidate_sha and isinstance(tracker, dict) and not sha_dirs:
@@ -418,6 +419,93 @@ def _validate_safe_task_id(task_id: str, label: str = "root_task_id") -> str:
             f"Invalid {label} {task_id!r} (must match {SAFE_TASK_ID_RE.pattern})."
         )
     return cleaned
+
+
+def extract_root_task_id(
+    *,
+    task_packet: Path | None = None,
+    task_manifest: Path | None = None,
+) -> str | None:
+    """Extract declared ``root_task_id`` from ``readiness.json`` or ``packet.md``."""
+    if task_manifest is not None and task_manifest.is_file():
+        m_data = _read_optional_json_dict(task_manifest)
+        if isinstance(m_data, dict):
+            rt = m_data.get("root_task_id")
+            if isinstance(rt, str) and rt.strip():
+                return rt.strip()
+    if task_packet is not None and task_packet.is_file():
+        try:
+            text = task_packet.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            text = ""
+        m = re.search(
+            r"^\s*[-*]\s+\*\*Root Task ID\*\*:\s*`([^`\r\n]+)`",
+            text,
+            flags=re.MULTILINE,
+        )
+        if m and m.group(1).strip():
+            return m.group(1).strip()
+    return None
+
+
+def find_ledger_path_for_task(
+    task_id: str,
+    *,
+    repo_root: Path,
+    task_packet: Path | None = None,
+    task_manifest: Path | None = None,
+) -> Path | None:
+    """Locate ``ledger.json`` by task_id, packet/manifest root_task_id, or runs/ scan."""
+    root = repo_root.resolve()
+    runs_dir = root / "harness" / "runs"
+    try:
+        direct = default_ledger_path(task_id, repo_root=root)
+        if direct.is_file():
+            return direct.resolve()
+    except ValueError:
+        pass
+
+    hinted_root = extract_root_task_id(task_packet=task_packet, task_manifest=task_manifest)
+    if hinted_root:
+        try:
+            hinted = default_ledger_path(hinted_root, repo_root=root)
+            if hinted.is_file():
+                return hinted.resolve()
+        except ValueError:
+            pass
+
+    if runs_dir.is_dir():
+        for cand in sorted(runs_dir.glob("*/ledger.json")):
+            data = _read_optional_json_dict(cand)
+            if not isinstance(data, dict) or not data.get("root_task_id"):
+                continue
+            if data.get("task_id") == task_id or data.get("root_task_id") == task_id:
+                return cand.resolve()
+    return None
+
+
+def validate_ledger_task_binding(
+    ledger: dict[str, Any],
+    *,
+    task_id: str,
+    expected_root_task_id: str | None = None,
+) -> str | None:
+    """Verify ``ledger.json`` belongs to ``task_id`` / ``expected_root_task_id``."""
+    actual_root = ledger.get("root_task_id")
+    if expected_root_task_id and actual_root != expected_root_task_id:
+        return (
+            f"Ledger root_task_id mismatch: expected {expected_root_task_id!r}, "
+            f"got {actual_root!r}."
+        )
+    if task_id == "adhoc" and expected_root_task_id is None:
+        return None
+    allowed_ids = {ledger.get("task_id"), actual_root}
+    if task_id not in allowed_ids:
+        return (
+            f"Ledger task mismatch: ledger belongs to root={actual_root!r} "
+            f"task={ledger.get('task_id')!r}, cannot bind task_id={task_id!r}."
+        )
+    return None
 
 
 def default_ledger_path(root_task_id: str, repo_root: Path | None = None) -> Path:
@@ -707,6 +795,7 @@ def run_review_gate_step(
     base_sha: str | None = None,
     repo_root: Path | None = None,
     ledger: dict[str, Any] | None = None,
+    ledger_path: Path | None = None,
 ) -> subprocess.CompletedProcess[str]:
     """Execute ``codex_room_review.py`` via managed subprocess with reviewer deadlines."""
     root = (repo_root or REPO_ROOT).resolve()
@@ -736,6 +825,17 @@ def run_review_gate_step(
     ]
     if effective_base:
         cmd.extend(["--base", effective_base])
+    effective_ledger = ledger_path
+    if effective_ledger is None and isinstance(ledger, dict) and ledger.get("root_task_id"):
+        cand = default_ledger_path(str(ledger["root_task_id"]), repo_root=root)
+        if cand.is_file():
+            effective_ledger = cand
+    if effective_ledger is None:
+        effective_ledger = find_ledger_path_for_task(
+            task_id, repo_root=root, task_packet=packet_path
+        )
+    if effective_ledger is not None:
+        cmd.extend(["--ledger", str(effective_ledger)])
     outer_timeout = float(max(pass_total * 2 + 60, pass_total + 60))
     return run_managed_stage_cmd(
         "reviewer_pass_total",
@@ -792,10 +892,14 @@ def run_receipt_gate_step(
     if red_proof_json is not None:
         cmd.extend(["--red-proof-json", str(red_proof_json)])
     effective_ledger = ledger_path
+    if effective_ledger is None and isinstance(ledger, dict) and ledger.get("root_task_id"):
+        cand = default_ledger_path(str(ledger["root_task_id"]), repo_root=root)
+        if cand.is_file():
+            effective_ledger = cand
     if effective_ledger is None:
-        candidate_ledger = root / "harness" / "runs" / task_id / "ledger.json"
-        if candidate_ledger.is_file():
-            effective_ledger = candidate_ledger
+        effective_ledger = find_ledger_path_for_task(
+            task_id, repo_root=root, task_manifest=readiness_json
+        )
     if effective_ledger is not None:
         cmd.extend(["--ledger", str(effective_ledger)])
     return run_managed_stage_cmd("verifier_step", cmd, ledger=ledger, cwd=root)
@@ -1494,9 +1598,17 @@ def _record_peer_outcome_locked(
         if not cand_valid:
             return _record_peer_failure({"reason": "Unreachable or non-distinct candidate_sha."})
 
+        already_recorded = any(
+            isinstance(ev, dict)
+            and ev.get("kind") == "CANDIDATE_READY"
+            and isinstance(ev.get("detail"), dict)
+            and ev["detail"].get("candidate_sha") == candidate_sha
+            for ev in ledger.get("events", [])
+        )
         ledger["transient_retries_in_stage"] = 0
-        ledger["total_candidates"] = int(ledger["total_candidates"]) + 1
-        ledger["candidates_in_packet"] = int(ledger["candidates_in_packet"]) + 1
+        if not already_recorded:
+            ledger["total_candidates"] = int(ledger["total_candidates"]) + 1
+            ledger["candidates_in_packet"] = int(ledger["candidates_in_packet"]) + 1
 
         diff_cmd = [
             "git",
@@ -1688,6 +1800,8 @@ def record_replan(
     *,
     packet_path: Path | None = None,
     human_approved: bool = False,
+    max_total_candidates: int | None = None,
+    max_g4_rounds: int | None = None,
     repo_root: Path | None = None,
     policy_path: Path | None = None,
 ) -> tuple[dict[str, Any], int, str]:
@@ -1697,6 +1811,22 @@ def record_replan(
         current_state = ledger["state"]
         if current_state == "VERIFIED":
             return ledger, 2, "Refusing replan: ledger is already VERIFIED."
+        if (max_total_candidates is not None or max_g4_rounds is not None) and (
+            not human_approved
+        ):
+            return ledger, 2, "Ceiling overrides require --human-approved."
+        if max_total_candidates is not None and (
+            not is_strict_int(max_total_candidates) or max_total_candidates < 1
+        ):
+            return (
+                ledger,
+                2,
+                f"Invalid max_total_candidates={max_total_candidates!r}; must be >= 1.",
+            )
+        if max_g4_rounds is not None and (
+            not is_strict_int(max_g4_rounds) or max_g4_rounds < 1
+        ):
+            return ledger, 2, f"Invalid max_g4_rounds={max_g4_rounds!r}; must be >= 1."
         if not human_approved and current_state != "NEEDS_REPLAN":
             return (
                 ledger,
@@ -1795,6 +1925,21 @@ def record_replan(
             ledger["auto_replans_used"] = int(ledger["auto_replans_used"]) + 1
         else:
             ledger["budget_limit_usd"] = new_budget
+            cb = ledger.setdefault("circuit_breakers", {})
+            if max_total_candidates is not None:
+                cb["max_total_candidates_per_root_task"] = int(max_total_candidates)
+            elif int(ledger.get("total_candidates", 0)) >= int(
+                cb.get("max_total_candidates_per_root_task", 6)
+            ):
+                cb["max_total_candidates_per_root_task"] = (
+                    int(ledger.get("total_candidates", 0)) + 1
+                )
+            if max_g4_rounds is not None:
+                cb["max_g4_rounds_per_root_task"] = int(max_g4_rounds)
+            elif int(ledger.get("g4_rounds_total", 0)) >= int(
+                cb.get("max_g4_rounds_per_root_task", 6)
+            ):
+                cb["max_g4_rounds_per_root_task"] = int(ledger.get("g4_rounds_total", 0)) + 1
         ledger["packet_version"] = new_version
         ledger["task_id"] = str(readiness.get("task_id", ledger["task_id"]))
         ledger["base_sha"] = new_base_sha
@@ -2063,6 +2208,8 @@ def _build_parser() -> argparse.ArgumentParser:
     p_rep.add_argument("--readiness", type=Path, required=True)
     p_rep.add_argument("--packet", type=Path, default=None)
     p_rep.add_argument("--human-approved", action="store_true")
+    p_rep.add_argument("--max-total-candidates", type=int, default=None)
+    p_rep.add_argument("--max-g4-rounds", type=int, default=None)
     p_rep.add_argument("--repo-root", type=Path, default=None)
     p_rep.add_argument("--policy", type=Path, default=None)
     p_rep.add_argument("--json", action="store_true")
@@ -2186,6 +2333,8 @@ def _dispatch_cli(args: argparse.Namespace) -> int:
             args.readiness,
             packet_path=args.packet,
             human_approved=args.human_approved,
+            max_total_candidates=args.max_total_candidates,
+            max_g4_rounds=args.max_g4_rounds,
             repo_root=args.repo_root,
             policy_path=args.policy,
         )

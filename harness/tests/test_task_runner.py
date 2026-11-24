@@ -1054,3 +1054,141 @@ def test_g4_circuit_breakers_ledger_backfill_replan_and_idempotent_gates(
     assert "--ledger" in seen_cmds[0]
     assert str(ledger_path) in seen_cmds[0]
 
+
+def test_human_approved_ceiling_overrides_and_root_wrapper_forwarding(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Ceiling overrides require --human-approved, avoid duplicate candidate count, forward root."""
+    base_sha, pkt1, _ = _setup_repo_with_valid_packet(tmp_path, packet_version=1, budget_usd=6.0)
+    ledger_path = tmp_path / "harness" / "runs" / "ROOT" / "ledger.json"
+    led = task_runner.init_or_load_ledger(
+        ledger_path, root_task_id="ROOT", base_sha=base_sha, budget_usd=6.0
+    )
+    led["total_candidates"] = 6
+    led["g4_rounds_total"] = 6
+    led["state"] = "PAUSED_BUDGET"
+    task_runner.save_ledger(ledger_path, led)
+
+    pkt2_text = (
+        pkt1.read_text(encoding="utf-8")
+        .replace("- **Root Task ID**: `T-RUN-01`", "- **Root Task ID**: `ROOT`")
+        .replace("- **Task ID**: `T-RUN-01`", "- **Task ID**: `CHILD-V2`")
+        .replace("- **Packet Version**: `1`", "- **Packet Version**: `2`")
+    )
+    pkt2 = tmp_path / "packet_root_v2.md"
+    pkt2.write_text(pkt2_text, encoding="utf-8")
+    r2 = tmp_path / "readiness_root_v2.json"
+    assert (
+        brief_gate.main(
+            [
+                "--packet",
+                str(pkt2),
+                "--repo-root",
+                str(tmp_path),
+                "--out",
+                str(r2),
+            ]
+        )
+        == 0
+    )
+
+    # Without --human-approved, ceiling override is rejected with rc == 2.
+    _, rc_no_human, msg_no_human = task_runner.record_replan(
+        ledger_path,
+        r2,
+        packet_path=pkt2,
+        human_approved=False,
+        max_total_candidates=7,
+        repo_root=tmp_path,
+    )
+    assert rc_no_human == 2
+    assert "human-approved" in msg_no_human
+
+    # With --human-approved via CLI, max_total_candidates=7 and auto-bumped max_g4_rounds=7 apply.
+    rc_cli = task_runner.main(
+        [
+            "record-replan",
+            "--ledger",
+            str(ledger_path),
+            "--readiness",
+            str(r2),
+            "--packet",
+            str(pkt2),
+            "--human-approved",
+            "--max-total-candidates",
+            "7",
+            "--repo-root",
+            str(tmp_path),
+        ]
+    )
+    assert rc_cli == 0
+    updated = task_runner.load_ledger(ledger_path)
+    assert updated["task_id"] == "CHILD-V2"
+    assert updated["circuit_breakers"]["max_total_candidates_per_root_task"] == 7
+    assert updated["circuit_breakers"]["max_g4_rounds_per_root_task"] == 7
+
+    # Duplicate CANDIDATE_READY on the same SHA must not double-increment total_candidates.
+    (tmp_path / "backend" / "app" / "feature.py").write_text("x = 42\n", encoding="utf-8")
+    _git(tmp_path, "add", "backend/app/feature.py")
+    _git(tmp_path, "commit", "-m", "cand same sha")
+    same_sha = _git(tmp_path, "rev-parse", "HEAD")
+
+    out1, led1, rc1 = task_runner.record_peer_outcome(
+        ledger_path,
+        signal="CANDIDATE_READY",
+        candidate_sha=same_sha,
+        readiness_path=r2,
+        packet_path=pkt2,
+        repo_root=tmp_path,
+    )
+    assert out1 == "CANDIDATE_READY" and rc1 == 0
+    assert led1["total_candidates"] == 7
+
+    led1["state"] = "ACTIVE_PEER_G1"
+    task_runner.save_ledger(ledger_path, led1)
+    out2, led2, rc2 = task_runner.record_peer_outcome(
+        ledger_path,
+        signal="CANDIDATE_READY",
+        candidate_sha=same_sha,
+        readiness_path=r2,
+        packet_path=pkt2,
+        repo_root=tmp_path,
+    )
+    assert out2 == "CANDIDATE_READY" and rc2 == 0
+    assert led2["total_candidates"] == 7
+
+    # Both run_review_gate_step & run_receipt_gate_step forward ROOT/ledger.json for CHILD-V2.
+    seen_cmds: list[list[str]] = []
+    monkeypatch.setattr(
+        task_runner,
+        "run_managed_cmd",
+        lambda cmd, **_kw: (
+            seen_cmds.append(cmd)
+            or subprocess.CompletedProcess(args=cmd, returncode=0, stdout="", stderr="")
+        ),
+    )
+    task_runner.run_review_gate_step(
+        commit_sha=same_sha,
+        task_id="CHILD-V2",
+        packet_path=pkt2,
+        out_dir=tmp_path / "rev_child",
+        base_sha=base_sha,
+        repo_root=tmp_path,
+        ledger=None,
+    )
+    task_runner.run_receipt_gate_step(
+        task_id="CHILD-V2",
+        phase=2,
+        base_sha=base_sha,
+        candidate_sha=same_sha,
+        verifier_json=tmp_path / "v.json",
+        review_json=tmp_path / "r.json",
+        readiness_json=r2,
+        out_dir=tmp_path / "rec_child",
+        repo_root=tmp_path,
+        ledger=None,
+    )
+    assert "--ledger" in seen_cmds[0] and str(ledger_path.resolve()) in seen_cmds[0]
+    assert "--ledger" in seen_cmds[1] and str(ledger_path.resolve()) in seen_cmds[1]
+
+

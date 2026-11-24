@@ -1621,13 +1621,15 @@ def _should_enforce_g4_caps(
         return False
     if str(args.task_id).startswith("canary-"):
         return False
-    adhoc_ledger = git_top / "harness" / "runs" / "adhoc" / "ledger.json"
     if (
         args.ledger is None
         and not args.require_ledger
         and args.task_id == "adhoc"
         and out_dir.parent.name != "attempts"
-        and not adhoc_ledger.is_file()
+        and task_runner.find_ledger_path_for_task(
+            args.task_id, repo_root=git_top, task_packet=args.task_packet
+        )
+        is None
     ):
         return False
     return True
@@ -1636,8 +1638,9 @@ def _should_enforce_g4_caps(
 def _resolve_g4_ledger_path(args: argparse.Namespace, git_top: Path) -> Path | None:
     if args.ledger is not None:
         return args.ledger.resolve()
-    auto_path = git_top / "harness" / "runs" / args.task_id / "ledger.json"
-    return auto_path.resolve() if auto_path.is_file() else None
+    return task_runner.find_ledger_path_for_task(
+        args.task_id, repo_root=git_top, task_packet=args.task_packet
+    )
 
 
 def _seed_tracker_from_union(
@@ -1656,6 +1659,7 @@ def _seed_tracker_from_union(
                 "candidate_sha": meta.get("candidate_sha"),
                 "status": meta.get("status"),
                 "completed_at_utc": now_iso,
+                "seeded_from_fs": True,
             }
             changed = True
     sha_counts: dict[str, int] = {}
@@ -1692,8 +1696,23 @@ def _preflight_g4_caps(
         )
         return 2, None, None
 
+    expected_root = task_runner.extract_root_task_id(task_packet=args.task_packet)
+    tracker_id = args.task_id
+    if ledger_path is not None and ledger_path.is_file():
+        raw_ledger = task_runner._read_optional_json_dict(ledger_path)
+        if isinstance(raw_ledger, dict) and raw_ledger.get("root_task_id"):
+            bind_err = task_runner.validate_ledger_task_binding(
+                raw_ledger,
+                task_id=args.task_id,
+                expected_root_task_id=expected_root,
+            )
+            if bind_err:
+                print(f"[codex_room_review] BLOCKED: {bind_err}", file=sys.stderr)
+                return 2, None, None
+            tracker_id = str(raw_ledger["root_task_id"])
+
     try:
-        tracker_path = task_runner.default_g4_tracker_path(args.task_id, repo_root=git_top)
+        tracker_path = task_runner.default_g4_tracker_path(tracker_id, repo_root=git_top)
     except ValueError as exc:
         print(f"[codex_room_review] BLOCKED: {exc}", file=sys.stderr)
         return 2, None, None
@@ -1703,6 +1722,8 @@ def _preflight_g4_caps(
     max_g4_sha = int(policy_cb["max_g4_invocations_per_candidate_sha"])
 
     attempt_roots = [git_top / "harness" / "runs" / args.task_id / "attempts"]
+    if tracker_id != args.task_id:
+        attempt_roots.append(git_top / "harness" / "runs" / tracker_id / "attempts")
     if out_dir.parent.name == "attempts":
         attempt_roots.append(out_dir.parent)
 
@@ -1719,7 +1740,7 @@ def _preflight_g4_caps(
     now_iso = datetime.now(timezone.utc).isoformat()
 
     def _check_and_reserve_locked() -> tuple[int | None, Path | None, str | None]:
-        tracker = task_runner.load_g4_tracker(tracker_path, task_id=args.task_id)
+        tracker = task_runner.load_g4_tracker(tracker_path, task_id=tracker_id)
         union = task_runner.collect_g4_attempt_union(
             attempt_roots, tracker, candidate_sha=candidate_sha
         )
@@ -1788,6 +1809,12 @@ def _preflight_g4_caps(
             return None, tracker_path, reservation_id
 
         ledger = task_runner.load_ledger(ledger_path, repo_root=git_top)
+        locked_bind_err = task_runner.validate_ledger_task_binding(
+            ledger, task_id=args.task_id, expected_root_task_id=expected_root
+        )
+        if locked_bind_err:
+            print(f"[codex_room_review] BLOCKED: {locked_bind_err}", file=sys.stderr)
+            return 2, None, None
         cb = ledger.get("circuit_breakers", {})
         l_max_root = int(cb.get("max_g4_rounds_per_root_task", max_g4_root))
         l_max_pkt = int(
@@ -2158,6 +2185,8 @@ def _record_g4_outcome(
     gate_status = str(report.get("review_gate_status", "BLOCKED"))
     count_round = gate_status in {"PASSED", "CHANGES_REQUESTED", "BLOCKED"}
     attempt_roots = [git_top / "harness" / "runs" / task_id / "attempts"]
+    if tracker_path is not None and tracker_path.parent.name != task_id:
+        attempt_roots.append(tracker_path.parent / "attempts")
     if out_dir.parent.name == "attempts":
         attempt_roots.append(out_dir.parent)
 
