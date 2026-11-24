@@ -32,7 +32,12 @@ from pathlib import Path
 from typing import Any
 
 try:
-    from harness.scripts.codex_room_sync import EXPECTED_REVIEW_MODEL, verify_role
+    from harness.scripts.codex_room_sync import (
+        EXPECTED_REVIEW_MODEL,
+        is_excluded_model,
+        load_model_policy,
+        verify_role,
+    )
     from harness.scripts.schema_utils import (
         cleanup_readonly_tree,
         close_job_handle,
@@ -47,7 +52,12 @@ try:
         validate_instance_against_schema,
     )
 except ImportError:
-    from codex_room_sync import EXPECTED_REVIEW_MODEL, verify_role
+    from codex_room_sync import (
+        EXPECTED_REVIEW_MODEL,
+        is_excluded_model,
+        load_model_policy,
+        verify_role,
+    )
     from schema_utils import (
         cleanup_readonly_tree,
         close_job_handle,
@@ -944,6 +954,25 @@ def _write_once_outputs(out_dir: Path, report: dict[str, Any]) -> bool:
 def main(argv: list[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
     repo_root = args.repo_root.resolve()
+    _, excluded_prefixes, policy_err = load_model_policy(repo_root, require_exists=False)
+    if policy_err:
+        print(f"[codex_room_review] BLOCKED: {policy_err}", file=sys.stderr)
+        return 2
+    if args.model and is_excluded_model(args.model, excluded_prefixes):
+        print(
+            f"[codex_room_review] BLOCKED: --model {args.model!r} "
+            "is excluded by model-policy.json.",
+            file=sys.stderr,
+        )
+        return 2
+    if args.fallback_model and is_excluded_model(args.fallback_model, excluded_prefixes):
+        print(
+            f"[codex_room_review] BLOCKED: --fallback-model {args.fallback_model!r} "
+            "is excluded by model-policy.json.",
+            file=sys.stderr,
+        )
+        return 2
+
     schema = json.loads(SCHEMA_PATH.read_text(encoding="utf-8"))
     schema_errors = validate_strict_json_schema(schema)
     if schema_errors:
@@ -956,6 +985,24 @@ def main(argv: list[str] | None = None) -> int:
         print(f"[codex_room_review] {exc}", file=sys.stderr)
         return 2
     git_top = Path(info["git_top"])
+    if git_top != repo_root:
+        _, git_prefixes, git_policy_err = load_model_policy(git_top, require_exists=False)
+        if git_policy_err:
+            print(f"[codex_room_review] BLOCKED: {git_policy_err}", file=sys.stderr)
+            return 2
+        if args.model and is_excluded_model(args.model, git_prefixes):
+            print(
+                f"[codex_room_review] BLOCKED: --model {args.model!r} is excluded.",
+                file=sys.stderr,
+            )
+            return 2
+        if args.fallback_model and is_excluded_model(args.fallback_model, git_prefixes):
+            print(
+                f"[codex_room_review] BLOCKED: --fallback-model {args.fallback_model!r} "
+                "is excluded.",
+                file=sys.stderr,
+            )
+            return 2
     candidate_sha = info["candidate_sha"]
     if args.out_dir is not None:
         out_dir = args.out_dir.resolve()

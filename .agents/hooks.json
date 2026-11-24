@@ -1,0 +1,16 @@
+{
+  "topstep-safety-guard": {
+    "PreToolUse": [
+      {
+        "matcher": "write_file|edit_file|replace_file_content|multi_replace_file_content|write_to_file|run_command|swarm|invoke_subagent",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python ../harness/scripts/safety_hook.py",
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  }
+}

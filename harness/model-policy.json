@@ -1,0 +1,87 @@
+{
+  "schema_version": "2.0.0",
+  "effective_date": "2026-11-24",
+  "excluded_model_prefixes": [
+    "gemini-3.8-flash",
+    "gemini-4-argon",
+    "gemini-pro-orchestrator-argon",
+    "gemini-3.7-flash",
+    "gemini-2.5-pro"
+  ],
+  "discontinued_peer_subagent_tiers": [
+    "flash",
+    "flash_lite"
+  ],
+  "surface_lifecycle_notes": {
+    "antigravity_product_withdrawal": "Antigravity IDE/CLI product-level withdrawal effective 2026-11-30 for Gemini 3.8 Flash (gemini-3.8-flash-*) and Gemini 4 Argon (gemini-4-argon-*, gemini-pro-orchestrator-argon).",
+    "gemini_api_model_lifecycle": "Gemini API model lifecycle redirects and retirements exclude gemini-3.7-flash* and gemini-2.5-pro* variants from active harness selection."
+  },
+  "roles": {
+    "cli_coordinator": {
+      "selected_model": "gemini-4-neon-medium",
+      "qualification_status": "benchmark_pilot_qualified"
+    },
+    "app_coordinator": {
+      "selected_mode": "Orchestrator",
+      "planner_label": "Gemini 4 Neon Medium",
+      "internal_executor_label": "Gemini 4 Hydrogen High",
+      "qualification_status": "canary_required",
+      "forbid_internal_executor_product_writes": true
+    },
+    "peer_default": {
+      "dispatch_tool": "swarm",
+      "workspace_mode": "share",
+      "selected_model": "gemini-4-hydrogen-high",
+      "qualification_status": "benchmark_pilot_qualified"
+    },
+    "peer_low_risk": {
+      "dispatch_tool": "swarm",
+      "workspace_mode": "share",
+      "selected_model": "gemini-4-hydrogen-low",
+      "qualification_status": "constrained_candidate",
+      "require_pure_domain_classification": true
+    },
+    "independent_reviewer_primary": {
+      "backend": "codex",
+      "selected_model": "gpt-6.1-sol",
+      "selected_effort": "high",
+      "qualification_status": "production_qualified"
+    },
+    "independent_reviewer_fallbacks": {
+      "qualified_routes": [],
+      "unqualified_candidates_requiring_canary": [
+        "claude-opus-5-5-medium",
+        "gemini-4-carbon-high",
+        "gemini-4-neon-high"
+      ],
+      "quota_pools": {
+        "gpt-6.1-sol": "openai_codex",
+        "claude-opus-5-5-medium": "anthropic_agy",
+        "claude-opus-5-5-high": "anthropic_agy",
+        "gemini-4-carbon-high": "gemini_agy",
+        "gemini-4-neon-high": "gemini_agy"
+      }
+    }
+  },
+  "circuit_breakers": {
+    "max_candidates_per_packet_version": 3,
+    "reassess_after_failed_candidates": 2,
+    "max_auto_replans_per_root_task": 1,
+    "max_total_candidates_per_root_task": 6,
+    "max_transient_retries_per_provider_pass": 1,
+    "api_equiv_budget_usd": {
+      "low_risk": 4.0,
+      "standard": 6.0,
+      "high_risk": 12.0
+    },
+    "deadlines_sec": {
+      "brief_generation": 300,
+      "peer_round": 600,
+      "verifier_step": 180,
+      "verifier_total": 420,
+      "reviewer_pass_total": 600,
+      "reviewer_pass_idle": 180,
+      "root_task_wall_clock": 3600
+    }
+  }
+}

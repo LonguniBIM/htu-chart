@@ -8,9 +8,9 @@
 | Role | Agent / Runtime | Authority & Responsibility |
 | :--- | :--- | :--- |
 | **Human** | Project Owner | Product goals, priority, cost, TopstepX credentials (`.env`), irreversible changes. |
-| **Supervisor + Lead** | **Gemini Neon** (this session) | Scope & Prop Firm compliance guard, Task Packets, equal-colleague debate resolution, dispatching Codex Room review, and final acceptance (`test pass ≠ acceptance`). |
-| **Peer (Coder & Debater)** | **Lower Model (`flash`)** via `peer-coder` / swarm worker | Implements scoped Task Packet, writes value-first tests, challenges flawed assumptions (`REOPEN_REQUEST`, `DEPENDENCY_REQUEST`, `BLOCKED`), delivers immutable git commit (`CANDIDATE_READY`). |
-| **Lead Review** | **Codex CLI** (`codex-room`: `pass1` + `pass2`; auto-fallback to `agy` `claude-opus-5-5-medium` on Codex quota exhaustion) | Independent 2-pass **read-only** review on exact candidate commit SHA (`correctness_and_tests` + `security_and_invariants`). Always prioritizes Codex CLI when available; never edits files or spawns sub-agents. |
+| **Coordinator** (Supervisor + Lead) | **Gemini Neon** (`gemini-4-neon-medium` CLI default; App `Orchestrator` `Neon Medium` + `Hydrogen High`, Internal Executor forbidden from editing Peer-owned product files) | Scope & Prop Firm compliance guard, Task Packets, `G0.5` `brief_gate.py`, equal-colleague debate resolution, dispatching `Independent Reviewer` (`G4`), commit-reachability landing before `swarm(action="kill")`, and final acceptance (`test pass ≠ acceptance`). |
+| **Peer** (Coder & Debater) | **`swarm(action="add", model="gemini-4-hydrogen-high", workspace="share")`** (`gemini-4-hydrogen-low` constrained to `G0.5` zero-risk pure domain packets; legacy `peer-coder` subagent and `flash` tiers are discontinued) | Implements scoped Task Packet in isolated `share` worktree, writes value-first tests, challenges flawed assumptions (`REOPEN_REQUEST`, `DEPENDENCY_REQUEST`, `BLOCKED`) via `post_message`, delivers immutable git commit (`CANDIDATE_READY`). |
+| **Independent Reviewer** | **Codex CLI** (`codex-room`: `pass1` + `pass2` on `gpt-6.1-sol` `high` primary; canary-qualified `agy` fallbacks only per `harness/model-policy.json`) | Independent 2-pass **read-only** review on exact candidate commit SHA (`correctness_and_tests` + `security_and_invariants`). Always prioritizes Codex CLI when available; never edits files or spawns sub-agents. |
 
 ## 2. Rule ↔ Mechanical Enforcement Map
 
@@ -21,7 +21,8 @@
 | Explicit Loopback / Tailscale Bind (no blind `0.0.0.0`) — `F01` | `arch_check.py` (`SEC-003`) + Codex `pass2` | Gate fail (`exit 1`) |
 | Strict Layer Boundaries (`engine` pure, `storage` isolated, `topstep` transport-only, `drawings` reusable) | `arch_check.py` (`ARCH-001`..`ARCH-004`) | Gate fail (`exit 1`) |
 | CME Globex Session Calendar (`America/New_York` 18:00 reset, no naive `utcnow()`) — `R05` | `arch_check.py` (`ARCH-005`) + Codex `pass1` | Gate fail (`exit 1`) |
-| Keep Upstream Fork `../lightweight-charts/` Untouched | `safety_hook.py` (`ask`) + `arch_check.py` (`ARCH-006`) + `verify_app.py doctor` | Hook prompt + gate fail (`exit 1`) |
+| Keep Upstream Fork `../lightweight-charts/` Untouched | `safety_hook.py` (`deny` in Peer worktrees, `ask` for Coordinator) + `arch_check.py` (`ARCH-006`) + `verify_app.py doctor` | Hook `deny`/prompt + gate fail (`exit 1`) |
+| Model Policy & Hook Guard (`MOD-001`, `NC-08`) | `harness/model-policy.json` + `.agents/hooks.json` + `safety_hook.py` + `arch_check.py` (`MOD-001`) + `verify_app.py doctor` | Hook `deny` / gate fail (`exit 1`) |
 | No Unapproved Lint/Type Suppressions or Chart Raw Timers (`SLOP-001`, `SLOP-002`) | `arch_check.py` (`SLOP-001`, `SLOP-002`, expiring `EXEMPT(...)`) | Gate fail (`exit 1`) |
 | Anti-Self-Confirming Tests (`assert True`, `x == x`, swallowed `except: pass`, unapproved `skip`) | `arch_check.py` (`TEST-001`) + Codex `pass1` | Gate fail (`exit 1`) |
 | No Empty Test Suites / Swallowed Exit Codes (`build-verifier`) | `build_verifier.py` (fails on `0 collected` or missing phase target) | `FAILED` (`exit 1`) / `BLOCKED` (`exit 2`) |

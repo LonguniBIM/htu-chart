@@ -70,17 +70,28 @@ stateDiagram-v2
 
 ```mermaid
 stateDiagram-v2
-    [*] --> INTAKE_G0: Lead (Neon) writes self-contained Task Packet
-    INTAKE_G0 --> PEER_WORK_G1: Dispatch Peer (flash) with single write scope
-    PEER_WORK_G1 --> DEBATE: "Peer sends REOPEN_REQUEST / DEPENDENCY_REQUEST"
-    DEBATE --> PEER_WORK_G1: Lead sends ACCEPT_AMENDMENT or REJECT_WITH_RATIONALE
-    DEBATE --> BLOCKED: Lead sends ESCALATE_TO_HUMAN or Peer reports BLOCKED
-    PEER_WORK_G1 --> VERIFY_G3: "Peer delivers immutable commit SHA (plus RED proof if bugfix)"
-    VERIFY_G3 --> PEER_WORK_G1: build_verifier.py FAILED
-    VERIFY_G3 --> REVIEW_G4: build_verifier.py VERIFIED on exact candidate SHA
-    REVIEW_G4 --> PEER_WORK_G1: Codex Room Pass 1 or Pass 2 finds OPEN blocking issue
+    [*] --> INTAKE_G0: Coordinator writes self-contained Task Packet
+    INTAKE_G0 --> BRIEF_GATE_G05: Run brief_gate.py (write-once readiness.json)
+    BRIEF_GATE_G05 --> BLOCKED_BRIEF: Missing anchor, overlapping scope, or excluded model
+    BRIEF_GATE_G05 --> ACTIVE_PEER_G1: Dispatch Peer via swarm(workspace="share", gemini-4-hydrogen-high)
+    ACTIVE_PEER_G1 --> DEBATE: "Peer posts REOPEN_REQUEST / DEPENDENCY_REQUEST"
+    DEBATE --> ACTIVE_PEER_G1: Coordinator sends REJECT_WITH_RATIONALE
+    DEBATE --> NEEDS_REPLAN: Coordinator accepts amendment (Packet Version + 1)
+    NEEDS_REPLAN --> BRIEF_GATE_G05: Re-validate amended packet within replan budget
+    NEEDS_REPLAN --> PAUSED_BUDGET: "max_auto_replans (1) or USD budget exhausted"
+    ACTIVE_PEER_G1 --> BLOCKED_INFRA: 0-token startup or runtime crash (circuit-breaker bounded)
+    ACTIVE_PEER_G1 --> BLOCKED_AUTH: Missing credentials or auth failure
+    ACTIVE_PEER_G1 --> VERIFY_G3: "Peer posts CANDIDATE_READY (plus RED->GREEN proof if bugfix)"
+    VERIFY_G3 --> ACTIVE_PEER_G1: "build_verifier.py (frozen-src) FAILED (within candidate cap)"
+    VERIFY_G3 --> PAUSED_BUDGET: "Candidate cap (3/version or 6/root) or USD budget exhausted"
+    VERIFY_G3 --> REVIEW_G4: "build_verifier.py (frozen-src) VERIFIED on exact candidate SHA"
+    REVIEW_G4 --> BLOCKED_INFRA: Primary + canary-qualified fallback reviewers unavailable/quota-exhausted
+    REVIEW_G4 --> ACTIVE_PEER_G1: Independent Reviewer Pass 1 or Pass 2 finds OPEN blocking issue
     REVIEW_G4 --> ACCEPT_G5: Both passes PASSED (or blocking findings REFUTED_WITH_EVIDENCE)
-    ACCEPT_G5 --> VERIFIED: receipt.py exits 0
-    BLOCKED --> [*]
+    ACCEPT_G5 --> VERIFIED: "receipt.py (write-once) exits 0"
+    BLOCKED_BRIEF --> [*]
+    BLOCKED_INFRA --> [*]
+    BLOCKED_AUTH --> [*]
+    PAUSED_BUDGET --> [*]
     VERIFIED --> [*]
 ```

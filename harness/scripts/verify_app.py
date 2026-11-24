@@ -13,6 +13,7 @@ import argparse
 import json
 import os
 import re
+import shlex
 import shutil
 import signal
 import subprocess
@@ -26,9 +27,13 @@ from pathlib import Path
 from typing import Any
 
 try:
-    from harness.scripts.codex_room_sync import verify_role
+    from harness.scripts.codex_room_sync import (
+        is_excluded_model,
+        load_model_policy,
+        verify_role,
+    )
 except ImportError:
-    from codex_room_sync import verify_role
+    from codex_room_sync import is_excluded_model, load_model_policy, verify_role
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 EVIDENCE_DIR = REPO_ROOT / "harness" / "evidence"
@@ -87,6 +92,183 @@ def _check_lightweight_charts_clean(sibling: Path) -> dict[str, Any]:
     return {"present": True, "clean": not dirty_items, "dirty_items": dirty_items}
 
 
+def _check_model_policy(root: Path) -> dict[str, Any]:
+    policy_path = root / "harness" / "model-policy.json"
+    data, excluded_prefixes, err = load_model_policy(root, require_exists=True)
+    errors: list[str] = [err] if err else []
+
+    if isinstance(data, dict):
+        roles = data.get("roles", {})
+        if not isinstance(roles, dict):
+            errors.append("model-policy.json 'roles' must be an object.")
+        else:
+            for role_key, role_val in roles.items():
+                if not isinstance(role_val, dict):
+                    continue
+                for field in (
+                    "selected_model",
+                    "fallback_model",
+                    "planner_label",
+                    "internal_executor_label",
+                ):
+                    val = role_val.get(field)
+                    if isinstance(val, str) and is_excluded_model(val, excluded_prefixes):
+                        errors.append(
+                            f"Excluded model {val!r} configured in roles.{role_key}.{field}."
+                        )
+                if role_key == "independent_reviewer_fallbacks":
+                    routes = role_val.get("qualified_routes", [])
+                    if isinstance(routes, list):
+                        for item in routes:
+                            m_val = item.get("model") if isinstance(item, dict) else item
+                            if isinstance(m_val, str) and is_excluded_model(
+                                m_val, excluded_prefixes
+                            ):
+                                errors.append(
+                                    f"Excluded model {m_val!r} found in qualified_routes."
+                                )
+
+    return {
+        "ok": not errors,
+        "path": str(policy_path),
+        "excluded_model_prefixes": list(excluded_prefixes),
+        "errors": errors,
+    }
+
+
+def _run_hook_probe(
+    argv: list[str],
+    agents_dir: Path,
+    root: Path,
+    tool_id: str,
+    rel_path: str,
+    content: str,
+) -> tuple[str | None, str | None]:
+    payload = {
+        "hookEventName": "PreToolUse",
+        "cwd": str(root),
+        "toolCall": {
+            "id": tool_id,
+            "name": "write_file",
+            "args": {"Path": rel_path, "Content": content},
+        },
+    }
+    try:
+        proc = subprocess.run(
+            argv,
+            cwd=str(agents_dir),
+            input=json.dumps(payload),
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return None, f"Hook execution failed: {exc}"
+    if proc.returncode != 0:
+        return None, f"Hook exited {proc.returncode}: {proc.stderr.strip()}"
+    try:
+        out = json.loads(proc.stdout.strip())
+    except json.JSONDecodeError as exc:
+        return None, f"Hook emitted invalid JSON: {exc}"
+    decision = out.get("decision") if isinstance(out, dict) else None
+    if not isinstance(decision, str):
+        return None, "Hook JSON missing string 'decision' field."
+    return decision, None
+
+
+def _check_hooks(root: Path) -> dict[str, Any]:
+    agents_dir = root / ".agents"
+    hooks_path = agents_dir / "hooks.json"
+    errors: list[str] = []
+    cmd_str: str | None = None
+    deny_decision: str | None = None
+    allow_decision: str | None = None
+
+    if not hooks_path.is_file():
+        errors.append(f"Missing required hook config: {hooks_path}")
+        return {
+            "ok": False,
+            "path": str(hooks_path),
+            "command": None,
+            "deny_probe": None,
+            "allow_probe": None,
+            "errors": errors,
+        }
+
+    try:
+        cfg = json.loads(hooks_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        errors.append(f"Malformed .agents/hooks.json: {exc}")
+        cfg = None
+
+    if isinstance(cfg, dict):
+        guard = cfg.get("topstep-safety-guard")
+        pre_groups = guard.get("PreToolUse") if isinstance(guard, dict) else None
+        if not isinstance(pre_groups, list) or not pre_groups:
+            errors.append(".agents/hooks.json missing topstep-safety-guard.PreToolUse array.")
+        else:
+            first_group = pre_groups[0] if isinstance(pre_groups[0], dict) else {}
+            hooks_list = first_group.get("hooks") if isinstance(first_group, dict) else None
+            if not isinstance(hooks_list, list) or not hooks_list:
+                errors.append(".agents/hooks.json PreToolUse group missing hooks list.")
+            else:
+                first_hook = hooks_list[0] if isinstance(hooks_list[0], dict) else {}
+                raw_cmd = first_hook.get("command") if isinstance(first_hook, dict) else None
+                if (
+                    first_hook.get("type") != "command"
+                    or not isinstance(raw_cmd, str)
+                    or not raw_cmd.strip()
+                ):
+                    errors.append(
+                        ".agents/hooks.json PreToolUse hook requires type='command' and command."
+                    )
+                else:
+                    cmd_str = raw_cmd.strip()
+    elif cfg is not None:
+        errors.append(".agents/hooks.json root must be a JSON object.")
+
+    if cmd_str:
+        argv = shlex.split(cmd_str, posix=(os.name != "nt"))
+        if argv and Path(argv[0]).name.lower() in {"python", "python3", "python.exe"}:
+            argv[0] = sys.executable
+
+        deny_decision, deny_err = _run_hook_probe(
+            argv,
+            agents_dir,
+            root,
+            "doctor_deny",
+            "backend/app/x.py",
+            'await client.post("/api/Order/place")',
+        )
+        if deny_err:
+            errors.append(f"deny_probe: {deny_err}")
+        elif deny_decision != "deny":
+            errors.append(f"deny_probe expected 'deny', got {deny_decision!r}.")
+
+        allow_decision, allow_err = _run_hook_probe(
+            argv,
+            agents_dir,
+            root,
+            "doctor_allow",
+            "backend/app/engine/instruments.py",
+            "MES_TICK_SIZE = 0.25\n",
+        )
+        if allow_err:
+            errors.append(f"allow_probe: {allow_err}")
+        elif allow_decision != "allow":
+            errors.append(f"allow_probe expected 'allow', got {allow_decision!r}.")
+
+    return {
+        "ok": not errors,
+        "path": str(hooks_path),
+        "command": cmd_str,
+        "deny_probe": deny_decision,
+        "allow_probe": allow_decision,
+        "errors": errors,
+    }
+
+
 def run_doctor(root: Path, runtime_root: Path) -> dict[str, Any]:
     """Run read-only diagnostic checks across toolchain, repo, and Codex Room."""
     root = root.resolve()
@@ -105,6 +287,8 @@ def run_doctor(root: Path, runtime_root: Path) -> dict[str, Any]:
     )
     pass1_runtime = verify_role("pass1", runtime_root)
     pass2_runtime = verify_role("pass2", runtime_root)
+    hooks_report = _check_hooks(root)
+    policy_report = _check_model_policy(root)
 
     required_tools_ok = all(tools[k] is not None for k in ("python", "uv", "ruff", "pytest", "node", "pnpm", "git"))
     bundle_ok = lwc_bundle.is_file()
@@ -113,7 +297,13 @@ def run_doctor(root: Path, runtime_root: Path) -> dict[str, Any]:
     return {
         "checked_at_utc": datetime.now(timezone.utc).isoformat(),
         "root": str(root),
-        "ok": required_tools_ok and bundle_ok and lwc_clean_ok,
+        "ok": (
+            required_tools_ok
+            and bundle_ok
+            and lwc_clean_ok
+            and hooks_report["ok"]
+            and policy_report["ok"]
+        ),
         "tools": tools,
         "lightweight_charts_bundle_exists": bundle_ok,
         "lightweight_charts_bundle_path": str(lwc_bundle),
@@ -123,6 +313,8 @@ def run_doctor(root: Path, runtime_root: Path) -> dict[str, Any]:
         "env_file_present": (root / ".env").is_file(),
         "backend_present": (root / "backend" / "pyproject.toml").is_file(),
         "frontend_present": (root / "frontend" / "package.json").is_file(),
+        "hooks": hooks_report,
+        "model_policy": policy_report,
         "codex_room": {
             "pass1": pass1_runtime,
             "pass2": pass2_runtime,
@@ -348,6 +540,7 @@ def main(argv: list[str] | None = None) -> int:
             print(
                 f"[doctor] ok={report['ok']} lwc_bundle={report['lightweight_charts_bundle_exists']} "
                 f"lwc_clean={report['lightweight_charts_git']['clean']} "
+                f"hooks={report['hooks']['ok']} model_policy={report['model_policy']['ok']} "
                 f"codex_room_p1={report['codex_room']['pass1']['ok']} "
                 f"codex_room_p2={report['codex_room']['pass2']['ok']}"
             )

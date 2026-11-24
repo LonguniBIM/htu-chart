@@ -20,8 +20,10 @@ from pathlib import Path
 from typing import Any
 
 try:
+    from harness.scripts.codex_room_sync import is_excluded_model, load_model_policy
     from harness.scripts.schema_utils import is_hex_sha40, is_strict_bool, is_strict_int, resolve_git_toplevel, run_managed_cmd
 except ImportError:
+    from codex_room_sync import is_excluded_model, load_model_policy
     from schema_utils import is_hex_sha40, is_strict_bool, is_strict_int, resolve_git_toplevel, run_managed_cmd
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -260,9 +262,20 @@ def _evaluate_review_gate(
     candidate_sha: str,
     dispositions: dict[str, Any] | None,
     repo_root: Path = REPO_ROOT,
+    excluded_prefixes: tuple[str, ...] = (),
 ) -> tuple[str, list[str], dict[str, Any]]:
     if not isinstance(review_data, dict):
         return "BLOCKED", ["Missing consolidated Codex Room review JSON."], {"passes_completed": 0}
+
+    rev_model = review_data.get("review_model")
+    if isinstance(rev_model, str) and rev_model.strip() and is_excluded_model(
+        rev_model, excluded_prefixes
+    ):
+        return (
+            "BLOCKED",
+            [f"Review model {rev_model!r} is excluded by model-policy.json (MOD-001)."],
+            {"passes_completed": review_data.get("passes_completed", 0), "review_model": rev_model},
+        )
 
     passes = review_data.get("passes_completed", 0)
     independent = review_data.get("independent_contexts")
@@ -516,11 +529,15 @@ def evaluate_receipt(
         red_msg = "Không áp dụng (non-bugfix task)."
 
     # 3. Review gate (2 independent Codex Room passes)
+    _, excluded_prefixes, policy_err = load_model_policy(active_root, require_exists=False)
+    if policy_err:
+        blockers.append(f"Model policy error: {policy_err}")
     review_gate, review_reasons, review_summary = _evaluate_review_gate(
         review_data,
         candidate_sha,
         dispositions,
         repo_root=active_root,
+        excluded_prefixes=excluded_prefixes,
     )
     if review_gate == "FAILED":
         failures.extend(review_reasons)

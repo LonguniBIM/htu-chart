@@ -77,6 +77,29 @@ FORBIDDEN_ENGINE_IMPORTS = {
 FORBIDDEN_STORAGE_IMPORTS = {"app.api", "app.topstep", "app.notify"}
 FORBIDDEN_TOPSTEP_IMPORTS = {"app.api", "app.engine.backtester", "app.mcp"}
 
+MANDATORY_EXCLUDED_MODEL_PREFIXES = (
+    "gemini-3.8-flash",
+    "gemini-4-argon",
+    "gemini-pro-orchestrator-argon",
+    "gemini-3.7-flash",
+    "gemini-2.5-pro",
+)
+MOD001_PROHIBITION_RE = re.compile(
+    r"\b(exclude|excluded|forbid|forbidden|prohibit|prohibited|never|"
+    r"discontinued|retired|banned|denylist|deny|withdrawal|withdrawn|"
+    r"mod-001|deprecated|rejected|reject|must\s+not|do\s+not\s+use)\b",
+    re.IGNORECASE,
+)
+MOD001_SUBAGENT_PEER_RE = re.compile(
+    r"(?:invoke_subagent\([^\n]*\bModel\s*[:=]\s*['\"]?(?:flash|flash_lite)\b|"
+    r"\bpeer-coder\b)",
+    re.IGNORECASE,
+)
+MOD001_PY_DENYLIST_BLOCK_RE = re.compile(
+    r"^\s*(?:MANDATORY_EXCLUDED_MODEL_PREFIXES|DEFAULT_EXCLUDED_MODEL_PREFIXES|"
+    r"EXCLUDED_MODEL_PREFIXES|DISCONTINUED_SUBAGENT_TIERS|MOD001_)"
+)
+
 
 @dataclass(frozen=True)
 class Violation:
@@ -492,6 +515,214 @@ def _check_upstream_fork(root: Path) -> list[Violation]:
     return []
 
 
+def _validate_model_policy_file(
+    root: Path,
+) -> tuple[tuple[str, ...], list[Violation]]:
+    policy_path = root / "harness" / "model-policy.json"
+    rel = "harness/model-policy.json"
+    fix = (
+        "Maintain valid harness/model-policy.json with all mandatory "
+        "excluded_model_prefixes and zero excluded models in active roles."
+    )
+    has_governance_surface = (
+        (root / "AGENTS.md").is_file()
+        or (root / ".agents").is_dir()
+        or (root / "harness" / "codex-room").is_dir()
+    )
+    if not policy_path.is_file():
+        if not has_governance_surface:
+            return MANDATORY_EXCLUDED_MODEL_PREFIXES, []
+        return MANDATORY_EXCLUDED_MODEL_PREFIXES, [
+            Violation(
+                rule_id="MOD-001",
+                file=rel,
+                line=1,
+                message="Missing required harness/model-policy.json governance file.",
+                fix=fix,
+            )
+        ]
+    try:
+        data = json.loads(policy_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        return MANDATORY_EXCLUDED_MODEL_PREFIXES, [
+            Violation(
+                rule_id="MOD-001",
+                file=rel,
+                line=1,
+                message=f"Invalid JSON in harness/model-policy.json: {exc}",
+                fix=fix,
+            )
+        ]
+    if not isinstance(data, dict):
+        return MANDATORY_EXCLUDED_MODEL_PREFIXES, [
+            Violation(
+                rule_id="MOD-001",
+                file=rel,
+                line=1,
+                message="harness/model-policy.json root must be a JSON object.",
+                fix=fix,
+            )
+        ]
+
+    prefixes = data.get("excluded_model_prefixes")
+    if not isinstance(prefixes, list) or not all(
+        isinstance(p, str) and p.strip() for p in prefixes
+    ):
+        return MANDATORY_EXCLUDED_MODEL_PREFIXES, [
+            Violation(
+                rule_id="MOD-001",
+                file=rel,
+                line=1,
+                message=(
+                    "harness/model-policy.json 'excluded_model_prefixes' "
+                    "must be non-empty strings."
+                ),
+                fix=fix,
+            )
+        ]
+
+    present_low = {p.strip().lower() for p in prefixes}
+    missing = [p for p in MANDATORY_EXCLUDED_MODEL_PREFIXES if p.lower() not in present_low]
+    merged = tuple(
+        dict.fromkeys([*MANDATORY_EXCLUDED_MODEL_PREFIXES, *(p.strip() for p in prefixes)])
+    )
+    violations: list[Violation] = []
+    if missing:
+        violations.append(
+            Violation(
+                rule_id="MOD-001",
+                file=rel,
+                line=1,
+                message=f"harness/model-policy.json missing mandatory prefixes: {missing}",
+                fix=fix,
+            )
+        )
+
+    roles = data.get("roles", {})
+    if isinstance(roles, dict):
+        for role_key, role_val in roles.items():
+            if not isinstance(role_val, dict):
+                continue
+            for field in (
+                "selected_model",
+                "fallback_model",
+                "planner_label",
+                "internal_executor_label",
+            ):
+                val = role_val.get(field)
+                if isinstance(val, str) and any(
+                    val.strip().lower().startswith(p.lower()) for p in merged
+                ):
+                    violations.append(
+                        Violation(
+                            rule_id="MOD-001",
+                            file=rel,
+                            line=1,
+                            message=(
+                                f"Excluded model {val!r} configured in "
+                                f"roles.{role_key}.{field}."
+                            ),
+                            fix=fix,
+                        )
+                    )
+            if role_key == "independent_reviewer_fallbacks":
+                routes = role_val.get("qualified_routes", [])
+                if isinstance(routes, list):
+                    for item in routes:
+                        m_val = item.get("model") if isinstance(item, dict) else item
+                        if isinstance(m_val, str) and any(
+                            m_val.strip().lower().startswith(p.lower()) for p in merged
+                        ):
+                            violations.append(
+                                Violation(
+                                    rule_id="MOD-001",
+                                    file=rel,
+                                    line=1,
+                                    message=f"Excluded model {m_val!r} in qualified_routes.",
+                                    fix=fix,
+                                )
+                            )
+    return merged, violations
+
+
+def _collect_mod001_targets(root: Path) -> list[Path]:
+    targets: list[Path] = []
+    for rel_file in ("AGENTS.md", "docs/WORKSPACE_PROTOCOL.md", "harness/README.md"):
+        candidate = root / rel_file
+        if candidate.is_file():
+            targets.append(candidate)
+    for rel_dir in (".agents/skills", "harness/codex-room", "harness/scripts"):
+        base_dir = root / rel_dir
+        if not base_dir.is_dir():
+            continue
+        for item in sorted(base_dir.rglob("*")):
+            if not item.is_file():
+                continue
+            if any(part in {"__pycache__", ".pytest_cache"} for part in item.parts):
+                continue
+            if item.suffix.lower() in {".md", ".py", ".toml", ".json", ".yaml", ".yml", ".txt"}:
+                targets.append(item)
+    return targets
+
+
+def _scan_model_policy_compliance(root: Path, today: date) -> list[Violation]:
+    prefixes, violations = _validate_model_policy_file(root)
+    escaped = "|".join(re.escape(p) for p in prefixes)
+    excl_re = re.compile(rf"\b(?:{escaped})(?:-[a-z0-9._-]+)?\b", re.IGNORECASE)
+    fix_msg = (
+        "Replace excluded models and discontinued peer-coder/flash dispatch with "
+        "qualified models from harness/model-policy.json (e.g. swarm with gemini-4-hydrogen-high)."
+    )
+
+    for path in _collect_mod001_targets(root):
+        rel = _rel_posix(path, root)
+        is_py = path.suffix.lower() == ".py"
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+        in_py_denylist = False
+        paren_depth = 0
+        for idx, line in enumerate(lines, start=1):
+            if is_py:
+                if MOD001_PY_DENYLIST_BLOCK_RE.match(line):
+                    in_py_denylist = True
+                    paren_depth = (
+                        line.count("(") + line.count("[") - line.count(")") - line.count("]")
+                    )
+                    if paren_depth <= 0:
+                        in_py_denylist = False
+                    continue
+                if in_py_denylist:
+                    paren_depth += (
+                        line.count("(") + line.count("[") - line.count(")") - line.count("]")
+                    )
+                    if paren_depth <= 0:
+                        in_py_denylist = False
+                    continue
+
+            has_excl = bool(excl_re.search(line))
+            has_legacy_peer = bool(MOD001_SUBAGENT_PEER_RE.search(line))
+            if not (has_excl or has_legacy_peer):
+                continue
+
+            if MOD001_PROHIBITION_RE.search(line):
+                continue
+            ok, _ = parse_exempt(line, today=today)
+            if ok:
+                continue
+
+            matched = excl_re.search(line) or MOD001_SUBAGENT_PEER_RE.search(line)
+            tok = matched.group(0) if matched else "excluded-model"
+            violations.append(
+                Violation(
+                    rule_id="MOD-001",
+                    file=rel,
+                    line=idx,
+                    message=f"Active/unprohibited excluded model or legacy peer dispatch '{tok}'.",
+                    fix=fix_msg,
+                )
+            )
+    return violations
+
+
 def run_checks(
     root: Path,
     baseline_path: Path | None = None,
@@ -517,6 +748,7 @@ def run_checks(
             all_violations.extend(_scan_js_ts_html_file(path, rel, current_day))
 
     all_violations.extend(_check_upstream_fork(root))
+    all_violations.extend(_scan_model_policy_compliance(root, current_day))
 
     baseline_keys: set[tuple[str, str, int]] = set()
     if use_baseline and baseline_path and baseline_path.exists():

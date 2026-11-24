@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import subprocess
 from datetime import date
 from pathlib import Path
@@ -152,3 +153,90 @@ def test_test001_blocks_self_confirming_and_gate_weakening_tests(tmp_path: Path)
     res = run_checks(tmp_path, use_baseline=False, today=FIXED_TODAY)
     test001 = [v for v in res["violations"] if v["rule_id"] == "TEST-001"]
     assert len(test001) == 4
+
+
+def _write_valid_policy(root: Path) -> None:
+    policy = {
+        "schema_version": "2.0.0",
+        "effective_date": "2026-11-24",
+        "excluded_model_prefixes": [
+            "gemini-3.8-flash",
+            "gemini-4-argon",
+            "gemini-pro-orchestrator-argon",
+            "gemini-3.7-flash",
+            "gemini-2.5-pro",
+        ],
+        "discontinued_peer_subagent_tiers": ["flash", "flash_lite"],
+        "surface_lifecycle_notes": {
+            "antigravity_withdrawal": "Gemini 3.8 Flash and Gemini 4 Argon withdrawn 2026-11-30.",
+            "gemini_api_lifecycle": "gemini-3.7-flash and gemini-2.5-pro redirects excluded.",
+        },
+        "roles": {
+            "cli_coordinator": {"selected_model": "gemini-4-neon-medium"},
+            "peer_default": {"dispatch_tool": "swarm", "selected_model": "gemini-4-hydrogen-high"},
+            "independent_reviewer_fallbacks": {"qualified_routes": []},
+        },
+    }
+    _write(root, "harness/model-policy.json", json.dumps(policy, indent=2) + "\n")
+
+
+def test_mod001_detects_active_excluded_models_and_allows_prohibition_prose(tmp_path: Path) -> None:
+    """Contract: MOD-001 flags active excluded models while allowing denylists/prohibitions.
+
+    Defect caught: Active SKILL.md/docs recommending gemini-3.8-flash-high or invoke_subagent flash.
+    """
+    _write_valid_policy(tmp_path)
+    _write(
+        tmp_path,
+        ".agents/skills/slp-orchestrator/SKILL.md",
+        "\n".join(
+            [
+                "# S-L-P Orchestrator",
+                '- Default single-writer: `invoke_subagent(..., Model: "flash")`',
+                '- Parallel: `swarm{action: "add", model: "gemini-3.8-flash-high"}`',
+            ]
+        )
+        + "\n",
+    )
+    _write(
+        tmp_path,
+        "harness/README.md",
+        "Use `gemini-4-argon-high` for fallback.\n",
+    )
+    _write(
+        tmp_path,
+        "AGENTS.md",
+        "Never select excluded models `gemini-3.8-flash`, `gemini-4-argon`, or `gemini-2.5-pro`.\n",
+    )
+    res = run_checks(tmp_path, use_baseline=False, today=FIXED_TODAY)
+    mod001 = [v for v in res["violations"] if v["rule_id"] == "MOD-001"]
+    flagged_files = {v["file"] for v in mod001}
+    assert ".agents/skills/slp-orchestrator/SKILL.md" in flagged_files
+    assert "harness/README.md" in flagged_files
+    assert "AGENTS.md" not in flagged_files
+    assert "harness/model-policy.json" not in flagged_files
+
+
+def test_mod001_flags_missing_or_corrupt_model_policy_json(tmp_path: Path) -> None:
+    """Contract: Missing or corrupt harness/model-policy.json triggers MOD-001 violation.
+
+    Defect caught: Unnoticed policy deletion or malformed JSON bypassing model governance.
+    """
+    _write(tmp_path, "AGENTS.md", "# Governed Repository\n")
+    res_missing = run_checks(tmp_path, use_baseline=False, today=FIXED_TODAY)
+    assert any(v["rule_id"] == "MOD-001" for v in res_missing["violations"])
+
+    _write(tmp_path, "harness/model-policy.json", "{corrupt json")
+    res_corrupt = run_checks(tmp_path, use_baseline=False, today=FIXED_TODAY)
+    assert any(v["rule_id"] == "MOD-001" for v in res_corrupt["violations"])
+
+
+def test_mod001_passes_on_repository_root() -> None:
+    """Contract: Repository skills, docs, and policy contain zero active MOD-001 violations.
+
+    Defect caught: Pre-fix SKILL.md:15-16 and missing model-policy.json failing MOD-001 gate.
+    """
+    repo_root = Path(__file__).resolve().parents[2]
+    res = run_checks(repo_root, use_baseline=False, today=FIXED_TODAY)
+    mod001 = [v for v in res["violations"] if v["rule_id"] == "MOD-001"]
+    assert mod001 == []

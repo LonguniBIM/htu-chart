@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import copy
 import hashlib
+import json
 import os
 import shutil
 import sys
@@ -28,8 +29,82 @@ ROLE_MAP: dict[str, tuple[str, str]] = {
 }
 EXPECTED_REVIEW_MODEL = "gpt-6.1-sol"
 EXPECTED_REASONING_EFFORT = "high"
+MANDATORY_EXCLUDED_MODEL_PREFIXES = (
+    "gemini-3.8-flash",
+    "gemini-4-argon",
+    "gemini-pro-orchestrator-argon",
+    "gemini-3.7-flash",
+    "gemini-2.5-pro",
+)
 
 BARE_KEY_CHARS = frozenset("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-")
+
+
+def is_excluded_model(model: str | None, prefixes: tuple[str, ...]) -> bool:
+    """Return True if ``model`` matches any excluded model prefix."""
+    if not isinstance(model, str):
+        return False
+    low = model.strip().lower()
+    if not low:
+        return False
+    return any(low.startswith(p.lower()) for p in prefixes)
+
+
+def load_model_policy(
+    repo_root: Path,
+    *,
+    require_exists: bool = False,
+) -> tuple[dict[str, Any] | None, tuple[str, ...], str | None]:
+    """Load and validate ``harness/model-policy.json`` fail-closed."""
+    policy_path = repo_root / "harness" / "model-policy.json"
+    if not policy_path.is_file():
+        if require_exists:
+            return (
+                None,
+                MANDATORY_EXCLUDED_MODEL_PREFIXES,
+                f"Missing required model policy: {policy_path}",
+            )
+        return None, MANDATORY_EXCLUDED_MODEL_PREFIXES, None
+
+    try:
+        data = json.loads(policy_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        return (
+            None,
+            MANDATORY_EXCLUDED_MODEL_PREFIXES,
+            f"Malformed model-policy.json ({policy_path}): {exc}",
+        )
+
+    if not isinstance(data, dict):
+        return (
+            None,
+            MANDATORY_EXCLUDED_MODEL_PREFIXES,
+            "model-policy.json root must be a JSON object.",
+        )
+
+    prefixes = data.get("excluded_model_prefixes")
+    if not isinstance(prefixes, list) or not all(
+        isinstance(p, str) and p.strip() for p in prefixes
+    ):
+        return (
+            None,
+            MANDATORY_EXCLUDED_MODEL_PREFIXES,
+            "model-policy.json 'excluded_model_prefixes' must be non-empty strings.",
+        )
+
+    present_low = {p.strip().lower() for p in prefixes}
+    missing = [p for p in MANDATORY_EXCLUDED_MODEL_PREFIXES if p.lower() not in present_low]
+    if missing:
+        return (
+            None,
+            MANDATORY_EXCLUDED_MODEL_PREFIXES,
+            f"model-policy.json missing mandatory excluded_model_prefixes: {missing}",
+        )
+
+    merged = tuple(
+        dict.fromkeys([*MANDATORY_EXCLUDED_MODEL_PREFIXES, *(p.strip() for p in prefixes)])
+    )
+    return data, merged, None
 
 
 def _sha256_bytes(data: bytes) -> str:
@@ -356,6 +431,14 @@ def sync_role(
     if role not in ROLE_MAP:
         raise ValueError(f"Unknown Codex Room role '{role}'. Expected one of: {sorted(ROLE_MAP)}")
 
+    _, excluded_prefixes, policy_err = load_model_policy(REPO_ROOT, require_exists=False)
+    if policy_err:
+        raise ValueError(policy_err)
+    if is_excluded_model(EXPECTED_REVIEW_MODEL, excluded_prefixes):
+        raise ValueError(f"EXPECTED_REVIEW_MODEL {EXPECTED_REVIEW_MODEL!r} is excluded by policy.")
+    if is_excluded_model(model_override, excluded_prefixes):
+        raise ValueError(f"Requested model {model_override!r} is excluded by model-policy.json.")
+
     runtime_name, overlay_filename = ROLE_MAP[role]
     overlay_path = overlays_dir / overlay_filename
     if not overlay_path.is_file():
@@ -367,6 +450,10 @@ def sync_role(
         base_cfg = loads_toml(base_config_path.read_text(encoding="utf-8"))
 
     overlay_cfg = loads_toml(overlay_path.read_text(encoding="utf-8"))
+    if is_excluded_model(overlay_cfg.get("model"), excluded_prefixes):
+        raise ValueError(
+            f"Overlay {overlay_filename} model {overlay_cfg.get('model')!r} is excluded by policy."
+        )
     merged = apply_safety_locks(deep_merge(base_cfg, overlay_cfg), model_override=model_override)
     rendered_toml = dumps_toml(merged)
 
@@ -411,19 +498,40 @@ def sync_role(
 
 def verify_role(role: str, runtime_root: Path) -> dict[str, Any]:
     """Verify an existing isolated Codex Room runtime satisfies all safety invariants."""
-    runtime_name, _ = ROLE_MAP[role]
+    runtime_name, overlay_filename = ROLE_MAP[role]
     runtime_dir = runtime_root / runtime_name
     cfg_path = runtime_dir / "config.toml"
     errors: list[str] = []
 
+    _, excluded_prefixes, policy_err = load_model_policy(REPO_ROOT, require_exists=False)
+    if policy_err:
+        errors.append(policy_err)
+    if is_excluded_model(EXPECTED_REVIEW_MODEL, excluded_prefixes):
+        errors.append(f"EXPECTED_REVIEW_MODEL {EXPECTED_REVIEW_MODEL!r} is excluded by policy.")
+
+    overlay_path = OVERLAYS_DIR / overlay_filename
+    if overlay_path.is_file():
+        try:
+            overlay_cfg = loads_toml(overlay_path.read_text(encoding="utf-8"))
+            if is_excluded_model(overlay_cfg.get("model"), excluded_prefixes):
+                errors.append(
+                    f"Overlay {overlay_filename} model {overlay_cfg.get('model')!r} is excluded."
+                )
+        except tomllib.TOMLDecodeError as exc:
+            errors.append(f"Invalid overlay TOML {overlay_filename}: {exc}")
+
     if not cfg_path.is_file():
-        return {"role": role, "runtime_dir": str(runtime_dir), "ok": False, "errors": ["Missing config.toml"]}
+        errors.append("Missing config.toml")
+        return {"role": role, "runtime_dir": str(runtime_dir), "ok": False, "errors": errors}
 
     try:
         cfg = tomllib.loads(cfg_path.read_text(encoding="utf-8"))
     except tomllib.TOMLDecodeError as exc:
-        return {"role": role, "runtime_dir": str(runtime_dir), "ok": False, "errors": [f"Invalid TOML: {exc}"]}
+        errors.append(f"Invalid TOML: {exc}")
+        return {"role": role, "runtime_dir": str(runtime_dir), "ok": False, "errors": errors}
 
+    if is_excluded_model(cfg.get("model"), excluded_prefixes):
+        errors.append(f"Runtime model {cfg.get('model')!r} is excluded by model-policy.json.")
     if cfg.get("model") != EXPECTED_REVIEW_MODEL:
         errors.append(f"Expected model={EXPECTED_REVIEW_MODEL!r}, got {cfg.get('model')!r}")
     if cfg.get("model_reasoning_effort") != EXPECTED_REASONING_EFFORT:

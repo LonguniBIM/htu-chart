@@ -5,7 +5,12 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from harness.scripts import verify_app
+from harness.scripts import codex_room_review, codex_room_sync, receipt, verify_app
+from harness.scripts.schema_utils import run_managed_cmd
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+REAL_SAFETY_HOOK = REPO_ROOT / "harness" / "scripts" / "safety_hook.py"
+OVERLAYS_DIR = REPO_ROOT / "harness" / "codex-room" / "overlays"
 
 
 def test_cmd_smoke_fails_closed_on_unparseable_secret_bearing_status_body(
@@ -173,3 +178,246 @@ def test_cmd_smoke_fails_on_access_token_and_password_hash_fields(
     report_2 = json.loads((out_dir_2 / "smoke.json").read_text(encoding="utf-8"))
     assert report_2["passed"] is False
     assert "$.APP_PASSWORD_HASH" in report_2["secret_leaks_detected"]
+
+
+def _seed_doctor_workspace(base: Path, *, hook_cmd: str | None = None) -> Path:
+    lwc_bundle = (
+        base
+        / "lightweight-charts"
+        / "dist"
+        / "lightweight-charts.standalone.production.js"
+    )
+    lwc_bundle.parent.mkdir(parents=True, exist_ok=True)
+    lwc_bundle.write_text("// bundle\n", encoding="utf-8")
+
+    app_root = base / "topstep-chart-app"
+    (app_root / "backend").mkdir(parents=True, exist_ok=True)
+    (app_root / "backend" / "pyproject.toml").write_text("[project]\nname='x'\n", encoding="utf-8")
+    (app_root / "frontend").mkdir(parents=True, exist_ok=True)
+    (app_root / "frontend" / "package.json").write_text('{"name":"x"}\n', encoding="utf-8")
+    (app_root / "harness" / "scripts").mkdir(parents=True, exist_ok=True)
+    (app_root / "harness" / "scripts" / "safety_hook.py").write_text(
+        REAL_SAFETY_HOOK.read_text(encoding="utf-8"),
+        encoding="utf-8",
+    )
+
+    if hook_cmd is not None:
+        hooks_cfg = {
+            "topstep-safety-guard": {
+                "PreToolUse": [
+                    {
+                        "matcher": "write_file|edit_file|run_command|swarm|invoke_subagent",
+                        "hooks": [{"type": "command", "command": hook_cmd, "timeout": 10}],
+                    }
+                ]
+            }
+        }
+        (app_root / ".agents").mkdir(parents=True, exist_ok=True)
+        (app_root / ".agents" / "hooks.json").write_text(
+            json.dumps(hooks_cfg, indent=2) + "\n",
+            encoding="utf-8",
+        )
+    return app_root
+
+
+def _valid_model_policy_dict() -> dict:
+    return {
+        "schema_version": "2.0.0",
+        "effective_date": "2026-11-24",
+        "excluded_model_prefixes": [
+            "gemini-3.8-flash",
+            "gemini-4-argon",
+            "gemini-pro-orchestrator-argon",
+            "gemini-3.7-flash",
+            "gemini-2.5-pro",
+        ],
+        "discontinued_peer_subagent_tiers": ["flash", "flash_lite"],
+        "roles": {
+            "cli_coordinator": {"selected_model": "gemini-4-neon-medium"},
+            "peer_default": {"dispatch_tool": "swarm", "selected_model": "gemini-4-hydrogen-high"},
+            "independent_reviewer_primary": {"backend": "codex", "selected_model": "gpt-6.1-sol"},
+            "independent_reviewer_fallbacks": {"qualified_routes": []},
+        },
+    }
+
+
+def test_doctor_validates_hooks_and_model_policy_fail_closed(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """Contract: verify_app doctor fails closed if hooks.json or model-policy.json is broken.
+
+    Defect caught: Missing/corrupt hooks or model-policy passing doctor silently.
+    """
+    monkeypatch.setattr(verify_app, "_tool_path", lambda name: f"/stub/{name}")
+    monkeypatch.setattr(
+        verify_app,
+        "verify_role",
+        lambda role, rt: {"role": role, "ok": True, "errors": []},
+    )
+
+    app_missing = _seed_doctor_workspace(tmp_path / "case_missing")
+    rep_missing = verify_app.run_doctor(app_missing, tmp_path / "rt1")
+    assert rep_missing["ok"] is False
+    assert rep_missing["hooks"]["ok"] is False
+    assert rep_missing["model_policy"]["ok"] is False
+
+    app_ok = _seed_doctor_workspace(
+        tmp_path / "case_ok",
+        hook_cmd="python ../harness/scripts/safety_hook.py",
+    )
+    (app_ok / "harness" / "model-policy.json").write_text(
+        json.dumps(_valid_model_policy_dict(), indent=2) + "\n",
+        encoding="utf-8",
+    )
+    rep_ok = verify_app.run_doctor(app_ok, tmp_path / "rt2")
+    assert rep_ok["hooks"]["ok"] is True
+    assert rep_ok["model_policy"]["ok"] is True
+    assert rep_ok["ok"] is True
+
+    (app_ok / "harness" / "model-policy.json").write_text("{bad json", encoding="utf-8")
+    rep_bad_policy = verify_app.run_doctor(app_ok, tmp_path / "rt2")
+    assert rep_bad_policy["model_policy"]["ok"] is False
+    assert rep_bad_policy["ok"] is False
+
+    # Restore valid policy, break hook command so it allows /api/Order/place
+    (app_ok / "harness" / "model-policy.json").write_text(
+        json.dumps(_valid_model_policy_dict(), indent=2) + "\n",
+        encoding="utf-8",
+    )
+    (app_ok / "harness" / "scripts" / "permissive_hook.py").write_text(
+        'import json; print(json.dumps({"decision": "allow"}))\n',
+        encoding="utf-8",
+    )
+    hooks_broken = json.loads((app_ok / ".agents" / "hooks.json").read_text(encoding="utf-8"))
+    hooks_broken["topstep-safety-guard"]["PreToolUse"][0]["hooks"][0]["command"] = (
+        "python ../harness/scripts/permissive_hook.py"
+    )
+    (app_ok / ".agents" / "hooks.json").write_text(
+        json.dumps(hooks_broken, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    rep_bad_hook = verify_app.run_doctor(app_ok, tmp_path / "rt2")
+    assert rep_bad_hook["hooks"]["ok"] is False
+    assert rep_bad_hook["ok"] is False
+
+
+def test_doctor_on_repo_root_reports_hooks_and_model_policy_ok(tmp_path: Path) -> None:
+    """Contract: Deployed repository root passes hooks and model_policy doctor checks.
+
+    Defect caught: Missing .agents/hooks.json or harness/model-policy.json in repository.
+    """
+    rep = verify_app.run_doctor(REPO_ROOT, tmp_path / "rt_repo")
+    assert rep["hooks"]["ok"] is True
+    assert rep["model_policy"]["ok"] is True
+
+
+def _init_mini_git_repo(repo: Path) -> str:
+    repo.mkdir(parents=True, exist_ok=True)
+    run_managed_cmd(["git", "init"], cwd=repo, timeout_sec=15.0)
+    run_managed_cmd(["git", "config", "user.email", "t@example.com"], cwd=repo, timeout_sec=15.0)
+    run_managed_cmd(["git", "config", "user.name", "Tester"], cwd=repo, timeout_sec=15.0)
+    (repo / "harness").mkdir(parents=True, exist_ok=True)
+    (repo / "harness" / "model-policy.json").write_text(
+        json.dumps(_valid_model_policy_dict(), indent=2) + "\n",
+        encoding="utf-8",
+    )
+    (repo / "README.md").write_text("hi\n", encoding="utf-8")
+    run_managed_cmd(["git", "add", "."], cwd=repo, timeout_sec=15.0)
+    run_managed_cmd(["git", "commit", "-m", "init"], cwd=repo, timeout_sec=15.0)
+    proc = run_managed_cmd(["git", "rev-parse", "HEAD"], cwd=repo, timeout_sec=15.0)
+    return proc.stdout.strip()
+
+
+def test_policy_consumers_fail_closed_on_excluded_models_and_corrupt_policy(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """Contract: codex_room_sync, codex_room_review, and receipt reject excluded models.
+
+    Defect caught: Excluded review_model or corrupt model-policy.json allowed through gates.
+    """
+    repo = _init_mini_git_repo(tmp_path / "repo")
+    repo_path = tmp_path / "repo"
+    monkeypatch.setattr(codex_room_sync, "REPO_ROOT", repo_path)
+
+    def _forbid_cli() -> list[str]:
+        raise AssertionError("External CLI must not be invoked when policy rejects model")
+
+    monkeypatch.setattr(codex_room_review, "resolve_agy_command", _forbid_cli)
+    monkeypatch.setattr(codex_room_review, "resolve_codex_command", _forbid_cli)
+
+    rc_fb = codex_room_review.main(
+        [
+            "--commit",
+            "HEAD",
+            "--repo-root",
+            str(repo_path),
+            "--backend",
+            "agy",
+            "--fallback-model",
+            "gemini-3.8-flash-high",
+            "--out-dir",
+            str(tmp_path / "out_fb"),
+        ]
+    )
+    assert rc_fb == 2
+
+    rc_mod = codex_room_review.main(
+        [
+            "--commit",
+            "HEAD",
+            "--repo-root",
+            str(repo_path),
+            "--model",
+            "gemini-4-argon-high",
+            "--out-dir",
+            str(tmp_path / "out_mod"),
+        ]
+    )
+    assert rc_mod == 2
+
+    verifier_ok = {
+        "status": "VERIFIED",
+        "phase": 0,
+        "git_sha": repo,
+        "worktree_dirty": False,
+        "steps": [
+            {"name": "arch_check", "command": ["arch"], "status": "PASSED", "exit_code": 0},
+            {"name": "harness_ruff", "command": ["ruff"], "status": "PASSED", "exit_code": 0},
+            {"name": "harness_pytest", "command": ["pytest"], "status": "PASSED", "exit_code": 0},
+        ],
+    }
+    review_excl = {
+        "revision_sha": repo,
+        "passes_completed": 2,
+        "independent_contexts": True,
+        "review_gate_status": "PASSED",
+        "review_backend": "agy",
+        "review_model": "gemini-3.8-flash-high",
+        "consolidated_findings": [],
+    }
+    rec = receipt.evaluate_receipt(
+        task_id="T-POL",
+        phase=0,
+        base_sha="0" * 40,
+        candidate_sha=repo,
+        verifier_data=verifier_ok,
+        review_data=review_excl,
+        repo_root=repo_path,
+    )
+    assert rec["conclusion"] == "BLOCKED"
+
+    base_home = tmp_path / "base_codex"
+    rt = tmp_path / "rt"
+    base_home.mkdir()
+    codex_room_sync.sync_role(
+        "pass1",
+        base_home=base_home,
+        runtime_root=rt,
+        overlays_dir=OVERLAYS_DIR,
+    )
+    assert codex_room_sync.verify_role("pass1", rt)["ok"] is True
+
+    (repo_path / "harness" / "model-policy.json").write_text("{corrupt", encoding="utf-8")
+    assert codex_room_sync.verify_role("pass1", rt)["ok"] is False
