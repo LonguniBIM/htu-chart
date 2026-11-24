@@ -2047,3 +2047,23 @@ def test_resume_from_reuses_matching_provenance_and_rejects_stale_provenance(
     assert "pass1" not in report4["reused_passes"]
 
 
+def test_live_model_policy_promotes_canary_qualified_carbon_high() -> None:
+    """Repo harness/model-policy.json promotes canary-qualified gemini-4-carbon-high cleanly."""
+    from harness.scripts.codex_room_sync import load_model_policy
+
+    policy, excluded, err = load_model_policy(REPO_ROOT, require_exists=True)
+    assert err is None
+    assert policy is not None
+    routes, routes_err = codex_room_review.extract_qualified_routes(policy, excluded)
+    assert routes_err is None
+    assert routes == ["gemini-4-carbon-high"]
+    assert codex_room_review.resolve_quota_pool("gemini-4-carbon-high", policy) == "gemini_agy"
+    fb = policy["roles"]["independent_reviewer_fallbacks"]
+    assert "gemini-4-carbon-high" not in fb["unqualified_candidates_requiring_canary"]
+    assert (
+        fb["qualification_evidence"]["gemini-4-carbon-high"]
+        == "harness/evidence/canary-carbon-high/canary-report.json"
+    )
+
+
+

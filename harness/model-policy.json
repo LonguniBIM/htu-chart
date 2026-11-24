@@ -48,12 +48,16 @@
       "qualification_status": "production_qualified"
     },
     "independent_reviewer_fallbacks": {
-      "qualified_routes": [],
+      "qualified_routes": [
+        "gemini-4-carbon-high"
+      ],
       "unqualified_candidates_requiring_canary": [
         "claude-opus-5-5-medium",
-        "gemini-4-carbon-high",
         "gemini-4-neon-high"
       ],
+      "qualification_evidence": {
+        "gemini-4-carbon-high": "harness/evidence/canary-carbon-high/canary-report.json"
+      },
       "quota_pools": {
         "gpt-6.1-sol": "openai_codex",
         "claude-opus-5-5-medium": "anthropic_agy",
