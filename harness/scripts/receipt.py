@@ -67,6 +67,18 @@ def _strip_quotes(tok: str) -> str:
     return tok
 
 
+def _normalize_dir_arg(raw: str) -> str:
+    d = raw.strip().replace("\\", "/")
+    if re.fullmatch(r"/+", d):
+        return "/"
+    if re.fullmatch(r"[A-Za-z]:/+", d):
+        return f"{d[0].upper()}:/"
+    stripped = d.rstrip("/")
+    if stripped.startswith("./") and len(stripped) > 2:
+        stripped = stripped[2:]
+    return stripped or "."
+
+
 def _extract_test_target(command_text: str) -> str:
     try:
         raw_tokens = shlex.split(command_text.strip(), posix=False)
@@ -90,12 +102,12 @@ def _extract_test_target(command_text: str) -> str:
             idx += 1
         while idx < len(tokens):
             if tokens[idx] in {"--directory", "-C"} and idx + 1 < len(tokens):
-                norm_dir = tokens[idx + 1].replace("\\", "/").rstrip("/") or "."
+                norm_dir = _normalize_dir_arg(tokens[idx + 1])
                 preserved_env.extend(["--directory", norm_dir])
                 idx += 2
                 continue
             if tokens[idx].startswith(("--directory=", "-C=")):
-                dir_val = tokens[idx].split("=", 1)[1].replace("\\", "/").rstrip("/") or "."
+                dir_val = _normalize_dir_arg(tokens[idx].split("=", 1)[1])
                 preserved_env.extend(["--directory", dir_val])
                 idx += 1
                 continue
@@ -384,6 +396,7 @@ def _evaluate_verifier_gate(
     review_data: dict[str, Any] | None,
     candidate_sha: str,
     *,
+    phase: int,
     require_frozen: bool = False,
 ) -> tuple[str, list[str], list[str]]:
     if not isinstance(verifier_data, dict):
@@ -399,6 +412,10 @@ def _evaluate_verifier_gate(
         return "BLOCKED", [], ["build_verifier reported BLOCKED (missing required phase target)."]
     if v_status != "VERIFIED":
         return "FAILED", [f"Unexpected build_verifier status: {v_status!r}"], []
+
+    v_phase = verifier_data.get("phase")
+    if not is_strict_int(v_phase) or v_phase != phase:
+        return "BLOCKED", [], [f"build_verifier phase mismatch ({v_phase!r} != {phase})."]
 
     worktree_dirty = verifier_data.get("worktree_dirty")
     if not is_strict_bool(worktree_dirty) or worktree_dirty is not False:
@@ -418,6 +435,25 @@ def _evaluate_verifier_gate(
             return "FAILED", [f"build_verifier step '{s_name}' failed (status={s_status!r}, exit_code={s_exit!r})."], []
         if s_status != "PASSED" or not is_strict_int(s_exit) or s_exit != 0:
             return "BLOCKED", [], [f"build_verifier step '{s_name}' did not pass cleanly (status={s_status!r}, exit_code={s_exit!r})."]
+
+    if phase in {1, 2, 4, 5, 6}:
+        has_backend = any(
+            str(s.get("name", "")).startswith("backend")
+            or "backend" in " ".join(str(x) for x in s.get("command", []))
+            for s in steps
+        )
+        if not has_backend:
+            return "BLOCKED", [], [f"build_verifier missing required backend step(s) for phase {phase}."]
+
+    if phase in {3, 4, 6}:
+        has_frontend = any(
+            str(s.get("name", "")).startswith("frontend")
+            or "frontend" in " ".join(str(x) for x in s.get("command", []))
+            or "pnpm" in " ".join(str(x) for x in s.get("command", []))
+            for s in steps
+        )
+        if not has_frontend:
+            return "BLOCKED", [], [f"build_verifier missing required frontend step(s) for phase {phase}."]
 
     if require_frozen:
         if verifier_data.get("source_mode") != "frozen_commit_archive":
@@ -475,6 +511,7 @@ def evaluate_receipt(
         verifier_data,
         review_data,
         candidate_sha,
+        phase=phase,
         require_frozen=require_frozen,
     )
     failures.extend(v_failures)

@@ -336,13 +336,13 @@ def test_spawn_managed_process_kills_rapid_grandchild_and_fails_closed_on_job_er
         "_resolve_tool",
         lambda name, python_module=None: [sys.executable, str(parent_script)] if name == "pytest" else [sys.executable, "-c", "pass"],
     )
-    report = run_verifier(tmp_path, phase=0, strict_clean=False, step_timeout_sec=0.8, total_timeout_sec=5.0)
+    report = run_verifier(tmp_path, phase=0, strict_clean=False, step_timeout_sec=1.2, total_timeout_sec=5.0)
     assert report["status"] == "FAILED"
     pytest_step = next(s for s in report["steps"] if s["name"] == "harness_pytest")
     assert pytest_step["exit_code"] == 124
-    if grandchild_pid_file.is_file():
-        gc_pid = int(grandchild_pid_file.read_text(encoding="utf-8").strip())
-        assert not _is_pid_alive(gc_pid)
+    assert grandchild_pid_file.is_file()
+    gc_pid = int(grandchild_pid_file.read_text(encoding="utf-8").strip())
+    assert not _is_pid_alive(gc_pid)
 
     # Part B: Simulate Win32 Job Object attach failure -> fail closed and kill suspended process
     if sys.platform == "win32":
@@ -366,3 +366,55 @@ def test_spawn_managed_process_kills_rapid_grandchild_and_fails_closed_on_job_er
         else:
             schema_utils.terminate_process_tree(proc)
             raise AssertionError("Expected RuntimeError when AssignProcessToJobObject fails")
+
+
+def test_spawn_managed_process_attaches_job_before_resuming_process(monkeypatch) -> None:
+    """P1-001: Verify exact call order CREATE_SUSPENDED -> AssignProcessToJobObject -> NtResumeProcess."""
+    if sys.platform != "win32":
+        return
+
+    from harness.scripts import schema_utils
+
+    events: list[str] = []
+
+    class _FakeProc:
+        def __init__(self) -> None:
+            self.pid = 4321
+            self._handle = 999
+
+        def kill(self) -> None:
+            events.append("kill")
+
+        def wait(self, timeout: float = 0.0) -> int:
+            return 0
+
+    def _fake_popen(cmd, **kwargs):
+        assert int(kwargs.get("creationflags", 0)) & 0x00000004
+        events.append("Popen(CREATE_SUSPENDED)")
+        return _FakeProc()
+
+    class _FakeKernel32:
+        def AssignProcessToJobObject(self, job, proc_handle):
+            assert int(job.value) == 777
+            assert int(proc_handle.value) == 999
+            events.append("AssignProcessToJobObject")
+            return 1
+
+        def CloseHandle(self, _handle):
+            return 1
+
+    class _FakeNtdll:
+        def NtResumeProcess(self, proc_handle):
+            assert int(proc_handle.value) == 999
+            events.append("NtResumeProcess")
+            return 0
+
+    monkeypatch.setattr(schema_utils.subprocess, "Popen", _fake_popen)
+    monkeypatch.setattr(schema_utils, "_configure_kernel32", lambda: _FakeKernel32())
+    monkeypatch.setattr(schema_utils, "_create_kill_on_close_job", lambda _k32: 777)
+    monkeypatch.setattr(schema_utils, "_configure_ntdll", lambda: _FakeNtdll())
+
+    proc, job = schema_utils.spawn_managed_process(["echo", "hi"])
+    assert proc.pid == 4321
+    assert job == 777
+    assert events == ["Popen(CREATE_SUSPENDED)", "AssignProcessToJobObject", "NtResumeProcess"]

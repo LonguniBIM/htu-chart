@@ -12,14 +12,25 @@ from harness.scripts.receipt import evaluate_receipt, render_receipt_markdown
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
-def _verifier(sha: str, status: str = "VERIFIED") -> dict:
+def _verifier(sha: str, status: str = "VERIFIED", phase: int = 1) -> dict:
+    step_ok = status == "VERIFIED"
+    if phase == 0:
+        steps = [{"name": "harness_pytest", "command": ["pytest", "harness/tests"], "status": "PASSED" if step_ok else "FAILED", "exit_code": 0 if step_ok else 1}]
+    elif phase == 3:
+        steps = [{"name": "frontend_build", "command": ["pnpm", "--dir", "frontend", "build"], "status": "PASSED" if step_ok else "FAILED", "exit_code": 0 if step_ok else 1}]
+    elif phase in {4, 6}:
+        steps = [
+            {"name": "backend_pytest", "command": ["pytest", "backend/tests"], "status": "PASSED" if step_ok else "FAILED", "exit_code": 0 if step_ok else 1},
+            {"name": "frontend_build", "command": ["pnpm", "--dir", "frontend", "build"], "status": "PASSED" if step_ok else "FAILED", "exit_code": 0 if step_ok else 1},
+        ]
+    else:
+        steps = [{"name": "backend_pytest", "command": ["pytest", "backend/tests"], "status": "PASSED" if step_ok else "FAILED", "exit_code": 0 if step_ok else 1}]
     return {
         "status": status,
+        "phase": phase,
         "git_sha": sha,
         "worktree_dirty": False,
-        "steps": [
-            {"command": ["pytest", "harness/tests"], "status": "PASSED" if status == "VERIFIED" else "FAILED", "exit_code": 0 if status == "VERIFIED" else 1}
-        ],
+        "steps": steps,
     }
 
 
@@ -253,7 +264,7 @@ def test_receipt_records_agy_fallback_provenance_in_json_and_markdown() -> None:
         phase=3,
         base_sha=base,
         candidate_sha=cand,
-        verifier_data=_verifier(cand),
+        verifier_data=_verifier(cand, phase=3),
         review_data=review,
     )
     assert receipt["conclusion"] == "VERIFIED"
@@ -611,6 +622,81 @@ def test_receipt_rejects_refuted_evidence_when_commit_missing_in_git_even_if_fil
         repo_root=tmp_path,
     )
     assert res["conclusion"] != "VERIFIED"
+
+
+def test_receipt_blocks_verifier_phase_mismatch_and_missing_phase_steps() -> None:
+    """P1-C01: phase=0 verifier_data or phase=3 verifier lacking frontend step must block phase=3 receipt."""
+    base = "1" * 40
+    cand = "2" * 40
+
+    phase0_v = _verifier(cand, phase=0)
+    res_mismatch = evaluate_receipt(
+        task_id="P1-C01-PHASE",
+        phase=3,
+        base_sha=base,
+        candidate_sha=cand,
+        verifier_data=phase0_v,
+        review_data=_review(cand),
+    )
+    assert res_mismatch["conclusion"] == "BLOCKED"
+
+    phase3_no_fe = _verifier(cand, phase=1)
+    phase3_no_fe["phase"] = 3
+    res_no_fe = evaluate_receipt(
+        task_id="P1-C01-NOFE",
+        phase=3,
+        base_sha=base,
+        candidate_sha=cand,
+        verifier_data=phase3_no_fe,
+        review_data=_review(cand),
+    )
+    assert res_no_fe["conclusion"] == "BLOCKED"
+
+
+def test_receipt_preserves_root_and_drive_root_directory_targets() -> None:
+    """P1-C02: --directory / vs . and --directory=C:/ vs C: must stay distinct and block."""
+    base = "1" * 40
+    cand = "2" * 40
+
+    root_vs_dot = evaluate_receipt(
+        task_id="P1-C02-ROOT",
+        phase=1,
+        base_sha=base,
+        candidate_sha=cand,
+        verifier_data=_verifier(cand),
+        review_data=_review(cand),
+        is_bugfix=True,
+        red_proof={
+            "red_sha": base,
+            "red_exit_code": 1,
+            "red_failure_reason": "AssertionError: root",
+            "green_sha": cand,
+            "green_exit_code": 0,
+            "red_test_command": "uv run --directory / pytest tests -q",
+            "green_test_command": "uv run --directory . pytest tests -q",
+        },
+    )
+    assert root_vs_dot["conclusion"] == "BLOCKED"
+
+    drive_root_vs_rel = evaluate_receipt(
+        task_id="P1-C02-DRIVE",
+        phase=1,
+        base_sha=base,
+        candidate_sha=cand,
+        verifier_data=_verifier(cand),
+        review_data=_review(cand),
+        is_bugfix=True,
+        red_proof={
+            "red_sha": base,
+            "red_exit_code": 1,
+            "red_failure_reason": "AssertionError: drive",
+            "green_sha": cand,
+            "green_exit_code": 0,
+            "red_test_command": "uv run --directory=C:/ pytest tests -q",
+            "green_test_command": "uv run --directory=C: pytest tests -q",
+        },
+    )
+    assert drive_root_vs_rel["conclusion"] == "BLOCKED"
 
 
 def test_receipt_blocks_none_verifier_steps_without_crashing() -> None:
