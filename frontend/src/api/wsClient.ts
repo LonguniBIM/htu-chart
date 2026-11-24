@@ -5,6 +5,7 @@ import type {
   WsFeedStatusMessage,
   WsInboundMessage,
   WsResyncRequiredMessage,
+  WsSubscribedMessage,
 } from "./types";
 
 export type WsConnectionState = "disconnected" | "connecting" | "connected";
@@ -12,6 +13,7 @@ export type WsConnectionState = "disconnected" | "connecting" | "connected";
 type BarUpdateListener = (message: WsBarUpdateMessage) => void;
 type FeedStatusListener = (message: WsFeedStatusMessage) => void;
 type ResyncRequiredListener = (message: WsResyncRequiredMessage) => void;
+type SubscribedListener = (message: WsSubscribedMessage) => void;
 type ErrorListener = (message: WsErrorMessage) => void;
 type ConnectionStateListener = (state: WsConnectionState) => void;
 
@@ -49,6 +51,7 @@ export class MarketWsClient {
   private readonly barListeners = new Set<BarUpdateListener>();
   private readonly feedStatusListeners = new Set<FeedStatusListener>();
   private readonly resyncListeners = new Set<ResyncRequiredListener>();
+  private readonly subscribedListeners = new Set<SubscribedListener>();
   private readonly errorListeners = new Set<ErrorListener>();
   private readonly connectionListeners = new Set<ConnectionStateListener>();
   private readonly urlFactory: () => string;
@@ -153,6 +156,13 @@ export class MarketWsClient {
     };
   }
 
+  onSubscribed(listener: SubscribedListener): () => void {
+    this.subscribedListeners.add(listener);
+    return () => {
+      this.subscribedListeners.delete(listener);
+    };
+  }
+
   onError(listener: ErrorListener): () => void {
     this.errorListeners.add(listener);
     return () => {
@@ -237,6 +247,10 @@ export class MarketWsClient {
         }
       } else if (parsed.type === "resync_required") {
         for (const listener of this.resyncListeners) {
+          listener(parsed);
+        }
+      } else if (parsed.type === "subscribed") {
+        for (const listener of this.subscribedListeners) {
           listener(parsed);
         }
       } else if (parsed.type === "error") {

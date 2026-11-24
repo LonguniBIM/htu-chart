@@ -13,6 +13,7 @@ import type {
   WsErrorMessage,
   WsFeedStatusMessage,
   WsResyncRequiredMessage,
+  WsSubscribedMessage,
 } from "./api/types";
 import type { WsConnectionState } from "./api/wsClient";
 import { App } from "./App";
@@ -28,6 +29,7 @@ let connectionStateListeners = new Set<(state: WsConnectionState) => void>();
 let barUpdateListeners = new Set<(msg: WsBarUpdateMessage) => void>();
 let resyncListeners = new Set<(msg: WsResyncRequiredMessage) => void>();
 let errorListeners = new Set<(msg: WsErrorMessage) => void>();
+let subscribedListeners = new Set<(msg: WsSubscribedMessage) => void>();
 
 vi.mock("./api/wsClient", () => ({
   MarketWsClient: class MockMarketWsClient {
@@ -67,6 +69,13 @@ vi.mock("./api/wsClient", () => ({
       errorListeners.add(listener);
       return () => {
         errorListeners.delete(listener);
+      };
+    }
+
+    onSubscribed(listener: (msg: WsSubscribedMessage) => void) {
+      subscribedListeners.add(listener);
+      return () => {
+        subscribedListeners.delete(listener);
       };
     }
   },
@@ -188,6 +197,7 @@ describe("App bootstrap and R03 503 recovery (P1-R3-03, P1-R3-04, P2-005)", () =
     barUpdateListeners = new Set();
     resyncListeners = new Set();
     errorListeners = new Set();
+    subscribedListeners = new Set();
     vi.stubGlobal("ResizeObserver", MockResizeObserver);
   });
 
@@ -859,5 +869,163 @@ describe("App bootstrap and R03 503 recovery (P1-R3-03, P1-R3-04, P2-005)", () =
     });
 
     expect(screen.getByText("Timeframe '3m' is not enabled")).toBeTruthy();
+  });
+
+  it("mutually aborts and generation-guards retryUnresolvedContracts vs layout-switch fetchContracts (P1-R5-01)", async () => {
+    /**
+     * Contract: Starting a layout-switch contract fetch aborts an in-flight retryUnresolvedContracts
+     * request and advances contractResolveGenerationRef so that a late-resolving oldRetryDeferred
+     * (even if transport ignores AbortSignal) cannot clobber fresh layout-switch contracts,
+     * cleared error banner, or cleared Retry Contracts state.
+     * Defect caught: Out-of-order retryUnresolvedContracts vs layout-switch overwriting fresh contracts.
+     */
+    const liveLayout: LayoutRecord = {
+      ...SAMPLE_LAYOUT,
+      id: "layout-live",
+      name: "Live MNQ",
+      is_default: false,
+      panes: [
+        {
+          pane_id: "pane-live",
+          root_symbol: "MNQ",
+          timeframe: "5m",
+          live_mode: true,
+          playback_mode: "live",
+        },
+      ],
+    };
+
+    fetchSessionMock.mockResolvedValue({
+      authenticated: true,
+      csrf_token: "csrf-token-1234567890",
+    });
+    fetchStatusMock.mockResolvedValue({
+      connected: true,
+      live: false,
+      feed_state: "LIVE",
+    });
+    listLayoutsMock.mockResolvedValue([SAMPLE_LAYOUT, liveLayout]);
+
+    let oldRetrySignal: AbortSignal | undefined;
+    let resolveOldRetry!: (value: ContractsResponse) => void;
+    let liveSwitchSignal: AbortSignal | undefined;
+
+    fetchContractsMock
+      .mockResolvedValueOnce({
+        live: false,
+        contracts: {
+          MES: {
+            selected: null,
+            error_type: "InitialTimeout",
+            error: "Timed out querying MES",
+          },
+        },
+      })
+      .mockImplementationOnce((_symbols, _live, signal) => {
+        oldRetrySignal = signal;
+        return new Promise<ContractsResponse>((resolve) => {
+          resolveOldRetry = resolve;
+        });
+      })
+      .mockImplementationOnce((_symbols, _live, signal) => {
+        liveSwitchSignal = signal;
+        return new Promise<ContractsResponse>(() => {
+          // Aborted before resolving when user switches back to SAMPLE_LAYOUT
+        });
+      })
+      .mockResolvedValueOnce({
+        live: false,
+        contracts: {
+          MES: {
+            selected: { id: "CON.F.US.MES.FRESH" },
+            error_type: null,
+            error: null,
+          },
+        },
+      });
+
+    fetchBarsMock.mockResolvedValue({
+      provider: "topstepx",
+      live: false,
+      contract_id: "CON.F.US.MES.FRESH",
+      root_symbol: "MES",
+      timeframe: "5m",
+      start_time: 1000,
+      end_time: 1000,
+      count: 0,
+      include_partial: true,
+      quality: {
+        is_complete: true,
+        truncated: false,
+        provider_gap: false,
+        quarantined_count: 0,
+      },
+      bars: [],
+    });
+
+    render(<App />);
+    await act(async () => {
+      await flushMicrotasks();
+    });
+
+    expect(screen.getByRole("button", { name: "Retry Contracts" })).toBeTruthy();
+    expect(screen.getByText(/MES \(InitialTimeout\)/)).toBeTruthy();
+
+    // Start retryUnresolvedContracts (pending oldRetryDeferred)
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Retry Contracts" }));
+      await flushMicrotasks();
+    });
+    expect(fetchContractsMock).toHaveBeenCalledTimes(2);
+    expect(oldRetrySignal?.aborted).toBe(false);
+
+    // Switch to Live MNQ layout, then immediately back to Default Sim layout
+    await act(async () => {
+      fireEvent.change(screen.getByLabelText("Active layout"), {
+        target: { value: "layout-live" },
+      });
+      await flushMicrotasks();
+    });
+    expect(fetchContractsMock).toHaveBeenCalledTimes(3);
+    expect(oldRetrySignal?.aborted).toBe(true);
+    expect(liveSwitchSignal?.aborted).toBe(false);
+
+    await act(async () => {
+      fireEvent.change(screen.getByLabelText("Active layout"), {
+        target: { value: "layout-1" },
+      });
+      await flushMicrotasks();
+    });
+    expect(fetchContractsMock).toHaveBeenCalledTimes(4);
+    expect(liveSwitchSignal?.aborted).toBe(true);
+    expect(screen.getByText(/CON\.F\.US\.MES\.FRESH/)).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Retry Contracts" })).toBeNull();
+    expect(screen.queryByText(/Incomplete contracts/)).toBeNull();
+
+    // Late resolution of oldRetryDeferred with stale contract ID and partial selected=null failure
+    await act(async () => {
+      resolveOldRetry({
+        live: false,
+        contracts: {
+          MES: {
+            selected: { id: "CON.F.US.MES.STALE" },
+            error_type: null,
+            error: null,
+          },
+          MNQ: {
+            selected: null,
+            error_type: "LateRetryError",
+            error: "Stale retry partial failure",
+          },
+        },
+      });
+      await flushMicrotasks();
+    });
+
+    expect(screen.getByText(/CON\.F\.US\.MES\.FRESH/)).toBeTruthy();
+    expect(screen.queryByText(/CON\.F\.US\.MES\.STALE/)).toBeNull();
+    expect(screen.queryByText(/LateRetryError/)).toBeNull();
+    expect(screen.queryByText(/Incomplete contracts/)).toBeNull();
+    expect(screen.queryByRole("button", { name: "Retry Contracts" })).toBeNull();
   });
 });

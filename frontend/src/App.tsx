@@ -89,12 +89,14 @@ export function App() {
   const retryAbortControllerRef = useRef<AbortController | null>(null);
   const layoutResolveControllerRef = useRef<AbortController | null>(null);
   const sessionEpochRef = useRef<number>(0);
+  const contractResolveGenerationRef = useRef<number>(0);
   const activeLayoutRef = useRef<LayoutRecord | null>(null);
   activeLayoutRef.current = activeLayout;
 
   useEffect(() => {
     return () => {
       sessionEpochRef.current += 1;
+      contractResolveGenerationRef.current += 1;
       activeAuthControllerRef.current?.abort();
       activeAuthControllerRef.current = null;
       retryAbortControllerRef.current?.abort();
@@ -164,12 +166,52 @@ export function App() {
     [],
   );
 
+  const applyContractResolutionResult = useCallback((result: FetchContractsBatchResult) => {
+    setContracts((prev) => mergeResolvedContracts(prev, result.updates));
+    for (const mode of result.resolvedModes) {
+      resolvedModesRef.current.add(mode);
+      unresolvedModesRef.current.delete(mode);
+    }
+    for (const mode of result.incompleteModes) {
+      resolvedModesRef.current.delete(mode);
+      unresolvedModesRef.current.add(mode);
+    }
+    if (unresolvedModesRef.current.size === 0 && result.incompleteModes.length === 0) {
+      contractsRetryNeededRef.current = false;
+      setContractsPendingRetry(false);
+      setRetrySchedule((prev) => ({ attempt: 0, nonce: prev.nonce + 1 }));
+      setLoadError(null);
+    } else {
+      contractsRetryNeededRef.current = true;
+      setContractsPendingRetry(true);
+      setLoadError(result.partialFailureSummary);
+    }
+  }, []);
+
+  const applyContractResolutionError = useCallback(
+    (err: unknown, attemptedModes: readonly boolean[]) => {
+      if (err instanceof ApiError && err.status === 503) {
+        contractsRetryNeededRef.current = true;
+        for (const mode of attemptedModes) {
+          unresolvedModesRef.current.add(mode);
+        }
+        setContractsPendingRetry(true);
+        return;
+      }
+      setLoadError(err instanceof Error ? err.message : "Failed to resolve contracts");
+    },
+    [],
+  );
+
   const retryUnresolvedContracts = useCallback(
     async (options?: { countAsAutoAttempt?: boolean; resetAttempt?: boolean }) => {
       retryAbortControllerRef.current?.abort();
+      layoutResolveControllerRef.current?.abort();
+      layoutResolveControllerRef.current = null;
       const controller = new AbortController();
       retryAbortControllerRef.current = controller;
       const requestEpoch = sessionEpochRef.current;
+      const generation = ++contractResolveGenerationRef.current;
       setIsRetryingContracts(true);
       if (options?.resetAttempt) {
         setRetrySchedule((prev) => ({ attempt: 0, nonce: prev.nonce + 1 }));
@@ -186,7 +228,11 @@ export function App() {
           fetchContractsForModes(modes, controller.signal),
         ]);
 
-        if (controller.signal.aborted || requestEpoch !== sessionEpochRef.current) {
+        if (
+          controller.signal.aborted ||
+          requestEpoch !== sessionEpochRef.current ||
+          generation !== contractResolveGenerationRef.current
+        ) {
           return;
         }
 
@@ -199,29 +245,7 @@ export function App() {
         }
 
         if (contractsResult.status === "fulfilled") {
-          const result = contractsResult.value;
-          setContracts((prev) => mergeResolvedContracts(prev, result.updates));
-          for (const mode of result.resolvedModes) {
-            resolvedModesRef.current.add(mode);
-            unresolvedModesRef.current.delete(mode);
-          }
-          for (const mode of result.incompleteModes) {
-            resolvedModesRef.current.delete(mode);
-            unresolvedModesRef.current.add(mode);
-          }
-          if (
-            unresolvedModesRef.current.size === 0 &&
-            result.incompleteModes.length === 0
-          ) {
-            contractsRetryNeededRef.current = false;
-            setContractsPendingRetry(false);
-            setRetrySchedule((prev) => ({ attempt: 0, nonce: prev.nonce + 1 }));
-            setLoadError(null);
-          } else {
-            contractsRetryNeededRef.current = true;
-            setContractsPendingRetry(true);
-            setLoadError(result.partialFailureSummary);
-          }
+          applyContractResolutionResult(contractsResult.value);
           return;
         }
 
@@ -229,15 +253,7 @@ export function App() {
         if (err instanceof DOMException && err.name === "AbortError") {
           return;
         }
-        if (err instanceof ApiError && err.status === 503) {
-          contractsRetryNeededRef.current = true;
-          for (const mode of modes) {
-            unresolvedModesRef.current.add(mode);
-          }
-          setContractsPendingRetry(true);
-          return;
-        }
-        setLoadError(err instanceof Error ? err.message : "Failed to resolve contracts");
+        applyContractResolutionError(err, modes);
       } finally {
         if (retryAbortControllerRef.current === controller) {
           retryAbortControllerRef.current = null;
@@ -245,6 +261,7 @@ export function App() {
           if (
             !controller.signal.aborted &&
             requestEpoch === sessionEpochRef.current &&
+            generation === contractResolveGenerationRef.current &&
             options?.countAsAutoAttempt &&
             contractsRetryNeededRef.current
           ) {
@@ -253,7 +270,7 @@ export function App() {
         }
       }
     },
-    [fetchContractsForModes],
+    [applyContractResolutionError, applyContractResolutionResult, fetchContractsForModes],
   );
 
   useEffect(() => {
@@ -328,6 +345,7 @@ export function App() {
     async (signal?: AbortSignal) => {
       sessionEpochRef.current += 1;
       const requestEpoch = sessionEpochRef.current;
+      const generation = ++contractResolveGenerationRef.current;
       setLoadError(null);
       retryAbortControllerRef.current?.abort();
       retryAbortControllerRef.current = null;
@@ -339,20 +357,25 @@ export function App() {
       setRetrySchedule((prev) => ({ attempt: 0, nonce: prev.nonce + 1 }));
       setContractsPendingRetry(false);
 
+      const isStale = () =>
+        Boolean(signal?.aborted) ||
+        requestEpoch !== sessionEpochRef.current ||
+        generation !== contractResolveGenerationRef.current;
+
       const statusOpts = signal !== undefined ? signal : undefined;
       await fetchSession(statusOpts);
-      if (signal?.aborted || requestEpoch !== sessionEpochRef.current) {
+      if (isStale()) {
         return;
       }
       const status = await fetchStatus(statusOpts);
-      if (signal?.aborted || requestEpoch !== sessionEpochRef.current) {
+      if (isStale()) {
         return;
       }
       setStatusData(status);
       prevFeedStateRef.current = String(status.feed_state ?? "DISCONNECTED");
 
       const loadedLayouts = await listLayouts(statusOpts);
-      if (signal?.aborted || requestEpoch !== sessionEpochRef.current) {
+      if (isStale()) {
         return;
       }
       setLayouts(loadedLayouts);
@@ -365,7 +388,7 @@ export function App() {
       const distinctModes = distinctPaneLiveModes(defaultLayout?.panes ?? []);
       try {
         const result = await fetchContractsForModes(distinctModes, statusOpts);
-        if (signal?.aborted || requestEpoch !== sessionEpochRef.current) {
+        if (isStale()) {
           return;
         }
         for (const mode of result.resolvedModes) {
@@ -389,7 +412,7 @@ export function App() {
         if (err instanceof DOMException && err.name === "AbortError") {
           throw err;
         }
-        if (signal?.aborted || requestEpoch !== sessionEpochRef.current) {
+        if (isStale()) {
           return;
         }
         if (err instanceof ApiError && err.status === 503) {
@@ -402,7 +425,7 @@ export function App() {
         }
       }
 
-      if (signal?.aborted || requestEpoch !== sessionEpochRef.current) {
+      if (isStale()) {
         return;
       }
       wsClient.connect();
@@ -454,6 +477,7 @@ export function App() {
     event.preventDefault();
     setAuthError(null);
     sessionEpochRef.current += 1;
+    contractResolveGenerationRef.current += 1;
     layoutResolveControllerRef.current?.abort();
     layoutResolveControllerRef.current = null;
     activeAuthControllerRef.current?.abort();
@@ -488,6 +512,7 @@ export function App() {
 
   const handleLogout = async () => {
     sessionEpochRef.current += 1;
+    contractResolveGenerationRef.current += 1;
     activeAuthControllerRef.current?.abort();
     activeAuthControllerRef.current = null;
     retryAbortControllerRef.current?.abort();
@@ -545,6 +570,58 @@ export function App() {
     });
   };
 
+  const handleLayoutChange = (nextLayoutId: string) => {
+    const picked = layouts.find((item) => item.id === nextLayoutId) ?? null;
+    setActiveLayout(picked);
+    activeLayoutRef.current = picked;
+    layoutResolveControllerRef.current?.abort();
+    layoutResolveControllerRef.current = null;
+    if (picked === null) {
+      return;
+    }
+    const missingModes = distinctPaneLiveModes(picked.panes).filter(
+      (mode) => !resolvedModesRef.current.has(mode),
+    );
+    if (missingModes.length === 0) {
+      return;
+    }
+    retryAbortControllerRef.current?.abort();
+    retryAbortControllerRef.current = null;
+    setIsRetryingContracts(false);
+    const controller = new AbortController();
+    layoutResolveControllerRef.current = controller;
+    const requestEpoch = sessionEpochRef.current;
+    const generation = ++contractResolveGenerationRef.current;
+
+    void fetchContractsForModes(missingModes, controller.signal)
+      .then((result) => {
+        if (
+          controller.signal.aborted ||
+          requestEpoch !== sessionEpochRef.current ||
+          generation !== contractResolveGenerationRef.current
+        ) {
+          return;
+        }
+        applyContractResolutionResult(result);
+      })
+      .catch((err: unknown) => {
+        if (
+          controller.signal.aborted ||
+          requestEpoch !== sessionEpochRef.current ||
+          generation !== contractResolveGenerationRef.current ||
+          (err instanceof DOMException && err.name === "AbortError")
+        ) {
+          return;
+        }
+        applyContractResolutionError(err, missingModes);
+      })
+      .finally(() => {
+        if (layoutResolveControllerRef.current === controller) {
+          layoutResolveControllerRef.current = null;
+        }
+      });
+  };
+
   if (authStage === "checking") {
     return (
       <main className="login-gate">
@@ -597,70 +674,7 @@ export function App() {
               aria-label="Active layout"
               value={activeLayout?.id ?? ""}
               onChange={(e) => {
-                const picked = layouts.find((item) => item.id === e.target.value) ?? null;
-                setActiveLayout(picked);
-                activeLayoutRef.current = picked;
-                layoutResolveControllerRef.current?.abort();
-                layoutResolveControllerRef.current = null;
-                if (picked !== null) {
-                  const missingModes = distinctPaneLiveModes(picked.panes).filter(
-                    (mode) => !resolvedModesRef.current.has(mode),
-                  );
-                  if (missingModes.length > 0) {
-                    const controller = new AbortController();
-                    layoutResolveControllerRef.current = controller;
-                    const requestEpoch = sessionEpochRef.current;
-                    void fetchContractsForModes(missingModes, controller.signal)
-                      .then((result) => {
-                        if (
-                          controller.signal.aborted ||
-                          requestEpoch !== sessionEpochRef.current
-                        ) {
-                          return;
-                        }
-                        for (const mode of result.resolvedModes) {
-                          resolvedModesRef.current.add(mode);
-                        }
-                        for (const mode of result.incompleteModes) {
-                          resolvedModesRef.current.delete(mode);
-                        }
-                        setContracts((prev) => mergeResolvedContracts(prev, result.updates));
-                        if (result.incompleteModes.length > 0) {
-                          contractsRetryNeededRef.current = true;
-                          for (const mode of result.incompleteModes) {
-                            unresolvedModesRef.current.add(mode);
-                          }
-                          setContractsPendingRetry(true);
-                          setLoadError(result.partialFailureSummary);
-                        }
-                      })
-                      .catch((err: unknown) => {
-                        if (
-                          controller.signal.aborted ||
-                          requestEpoch !== sessionEpochRef.current ||
-                          (err instanceof DOMException && err.name === "AbortError")
-                        ) {
-                          return;
-                        }
-                        if (err instanceof ApiError && err.status === 503) {
-                          contractsRetryNeededRef.current = true;
-                          for (const mode of missingModes) {
-                            unresolvedModesRef.current.add(mode);
-                          }
-                          setContractsPendingRetry(true);
-                          return;
-                        }
-                        setLoadError(
-                          err instanceof Error ? err.message : "Failed to resolve contracts",
-                        );
-                      })
-                      .finally(() => {
-                        if (layoutResolveControllerRef.current === controller) {
-                          layoutResolveControllerRef.current = null;
-                        }
-                      });
-                  }
-                }
+                handleLayoutChange(e.target.value);
               }}
             >
               {layouts.map((item) => (

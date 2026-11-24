@@ -557,3 +557,50 @@ async def test_layouts_default_swap_rolls_back_atomically_on_mid_tx_failure(
         assert reloaded_secondary.is_default is False
     finally:
         store.close()
+
+
+async def test_layouts_update_sole_default_to_false_preserves_default_in_sqlite_store(
+    tmp_path: Path,
+) -> None:
+    """Contract: Updating the sole remaining layout with is_default=False preserves is_default=True.
+
+    Defect caught: Zero-default SQLite commit masked by ensure_default_layout()
+    on subsequent GET (P1-R5-02).
+    """
+    async with _async_client(tmp_path) as (client, app):
+        csrf = await _login(client)
+        headers = {"X-CSRF-Token": csrf}
+
+        initial = await client.get("/api/layouts")
+        assert initial.status_code == 200
+        layouts = initial.json()["layouts"]
+        assert len(layouts) == 1
+        seeded_id = layouts[0]["id"]
+        assert layouts[0]["is_default"] is True
+
+        put_resp = await client.put(
+            f"/api/layouts/{seeded_id}",
+            json=_valid_layout_payload(
+                name="Sole Desk",
+                template_id="2-cols",
+                is_default=False,
+            ),
+            headers=headers,
+        )
+        assert put_resp.status_code == 200
+        assert put_resp.json()["layout"]["id"] == seeded_id
+        assert put_resp.json()["layout"]["name"] == "Sole Desk"
+        assert put_resp.json()["layout"]["is_default"] is True
+
+        # Inspect SqliteStore directly BEFORE calling GET /api/layouts (ensure_default_layout).
+        direct_rows = await app.state.sqlite_store.list_layouts()
+        assert len(direct_rows) == 1
+        assert direct_rows[0].id == seeded_id
+        assert direct_rows[0].is_default is True
+
+        after_get = await client.get("/api/layouts")
+        assert after_get.status_code == 200
+        after_layouts = after_get.json()["layouts"]
+        assert len(after_layouts) == 1
+        assert after_layouts[0]["id"] == seeded_id
+        assert after_layouts[0]["is_default"] is True

@@ -3,6 +3,7 @@ import {
   LIVE_WS_TIMEFRAMES,
   isLiveWsTimeframe,
   type WsResyncRequiredMessage,
+  type WsSubscribedMessage,
 } from "./types";
 import { MarketWsClient } from "./wsClient";
 
@@ -317,5 +318,67 @@ describe("MarketWsClient (P1-04, P1-05, P2-003)", () => {
     unsubscribe();
     ws2?.emitMessage({ type: "error", detail: "after unsubscribe" });
     expect(errors).toEqual(["Timeframe '3m' is not enabled"]);
+  });
+
+  it("dispatches inbound subscribed ACKs to onSubscribed and ignores stale-socket frames (P2-001)", () => {
+    /**
+     * Contract: MarketWsClient.onSubscribed delivers { type: "subscribed", contract_id, timeframe }
+     * frames from the active socket while ignoring replaced stale-socket frames and unsubscribed frames.
+     * Defect caught: Missing onSubscribed listener or stale-socket subscribed ACK triggering resync.
+     */
+    const client = new MarketWsClient(() => "ws://127.0.0.1:8000/ws/market");
+    const subscribedEvents: WsSubscribedMessage[] = [];
+    const unsubscribe = client.onSubscribed((msg) => {
+      subscribedEvents.push(msg);
+    });
+
+    client.connect();
+    const ws1 = FakeWebSocket.instances[0];
+    expect(ws1).toBeDefined();
+    ws1?.emitOpen();
+
+    client.disconnect();
+    client.connect();
+    const ws2 = FakeWebSocket.instances[1];
+    expect(ws2).toBeDefined();
+    ws2?.emitOpen();
+
+    // Replaced stale socket subscribed frame must be ignored
+    ws1?.emitMessage({
+      type: "subscribed",
+      contract_id: "CON.F.US.MES.H26",
+      timeframe: "5m",
+    });
+    expect(subscribedEvents).toEqual([]);
+
+    // Active socket unsubscribed frame must not fire onSubscribed
+    ws2?.emitMessage({
+      type: "unsubscribed",
+      contract_id: "CON.F.US.MES.H26",
+      timeframe: "5m",
+    });
+    expect(subscribedEvents).toEqual([]);
+
+    // Active socket subscribed frame reaches listener
+    ws2?.emitMessage({
+      type: "subscribed",
+      contract_id: "CON.F.US.MES.H26",
+      timeframe: "5m",
+    });
+    expect(subscribedEvents).toEqual([
+      {
+        type: "subscribed",
+        contract_id: "CON.F.US.MES.H26",
+        timeframe: "5m",
+      },
+    ]);
+
+    unsubscribe();
+    ws2?.emitMessage({
+      type: "subscribed",
+      contract_id: "CON.F.US.MNQ.H26",
+      timeframe: "15m",
+    });
+    expect(subscribedEvents).toHaveLength(1);
   });
 });

@@ -1915,11 +1915,13 @@ class SqliteStore:
                         """,
                         (clean_id,),
                     ).fetchone()
-                    if oldest_other is not None:
-                        conn.execute(
-                            "UPDATE layouts SET is_default = 1, updated_at_utc = ? WHERE id = ?",
-                            (now_ts, str(oldest_other["id"])),
-                        )
+                    promote_id = (
+                        str(oldest_other["id"]) if oldest_other is not None else clean_id
+                    )
+                    conn.execute(
+                        "UPDATE layouts SET is_default = 1, updated_at_utc = ? WHERE id = ?",
+                        (now_ts, promote_id),
+                    )
                 row = conn.execute(
                     f"{self._LAYOUT_SELECT} WHERE id = ?",
                     (clean_id,),

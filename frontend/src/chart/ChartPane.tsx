@@ -373,6 +373,14 @@ export function ChartPane({
         );
       }
     });
+    const removeSubscribedListener = wsClient.onSubscribed((msg) => {
+      if (
+        msg.contract_id.trim().toUpperCase() === resolvedContractId.toUpperCase() &&
+        msg.timeframe === pane.timeframe
+      ) {
+        setResyncNonce((n) => n + 1);
+      }
+    });
     const removeResyncListener = wsClient.onResyncRequired((msg) => {
       if (
         msg.contract_id === null ||
@@ -384,6 +392,7 @@ export function ChartPane({
 
     return () => {
       removeBarListener();
+      removeSubscribedListener();
       removeResyncListener();
       unsubscribeWs();
     };

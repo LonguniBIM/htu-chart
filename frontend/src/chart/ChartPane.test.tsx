@@ -9,6 +9,7 @@ import type {
   Timeframe,
   WsBarUpdateMessage,
   WsResyncRequiredMessage,
+  WsSubscribedMessage,
 } from "../api/types";
 import type { MarketWsClient } from "../api/wsClient";
 import { ChartPane } from "./ChartPane";
@@ -117,6 +118,7 @@ function makeBarsResponse(contractId: string, bars: OhlcvBar[]): BarsResponse {
 function createFakeWsClient() {
   const barListeners = new Set<(msg: WsBarUpdateMessage) => void>();
   const resyncListeners = new Set<(msg: WsResyncRequiredMessage) => void>();
+  const subscribedListeners = new Set<(msg: WsSubscribedMessage) => void>();
   const subscribe = vi.fn<(contractId: string, timeframe: Timeframe) => () => void>(
     () => vi.fn(),
   );
@@ -135,6 +137,12 @@ function createFakeWsClient() {
         resyncListeners.delete(listener);
       };
     },
+    onSubscribed: (listener: (msg: WsSubscribedMessage) => void) => {
+      subscribedListeners.add(listener);
+      return () => {
+        subscribedListeners.delete(listener);
+      };
+    },
   };
 
   return {
@@ -142,6 +150,11 @@ function createFakeWsClient() {
     subscribe,
     emitBarUpdate: (msg: WsBarUpdateMessage) => {
       for (const listener of barListeners) {
+        listener(msg);
+      }
+    },
+    emitSubscribed: (msg: WsSubscribedMessage) => {
+      for (const listener of subscribedListeners) {
         listener(msg);
       }
     },
@@ -545,5 +558,82 @@ describe("ChartPane (F06, P1-R3-01, P1-R3-02)", () => {
 
     expect(candleUpdate).not.toHaveBeenCalled();
     expect(volumeUpdate).not.toHaveBeenCalled();
+  });
+
+  it("triggers a post-ACK fetchBars snapshot resync when subscribed ACK arrives after initial load (P2-001)", async () => {
+    /**
+     * Contract: When initial fetchBars resolves with [1000] before the server's WS "subscribed"
+     * ACK arrives, receiving { type: "subscribed", contract_id, timeframe } for this pane triggers
+     * a second fetchBars snapshot and applies [1000, 1060] to candleSeries.setData.
+     * Defect caught: Bar gap between initial REST snapshot and server WS subscription registration.
+     */
+    const firstFetch = createDeferred<BarsResponse>();
+    const resyncFetch = createDeferred<BarsResponse>();
+    fetchBarsMock.mockReturnValueOnce(firstFetch.promise).mockReturnValueOnce(resyncFetch.promise);
+
+    const coordinator = new PaneFetchCoordinator();
+    const fakeWs = createFakeWsClient();
+    const pane: PaneConfig = {
+      pane_id: "pane-1",
+      root_symbol: "MES",
+      timeframe: "5m",
+      live_mode: false,
+      playback_mode: "live",
+    };
+
+    render(
+      <ChartPane
+        pane={pane}
+        contractId="CON.F.US.MES.H26"
+        activeFeedLive={false}
+        wsClient={fakeWs.client}
+        coordinator={coordinator}
+      />,
+    );
+
+    expect(fetchBarsMock).toHaveBeenCalledTimes(1);
+
+    await act(async () => {
+      firstFetch.resolve(makeBarsResponse("CON.F.US.MES.H26", [makeBar(1000, 5000)]));
+      await firstFetch.promise;
+    });
+
+    // Unrelated contract/timeframe subscribed ACKs must not trigger resync
+    act(() => {
+      fakeWs.emitSubscribed({
+        type: "subscribed",
+        contract_id: "CON.F.US.MNQ.H26",
+        timeframe: "5m",
+      });
+      fakeWs.emitSubscribed({
+        type: "subscribed",
+        contract_id: "CON.F.US.MES.H26",
+        timeframe: "15m",
+      });
+    });
+    expect(fetchBarsMock).toHaveBeenCalledTimes(1);
+
+    // Matching subscribed ACK triggers second snapshot fetch
+    act(() => {
+      fakeWs.emitSubscribed({
+        type: "subscribed",
+        contract_id: "CON.F.US.MES.H26",
+        timeframe: "5m",
+      });
+    });
+    expect(fetchBarsMock).toHaveBeenCalledTimes(2);
+
+    await act(async () => {
+      resyncFetch.resolve(
+        makeBarsResponse("CON.F.US.MES.H26", [makeBar(1000, 5000), makeBar(1060, 5012)]),
+      );
+      await resyncFetch.promise;
+    });
+
+    const lastCallBars = candleSetData.mock.calls[candleSetData.mock.calls.length - 1]?.[0] as
+      | Array<{ time: number; close: number }>
+      | undefined;
+    expect(lastCallBars?.map((b) => b.time)).toEqual([1000, 1060]);
+    expect(screen.getByText("2 bars")).toBeTruthy();
   });
 });
