@@ -331,4 +331,66 @@ describe("ChartPane (F06, P1-R3-01, P1-R3-02)", () => {
 
     expect(screen.getByText(/Hist only \(feed: Sim\) · 1 bars/)).toBeTruthy();
   });
+
+  it("triggers a second fetchBars resync when >500 distinct-timestamp WS bars overflow buffer while initial fetch is pending (P1-R3-01)", async () => {
+    /**
+     * Contract: When more than MAX_PENDING_WS_BARS (500) distinct-timestamp bar_update frames
+     * arrive while fetchBars is pending, resolving fetchBars detects bufferOverflowRef and
+     * increments resyncNonce to trigger a second fetchBars snapshot request.
+     * Defect caught: Silent WS bar eviction without resync when buffer overflows during REST fetch.
+     */
+    const firstFetch = createDeferred<BarsResponse>();
+    const resyncFetch = createDeferred<BarsResponse>();
+    fetchBarsMock.mockReturnValueOnce(firstFetch.promise).mockReturnValueOnce(resyncFetch.promise);
+
+    const coordinator = new PaneFetchCoordinator();
+    const fakeWs = createFakeWsClient();
+    const pane: PaneConfig = {
+      pane_id: "pane-1",
+      root_symbol: "MES",
+      timeframe: "5m",
+      live_mode: false,
+      playback_mode: "live",
+    };
+
+    render(
+      <ChartPane
+        pane={pane}
+        contractId="CON.F.US.MES.H26"
+        activeFeedLive={false}
+        wsClient={fakeWs.client}
+        coordinator={coordinator}
+      />,
+    );
+
+    expect(fetchBarsMock).toHaveBeenCalledTimes(1);
+
+    for (let i = 0; i < 502; i += 1) {
+      fakeWs.emitBarUpdate({
+        type: "bar_update",
+        contract_id: "CON.F.US.MES.H26",
+        live_mode: false,
+        timeframe: "5m",
+        is_recovered_historical: false,
+        recovery_tag: null,
+        bar: makeBar(2000 + i * 300, 5000 + i),
+      });
+    }
+
+    await act(async () => {
+      firstFetch.resolve(makeBarsResponse("CON.F.US.MES.H26", [makeBar(1000, 4999)]));
+      await firstFetch.promise;
+    });
+
+    expect(fetchBarsMock).toHaveBeenCalledTimes(2);
+
+    await act(async () => {
+      resyncFetch.resolve(
+        makeBarsResponse("CON.F.US.MES.H26", [makeBar(1000, 4999), makeBar(152300, 5501)]),
+      );
+      await resyncFetch.promise;
+    });
+
+    expect(screen.getByText("2 bars")).toBeTruthy();
+  });
 });

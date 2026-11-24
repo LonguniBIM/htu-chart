@@ -10,13 +10,38 @@ import httpx
 import pytest
 from argon2 import PasswordHasher
 
-from app.api.routes_layout import LAYOUT_TEMPLATE_PANE_COUNTS
 from app.config import Settings
 from app.main import create_app
 from app.storage.sqlite_store import SqliteStore
 
 TEST_PASSWORD = "layout-test-password-123"
 TEST_PASSWORD_HASH = PasswordHasher().hash(TEST_PASSWORD)
+
+# Independent expected template-to-pane-count contract from the F06 layout spec
+# (never imported from app.api.routes_layout so drift in production is caught).
+EXPECTED_TEMPLATE_PANE_COUNTS: dict[str, int] = {
+    "1-single": 1,
+    "2-cols": 2,
+    "2-rows": 2,
+    "3-cols": 3,
+    "3-rows": 3,
+    "3-left-main": 3,
+    "3-right-main": 3,
+    "3-top-main": 3,
+    "3-bottom-main": 3,
+    "4-grid-2x2": 4,
+    "4-cols": 4,
+    "4-rows": 4,
+    "4-left-main": 4,
+    "4-top-main": 4,
+    "5-top2-bot3": 5,
+    "5-left-main-4": 5,
+    "6-grid-3x2": 6,
+    "6-grid-2x3": 6,
+    "7-top3-bot4": 7,
+    "8-grid-4x2": 8,
+    "8-grid-2x4": 8,
+}
 
 
 @asynccontextmanager
@@ -58,7 +83,7 @@ def _valid_layout_payload(
     template_id: str = "2-cols",
     is_default: bool = False,
 ) -> dict[str, object]:
-    count = LAYOUT_TEMPLATE_PANE_COUNTS[template_id]
+    count = EXPECTED_TEMPLATE_PANE_COUNTS[template_id]
     symbols = ["MES", "MNQ", "MYM", "MGC"]
     panes = [
         {
@@ -287,6 +312,47 @@ async def test_layouts_validation_rejects_bad_template_counts_symbols_and_timefr
         assert saved["panes"][0]["root_symbol"] == "MES"
         assert saved["panes"][0]["timeframe"] == "1h"
         assert saved["panes"][0]["playback_mode"] == "replay"
+
+
+async def test_layouts_accept_all_spec_templates_against_independent_pane_counts(
+    tmp_path: Path,
+) -> None:
+    """Contract: Every F06 template_id enforces its exact spec pane count independently.
+
+    Defect caught: Production LAYOUT_TEMPLATE_PANE_COUNTS drifting from the 21-template F06 spec.
+    """
+    async with _async_client(tmp_path) as (client, _):
+        csrf = await _login(client)
+        headers = {"X-CSRF-Token": csrf}
+
+        for template_id, expected_count in EXPECTED_TEMPLATE_PANE_COUNTS.items():
+            resp = await client.post(
+                "/api/layouts",
+                json=_valid_layout_payload(
+                    name=f"Template {template_id}",
+                    template_id=template_id,
+                ),
+                headers=headers,
+            )
+            assert resp.status_code == 201, f"failed for {template_id}: {resp.text}"
+            layout = resp.json()["layout"]
+            assert layout["template_id"] == template_id
+            assert len(layout["panes"]) == expected_count
+
+        unknown_payload = {
+            "name": "Unknown Template",
+            "template_id": "9-unknown",
+            "panes": _valid_layout_payload(template_id="1-single")["panes"],
+            "sync_config": {
+                "symbol": False,
+                "interval": True,
+                "crosshair": True,
+                "time": False,
+                "dateRange": False,
+            },
+        }
+        unknown_resp = await client.post("/api/layouts", json=unknown_payload, headers=headers)
+        assert unknown_resp.status_code == 422
 
 
 async def test_layouts_delete_default_promotes_oldest_directly_in_sqlite_store(
