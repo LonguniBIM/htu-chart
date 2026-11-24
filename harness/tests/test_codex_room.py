@@ -327,7 +327,8 @@ def test_codex_room_review_parser_defaults_enable_parallel_and_idle_watchdog() -
     assert args.idle_timeout == 180.0
     assert args.sequential is False
     assert args.backend == "auto"
-    assert args.fallback_model == DEFAULT_AGY_FALLBACK_MODEL
+    assert args.fallback_model is None
+    assert args.resume_from is None
 
 
 def test_extract_agy_structured_output_parses_stream_json_and_rejects_failed_status() -> None:
@@ -417,7 +418,9 @@ def test_run_agy_pass_passes_readonly_flags_and_writes_schema_json(tmp_path: Pat
 def test_auto_backend_prioritizes_codex_and_falls_back_to_agy_on_quota_exhaustion(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    repo_dir, head_sha = _init_mini_git_repo(tmp_path / "repo_a")
+    repo_dir, head_sha = _init_policy_repo(
+        tmp_path / "repo_a", qualified_routes=[DEFAULT_AGY_FALLBACK_MODEL]
+    )
     agy_called = tmp_path / "agy_called.flag"
 
     codex_ok_script = tmp_path / "fake_codex_ok.py"
@@ -440,9 +443,10 @@ def test_auto_backend_prioritizes_codex_and_falls_back_to_agy_on_quota_exhaustio
     codex_quota_prefix = _write_fake_codex_script(
         codex_quota_script,
         (
-            "import sys\n"
+            "import json, sys\n"
             "_ = sys.stdin.read()\n"
-            "sys.stderr.write('Error: usage_limit_reached - Codex CLI quota exhausted\\n')\n"
+            "print(json.dumps({'type': 'error', "
+            "'message': 'usage_limit_reached - Codex CLI quota exhausted'}), flush=True)\n"
             "sys.exit(1)\n"
         ),
     )
@@ -486,13 +490,13 @@ def test_auto_backend_prioritizes_codex_and_falls_back_to_agy_on_quota_exhaustio
     assert report_a["fallback_used"] is False
     assert not agy_called.exists()
 
-    # Case B: Codex CLI hits quota limit -> auto falls back to agy Opus 5.5 and archives failed Codex logs.
+    # Case B: Codex CLI hits quota -> fallback to qualified agy route and archive failed logs.
     monkeypatch.setattr(codex_room_review, "resolve_codex_command", lambda: codex_quota_prefix)
     out_b = tmp_path / "out_auto_fallback"
     rc_b = codex_room_review.main(["--commit", "HEAD", "--repo-root", str(repo_dir), "--out-dir", str(out_b), "--backend", "auto"])
     assert rc_b == 0
     assert agy_called.exists()
-    assert (out_b / "pass1.codex-failed.stderr.log").is_file()
+    assert (out_b / "pass1.codex-failed.raw.jsonl").is_file()
     report_b = json.loads((out_b / "consolidated-review.json").read_text(encoding="utf-8"))
     assert report_b["review_gate_status"] == "PASSED"
     assert report_b["review_backend"] == "agy"
@@ -520,7 +524,9 @@ def test_codex_partial_blocking_finding_preserved_across_agy_fallback(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """When one Codex pass returns a blocking finding and the other hits quota, fallback must not erase it."""
-    repo_dir, head_sha = _init_mini_git_repo(tmp_path / "repo_partial")
+    repo_dir, head_sha = _init_policy_repo(
+        tmp_path / "repo_partial", qualified_routes=["gemini-4-carbon-high"]
+    )
 
     codex_partial_script = tmp_path / "fake_codex_partial.py"
     codex_partial_prefix = _write_fake_codex_script(
@@ -541,7 +547,8 @@ def test_codex_partial_blocking_finding_preserved_across_agy_fallback(
             "    out_path.write_text(json.dumps(payload), encoding='utf-8')\n"
             "    print(json.dumps({'type': 'turn.completed'}), flush=True)\n"
             "else:\n"
-            "    sys.stderr.write('Error: usage_limit_reached - Codex CLI quota exhausted\\n')\n"
+            "    print(json.dumps({'type': 'error', "
+            "'message': 'usage_limit_reached - Codex CLI quota exhausted'}), flush=True)\n"
             "    sys.exit(1)\n"
         ),
     )
@@ -1061,7 +1068,9 @@ def test_merge_prior_pass_findings_preserves_invalid_or_contradictory_prior_pass
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """P1-003: Contradictory/invalid prior Codex pass must NOT be washed away by agy fallback."""
-    repo_dir, sha = _init_mini_git_repo(tmp_path / "repo_merge_contradict")
+    repo_dir, sha = _init_policy_repo(
+        tmp_path / "repo_merge_contradict", qualified_routes=["gemini-4-carbon-high"]
+    )
 
     contradictory_p1 = _sample_pass(sha, "correctness_and_tests", "CHANGES_REQUESTED", [])
     agy_approve_p1 = _sample_pass(sha, "correctness_and_tests", "APPROVE", [])
@@ -1084,7 +1093,8 @@ def test_merge_prior_pass_findings_preserves_invalid_or_contradictory_prior_pass
             "'test_quality_issues': [], 'unverified_areas': []}\n"
             "    out_path.write_text(json.dumps(payload), encoding='utf-8')\n"
             "else:\n"
-            "    sys.stderr.write('Error: usage_limit_reached - Codex CLI quota exhausted\\n')\n"
+            "    print(json.dumps({'type': 'error', "
+            "'message': 'usage_limit_reached - Codex CLI quota exhausted'}), flush=True)\n"
             "    sys.exit(1)\n"
         ),
     )
@@ -1221,3 +1231,819 @@ def test_agy_sandbox_paths_are_strictly_inside_cwd(
         assert patch_file.is_relative_to(cwd)
         assert p_file.is_relative_to(cwd)
         assert (cwd / "topstep-chart-app").is_dir()
+
+
+def _commit_repo_change(repo_dir: Path, message: str) -> str:
+    import subprocess
+
+    subprocess.run(["git", "add", "."], cwd=repo_dir, check=True, capture_output=True)
+    subprocess.run(
+        ["git", "commit", "-m", message],
+        cwd=repo_dir,
+        check=True,
+        capture_output=True,
+    )
+    return subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=repo_dir,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+
+
+def _write_repo_model_policy(
+    repo_dir: Path,
+    *,
+    qualified_routes: list[str] | None = None,
+    quota_pools: dict[str, str] | None = None,
+    max_transient_retries: int = 1,
+) -> Path:
+    policy_dir = repo_dir / "harness"
+    policy_dir.mkdir(parents=True, exist_ok=True)
+    policy = {
+        "schema_version": "2.0.0",
+        "effective_date": "2026-11-24",
+        "excluded_model_prefixes": [
+            "gemini-3.8-flash",
+            "gemini-4-argon",
+            "gemini-pro-orchestrator-argon",
+            "gemini-3.7-flash",
+            "gemini-2.5-pro",
+        ],
+        "roles": {
+            "independent_reviewer_primary": {
+                "backend": "codex",
+                "selected_model": "gpt-6.1-sol",
+                "selected_effort": "high",
+            },
+            "independent_reviewer_fallbacks": {
+                "qualified_routes": qualified_routes if qualified_routes is not None else [],
+                "quota_pools": quota_pools
+                if quota_pools is not None
+                else {
+                    "gpt-6.1-sol": "openai_codex",
+                    "claude-opus-5-5-medium": "anthropic_agy",
+                    "gemini-4-carbon-high": "gemini_agy",
+                    "gemini-4-neon-high": "gemini_agy",
+                },
+            },
+        },
+        "circuit_breakers": {
+            "max_transient_retries_per_provider_pass": max_transient_retries,
+        },
+    }
+    policy_path = policy_dir / "model-policy.json"
+    policy_path.write_text(json.dumps(policy, indent=2) + "\n", encoding="utf-8")
+    return policy_path
+
+
+def _init_policy_repo(
+    repo_dir: Path,
+    *,
+    qualified_routes: list[str] | None = None,
+    quota_pools: dict[str, str] | None = None,
+    max_transient_retries: int = 1,
+) -> tuple[Path, str]:
+    repo_path, _ = _init_mini_git_repo(repo_dir)
+    _write_repo_model_policy(
+        repo_path,
+        qualified_routes=qualified_routes,
+        quota_pools=quota_pools,
+        max_transient_retries=max_transient_retries,
+    )
+    sha = _commit_repo_change(repo_path, "add policy")
+    return repo_path, sha
+
+
+def test_nc11_tool_output_with_usage_limit_does_not_trigger_quota_fallback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """NC-11: Tool/message JSONL events quoting usage_limit_reached or 429 must not fall back."""
+    repo_dir, _ = _init_policy_repo(
+        tmp_path / "repo_nc11", qualified_routes=["gemini-4-carbon-high"]
+    )
+
+    agy_called = tmp_path / "agy_called_nc11.flag"
+    codex_script = tmp_path / "fake_codex_nc11.py"
+    codex_prefix = _write_fake_codex_script(
+        codex_script,
+        (
+            "import json, sys\n"
+            "_ = sys.stdin.read()\n"
+            "print(json.dumps({'type': 'item.completed', 'item': {'id': 'i1', "
+            "'type': 'mcp_tool_call', 'output': 'test: usage_limit_reached 429'}}), flush=True)\n"
+            "print(json.dumps({'type': 'item.completed', 'item': {'id': 'i2', "
+            "'type': 'agent_message', 'text': 'Quoted usage_limit_reached'}}), flush=True)\n"
+            "sys.stderr.write('Error: internal parser crash\\n')\n"
+            "sys.exit(1)\n"
+        ),
+    )
+    agy_script = tmp_path / "fake_agy_nc11.py"
+    agy_prefix = _write_fake_codex_script(
+        agy_script,
+        (
+            "import json, pathlib, sys\n"
+            f"pathlib.Path({str(agy_called)!r}).write_text('called', encoding='utf-8')\n"
+            "print(json.dumps({'event': 'result', 'result': {'status': 'ERROR'}}), flush=True)\n"
+            "sys.exit(1)\n"
+        ),
+    )
+
+    monkeypatch.setattr(
+        codex_room_review, "verify_role", lambda role, root: {"ok": True, "errors": []}
+    )
+    monkeypatch.setattr(codex_room_review, "resolve_codex_command", lambda: codex_prefix)
+    monkeypatch.setattr(codex_room_review, "resolve_agy_command", lambda: agy_prefix)
+
+    out_dir = tmp_path / "out_nc11"
+    rc = codex_room_review.main(
+        [
+            "--commit",
+            "HEAD",
+            "--repo-root",
+            str(repo_dir),
+            "--out-dir",
+            str(out_dir),
+            "--backend",
+            "auto",
+        ]
+    )
+    assert rc == 2
+    assert not agy_called.exists()
+    report = json.loads((out_dir / "consolidated-review.json").read_text(encoding="utf-8"))
+    assert report["fallback_used"] is False
+    assert report["review_gate_status"] == "BLOCKED"
+
+
+def test_auth_error_401_token_revoked_halts_with_blocked_auth_no_retry_no_fallback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Auth 401/token_revoked must fail closed as BLOCKED_AUTH with no retry or fallback."""
+    repo_dir, _ = _init_policy_repo(
+        tmp_path / "repo_auth", qualified_routes=["gemini-4-carbon-high"]
+    )
+
+    calls_file = tmp_path / "codex_auth_calls.txt"
+    agy_called = tmp_path / "agy_called_auth.flag"
+    codex_script = tmp_path / "fake_codex_auth.py"
+    codex_prefix = _write_fake_codex_script(
+        codex_script,
+        (
+            "import json, pathlib, sys\n"
+            "_ = sys.stdin.read()\n"
+            f"p = pathlib.Path({str(calls_file)!r})\n"
+            "prev = p.read_text(encoding='utf-8') if p.is_file() else ''\n"
+            "p.write_text(prev + 'call\\n', encoding='utf-8')\n"
+            "print(json.dumps({'type': 'error', "
+            "'message': '401 Unauthorized: token_revoked'}), flush=True)\n"
+            "sys.exit(1)\n"
+        ),
+    )
+    agy_script = tmp_path / "fake_agy_auth.py"
+    agy_prefix = _write_fake_codex_script(
+        agy_script,
+        (
+            "import pathlib\n"
+            f"pathlib.Path({str(agy_called)!r}).write_text('called', encoding='utf-8')\n"
+        ),
+    )
+
+    monkeypatch.setattr(
+        codex_room_review, "verify_role", lambda role, root: {"ok": True, "errors": []}
+    )
+    monkeypatch.setattr(codex_room_review, "resolve_codex_command", lambda: codex_prefix)
+    monkeypatch.setattr(codex_room_review, "resolve_agy_command", lambda: agy_prefix)
+
+    out_dir = tmp_path / "out_auth"
+    rc = codex_room_review.main(
+        [
+            "--commit",
+            "HEAD",
+            "--repo-root",
+            str(repo_dir),
+            "--out-dir",
+            str(out_dir),
+            "--backend",
+            "auto",
+            "--sequential",
+        ]
+    )
+    assert rc == 2
+    assert not agy_called.exists()
+    assert len(calls_file.read_text(encoding="utf-8").splitlines()) == 2
+    report = json.loads((out_dir / "consolidated-review.json").read_text(encoding="utf-8"))
+    assert report["review_gate_status"] == "BLOCKED_AUTH"
+    assert report["fallback_used"] is False
+
+
+def test_auto_backend_blocks_infra_when_qualified_routes_empty_without_cli_override(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """When qualified_routes is [] and no --fallback-model is given, quota returns BLOCKED_INFRA."""
+    repo_dir, _ = _init_policy_repo(tmp_path / "repo_empty_routes", qualified_routes=[])
+
+    agy_called = tmp_path / "agy_called_empty.flag"
+    codex_script = tmp_path / "fake_codex_quota_empty.py"
+    codex_prefix = _write_fake_codex_script(
+        codex_script,
+        (
+            "import json, sys\n"
+            "_ = sys.stdin.read()\n"
+            "print(json.dumps({'type': 'turn.failed', "
+            "'error': {'message': 'You\\u2019ve hit your usage limit'}}), flush=True)\n"
+            "sys.exit(1)\n"
+        ),
+    )
+    agy_script = tmp_path / "fake_agy_empty.py"
+    agy_prefix = _write_fake_codex_script(
+        agy_script,
+        (
+            "import pathlib\n"
+            f"pathlib.Path({str(agy_called)!r}).write_text('called', encoding='utf-8')\n"
+        ),
+    )
+
+    monkeypatch.setattr(
+        codex_room_review, "verify_role", lambda role, root: {"ok": True, "errors": []}
+    )
+    monkeypatch.setattr(codex_room_review, "resolve_codex_command", lambda: codex_prefix)
+    monkeypatch.setattr(codex_room_review, "resolve_agy_command", lambda: agy_prefix)
+
+    out_dir = tmp_path / "out_empty_routes"
+    rc = codex_room_review.main(
+        [
+            "--commit",
+            "HEAD",
+            "--repo-root",
+            str(repo_dir),
+            "--out-dir",
+            str(out_dir),
+            "--backend",
+            "auto",
+        ]
+    )
+    assert rc == 2
+    assert not agy_called.exists()
+    report = json.loads((out_dir / "consolidated-review.json").read_text(encoding="utf-8"))
+    assert report["review_gate_status"] == "BLOCKED_INFRA"
+    assert report["fallback_used"] is False
+    assert "openai_codex" in report["exhausted_quota_pools"]
+
+
+def test_mid_run_quota_fallback_reuses_pass1_and_runs_only_pass2_on_qualified_route(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Pass 1 on Codex + Pass 2 curly-apostrophe quota must reuse Pass 1 and run ONLY Pass 2."""
+    repo_dir, head_sha = _init_policy_repo(
+        tmp_path / "repo_mid_fallback", qualified_routes=["gemini-4-carbon-high"]
+    )
+
+    agy_invocations = tmp_path / "agy_invocations.jsonl"
+    codex_script = tmp_path / "fake_codex_p1_ok_p2_curly.py"
+    codex_prefix = _write_fake_codex_script(
+        codex_script,
+        (
+            "import json, pathlib, sys\n"
+            "args = sys.argv[1:]\n"
+            "out_path = pathlib.Path(args[args.index('-o') + 1])\n"
+            "_ = sys.stdin.read()\n"
+            "if out_path.name == 'pass1.json':\n"
+            f"    payload = {{'revision_sha': {head_sha!r}, 'lens': 'correctness_and_tests', "
+            "'verdict': 'APPROVE', 'summary': 'p1 codex ok', 'findings': [], "
+            "'test_quality_issues': [], 'unverified_areas': []}\n"
+            "    out_path.write_text(json.dumps(payload), encoding='utf-8')\n"
+            "else:\n"
+            "    print(json.dumps({'type': 'turn.failed', "
+            "'error': {'message': 'You\\u2019ve hit your usage limit'}}), flush=True)\n"
+            "    sys.exit(1)\n"
+        ),
+    )
+    agy_script = tmp_path / "fake_agy_p2_only.py"
+    agy_prefix = _write_fake_codex_script(
+        agy_script,
+        (
+            "import json, pathlib, sys\n"
+            "args = sys.argv[1:]\n"
+            "model = args[args.index('--model') + 1]\n"
+            "prompt = args[args.index('-p') + 1]\n"
+            "lens = 'security_and_invariants' if 'security_and_invariants' in prompt "
+            "else 'correctness_and_tests'\n"
+            f"log_p = pathlib.Path({str(agy_invocations)!r})\n"
+            "prev = log_p.read_text(encoding='utf-8') if log_p.is_file() else ''\n"
+            "log_p.write_text(prev + json.dumps({'model': model, 'lens': lens}) + '\\n', "
+            "encoding='utf-8')\n"
+            f"payload = {{'revision_sha': {head_sha!r}, 'lens': lens, 'verdict': 'APPROVE', "
+            "'summary': 'p2 agy ok', 'findings': [], 'test_quality_issues': [], "
+            "'unverified_areas': []}\n"
+            "print(json.dumps({'event': 'init', 'init': {'model': model}}), flush=True)\n"
+            "print(json.dumps({'event': 'result', "
+            "'result': {'status': 'SUCCESS', 'structured_output': payload}}), flush=True)\n"
+        ),
+    )
+
+    monkeypatch.setattr(
+        codex_room_review, "verify_role", lambda role, root: {"ok": True, "errors": []}
+    )
+    monkeypatch.setattr(codex_room_review, "resolve_codex_command", lambda: codex_prefix)
+    monkeypatch.setattr(codex_room_review, "resolve_agy_command", lambda: agy_prefix)
+
+    out_dir = tmp_path / "out_mid_fallback"
+    rc = codex_room_review.main(
+        [
+            "--commit",
+            "HEAD",
+            "--repo-root",
+            str(repo_dir),
+            "--out-dir",
+            str(out_dir),
+            "--backend",
+            "auto",
+        ]
+    )
+    assert rc == 0
+    calls = [json.loads(ln) for ln in agy_invocations.read_text(encoding="utf-8").splitlines()]
+    assert calls == [{"model": "gemini-4-carbon-high", "lens": "security_and_invariants"}]
+
+    report = json.loads((out_dir / "consolidated-review.json").read_text(encoding="utf-8"))
+    assert report["review_gate_status"] == "PASSED"
+    assert report["pass1_backend"] == "codex"
+    assert report["pass1_model"] == "gpt-6.1-sol"
+    assert report["pass2_backend"] == "agy"
+    assert report["pass2_model"] == "gemini-4-carbon-high"
+    assert report["reused_passes"] == []
+    assert report["exhausted_quota_pools"] == ["openai_codex"]
+    assert (out_dir / "pass1.provenance.json").is_file()
+    assert (out_dir / "pass2.provenance.json").is_file()
+
+
+def test_qualified_routes_skips_shared_exhausted_quota_pool_and_advances_across_pools(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Shared exhausted pool must be skipped (neon_invocations == 0); distinct pool proceeds."""
+    # Part A: Two gemini_agy models -> carbon hits RESOURCE_EXHAUSTED, neon must NOT be called.
+    repo_a, sha_a = _init_policy_repo(
+        tmp_path / "repo_pool_skip",
+        qualified_routes=["gemini-4-carbon-high", "gemini-4-neon-high"],
+    )
+
+    codex_quota_script = tmp_path / "fake_codex_q_pool.py"
+    codex_prefix = _write_fake_codex_script(
+        codex_quota_script,
+        (
+            "import json, sys\n"
+            "_ = sys.stdin.read()\n"
+            "print(json.dumps({'type': 'error', 'message': 'usage_limit_reached'}), flush=True)\n"
+            "sys.exit(1)\n"
+        ),
+    )
+
+    agy_models_called = tmp_path / "agy_models_called.txt"
+    agy_pool_script = tmp_path / "fake_agy_pool_skip.py"
+    agy_prefix = _write_fake_codex_script(
+        agy_pool_script,
+        (
+            "import json, pathlib, sys\n"
+            "args = sys.argv[1:]\n"
+            "model = args[args.index('--model') + 1]\n"
+            f"p = pathlib.Path({str(agy_models_called)!r})\n"
+            "prev = p.read_text(encoding='utf-8') if p.is_file() else ''\n"
+            "p.write_text(prev + model + '\\n', encoding='utf-8')\n"
+            "if model == 'gemini-4-carbon-high':\n"
+            "    err = {'error_code': 429, 'status': 'RESOURCE_EXHAUSTED', "
+            "'short_error': 'quota limit reached'}\n"
+            "    sys.stderr.write('AGY_ERROR: ' + json.dumps(err) + '\\n')\n"
+            "    sys.exit(1)\n"
+            "prompt = args[args.index('-p') + 1]\n"
+            "lens = 'security_and_invariants' if 'security_and_invariants' in prompt "
+            "else 'correctness_and_tests'\n"
+            f"payload = {{'revision_sha': {sha_a!r}, 'lens': lens, 'verdict': 'APPROVE', "
+            "'summary': 'ok', 'findings': [], 'test_quality_issues': [], "
+            "'unverified_areas': []}\n"
+            "print(json.dumps({'event': 'result', "
+            "'result': {'status': 'SUCCESS', 'structured_output': payload}}), flush=True)\n"
+        ),
+    )
+
+    monkeypatch.setattr(
+        codex_room_review, "verify_role", lambda role, root: {"ok": True, "errors": []}
+    )
+    monkeypatch.setattr(codex_room_review, "resolve_codex_command", lambda: codex_prefix)
+    monkeypatch.setattr(codex_room_review, "resolve_agy_command", lambda: agy_prefix)
+
+    out_a = tmp_path / "out_pool_skip"
+    rc_a = codex_room_review.main(
+        [
+            "--commit",
+            "HEAD",
+            "--repo-root",
+            str(repo_a),
+            "--out-dir",
+            str(out_a),
+            "--backend",
+            "auto",
+        ]
+    )
+    assert rc_a == 2
+    called_models = agy_models_called.read_text(encoding="utf-8").splitlines()
+    neon_invocations = sum(1 for m in called_models if m == "gemini-4-neon-high")
+    assert neon_invocations == 0
+    report_a = json.loads((out_a / "consolidated-review.json").read_text(encoding="utf-8"))
+    assert report_a["review_gate_status"] == "BLOCKED_INFRA"
+    assert report_a["exhausted_quota_pools"] == ["openai_codex", "gemini_agy"]
+
+    # Part B: Distinct second pool (anthropic_agy) succeeds after gemini_agy exhausted.
+    agy_models_called.unlink()
+    _write_repo_model_policy(
+        repo_a, qualified_routes=["gemini-4-carbon-high", "claude-opus-5-5-medium"]
+    )
+    sha_b = _commit_repo_change(repo_a, "add opus route")
+    agy_pool_script.write_text(
+        agy_pool_script.read_text(encoding="utf-8").replace(sha_a, sha_b),
+        encoding="utf-8",
+    )
+    out_b = tmp_path / "out_pool_advance"
+    rc_b = codex_room_review.main(
+        [
+            "--commit",
+            "HEAD",
+            "--repo-root",
+            str(repo_a),
+            "--out-dir",
+            str(out_b),
+            "--backend",
+            "auto",
+        ]
+    )
+    assert rc_b == 0
+    report_b = json.loads((out_b / "consolidated-review.json").read_text(encoding="utf-8"))
+    assert report_b["review_gate_status"] == "PASSED"
+    assert report_b["review_model"] == "claude-opus-5-5-medium"
+    assert report_b["exhausted_quota_pools"] == ["openai_codex", "gemini_agy"]
+
+
+def test_transient_rate_or_transport_retries_only_failed_pass_once_then_blocks_infra(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Transient error retries ONLY failed pass at most once, archiving .retry0.*."""
+    repo_dir, head_sha = _init_policy_repo(
+        tmp_path / "repo_transient", qualified_routes=["gemini-4-carbon-high"]
+    )
+
+    p1_calls = tmp_path / "transient_p1_calls.txt"
+    p2_calls = tmp_path / "transient_p2_calls.txt"
+    codex_script = tmp_path / "fake_codex_transient_recover.py"
+    codex_prefix = _write_fake_codex_script(
+        codex_script,
+        (
+            "import json, pathlib, sys\n"
+            "args = sys.argv[1:]\n"
+            "out_path = pathlib.Path(args[args.index('-o') + 1])\n"
+            "_ = sys.stdin.read()\n"
+            f"p1_p = pathlib.Path({str(p1_calls)!r})\n"
+            f"p2_p = pathlib.Path({str(p2_calls)!r})\n"
+            "target_p = p2_p if out_path.name == 'pass2.json' else p1_p\n"
+            "prev = target_p.read_text(encoding='utf-8') if target_p.is_file() else ''\n"
+            "seen = len(prev.splitlines())\n"
+            "target_p.write_text(prev + out_path.name + '\\n', encoding='utf-8')\n"
+            "if out_path.name == 'pass2.json' and seen == 0:\n"
+            "    print(json.dumps({'type': 'error', 'message': 'rate_limit_exceeded', "
+            "'retry_after_sec': 0.01}), flush=True)\n"
+            "    sys.exit(1)\n"
+            "lens = 'security_and_invariants' if out_path.name == 'pass2.json' "
+            "else 'correctness_and_tests'\n"
+            f"payload = {{'revision_sha': {head_sha!r}, 'lens': lens, 'verdict': 'APPROVE', "
+            "'summary': 'recovered', 'findings': [], 'test_quality_issues': [], "
+            "'unverified_areas': []}\n"
+            "out_path.write_text(json.dumps(payload), encoding='utf-8')\n"
+        ),
+    )
+
+    monkeypatch.setattr(
+        codex_room_review, "verify_role", lambda role, root: {"ok": True, "errors": []}
+    )
+    monkeypatch.setattr(codex_room_review, "resolve_codex_command", lambda: codex_prefix)
+
+    out_ok = tmp_path / "out_transient_recover"
+    rc_ok = codex_room_review.main(
+        [
+            "--commit",
+            "HEAD",
+            "--repo-root",
+            str(repo_dir),
+            "--out-dir",
+            str(out_ok),
+            "--backend",
+            "auto",
+        ]
+    )
+    assert rc_ok == 0
+    assert len(p1_calls.read_text(encoding="utf-8").splitlines()) == 1
+    assert len(p2_calls.read_text(encoding="utf-8").splitlines()) == 2
+    assert (out_ok / "pass2.retry0.raw.jsonl").is_file()
+
+    # Persistent 503 after 1 retry -> BLOCKED_INFRA (rc == 2), no agy fallback.
+    agy_called = tmp_path / "agy_no_transient_fb.flag"
+    codex_always_503 = tmp_path / "fake_codex_503.py"
+    codex_503_prefix = _write_fake_codex_script(
+        codex_always_503,
+        (
+            "import json, pathlib, sys\n"
+            "args = sys.argv[1:]\n"
+            "out_path = pathlib.Path(args[args.index('-o') + 1])\n"
+            "_ = sys.stdin.read()\n"
+            "if out_path.name == 'pass1.json':\n"
+            f"    payload = {{'revision_sha': {head_sha!r}, 'lens': 'correctness_and_tests', "
+            "'verdict': 'APPROVE', 'summary': 'ok', 'findings': [], "
+            "'test_quality_issues': [], 'unverified_areas': []}\n"
+            "    out_path.write_text(json.dumps(payload), encoding='utf-8')\n"
+            "else:\n"
+            "    sys.stderr.write('HTTP 503 upstream connect error\\n')\n"
+            "    sys.exit(1)\n"
+        ),
+    )
+    agy_script = tmp_path / "fake_agy_unused_503.py"
+    agy_prefix = _write_fake_codex_script(
+        agy_script,
+        (
+            "import pathlib\n"
+            f"pathlib.Path({str(agy_called)!r}).write_text('called', encoding='utf-8')\n"
+        ),
+    )
+    monkeypatch.setattr(codex_room_review, "resolve_codex_command", lambda: codex_503_prefix)
+    monkeypatch.setattr(codex_room_review, "resolve_agy_command", lambda: agy_prefix)
+
+    out_fail = tmp_path / "out_transient_fail"
+    rc_fail = codex_room_review.main(
+        [
+            "--commit",
+            "HEAD",
+            "--repo-root",
+            str(repo_dir),
+            "--out-dir",
+            str(out_fail),
+            "--backend",
+            "auto",
+        ]
+    )
+    assert rc_fail == 2
+    assert not agy_called.exists()
+    report_fail = json.loads((out_fail / "consolidated-review.json").read_text(encoding="utf-8"))
+    assert report_fail["review_gate_status"] == "BLOCKED_INFRA"
+    assert (out_fail / "pass1.provenance.json").is_file()
+
+
+def test_agy_typed_classifier_handles_auth_quota_and_zero_token_startup_race(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """AGY classifier distinguishes 401/UNAUTHENTICATED, quota, and 0-token startup retry."""
+    d_auth = tmp_path / "agy_auth_dir"
+    d_auth.mkdir()
+    (d_auth / "pass1.stderr.log").write_text(
+        'AGY_ERROR: {"error_code": 401, "status": "UNAUTHENTICATED"}\n',
+        encoding="utf-8",
+    )
+    res_auth = codex_room_review.classify_agy_failure(d_auth, "pass1")
+    assert res_auth.category == codex_room_review.OUTCOME_AUTH_ERROR
+
+    d_quota = tmp_path / "agy_quota_dir"
+    d_quota.mkdir()
+    quota_ev = {
+        "event": "result",
+        "result": {"status": "ERROR", "error": "individual quota reached"},
+    }
+    (d_quota / "pass1.raw.jsonl").write_text(
+        json.dumps(quota_ev) + "\n",
+        encoding="utf-8",
+    )
+    res_quota = codex_room_review.classify_agy_failure(d_quota, "pass1")
+    assert res_quota.category == codex_room_review.OUTCOME_CONFIRMED_QUOTA
+
+    # End-to-end 0-token startup race recovers on single retry.
+    repo_dir, head_sha = _init_mini_git_repo(tmp_path / "repo_agy_race")
+    agy_calls = tmp_path / "agy_race_calls.txt"
+    agy_script = tmp_path / "fake_agy_startup_race.py"
+    agy_prefix = _write_fake_codex_script(
+        agy_script,
+        (
+            "import json, pathlib, sys\n"
+            "args = sys.argv[1:]\n"
+            "prompt = args[args.index('-p') + 1]\n"
+            "lens = 'security_and_invariants' if 'security_and_invariants' in prompt "
+            "else 'correctness_and_tests'\n"
+            f"p = pathlib.Path({str(agy_calls)!r})\n"
+            "prev = p.read_text(encoding='utf-8') if p.is_file() else ''\n"
+            "seen = sum(1 for ln in prev.splitlines() if ln == lens)\n"
+            "p.write_text(prev + lens + '\\n', encoding='utf-8')\n"
+            "if lens == 'correctness_and_tests' and seen == 0:\n"
+            "    err_ev = {'event': 'result', 'result': {'status': 'ERROR', "
+            "'error': 'failed to start conversation', 'usage': {'total_tokens': 0}}}\n"
+            "    print(json.dumps(err_ev), flush=True)\n"
+            "    sys.exit(1)\n"
+            f"payload = {{'revision_sha': {head_sha!r}, 'lens': lens, 'verdict': 'APPROVE', "
+            "'summary': 'ok', 'findings': [], 'test_quality_issues': [], "
+            "'unverified_areas': []}\n"
+            "print(json.dumps({'event': 'result', "
+            "'result': {'status': 'SUCCESS', 'structured_output': payload}}), flush=True)\n"
+        ),
+    )
+    monkeypatch.setattr(codex_room_review, "resolve_agy_command", lambda: agy_prefix)
+    out_dir = tmp_path / "out_agy_race"
+    rc = codex_room_review.main(
+        [
+            "--commit",
+            "HEAD",
+            "--repo-root",
+            str(repo_dir),
+            "--out-dir",
+            str(out_dir),
+            "--backend",
+            "agy",
+        ]
+    )
+    assert rc == 0
+    assert (out_dir / "pass1.retry0.raw.jsonl").is_file()
+
+
+def test_resume_from_reuses_matching_provenance_and_rejects_stale_provenance(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """--resume-from reuses pass1 iff all 7 provenance fields match; rejects stale packet/SHA."""
+    repo_dir, sha1 = _init_policy_repo(tmp_path / "repo_resume", qualified_routes=[])
+
+    packet_a = tmp_path / "packet_a.md"
+    packet_a.write_text("# Task Packet A\n", encoding="utf-8")
+    packet_b = tmp_path / "packet_b.md"
+    packet_b.write_text("# Task Packet B (changed)\n", encoding="utf-8")
+
+    codex_calls_dir = tmp_path / "resume_codex_calls"
+    codex_calls_dir.mkdir()
+    codex_script = tmp_path / "fake_codex_resume.py"
+    codex_prefix = _write_fake_codex_script(
+        codex_script,
+        (
+            "import json, pathlib, sys\n"
+            "args = sys.argv[1:]\n"
+            "out_path = pathlib.Path(args[args.index('-o') + 1])\n"
+            "_ = sys.stdin.read()\n"
+            f"d = pathlib.Path({str(codex_calls_dir)!r})\n"
+            "f = d / out_path.name\n"
+            "prev = f.read_text(encoding='utf-8') if f.is_file() else ''\n"
+            "f.write_text(prev + 'called\\n', encoding='utf-8')\n"
+            "if out_path.name == 'pass1.json':\n"
+            f"    payload = {{'revision_sha': {sha1!r}, 'lens': 'correctness_and_tests', "
+            "'verdict': 'APPROVE', 'summary': 'codex p1', 'findings': [], "
+            "'test_quality_issues': [], 'unverified_areas': []}\n"
+            "    out_path.write_text(json.dumps(payload), encoding='utf-8')\n"
+            "else:\n"
+            "    q_ev = {'type': 'error', 'message': 'usage_limit_reached'}\n"
+            "    print(json.dumps(q_ev), flush=True)\n"
+            "    sys.exit(1)\n"
+        ),
+    )
+    agy_calls_dir = tmp_path / "resume_agy_calls"
+    agy_calls_dir.mkdir()
+    agy_script = tmp_path / "fake_agy_resume.py"
+    agy_prefix = _write_fake_codex_script(
+        agy_script,
+        (
+            "import json, pathlib, sys\n"
+            "args = sys.argv[1:]\n"
+            "prompt = args[args.index('-p') + 1]\n"
+            "lens = 'security_and_invariants' if 'security_and_invariants' in prompt "
+            "else 'correctness_and_tests'\n"
+            f"d = pathlib.Path({str(agy_calls_dir)!r})\n"
+            "f = d / f'{lens}.txt'\n"
+            "prev = f.read_text(encoding='utf-8') if f.is_file() else ''\n"
+            "f.write_text(prev + 'called\\n', encoding='utf-8')\n"
+            f"payload = {{'revision_sha': {sha1!r}, 'lens': lens, 'verdict': 'APPROVE', "
+            "'summary': 'agy ok', 'findings': [], 'test_quality_issues': [], "
+            "'unverified_areas': []}\n"
+            "print(json.dumps({'event': 'result', "
+            "'result': {'status': 'SUCCESS', 'structured_output': payload}}), flush=True)\n"
+        ),
+    )
+
+    monkeypatch.setattr(
+        codex_room_review, "verify_role", lambda role, root: {"ok": True, "errors": []}
+    )
+    monkeypatch.setattr(codex_room_review, "resolve_codex_command", lambda: codex_prefix)
+    monkeypatch.setattr(codex_room_review, "resolve_agy_command", lambda: agy_prefix)
+
+    # Run 1: pass1 succeeds on Codex, pass2 hits quota, qualified_routes=[] -> BLOCKED_INFRA.
+    run1_dir = tmp_path / "resume_run1"
+    rc1 = codex_room_review.main(
+        [
+            "--commit",
+            sha1,
+            "--repo-root",
+            str(repo_dir),
+            "--task-packet",
+            str(packet_a),
+            "--out-dir",
+            str(run1_dir),
+            "--backend",
+            "auto",
+        ]
+    )
+    assert rc1 == 2
+    assert (run1_dir / "pass1.provenance.json").is_file()
+
+    # Run 2: --resume-from run1 with matching packet + SHA and --fallback-model -> reuses pass1.
+    for item in codex_calls_dir.iterdir():
+        item.unlink()
+    for item in agy_calls_dir.iterdir():
+        item.unlink()
+    run2_dir = tmp_path / "resume_run2"
+    rc2 = codex_room_review.main(
+        [
+            "--commit",
+            sha1,
+            "--repo-root",
+            str(repo_dir),
+            "--task-packet",
+            str(packet_a),
+            "--resume-from",
+            str(run1_dir),
+            "--fallback-model",
+            "gemini-4-carbon-high",
+            "--out-dir",
+            str(run2_dir),
+            "--backend",
+            "auto",
+        ]
+    )
+    assert rc2 == 0
+    assert not (codex_calls_dir / "pass1.json").exists()
+    assert (codex_calls_dir / "pass2.json").is_file()
+    assert not (agy_calls_dir / "correctness_and_tests.txt").exists()
+    assert (agy_calls_dir / "security_and_invariants.txt").is_file()
+    report2 = json.loads((run2_dir / "consolidated-review.json").read_text(encoding="utf-8"))
+    assert "pass1" in report2["reused_passes"]
+    assert report2["pass1_backend"] == "codex"
+    assert report2["pass2_backend"] == "agy"
+
+    # Run 3: --resume-from run1 with CHANGED packet_sha256 -> pass1 must NOT be reused!
+    for item in codex_calls_dir.iterdir():
+        item.unlink()
+    for item in agy_calls_dir.iterdir():
+        item.unlink()
+    run3_dir = tmp_path / "resume_run3_stale_packet"
+    rc3 = codex_room_review.main(
+        [
+            "--commit",
+            sha1,
+            "--repo-root",
+            str(repo_dir),
+            "--task-packet",
+            str(packet_b),
+            "--resume-from",
+            str(run1_dir),
+            "--fallback-model",
+            "gemini-4-carbon-high",
+            "--out-dir",
+            str(run3_dir),
+            "--backend",
+            "auto",
+        ]
+    )
+    assert rc3 == 0
+    assert (codex_calls_dir / "pass1.json").is_file()
+    report3 = json.loads((run3_dir / "consolidated-review.json").read_text(encoding="utf-8"))
+    assert "pass1" not in report3["reused_passes"]
+
+    # Run 4: --resume-from run1 on a NEW candidate_sha -> pass1 must NOT be reused!
+    (repo_dir / "extra.txt").write_text("new commit\n", encoding="utf-8")
+    sha2 = _commit_repo_change(repo_dir, "commit 2")
+    codex_script.write_text(
+        codex_script.read_text(encoding="utf-8").replace(sha1, sha2),
+        encoding="utf-8",
+    )
+    agy_script.write_text(
+        agy_script.read_text(encoding="utf-8").replace(sha1, sha2),
+        encoding="utf-8",
+    )
+    run4_dir = tmp_path / "resume_run4_stale_sha"
+    rc4 = codex_room_review.main(
+        [
+            "--commit",
+            sha2,
+            "--repo-root",
+            str(repo_dir),
+            "--task-packet",
+            str(packet_a),
+            "--resume-from",
+            str(run1_dir),
+            "--fallback-model",
+            "gemini-4-carbon-high",
+            "--out-dir",
+            str(run4_dir),
+            "--backend",
+            "auto",
+        ]
+    )
+    assert rc4 == 0
+    report4 = json.loads((run4_dir / "consolidated-review.json").read_text(encoding="utf-8"))
+    assert "pass1" not in report4["reused_passes"]
+
+

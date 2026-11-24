@@ -28,6 +28,7 @@ import sys
 import tempfile
 import threading
 import time
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -80,19 +81,90 @@ PROMPTS_DIR = CODEX_ROOM_DIR / "prompts"
 
 DEFAULT_AGY_FALLBACK_MODEL = "claude-opus-5-5-medium"
 AGY_INLINE_PROMPT_CHAR_LIMIT = 16000
-CODEX_QUOTA_ERROR_MARKERS = (
+
+OUTCOME_AUTH_ERROR = "AUTH_ERROR"
+OUTCOME_CONFIRMED_QUOTA = "CONFIRMED_QUOTA_EXHAUSTED"
+OUTCOME_TRANSIENT = "TRANSIENT_RATE_OR_TRANSPORT"
+OUTCOME_SCHEMA_OR_POLICY = "SCHEMA_OR_SHA_OR_POLICY_ERROR"
+
+PASS_LENS_MAP: dict[str, str] = {
+    "pass1": "correctness_and_tests",
+    "pass2": "security_and_invariants",
+}
+PROVENANCE_TUPLE_KEYS: tuple[str, ...] = (
+    "candidate_sha",
+    "base_sha",
+    "packet_sha256",
+    "policy_sha256",
+    "schema_sha256",
+    "lens",
+    "frozen_tree_sha256",
+)
+
+CODEX_AUTH_RE = re.compile(
+    r"(?:\b401\b|\bunauthorized\b|token_revoked|invalidated oauth token"
+    r"|refresh token was revoked|invalid_api_key|authentication failed)",
+    re.IGNORECASE,
+)
+CODEX_QUOTA_MARKERS: tuple[str, ...] = (
     "usage_limit_reached",
     "insufficient_quota",
-    "rate_limit_exceeded",
-    "rate_limit",
-    "quota",
-    "too many requests",
-    "429",
-    "usage limit",
-    "billing",
-    "credit balance",
+    "hit your usage limit",
     "exceeded your current quota",
+    "credit balance",
+    "billing_hard_limit_reached",
 )
+CODEX_TRANSIENT_RE = re.compile(
+    r"(?:rate_limit_exceeded|request timed out|connection reset"
+    r"|\b502\b|\b503\b|\b504\b|\b429\b)",
+    re.IGNORECASE,
+)
+AGY_AUTH_TEXT_MARKERS: tuple[str, ...] = (
+    "unauthenticated",
+    "not logged in",
+    "sign in",
+)
+AGY_QUOTA_TEXT_MARKERS: tuple[str, ...] = (
+    "individual quota reached",
+    "quota exhausted",
+    "quota reached",
+    "resource_exhausted",
+)
+AGY_TRANSIENT_RE = re.compile(
+    r"(?:\b502\b|\b503\b|\b504\b|deadline_exceeded|\bunavailable\b"
+    r"|connection reset|request timed out)",
+    re.IGNORECASE,
+)
+RETRY_AFTER_RE = re.compile(
+    r"retry[-_\s]?after(?:\s*[:=]\s*|\s+)(\d+(?:\.\d+)?)\s*s?",
+    re.IGNORECASE,
+)
+
+_PASS_EXEC_META_LOCK = threading.Lock()
+_PASS_EXEC_META: dict[tuple[str, str], tuple[int, str | None]] = {}
+
+
+@dataclass(frozen=True)
+class PassFailure:
+    """Typed classification for a failed review pass."""
+
+    category: str
+    reason: str
+    retry_after_sec: float | None = None
+
+
+@dataclass
+class PassState:
+    """Mutable per-pass state tracked across retries, fallbacks, and resume."""
+
+    pass_name: str
+    lens: str
+    payload: dict[str, Any] | None = None
+    backend: str | None = None
+    model: str | None = None
+    reused: bool = False
+    is_complete: bool = False
+
 
 SEVERITY_RANK = {
     "critical": 4,
@@ -154,18 +226,509 @@ def resolve_agy_command() -> list[str]:
     raise FileNotFoundError("Antigravity CLI (`agy`) not found on PATH.")
 
 
-def _detect_codex_quota_error(out_dir: Path, pass_names: tuple[str, ...] = ("pass1", "pass2")) -> str | None:
-    """Inspect Codex pass logs for quota exhaustion or rate-limit errors."""
-    for pass_name in pass_names:
-        for suffix in (".stderr.log", ".raw.jsonl"):
-            log_path = out_dir / f"{pass_name}{suffix}"
-            if not log_path.is_file():
-                continue
-            text = log_path.read_text(encoding="utf-8", errors="replace").lower()
-            for marker in CODEX_QUOTA_ERROR_MARKERS:
-                if marker in text:
-                    return f"codex_quota_exhausted ({pass_name}{suffix}: matched '{marker}')"
+def _norm_provider_text(text: str) -> str:
+    return text.replace("\u2019", "'").replace("\u2018", "'").lower()
+
+
+def _parse_retry_after_value(val: Any) -> float | None:
+    if isinstance(val, bool) or val is None:
+        return None
+    if isinstance(val, (int, float)):
+        return float(val) if val >= 0 else None
+    if isinstance(val, str):
+        try:
+            parsed = float(val.strip())
+            return parsed if parsed >= 0 else None
+        except ValueError:
+            return None
     return None
+
+
+def _extract_retry_after_from_text(text: str) -> float | None:
+    match = RETRY_AFTER_RE.search(text)
+    if not match:
+        return None
+    return _parse_retry_after_value(match.group(1))
+
+
+def _non_watchdog_stderr(stderr_text: str) -> str:
+    lines = [
+        ln
+        for ln in stderr_text.splitlines()
+        if not ln.lstrip().startswith("[codex_room_review]")
+    ]
+    return "\n".join(lines)
+
+
+def _extract_codex_error_events(raw_jsonl_text: str) -> list[tuple[str, float | None]]:
+    """Extract only `error` and `turn.failed` Codex JSONL events (never tool outputs)."""
+    events: list[tuple[str, float | None]] = []
+    for line in raw_jsonl_text.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        try:
+            ev = json.loads(stripped)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(ev, dict) or ev.get("type") not in {"error", "turn.failed"}:
+            continue
+        parts: list[str] = []
+        retry_after: float | None = None
+        for key in ("message", "code", "type"):
+            val = ev.get(key)
+            if isinstance(val, str) and val.strip():
+                parts.append(val.strip())
+        err_obj = ev.get("error")
+        if isinstance(err_obj, dict):
+            for key in ("message", "code", "type"):
+                val = err_obj.get(key)
+                if isinstance(val, str) and val.strip():
+                    parts.append(val.strip())
+            retry_after = _parse_retry_after_value(
+                err_obj.get("retry_after_sec")
+                or err_obj.get("retry_after")
+                or err_obj.get("retryAfterSec")
+            )
+        elif isinstance(err_obj, str) and err_obj.strip():
+            parts.append(err_obj.strip())
+        if retry_after is None:
+            retry_after = _parse_retry_after_value(
+                ev.get("retry_after_sec") or ev.get("retry_after")
+            )
+        joined = " ".join(parts).strip()
+        if joined:
+            events.append((joined, retry_after))
+    return events
+
+
+def classify_codex_failure(
+    out_dir: Path,
+    pass_name: str,
+    *,
+    returncode: int = 1,
+    termination_reason: str | None = None,
+    pass_payload: dict[str, Any] | None = None,
+    validation_errors: list[str] | None = None,
+) -> PassFailure:
+    """Classify a failed Codex pass into AUTH, QUOTA, TRANSIENT, or SCHEMA/POLICY."""
+    if pass_payload is not None and validation_errors:
+        return PassFailure(
+            OUTCOME_SCHEMA_OR_POLICY,
+            f"{pass_name}: validation error ({'; '.join(validation_errors)})",
+        )
+
+    raw_path = out_dir / f"{pass_name}.raw.jsonl"
+    stderr_path = out_dir / f"{pass_name}.stderr.log"
+    raw_text = raw_path.read_text(encoding="utf-8", errors="replace") if raw_path.is_file() else ""
+    stderr_text = (
+        stderr_path.read_text(encoding="utf-8", errors="replace") if stderr_path.is_file() else ""
+    )
+
+    sources: list[tuple[str, str, float | None]] = []
+    for ev_text, ev_retry in _extract_codex_error_events(raw_text):
+        sources.append((f"{pass_name}.raw.jsonl", ev_text, ev_retry))
+    stderr_provider = _non_watchdog_stderr(stderr_text)
+    if stderr_provider.strip():
+        sources.append(
+            (
+                f"{pass_name}.stderr.log",
+                stderr_provider,
+                _extract_retry_after_from_text(stderr_provider),
+            )
+        )
+
+    for src_name, text, _ in sources:
+        norm = _norm_provider_text(text)
+        m_auth = CODEX_AUTH_RE.search(norm)
+        if m_auth:
+            return PassFailure(
+                OUTCOME_AUTH_ERROR,
+                f"codex_auth_error ({src_name}: matched '{m_auth.group(0)}')",
+            )
+
+    for src_name, text, _ in sources:
+        norm = _norm_provider_text(text)
+        for marker in CODEX_QUOTA_MARKERS:
+            if marker in norm:
+                return PassFailure(
+                    OUTCOME_CONFIRMED_QUOTA,
+                    f"codex_quota_exhausted ({src_name}: matched '{marker}')",
+                )
+
+    has_watchdog = termination_reason is not None or (
+        "[codex_room_review]" in stderr_text and "terminated:" in stderr_text
+    )
+    if has_watchdog:
+        return PassFailure(
+            OUTCOME_SCHEMA_OR_POLICY,
+            f"{pass_name}: watchdog timeout",
+        )
+
+    for src_name, text, ev_retry in sources:
+        norm = _norm_provider_text(text)
+        m_tr = CODEX_TRANSIENT_RE.search(norm)
+        if m_tr:
+            retry_sec = ev_retry if ev_retry is not None else _extract_retry_after_from_text(norm)
+            return PassFailure(
+                OUTCOME_TRANSIENT,
+                f"codex_transient_error ({src_name}: matched '{m_tr.group(0)}')",
+                retry_after_sec=retry_sec,
+            )
+
+    return PassFailure(
+        OUTCOME_SCHEMA_OR_POLICY,
+        f"{pass_name}: non-quota codex failure (rc={returncode})",
+    )
+
+
+def _extract_agy_error_objects(stderr_text: str) -> list[dict[str, Any]]:
+    objs: list[dict[str, Any]] = []
+    decoder = json.JSONDecoder()
+    idx = 0
+    marker = "AGY_ERROR:"
+    while True:
+        pos = stderr_text.find(marker, idx)
+        if pos == -1:
+            break
+        brace = stderr_text.find("{", pos + len(marker))
+        if brace == -1:
+            idx = pos + len(marker)
+            continue
+        try:
+            obj, end_idx = decoder.raw_decode(stderr_text, brace)
+            if isinstance(obj, dict):
+                objs.append(obj)
+            idx = end_idx
+        except json.JSONDecodeError:
+            idx = brace + 1
+    return objs
+
+
+def _extract_agy_result_errors(raw_jsonl_text: str) -> list[dict[str, Any]]:
+    results: list[dict[str, Any]] = []
+    for line in raw_jsonl_text.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        try:
+            ev = json.loads(stripped)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(ev, dict):
+            continue
+        if ev.get("event") == "result" and isinstance(ev.get("result"), dict):
+            res = ev["result"]
+            if str(res.get("status", "")).upper() == "ERROR":
+                results.append(res)
+    return results
+
+
+def classify_agy_failure(
+    out_dir: Path,
+    pass_name: str,
+    *,
+    returncode: int = 1,
+    termination_reason: str | None = None,
+    pass_payload: dict[str, Any] | None = None,
+    validation_errors: list[str] | None = None,
+) -> PassFailure:
+    """Classify a failed AGY pass into AUTH, QUOTA, TRANSIENT, or SCHEMA/POLICY."""
+    if pass_payload is not None and validation_errors:
+        return PassFailure(
+            OUTCOME_SCHEMA_OR_POLICY,
+            f"{pass_name}: validation error ({'; '.join(validation_errors)})",
+        )
+
+    raw_path = out_dir / f"{pass_name}.raw.jsonl"
+    stderr_path = out_dir / f"{pass_name}.stderr.log"
+    raw_text = raw_path.read_text(encoding="utf-8", errors="replace") if raw_path.is_file() else ""
+    stderr_text = (
+        stderr_path.read_text(encoding="utf-8", errors="replace") if stderr_path.is_file() else ""
+    )
+    stderr_provider = _non_watchdog_stderr(stderr_text)
+    agy_errors = _extract_agy_error_objects(stderr_provider)
+    result_errors = _extract_agy_result_errors(raw_text)
+
+    for obj in agy_errors:
+        code = obj.get("error_code")
+        status = str(obj.get("status", "")).upper()
+        if code in {401, 403} or status == "UNAUTHENTICATED":
+            return PassFailure(
+                OUTCOME_AUTH_ERROR,
+                f"agy_auth_error ({pass_name}.stderr.log: code={code} status={status})",
+            )
+
+    for res in result_errors:
+        code = res.get("error_code")
+        err_blob = _norm_provider_text(
+            " ".join(str(res.get(k, "")) for k in ("error", "message", "short_error", "detail"))
+        )
+        if code in {401, 403} or any(m in err_blob for m in AGY_AUTH_TEXT_MARKERS):
+            return PassFailure(
+                OUTCOME_AUTH_ERROR,
+                f"agy_auth_error ({pass_name}.raw.jsonl: {err_blob[:120]})",
+            )
+
+    for obj in agy_errors:
+        code = obj.get("error_code")
+        status = str(obj.get("status", "")).upper()
+        short_err = _norm_provider_text(
+            str(obj.get("short_error") or obj.get("message") or obj.get("error") or "")
+        )
+        if status == "RESOURCE_EXHAUSTED" or (
+            code == 429 and ("quota" in short_err or "limit" in short_err)
+        ):
+            return PassFailure(
+                OUTCOME_CONFIRMED_QUOTA,
+                f"agy_quota_exhausted ({pass_name}.stderr.log: status={status} code={code})",
+            )
+
+    for res in result_errors:
+        err_blob = _norm_provider_text(
+            " ".join(str(res.get(k, "")) for k in ("error", "message", "short_error"))
+        )
+        for marker in AGY_QUOTA_TEXT_MARKERS:
+            if marker in err_blob:
+                return PassFailure(
+                    OUTCOME_CONFIRMED_QUOTA,
+                    f"agy_quota_exhausted ({pass_name}.raw.jsonl: matched '{marker}')",
+                )
+
+    has_watchdog = termination_reason is not None or (
+        "[codex_room_review]" in stderr_text and "terminated:" in stderr_text
+    )
+    if has_watchdog:
+        return PassFailure(OUTCOME_SCHEMA_OR_POLICY, f"{pass_name}: watchdog timeout")
+
+    for res in result_errors:
+        usage = res.get("usage") if isinstance(res.get("usage"), dict) else {}
+        total_tokens = usage.get("total_tokens")
+        err_blob = _norm_provider_text(
+            " ".join(str(res.get(k, "")) for k in ("error", "message", "short_error"))
+        )
+        retry_sec = _parse_retry_after_value(
+            res.get("retry_after_sec") or res.get("retry_after")
+        ) or _extract_retry_after_from_text(err_blob)
+        if total_tokens == 0 and (
+            "failed to start conversation" in err_blob or "empty conversation id" in err_blob
+        ):
+            return PassFailure(
+                OUTCOME_TRANSIENT,
+                f"agy_transient_startup ({pass_name}.raw.jsonl: 0-token startup race)",
+                retry_after_sec=retry_sec,
+            )
+        if AGY_TRANSIENT_RE.search(err_blob):
+            return PassFailure(
+                OUTCOME_TRANSIENT,
+                f"agy_transient_error ({pass_name}.raw.jsonl: {err_blob[:120]})",
+                retry_after_sec=retry_sec,
+            )
+
+    for obj in agy_errors:
+        code = obj.get("error_code")
+        status = str(obj.get("status", "")).upper()
+        short_err = _norm_provider_text(
+            str(obj.get("short_error") or obj.get("message") or obj.get("error") or "")
+        )
+        retry_sec = _parse_retry_after_value(
+            obj.get("retry_after_sec") or obj.get("retry_after") or obj.get("retryAfterSec")
+        ) or _extract_retry_after_from_text(short_err)
+        if (
+            code in {429, 502, 503, 504}
+            or status in {"UNAVAILABLE", "DEADLINE_EXCEEDED"}
+            or AGY_TRANSIENT_RE.search(short_err)
+        ):
+            return PassFailure(
+                OUTCOME_TRANSIENT,
+                f"agy_transient_error ({pass_name}.stderr.log: status={status} code={code})",
+                retry_after_sec=retry_sec,
+            )
+
+    if AGY_TRANSIENT_RE.search(stderr_provider):
+        return PassFailure(
+            OUTCOME_TRANSIENT,
+            f"agy_transient_error ({pass_name}.stderr.log)",
+            retry_after_sec=_extract_retry_after_from_text(stderr_provider),
+        )
+
+    return PassFailure(
+        OUTCOME_SCHEMA_OR_POLICY,
+        f"{pass_name}: non-quota agy failure (rc={returncode})",
+    )
+
+
+def _detect_codex_quota_error(
+    out_dir: Path, pass_names: tuple[str, ...] = ("pass1", "pass2")
+) -> str | None:
+    """Return confirmed quota exhaustion reason from Codex pass logs, if any."""
+    for pass_name in pass_names:
+        classification = classify_codex_failure(out_dir, pass_name)
+        if classification.category == OUTCOME_CONFIRMED_QUOTA:
+            return classification.reason
+    return None
+
+
+def resolve_quota_pool(model: str | None, policy: dict[str, Any] | None = None) -> str:
+    """Map a reviewer model name to its quota pool identifier."""
+    if isinstance(policy, dict):
+        roles = policy.get("roles", {})
+        if isinstance(roles, dict):
+            fb = roles.get("independent_reviewer_fallbacks", {})
+            if isinstance(fb, dict):
+                pools = fb.get("quota_pools", {})
+                if isinstance(pools, dict) and isinstance(model, str) and model in pools:
+                    pool_val = pools[model]
+                    if isinstance(pool_val, str) and pool_val.strip():
+                        return pool_val.strip()
+    if model is None or model == EXPECTED_REVIEW_MODEL or str(model).lower().startswith("gpt-"):
+        return "openai_codex"
+    low = str(model).strip().lower()
+    if low.startswith("claude-"):
+        return "anthropic_agy"
+    if low.startswith("gemini-"):
+        return "gemini_agy"
+    return f"pool:{low}"
+
+
+def extract_qualified_routes(
+    policy: dict[str, Any] | None,
+    excluded_prefixes: tuple[str, ...],
+) -> tuple[list[str], str | None]:
+    """Read and validate `roles.independent_reviewer_fallbacks.qualified_routes`."""
+    if not isinstance(policy, dict):
+        return [], None
+    roles = policy.get("roles")
+    if not isinstance(roles, dict):
+        return [], None
+    fb = roles.get("independent_reviewer_fallbacks")
+    if not isinstance(fb, dict):
+        return [], None
+    raw_routes = fb.get("qualified_routes", [])
+    if not isinstance(raw_routes, list):
+        return [], "model-policy.json qualified_routes must be a list."
+    routes: list[str] = []
+    for item in raw_routes:
+        model_val = item.get("model") if isinstance(item, dict) else item
+        if not isinstance(model_val, str) or not model_val.strip():
+            return [], f"Invalid entry in qualified_routes: {item!r}"
+        clean = model_val.strip()
+        if is_excluded_model(clean, excluded_prefixes):
+            return [], f"Excluded model {clean!r} in qualified_routes (MOD-001)."
+        routes.append(clean)
+    return routes, None
+
+
+def extract_max_transient_retries(policy: dict[str, Any] | None) -> int:
+    """Read `circuit_breakers.max_transient_retries_per_provider_pass` (default 1)."""
+    if not isinstance(policy, dict):
+        return 1
+    breakers = policy.get("circuit_breakers")
+    if not isinstance(breakers, dict):
+        return 1
+    val = breakers.get("max_transient_retries_per_provider_pass", 1)
+    if is_strict_int(val) and val >= 0:
+        return int(val)
+    return 1
+
+
+def _validate_pass_payload(
+    payload: Any,
+    schema: dict[str, Any],
+    *,
+    expected_sha: str,
+    expected_lens: str,
+) -> list[str]:
+    if not isinstance(payload, dict):
+        return ["pass output is missing or not a JSON object"]
+    errs = validate_instance_against_schema(payload, schema)
+    rev_sha = payload.get("revision_sha")
+    if rev_sha != expected_sha:
+        errs.append(f"revision_sha mismatch ({rev_sha!r} != {expected_sha!r})")
+    lens = payload.get("lens")
+    if lens != expected_lens:
+        errs.append(f"lens mismatch ({lens!r} != {expected_lens!r})")
+    return errs
+
+
+def _build_expected_provenance(
+    *,
+    candidate_sha: str,
+    base_sha: str,
+    packet_sha256: str,
+    policy_sha256: str,
+    schema_sha256: str,
+    lens: str,
+    frozen_tree_sha256: str,
+) -> dict[str, str]:
+    return {
+        "candidate_sha": candidate_sha,
+        "base_sha": base_sha,
+        "packet_sha256": packet_sha256,
+        "policy_sha256": policy_sha256,
+        "schema_sha256": schema_sha256,
+        "lens": lens,
+        "frozen_tree_sha256": frozen_tree_sha256,
+    }
+
+
+def _write_pass_provenance(
+    out_dir: Path,
+    pass_name: str,
+    expected_prov: dict[str, str],
+    *,
+    backend: str,
+    model: str,
+) -> Path:
+    prov_doc = {
+        **expected_prov,
+        "backend": backend,
+        "model": model,
+        "completed_at_utc": datetime.now(timezone.utc).isoformat(),
+    }
+    prov_path = out_dir / f"{pass_name}.provenance.json"
+    prov_path.write_text(json.dumps(prov_doc, indent=2) + "\n", encoding="utf-8")
+    return prov_path
+
+
+def _try_load_reusable_pass(
+    source_dir: Path,
+    pass_name: str,
+    expected_prov: dict[str, str],
+    schema: dict[str, Any],
+    excluded_prefixes: tuple[str, ...],
+) -> tuple[dict[str, Any], dict[str, Any]] | None:
+    pass_path = source_dir / f"{pass_name}.json"
+    prov_path = source_dir / f"{pass_name}.provenance.json"
+    if not pass_path.is_file() or not prov_path.is_file():
+        return None
+    try:
+        payload = json.loads(pass_path.read_text(encoding="utf-8"))
+        prov = json.loads(prov_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    if not isinstance(payload, dict) or not isinstance(prov, dict):
+        return None
+    val_errs = _validate_pass_payload(
+        payload,
+        schema,
+        expected_sha=expected_prov["candidate_sha"],
+        expected_lens=expected_prov["lens"],
+    )
+    if val_errs:
+        return None
+    if payload.get("verdict") == "BLOCKED":
+        return None
+    for key in PROVENANCE_TUPLE_KEYS:
+        if prov.get(key) != expected_prov[key]:
+            return None
+    backend = prov.get("backend")
+    model = prov.get("model")
+    if backend not in {"codex", "agy"} or not isinstance(model, str) or not model.strip():
+        return None
+    if is_excluded_model(model, excluded_prefixes):
+        return None
+    return payload, prov
 
 
 def _strip_json_fences(raw_text: str) -> str:
@@ -225,14 +788,21 @@ def _extract_agy_structured_output(stdout_lines: list[str]) -> dict[str, Any] | 
     return None
 
 
-def _archive_failed_codex_logs(out_dir: Path, pass_names: tuple[str, ...] = ("pass1", "pass2")) -> None:
+def _archive_pass_logs(out_dir: Path, pass_name: str, tag: str) -> None:
+    """Move pass artifacts aside under `<pass_name>.<tag>.<suffix>` before retry/fallback."""
+    for suffix in (".json", ".raw.jsonl", ".stderr.log"):
+        src = out_dir / f"{pass_name}{suffix}"
+        if src.is_file():
+            dst = out_dir / f"{pass_name}.{tag}{suffix}"
+            src.replace(dst)
+
+
+def _archive_failed_codex_logs(
+    out_dir: Path, pass_names: tuple[str, ...] = ("pass1", "pass2")
+) -> None:
     """Preserve failed Codex pass logs before running fallback backend."""
     for pass_name in pass_names:
-        for suffix in (".json", ".raw.jsonl", ".stderr.log"):
-            src = out_dir / f"{pass_name}{suffix}"
-            if src.is_file():
-                dst = out_dir / f"{pass_name}.codex-failed{suffix}"
-                src.replace(dst)
+        _archive_pass_logs(out_dir, pass_name, "codex-failed")
 
 
 def _git_output(repo_root: Path, args: list[str], *, timeout_sec: float = 60.0) -> subprocess.CompletedProcess[str]:
@@ -529,11 +1099,25 @@ def render_consolidated_markdown(report: dict[str, Any]) -> str:
         f"- **Gate Status**: `{report['review_gate_status']}`",
         f"- **Revision SHA**: `{report['revision_sha']}`",
         f"- **Review Backend**: {backend_label}",
-        f"- **Passes Completed**: `{report['passes_completed']}` (independent contexts: `{report['independent_contexts']}`)",
+        (
+            f"- **Passes Completed**: `{report['passes_completed']}` "
+            f"(independent contexts: `{report['independent_contexts']}`)"
+        ),
         f"- **Blocking Open Findings**: `{report['blocking_open_count']}`",
         f"- **Advisory Findings**: `{report['advisory_count']}`",
-        "",
     ]
+    if report.get("pass1_backend") or report.get("pass2_backend"):
+        p1_b = report.get("pass1_backend") or "none"
+        p1_m = report.get("pass1_model") or "none"
+        p2_b = report.get("pass2_backend") or "none"
+        p2_m = report.get("pass2_model") or "none"
+        lines.append(f"- **Pass Attribution**: pass1=`{p1_b}:{p1_m}`, pass2=`{p2_b}:{p2_m}`")
+    if report.get("reused_passes"):
+        lines.append(f"- **Reused Passes**: `{', '.join(report['reused_passes'])}`")
+    if report.get("exhausted_quota_pools"):
+        pools = ", ".join(report["exhausted_quota_pools"])
+        lines.append(f"- **Exhausted Quota Pools**: `{pools}`")
+    lines.append("")
     if report["errors"]:
         lines.append("## Errors / Blockers")
         for err in report["errors"]:
@@ -686,6 +1270,18 @@ def _run_subprocess_with_watchdog(
     return proc.returncode if proc.returncode is not None else 1, stdout_lines, stderr_lines, termination_reason
 
 
+def _record_pass_exec_meta(
+    out_dir: Path, pass_name: str, rc: int, termination_reason: str | None
+) -> None:
+    with _PASS_EXEC_META_LOCK:
+        _PASS_EXEC_META[(str(out_dir.resolve()), pass_name)] = (rc, termination_reason)
+
+
+def _pop_pass_exec_meta(out_dir: Path, pass_name: str) -> tuple[int, str | None]:
+    with _PASS_EXEC_META_LOCK:
+        return _PASS_EXEC_META.pop((str(out_dir.resolve()), pass_name), (1, None))
+
+
 def _run_codex_pass(
     codex_prefix: list[str],
     role: str,
@@ -736,6 +1332,7 @@ def _run_codex_pass(
 
     raw_jsonl.write_text("".join(stdout_lines), encoding="utf-8")
     stderr_log.write_text("".join(stderr_lines), encoding="utf-8")
+    _record_pass_exec_meta(out_dir, pass_name, rc, termination_reason)
 
     if termination_reason is not None or rc != 0 or not pass_json.is_file():
         return None
@@ -809,6 +1406,7 @@ def _run_agy_pass(
 
     raw_jsonl.write_text("".join(stdout_lines), encoding="utf-8")
     stderr_log.write_text("".join(stderr_lines), encoding="utf-8")
+    _record_pass_exec_meta(out_dir, pass_name, rc, termination_reason)
 
     if termination_reason is not None or rc != 0:
         return None
@@ -839,26 +1437,44 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--commit", default="HEAD", help="Immutable commit SHA or ref to review.")
     parser.add_argument("--base", default=None, help="Optional base commit SHA for diff context.")
     parser.add_argument("--task-id", default="adhoc", help="Task identifier for run folder naming.")
-    parser.add_argument("--attempt-id", default=None, help="Optional unique attempt ID for write-once run dir.")
-    parser.add_argument("--task-packet", type=Path, default=None, help="Path to Task Packet markdown.")
+    parser.add_argument(
+        "--attempt-id",
+        default=None,
+        help="Optional unique attempt ID for write-once run dir.",
+    )
+    parser.add_argument("--task-packet", type=Path, default=None, help="Path to Task Packet md.")
     parser.add_argument("--repo-root", type=Path, default=REPO_ROOT)
     parser.add_argument("--out-dir", type=Path, default=None)
+    parser.add_argument(
+        "--resume-from",
+        type=Path,
+        default=None,
+        help="Prior review output directory to reuse provenance-verified passes from.",
+    )
     parser.add_argument("--runtime-root", type=Path, default=Path.home() / ".codex-runtime")
-    parser.add_argument("--model", type=str, default=None, help="Optional explicit model override for active backend.")
+    parser.add_argument(
+        "--model",
+        type=str,
+        default=None,
+        help="Optional explicit model override for active backend.",
+    )
     parser.add_argument(
         "--backend",
         choices=("auto", "codex", "agy"),
         default="auto",
         help=(
-            "Review backend: 'auto' (default — prioritize Codex CLI, fallback to agy Opus 5.5 on "
-            "quota exhaustion or unavailability), 'codex' (Codex CLI only), or 'agy' (Antigravity CLI directly)."
+            "Review backend: 'auto' (prioritize Codex CLI, fallback to qualified_routes "
+            "on confirmed quota exhaustion), 'codex' (Codex CLI only), or 'agy' (AGY CLI)."
         ),
     )
     parser.add_argument(
         "--fallback-model",
         type=str,
-        default=DEFAULT_AGY_FALLBACK_MODEL,
-        help=f"Antigravity CLI model used for fallback or --backend agy. Default: {DEFAULT_AGY_FALLBACK_MODEL}.",
+        default=None,
+        help=(
+            "Explicit Antigravity CLI fallback model override (bypasses "
+            "qualified_routes when set on --backend auto)."
+        ),
     )
     parser.add_argument(
         "--timeout",
@@ -870,7 +1486,10 @@ def _build_parser() -> argparse.ArgumentParser:
         "--idle-timeout",
         type=float,
         default=180.0,
-        help="Inactivity watchdog timeout per pass in seconds; resets on stdout/stderr activity (0 disables). Default: 180.",
+        help=(
+            "Inactivity watchdog timeout per pass in seconds; resets on stdout/stderr "
+            "activity (0 disables). Default: 180."
+        ),
     )
     parser.add_argument(
         "--sequential",
@@ -966,7 +1585,9 @@ def _call_verify_role(role: str, runtime_root: Path, repo_root: Path) -> dict[st
 def main(argv: list[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
     repo_root = args.repo_root.resolve()
-    _, excluded_prefixes, policy_err = load_model_policy(repo_root, require_exists=False)
+    policy_data, excluded_prefixes, policy_err = load_model_policy(
+        repo_root, require_exists=False
+    )
     if policy_err:
         print(f"[codex_room_review] BLOCKED: {policy_err}", file=sys.stderr)
         return 2
@@ -985,10 +1606,15 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 2
 
-    schema = json.loads(SCHEMA_PATH.read_text(encoding="utf-8"))
+    schema_bytes = SCHEMA_PATH.read_bytes()
+    schema_sha256 = hashlib.sha256(schema_bytes).hexdigest()
+    schema = json.loads(schema_bytes.decode("utf-8"))
     schema_errors = validate_strict_json_schema(schema)
     if schema_errors:
-        print(f"[codex_room_review] Invalid review-output.schema.json: {schema_errors}", file=sys.stderr)
+        print(
+            f"[codex_room_review] Invalid review-output.schema.json: {schema_errors}",
+            file=sys.stderr,
+        )
         return 2
 
     try:
@@ -997,39 +1623,78 @@ def main(argv: list[str] | None = None) -> int:
         print(f"[codex_room_review] {exc}", file=sys.stderr)
         return 2
     git_top = Path(info["git_top"])
+    effective_prefixes = excluded_prefixes
     if git_top != repo_root:
-        _, git_prefixes, git_policy_err = load_model_policy(git_top, require_exists=False)
+        git_policy, git_prefixes, git_policy_err = load_model_policy(
+            git_top, require_exists=False
+        )
         if git_policy_err:
             print(f"[codex_room_review] BLOCKED: {git_policy_err}", file=sys.stderr)
             return 2
-        if args.model and is_excluded_model(args.model, git_prefixes):
+        policy_data = git_policy
+        effective_prefixes = git_prefixes
+        if args.model and is_excluded_model(args.model, effective_prefixes):
             print(
                 f"[codex_room_review] BLOCKED: --model {args.model!r} is excluded.",
                 file=sys.stderr,
             )
             return 2
-        if args.fallback_model and is_excluded_model(args.fallback_model, git_prefixes):
+        if args.fallback_model and is_excluded_model(args.fallback_model, effective_prefixes):
             print(
                 f"[codex_room_review] BLOCKED: --fallback-model {args.fallback_model!r} "
                 "is excluded.",
                 file=sys.stderr,
             )
             return 2
+
+    qualified_routes, routes_err = extract_qualified_routes(policy_data, effective_prefixes)
+    if routes_err:
+        print(f"[codex_room_review] BLOCKED: {routes_err}", file=sys.stderr)
+        return 2
+    max_transient_retries = extract_max_transient_retries(policy_data)
+    policy_file = git_top / "harness" / "model-policy.json"
+    policy_sha256 = (
+        hashlib.sha256(policy_file.read_bytes()).hexdigest()
+        if policy_file.is_file()
+        else hashlib.sha256(b"").hexdigest()
+    )
+
+    resume_dir: Path | None = None
+    if args.resume_from is not None:
+        resume_dir = args.resume_from.resolve()
+        if not resume_dir.is_dir():
+            print(
+                f"[codex_room_review] BLOCKED: --resume-from dir not found: {resume_dir}",
+                file=sys.stderr,
+            )
+            return 2
+
     candidate_sha = info["candidate_sha"]
     if args.out_dir is not None:
         out_dir = args.out_dir.resolve()
     else:
-        attempt_id = args.attempt_id or f"{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S.%fZ')}-{os.getpid()}"
+        ts_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
+        attempt_id = args.attempt_id or f"{ts_id}-{os.getpid()}"
         out_dir = (
-            git_top / "harness" / "runs" / args.task_id / "attempts" / f"{attempt_id}-{candidate_sha[:12]}"
+            git_top
+            / "harness"
+            / "runs"
+            / args.task_id
+            / "attempts"
+            / f"{attempt_id}-{candidate_sha[:12]}"
         ).resolve()
 
-    if any(
-        (out_dir / marker).exists()
-        for marker in (".review-attempt.lock", "consolidated-review.json", "pass1.prompt.md", "pass2.prompt.md", "frozen")
-    ):
+    lock_markers = (
+        ".review-attempt.lock",
+        "consolidated-review.json",
+        "pass1.prompt.md",
+        "pass2.prompt.md",
+        "frozen",
+    )
+    if any((out_dir / marker).exists() for marker in lock_markers):
         print(
-            f"[codex_room_review] Write-once refusal: {out_dir} already contains review artifacts or attempt lock.",
+            f"[codex_room_review] Write-once refusal: {out_dir} already contains "
+            "review artifacts or attempt lock.",
             file=sys.stderr,
         )
         return 2
@@ -1053,7 +1718,8 @@ def main(argv: list[str] | None = None) -> int:
             )
     except FileExistsError:
         print(
-            f"[codex_room_review] Write-once refusal: concurrent or duplicate attempt lock exists at {lock_path}.",
+            f"[codex_room_review] Write-once refusal: concurrent or duplicate attempt "
+            f"lock exists at {lock_path}.",
             file=sys.stderr,
         )
         return 2
@@ -1089,7 +1755,9 @@ def main(argv: list[str] | None = None) -> int:
     frozen_dir = out_dir / "frozen"
     frozen_src_dir = frozen_dir / "topstep-chart-app"
     try:
-        frozen_meta = materialize_frozen_tree(git_top, candidate_sha, frozen_src_dir, base_sha=info["base_sha"])
+        frozen_meta = materialize_frozen_tree(
+            git_top, candidate_sha, frozen_src_dir, base_sha=info["base_sha"]
+        )
     except (ValueError, RuntimeError, TimeoutError) as exc:
         print(f"[codex_room_review] {exc}", file=sys.stderr)
         return 2
@@ -1109,11 +1777,16 @@ def main(argv: list[str] | None = None) -> int:
             return True
         return hashlib.sha256(patch_file_path.read_bytes()).hexdigest() != patch_sha_before
 
+    default_task_text = (
+        "No Task Packet file supplied; review candidate commit against AGENTS.md, "
+        "implementation_plan.md, and docs/WORKSPACE_PROTOCOL.md."
+    )
     task_text = (
         args.task_packet.read_text(encoding="utf-8")
         if args.task_packet and args.task_packet.is_file()
-        else "No Task Packet file supplied; review candidate commit against AGENTS.md, implementation_plan.md, and docs/WORKSPACE_PROTOCOL.md."
+        else default_task_text
     )
+    packet_sha256 = hashlib.sha256(task_text.encode("utf-8")).hexdigest()
     prompt1 = render_prompt(PROMPTS_DIR / "pass1-correctness.md", info, task_text)
     prompt2 = render_prompt(PROMPTS_DIR / "pass2-security.md", info, task_text)
     prompt1_path = out_dir / "pass1.prompt.md"
@@ -1147,6 +1820,7 @@ def main(argv: list[str] | None = None) -> int:
             "schema_valid": True,
             "backend": args.backend,
             "fallback_model": args.fallback_model,
+            "qualified_routes": qualified_routes,
             "agy_available": agy_available,
             "out_dir": str(out_dir),
             "runtime_pass1": str(args.runtime_root / "topstep-review-pass1"),
@@ -1155,207 +1829,461 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(meta, indent=2))
         return 0
 
-    p1_data: dict[str, Any] | None = None
-    p2_data: dict[str, Any] | None = None
+    expected_prov_by_pass = {
+        pass_name: _build_expected_provenance(
+            candidate_sha=candidate_sha,
+            base_sha=info["base_sha"],
+            packet_sha256=packet_sha256,
+            policy_sha256=policy_sha256,
+            schema_sha256=schema_sha256,
+            lens=lens,
+            frozen_tree_sha256=frozen_meta["frozen_tree_sha256"],
+        )
+        for pass_name, lens in PASS_LENS_MAP.items()
+    }
+    states: dict[str, PassState] = {
+        pass_name: PassState(pass_name=pass_name, lens=lens)
+        for pass_name, lens in PASS_LENS_MAP.items()
+    }
+    reused_passes: list[str] = []
+    exhausted_quota_pools: list[str] = []
+
+    def _mark_pool_exhausted(model_name: str | None) -> str:
+        pool = resolve_quota_pool(model_name, policy_data)
+        if pool not in exhausted_quota_pools:
+            exhausted_quota_pools.append(pool)
+        return pool
+
+    if resume_dir is not None:
+        for pass_name, state in states.items():
+            loaded = _try_load_reusable_pass(
+                resume_dir,
+                pass_name,
+                expected_prov_by_pass[pass_name],
+                schema,
+                effective_prefixes,
+            )
+            if loaded is None:
+                continue
+            loaded_payload, loaded_prov = loaded
+            (out_dir / f"{pass_name}.json").write_text(
+                json.dumps(loaded_payload, indent=2) + "\n",
+                encoding="utf-8",
+            )
+            (out_dir / f"{pass_name}.provenance.json").write_text(
+                json.dumps(loaded_prov, indent=2) + "\n",
+                encoding="utf-8",
+            )
+            state.payload = loaded_payload
+            state.backend = loaded_prov["backend"]
+            state.model = loaded_prov["model"]
+            state.reused = True
+            state.is_complete = True
+            reused_passes.append(pass_name)
+
+    prompts_by_pass = {
+        "pass1": (prompt1, frozen_prompt1_path),
+        "pass2": (prompt2, frozen_prompt2_path),
+    }
+
     active_backend = "codex"
     active_model: str | None = args.model
     fallback_used = False
     fallback_reason: str | None = None
-    readonly_violation: str | None = None
+    forced_gate_status: str | None = None
+    stage_extra_errors: list[str] = []
 
-    def _run_agy_review_pair(agy_model: str) -> tuple[dict[str, Any] | None, dict[str, Any] | None, str | None]:
-        agy_prefix = resolve_agy_command()
-        try:
-            before_status = _git_output(git_top, ["status", "--porcelain"]).stdout
-        except TimeoutError as exc:
-            return None, None, f"Read-only check failed before agy pass: {exc}"
-        p1_kw = dict(
-            agy_prefix=agy_prefix,
-            role="pass1",
-            repo_root=frozen_dir,
-            schema_path=SCHEMA_PATH,
-            prompt_text=prompt1,
-            prompt_file=frozen_prompt1_path,
-            out_dir=out_dir,
-            pass_name="pass1",
-            model=agy_model,
-            timeout_sec=args.timeout,
-            idle_timeout_sec=args.idle_timeout,
+    def _finalize_and_exit() -> int:
+        report = consolidate_reviews(
+            states["pass1"].payload,
+            states["pass2"].payload,
+            expected_sha=candidate_sha,
         )
-        p2_kw = dict(
-            agy_prefix=agy_prefix,
-            role="pass2",
-            repo_root=frozen_dir,
-            schema_path=SCHEMA_PATH,
-            prompt_text=prompt2,
-            prompt_file=frozen_prompt2_path,
-            out_dir=out_dir,
-            pass_name="pass2",
-            model=agy_model,
-            timeout_sec=args.timeout,
-            idle_timeout_sec=args.idle_timeout,
+        if forced_gate_status:
+            report["review_gate_status"] = forced_gate_status
+        for err in stage_extra_errors:
+            if err and err not in report["errors"]:
+                report["errors"].append(err)
+        frozen_hash_final, _ = compute_tree_sha256(frozen_src_dir)
+        if frozen_hash_final != frozen_meta["frozen_tree_sha256"]:
+            report["errors"].append(
+                "Read-only violation: frozen-src snapshot changed during review."
+            )
+            report["review_gate_status"] = "BLOCKED"
+        if _patch_modified():
+            report["errors"].append(
+                "Read-only violation: candidate.patch changed during review."
+            )
+            report["review_gate_status"] = "BLOCKED"
+        report["frozen_tree_sha256"] = frozen_meta["frozen_tree_sha256"]
+        report["candidate_patch_path"] = frozen_meta["patch_path"]
+        report["worktree_dirty_at_review"] = info["worktree_dirty"]
+        report["review_backend"] = active_backend
+        report["review_model"] = active_model
+        report["fallback_used"] = fallback_used
+        report["fallback_reason"] = fallback_reason
+        report["pass1_backend"] = states["pass1"].backend
+        report["pass1_model"] = states["pass1"].model
+        report["pass2_backend"] = states["pass2"].backend
+        report["pass2_model"] = states["pass2"].model
+        report["reused_passes"] = list(reused_passes)
+        report["exhausted_quota_pools"] = list(exhausted_quota_pools)
+        if not _write_once_outputs(out_dir, report):
+            return 2
+
+        print(
+            f"[codex_room_review] sha={candidate_sha[:12]} backend={active_backend} "
+            f"model={active_model or 'default'} fallback={fallback_used} "
+            f"status={report['review_gate_status']} "
+            f"blocking_open={report['blocking_open_count']} out={out_dir}"
         )
-        res1, res2 = _execute_two_passes(_run_agy_pass, p1_kw, p2_kw, sequential=args.sequential)
+        if report["review_gate_status"] in {"BLOCKED", "BLOCKED_AUTH", "BLOCKED_INFRA"}:
+            return 2
+        if args.fail_on_blocking and report["blocking_open_count"] > 0:
+            return 1
+        return 0
+
+    def _verify_agy_readonly(before_status: str) -> str | None:
         try:
             after_status = _git_output(git_top, ["status", "--porcelain"]).stdout
         except TimeoutError as exc:
-            return res1, res2, f"Read-only check failed after agy pass: {exc}"
+            return f"Read-only check failed after agy pass: {exc}"
         frozen_hash_after, _ = compute_tree_sha256(frozen_src_dir)
         if after_status != before_status:
-            violation: str | None = "Read-only violation: git worktree changed during agy review pass."
-        elif frozen_hash_after != frozen_meta["frozen_tree_sha256"]:
-            violation = "Read-only violation: frozen-src snapshot modified during agy review pass."
-        elif _patch_modified():
-            violation = "Read-only violation: candidate.patch modified during agy review pass."
+            return "Read-only violation: git worktree changed during agy review pass."
+        if frozen_hash_after != frozen_meta["frozen_tree_sha256"]:
+            return "Read-only violation: frozen-src snapshot modified during agy review pass."
+        if _patch_modified():
+            return "Read-only violation: candidate.patch modified during agy review pass."
+        return None
+
+    def _invoke_passes(
+        backend_name: str,
+        cli_prefix: list[str],
+        model_name: str,
+        target_passes: list[str],
+    ) -> tuple[dict[str, dict[str, Any] | None], str | None]:
+        before_status = ""
+        if backend_name == "agy":
+            try:
+                before_status = _git_output(git_top, ["status", "--porcelain"]).stdout
+            except TimeoutError as exc:
+                return {p: None for p in target_passes}, f"Read-only check failed: {exc}"
+
+        kwargs_by_pass: dict[str, dict[str, Any]] = {}
+        for pass_name in target_passes:
+            prompt_text, frozen_prompt_path = prompts_by_pass[pass_name]
+            if backend_name == "codex":
+                rt_name = f"topstep-review-{pass_name}"
+                kwargs_by_pass[pass_name] = {
+                    "codex_prefix": cli_prefix,
+                    "role": pass_name,
+                    "runtime_dir": args.runtime_root / rt_name,
+                    "repo_root": frozen_dir,
+                    "schema_path": SCHEMA_PATH,
+                    "prompt_text": prompt_text,
+                    "out_dir": out_dir,
+                    "pass_name": pass_name,
+                    "model": model_name,
+                    "timeout_sec": args.timeout,
+                    "idle_timeout_sec": args.idle_timeout,
+                }
+            else:
+                kwargs_by_pass[pass_name] = {
+                    "agy_prefix": cli_prefix,
+                    "role": pass_name,
+                    "repo_root": frozen_dir,
+                    "schema_path": SCHEMA_PATH,
+                    "prompt_text": prompt_text,
+                    "prompt_file": frozen_prompt_path,
+                    "out_dir": out_dir,
+                    "pass_name": pass_name,
+                    "model": model_name,
+                    "timeout_sec": args.timeout,
+                    "idle_timeout_sec": args.idle_timeout,
+                }
+
+        runner = _run_codex_pass if backend_name == "codex" else _run_agy_pass
+        results: dict[str, dict[str, Any] | None] = {}
+        if len(target_passes) == 2:
+            r1, r2 = _execute_two_passes(
+                runner,
+                kwargs_by_pass[target_passes[0]],
+                kwargs_by_pass[target_passes[1]],
+                sequential=args.sequential,
+            )
+            results[target_passes[0]] = r1
+            results[target_passes[1]] = r2
         else:
-            violation = None
-        return res1, res2, violation
+            only_p = target_passes[0]
+            results[only_p] = runner(**kwargs_by_pass[only_p])
+
+        if backend_name == "agy":
+            ro_err = _verify_agy_readonly(before_status)
+            if ro_err:
+                return results, ro_err
+        return results, None
+
+    def _run_provider_stage(
+        backend_name: str,
+        cli_prefix: list[str],
+        model_name: str,
+    ) -> tuple[str, list[str], list[str]]:
+        needed = [p for p in ("pass1", "pass2") if not states[p].is_complete]
+        if not needed:
+            return "OK", [], []
+
+        retries_used = {p: 0 for p in needed}
+        failures: dict[str, PassFailure] = {}
+        classifier = classify_codex_failure if backend_name == "codex" else classify_agy_failure
+
+        def _record_and_classify(
+            batch_results: dict[str, dict[str, Any] | None],
+        ) -> None:
+            for pass_name, payload in batch_results.items():
+                rc, term_reason = _pop_pass_exec_meta(out_dir, pass_name)
+                state = states[pass_name]
+                if payload is not None:
+                    val_errs = _validate_pass_payload(
+                        payload,
+                        schema,
+                        expected_sha=candidate_sha,
+                        expected_lens=state.lens,
+                    )
+                    if not val_errs:
+                        state.payload = payload
+                        state.backend = backend_name
+                        state.model = model_name
+                        state.is_complete = True
+                        failures.pop(pass_name, None)
+                        if payload.get("verdict") != "BLOCKED":
+                            _write_pass_provenance(
+                                out_dir,
+                                pass_name,
+                                expected_prov_by_pass[pass_name],
+                                backend=backend_name,
+                                model=model_name,
+                            )
+                        continue
+                else:
+                    val_errs = None
+                failures[pass_name] = classifier(
+                    out_dir,
+                    pass_name,
+                    returncode=rc,
+                    termination_reason=term_reason,
+                    pass_payload=payload,
+                    validation_errors=val_errs,
+                )
+
+        batch, ro_err = _invoke_passes(backend_name, cli_prefix, model_name, needed)
+        if ro_err:
+            return "BLOCKED", [ro_err], list(needed)
+        _record_and_classify(batch)
+
+        while failures:
+            if any(f.category == OUTCOME_AUTH_ERROR for f in failures.values()):
+                reasons = [
+                    f.reason for f in failures.values() if f.category == OUTCOME_AUTH_ERROR
+                ]
+                return "BLOCKED_AUTH", reasons, list(failures.keys())
+            if any(f.category == OUTCOME_SCHEMA_OR_POLICY for f in failures.values()):
+                reasons = [
+                    f.reason
+                    for f in failures.values()
+                    if f.category == OUTCOME_SCHEMA_OR_POLICY
+                ]
+                return "BLOCKED", reasons, list(failures.keys())
+            if any(f.category == OUTCOME_CONFIRMED_QUOTA for f in failures.values()):
+                reasons = [
+                    f.reason
+                    for f in failures.values()
+                    if f.category == OUTCOME_CONFIRMED_QUOTA
+                ]
+                return "QUOTA_EXHAUSTED", reasons, list(failures.keys())
+
+            retry_targets = [
+                p
+                for p, f in failures.items()
+                if f.category == OUTCOME_TRANSIENT and retries_used[p] < max_transient_retries
+            ]
+            if not retry_targets:
+                reasons = [f.reason for f in failures.values()]
+                return "BLOCKED_INFRA", reasons, list(failures.keys())
+
+            max_sleep = max(
+                (min(failures[p].retry_after_sec or 0.0, 5.0) for p in retry_targets),
+                default=0.0,
+            )
+            if max_sleep > 0:
+                time.sleep(max_sleep)
+            for p in retry_targets:
+                _archive_pass_logs(out_dir, p, f"retry{retries_used[p]}")
+                retries_used[p] += 1
+
+            retry_batch, ro_err = _invoke_passes(
+                backend_name, cli_prefix, model_name, retry_targets
+            )
+            if ro_err:
+                return "BLOCKED", [ro_err], list(retry_targets)
+            _record_and_classify(retry_batch)
+
+        return "OK", [], []
+
+    if all(s.is_complete for s in states.values()):
+        active_backend = states["pass1"].backend or "codex"
+        active_model = states["pass1"].model
+        return _finalize_and_exit()
 
     if args.backend == "agy":
         active_backend = "agy"
-        active_model = args.model or args.fallback_model
+        active_model = (
+            args.model
+            or args.fallback_model
+            or (qualified_routes[0] if qualified_routes else DEFAULT_AGY_FALLBACK_MODEL)
+        )
+        if is_excluded_model(active_model, effective_prefixes):
+            forced_gate_status = "BLOCKED"
+            stage_extra_errors.append(f"Excluded model {active_model!r} (MOD-001).")
+            return _finalize_and_exit()
         try:
-            p1_data, p2_data, readonly_violation = _run_agy_review_pair(active_model)
+            agy_prefix = resolve_agy_command()
         except FileNotFoundError as exc:
             print(f"[codex_room_review] {exc}", file=sys.stderr)
             return 2
-    else:
-        if args.model is not None and args.model != EXPECTED_REVIEW_MODEL:
-            model_err = f"Primary codex reviewer model is locked to {EXPECTED_REVIEW_MODEL!r}, got {args.model!r}"
-            print(f"[codex_room_review] {model_err}", file=sys.stderr)
-            report = consolidate_reviews(None, None, expected_sha=candidate_sha)
-            report["errors"] = [model_err]
-            report["frozen_tree_sha256"] = frozen_meta["frozen_tree_sha256"]
-            report["candidate_patch_path"] = frozen_meta["patch_path"]
-            report["worktree_dirty_at_review"] = info["worktree_dirty"]
-            report["review_backend"] = "codex"
-            report["review_model"] = args.model
-            report["fallback_used"] = False
-            report["fallback_reason"] = None
-            _write_once_outputs(out_dir, report)
+        outcome, st_errs, _ = _run_provider_stage("agy", agy_prefix, active_model)
+        if outcome == "QUOTA_EXHAUSTED":
+            _mark_pool_exhausted(active_model)
+            forced_gate_status = "BLOCKED_INFRA"
+            stage_extra_errors.extend(st_errs)
+        elif outcome in {"BLOCKED", "BLOCKED_AUTH", "BLOCKED_INFRA"}:
+            forced_gate_status = outcome
+            stage_extra_errors.extend(st_errs)
+        return _finalize_and_exit()
+
+    if args.model is not None and args.model != EXPECTED_REVIEW_MODEL:
+        model_err = (
+            f"Primary codex reviewer model is locked to {EXPECTED_REVIEW_MODEL!r}, "
+            f"got {args.model!r}"
+        )
+        print(f"[codex_room_review] {model_err}", file=sys.stderr)
+        active_backend = "codex"
+        active_model = args.model
+        forced_gate_status = "BLOCKED"
+        stage_extra_errors.append(model_err)
+        return _finalize_and_exit()
+
+    active_model = EXPECTED_REVIEW_MODEL
+    v1 = _call_verify_role("pass1", args.runtime_root, git_top)
+    v2 = _call_verify_role("pass2", args.runtime_root, git_top)
+    if not (v1["ok"] and v2["ok"]):
+        preflight_err = (
+            "Codex Room runtime failed safety/model preflight: "
+            f"pass1={v1.get('errors', [])}; pass2={v2.get('errors', [])}"
+        )
+        print(f"[codex_room_review] {preflight_err}", file=sys.stderr)
+        active_backend = "codex"
+        forced_gate_status = "BLOCKED"
+        stage_extra_errors.append(preflight_err)
+        return _finalize_and_exit()
+
+    codex_prefix: list[str] | None = None
+    try:
+        codex_prefix = resolve_codex_command()
+    except FileNotFoundError:
+        if args.backend == "codex":
+            print("[codex_room_review] Codex CLI (`codex`) not found on PATH.", file=sys.stderr)
             return 2
+        fallback_reason = "codex_cli_not_found"
+        _mark_pool_exhausted(EXPECTED_REVIEW_MODEL)
 
-        active_model = EXPECTED_REVIEW_MODEL
-        v1 = _call_verify_role("pass1", args.runtime_root, git_top)
-        v2 = _call_verify_role("pass2", args.runtime_root, git_top)
-        if not (v1["ok"] and v2["ok"]):
-            preflight_err = (
-                "Codex Room runtime failed safety/model preflight: "
-                f"pass1={v1.get('errors', [])}; pass2={v2.get('errors', [])}"
-            )
-            print(f"[codex_room_review] {preflight_err}", file=sys.stderr)
-            report = consolidate_reviews(None, None, expected_sha=candidate_sha)
-            report["errors"] = [preflight_err]
-            report["frozen_tree_sha256"] = frozen_meta["frozen_tree_sha256"]
-            report["candidate_patch_path"] = frozen_meta["patch_path"]
-            report["worktree_dirty_at_review"] = info["worktree_dirty"]
-            report["review_backend"] = "codex"
-            report["review_model"] = active_model
-            report["fallback_used"] = False
-            report["fallback_reason"] = None
-            _write_once_outputs(out_dir, report)
-            return 2
-
-        codex_prefix: list[str] | None = None
-        codex_precheck_reason: str | None = None
-        try:
-            codex_prefix = resolve_codex_command()
-        except FileNotFoundError:
-            codex_precheck_reason = "codex_cli_not_found"
-
-        if codex_precheck_reason is not None:
+    if codex_prefix is not None:
+        outcome, st_errs, failed_passes = _run_provider_stage(
+            "codex", codex_prefix, EXPECTED_REVIEW_MODEL
+        )
+        if outcome == "OK":
+            if states["pass1"].backend and states["pass1"].backend != "codex":
+                active_backend = states["pass1"].backend
+                active_model = states["pass1"].model
+            return _finalize_and_exit()
+        if outcome == "QUOTA_EXHAUSTED":
+            _mark_pool_exhausted(EXPECTED_REVIEW_MODEL)
             if args.backend == "codex":
-                print("[codex_room_review] Codex CLI (`codex`) not found on PATH.", file=sys.stderr)
-                return 2
-            fallback_reason = codex_precheck_reason
+                forced_gate_status = "BLOCKED_INFRA"
+                stage_extra_errors.extend(st_errs)
+                return _finalize_and_exit()
+            fallback_reason = "; ".join(st_errs)
+            _archive_failed_codex_logs(out_dir, tuple(failed_passes))
         else:
-            assert codex_prefix is not None
-            pass1_kwargs = dict(
-                codex_prefix=codex_prefix,
-                role="pass1",
-                runtime_dir=args.runtime_root / "topstep-review-pass1",
-                repo_root=frozen_dir,
-                schema_path=SCHEMA_PATH,
-                prompt_text=prompt1,
-                out_dir=out_dir,
-                pass_name="pass1",
-                model=active_model,
-                timeout_sec=args.timeout,
-                idle_timeout_sec=args.idle_timeout,
-            )
-            pass2_kwargs = dict(
-                codex_prefix=codex_prefix,
-                role="pass2",
-                runtime_dir=args.runtime_root / "topstep-review-pass2",
-                repo_root=frozen_dir,
-                schema_path=SCHEMA_PATH,
-                prompt_text=prompt2,
-                out_dir=out_dir,
-                pass_name="pass2",
-                model=active_model,
-                timeout_sec=args.timeout,
-                idle_timeout_sec=args.idle_timeout,
-            )
-            p1_data, p2_data = _execute_two_passes(
-                _run_codex_pass, pass1_kwargs, pass2_kwargs, sequential=args.sequential
-            )
+            forced_gate_status = outcome
+            stage_extra_errors.extend(st_errs)
+            return _finalize_and_exit()
 
-            if args.backend == "auto" and (p1_data is None or p2_data is None):
-                quota_reason = _detect_codex_quota_error(out_dir)
-                if quota_reason:
-                    fallback_reason = quota_reason
-                    _archive_failed_codex_logs(out_dir)
+    if fallback_reason is not None and args.backend == "auto":
+        for p_name, p_state in states.items():
+            if p_state.is_complete:
+                loaded = _try_load_reusable_pass(
+                    out_dir,
+                    p_name,
+                    expected_prov_by_pass[p_name],
+                    schema,
+                    effective_prefixes,
+                )
+                if (
+                    loaded is None
+                    and p_state.payload
+                    and p_state.payload.get("verdict") != "BLOCKED"
+                ):
+                    p_state.is_complete = False
 
-        if fallback_reason is not None and args.backend == "auto":
-            print(
-                f"[codex_room_review] Codex CLI unavailable ({fallback_reason}); "
-                f"falling back to agy ({args.fallback_model}).",
-                file=sys.stderr,
+        candidate_routes = (
+            [args.fallback_model] if args.fallback_model is not None else list(qualified_routes)
+        )
+        if not candidate_routes:
+            forced_gate_status = "BLOCKED_INFRA"
+            stage_extra_errors.append(
+                f"Codex unavailable ({fallback_reason}) and no qualified_routes configured."
             )
-            prior_codex_p1 = p1_data
-            prior_codex_p2 = p2_data
+            return _finalize_and_exit()
+
+        for route_idx, route_model in enumerate(candidate_routes):
+            pool = resolve_quota_pool(route_model, policy_data)
+            if pool in exhausted_quota_pools:
+                continue
             try:
-                active_backend = "agy"
-                active_model = args.fallback_model
-                fallback_used = True
-                fb_p1, fb_p2, readonly_violation = _run_agy_review_pair(active_model)
-                p1_data = _merge_prior_pass_findings(fb_p1, prior_codex_p1, candidate_sha)
-                p2_data = _merge_prior_pass_findings(fb_p2, prior_codex_p2, candidate_sha)
+                agy_prefix = resolve_agy_command()
             except FileNotFoundError as exc:
                 print(f"[codex_room_review] Fallback failed: {exc}", file=sys.stderr)
                 return 2
 
-    report = consolidate_reviews(p1_data, p2_data, expected_sha=candidate_sha)
-    if readonly_violation:
-        report["errors"].append(readonly_violation)
-        report["review_gate_status"] = "BLOCKED"
-    frozen_hash_final, _ = compute_tree_sha256(frozen_src_dir)
-    if frozen_hash_final != frozen_meta["frozen_tree_sha256"]:
-        report["errors"].append("Read-only violation: frozen-src snapshot changed during review.")
-        report["review_gate_status"] = "BLOCKED"
-    if _patch_modified():
-        report["errors"].append("Read-only violation: candidate.patch changed during review.")
-        report["review_gate_status"] = "BLOCKED"
-    report["frozen_tree_sha256"] = frozen_meta["frozen_tree_sha256"]
-    report["candidate_patch_path"] = frozen_meta["patch_path"]
-    report["worktree_dirty_at_review"] = info["worktree_dirty"]
-    report["review_backend"] = active_backend
-    report["review_model"] = active_model
-    report["fallback_used"] = fallback_used
-    report["fallback_reason"] = fallback_reason
-    if not _write_once_outputs(out_dir, report):
-        return 2
+            print(
+                f"[codex_room_review] Codex CLI unavailable ({fallback_reason}); "
+                f"falling back to agy ({route_model}).",
+                file=sys.stderr,
+            )
+            active_backend = "agy"
+            active_model = route_model
+            fallback_used = True
 
-    print(
-        f"[codex_room_review] sha={candidate_sha[:12]} backend={active_backend} "
-        f"model={active_model or 'default'} fallback={fallback_used} "
-        f"status={report['review_gate_status']} blocking_open={report['blocking_open_count']} out={out_dir}"
-    )
-    if report["review_gate_status"] == "BLOCKED":
-        return 2
-    if args.fail_on_blocking and report["blocking_open_count"] > 0:
-        return 1
-    return 0
+            outcome, st_errs, failed_passes = _run_provider_stage("agy", agy_prefix, route_model)
+            if outcome == "OK":
+                return _finalize_and_exit()
+            if outcome == "QUOTA_EXHAUSTED":
+                _mark_pool_exhausted(route_model)
+                for fp in failed_passes:
+                    _archive_pass_logs(out_dir, fp, f"agy-failed-{route_idx}")
+                stage_extra_errors.extend(st_errs)
+                continue
+            forced_gate_status = outcome
+            stage_extra_errors.extend(st_errs)
+            return _finalize_and_exit()
+
+        forced_gate_status = "BLOCKED_INFRA"
+        stage_extra_errors.append(
+            f"All fallback routes exhausted quota pools: {exhausted_quota_pools}"
+        )
+
+    return _finalize_and_exit()
 
 
 if __name__ == "__main__":
