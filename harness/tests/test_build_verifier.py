@@ -160,12 +160,37 @@ def test_build_verifier_handles_hung_git_and_kills_child_process_tree(tmp_path: 
     assert pytest_step["exit_code"] == 124
     assert "TIMED_OUT" in pytest_step["summary"]
 
-    # Hung git subprocess must time out cleanly instead of blocking indefinitely
-    def _hung_git(*_args, **_kwargs):
-        raise subprocess.TimeoutExpired(cmd=["git", "rev-parse", "HEAD"], timeout=0.1)
+    # Hung git subprocess must time out cleanly via run_managed_cmd and kill orphan children
+    from harness.scripts import schema_utils
 
-    monkeypatch.setattr(build_verifier.subprocess, "run", _hung_git)
-    git_timeout_report = run_verifier(tmp_path, phase=0, strict_clean=False, total_timeout_sec=0.5)
+    git_child_pid_file = tmp_path / "git_child.pid"
+    fake_git_script = tmp_path / "fake_hung_git.py"
+    fake_git_script.write_text(
+        (
+            "import subprocess, sys\n"
+            "child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)'])\n"
+            f"open({str(git_child_pid_file)!r}, 'w', encoding='utf-8').write(str(child.pid))\n"
+            "sys.exit(0)\n"
+        ),
+        encoding="utf-8",
+    )
+
+    try:
+        schema_utils.run_managed_cmd([sys.executable, str(fake_git_script)], timeout_sec=0.8)
+    except subprocess.TimeoutExpired:
+        pass
+    else:
+        raise AssertionError("Expected run_managed_cmd to raise TimeoutExpired on hung child holding stdout")
+    assert git_child_pid_file.is_file()
+    git_child_pid = int(git_child_pid_file.read_text(encoding="utf-8").strip())
+    assert not _is_pid_alive(git_child_pid)
+
+    monkeypatch.setattr(
+        build_verifier,
+        "run_managed_cmd",
+        lambda *_a, **_kw: schema_utils.run_managed_cmd([sys.executable, str(fake_git_script)], timeout_sec=0.3),
+    )
+    git_timeout_report = run_verifier(tmp_path, phase=0, strict_clean=False, total_timeout_sec=2.0)
     assert git_timeout_report["status"] == "FAILED"
     assert any(s["exit_code"] == 124 and "TIMED_OUT" in s["summary"] for s in git_timeout_report["steps"])
 
@@ -222,10 +247,11 @@ def _is_pid_alive(pid: int) -> bool:
     if os.name == "nt":
         PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
         STILL_ACTIVE = 259
+        ERROR_ACCESS_DENIED = 5
         k32 = ctypes.WinDLL("kernel32", use_last_error=True)
         handle = k32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
         if not handle:
-            return False
+            return ctypes.get_last_error() == ERROR_ACCESS_DENIED
         try:
             exit_code = ctypes.c_ulong(0)
             if not k32.GetExitCodeProcess(handle, ctypes.byref(exit_code)):

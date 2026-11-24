@@ -26,6 +26,7 @@ try:
         cleanup_readonly_tree,
         close_job_handle,
         materialize_frozen_tree,
+        run_managed_cmd,
         spawn_managed_process,
         terminate_process_tree,
     )
@@ -34,6 +35,7 @@ except ImportError:
         cleanup_readonly_tree,
         close_job_handle,
         materialize_frozen_tree,
+        run_managed_cmd,
         spawn_managed_process,
         terminate_process_tree,
     )
@@ -169,20 +171,8 @@ def _run_step(
 
 
 def _git_snapshot(root: Path, *, timeout_sec: float = 60.0) -> dict[str, Any]:
-    rev = subprocess.run(
-        ["git", "-C", str(root), "rev-parse", "HEAD"],
-        capture_output=True,
-        text=True,
-        check=False,
-        timeout=timeout_sec if timeout_sec > 0 else None,
-    )
-    status_proc = subprocess.run(
-        ["git", "-C", str(root), "status", "--porcelain"],
-        capture_output=True,
-        text=True,
-        check=False,
-        timeout=timeout_sec if timeout_sec > 0 else None,
-    )
+    rev = run_managed_cmd(["git", "-C", str(root), "rev-parse", "HEAD"], timeout_sec=timeout_sec)
+    status_proc = run_managed_cmd(["git", "-C", str(root), "status", "--porcelain"], timeout_sec=timeout_sec)
     dirty_files = [ln for ln in status_proc.stdout.splitlines() if ln.strip()] if status_proc.returncode == 0 else []
     return {
         "initialized": rev.returncode == 0,
@@ -239,7 +229,7 @@ def _check_sibling_upstream_fork(root: Path, deadline: float | None) -> dict[str
     try:
         for git_cmd, kind in checks:
             rem = _remaining_budget(deadline)
-            proc = subprocess.run(git_cmd, capture_output=True, text=True, check=False, timeout=rem)
+            proc = run_managed_cmd(git_cmd, timeout_sec=rem)
             if proc.returncode != 0:
                 return {
                     "name": "upstream_fork_clean",

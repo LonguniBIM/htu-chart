@@ -1055,3 +1055,60 @@ def test_codex_room_review_atomic_lock_blocks_concurrent_same_out_dir(
     assert (out_dir / ".review-attempt.lock").is_file()
     report = json.loads((out_dir / "consolidated-review.json").read_text(encoding="utf-8"))
     assert report["review_gate_status"] == "PASSED"
+
+
+def test_merge_prior_pass_findings_preserves_invalid_or_contradictory_prior_pass_across_fallback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """P1-003: Contradictory/invalid prior Codex pass must NOT be washed away by agy fallback."""
+    repo_dir, sha = _init_mini_git_repo(tmp_path / "repo_merge_contradict")
+
+    contradictory_p1 = _sample_pass(sha, "correctness_and_tests", "CHANGES_REQUESTED", [])
+    agy_approve_p1 = _sample_pass(sha, "correctness_and_tests", "APPROVE", [])
+    preserved = codex_room_review._merge_prior_pass_findings(agy_approve_p1, contradictory_p1, sha)
+    assert preserved["verdict"] == "CHANGES_REQUESTED"
+    assert preserved["findings"] == []
+
+    # End-to-end: Codex pass1 returns contradictory CHANGES_REQUESTED + [], pass2 hits quota, agy APPROVEs -> BLOCKED (rc == 2)
+    codex_script = tmp_path / "fake_codex_contradict.py"
+    codex_prefix = _write_fake_codex_script(
+        codex_script,
+        (
+            "import json, pathlib, sys\n"
+            "args = sys.argv[1:]\n"
+            "out_path = pathlib.Path(args[args.index('-o') + 1])\n"
+            "_ = sys.stdin.read()\n"
+            "if out_path.name == 'pass1.json':\n"
+            f"    payload = {{'revision_sha': {sha!r}, 'lens': 'correctness_and_tests', "
+            "'verdict': 'CHANGES_REQUESTED', 'summary': 'contradictory', 'findings': [], "
+            "'test_quality_issues': [], 'unverified_areas': []}\n"
+            "    out_path.write_text(json.dumps(payload), encoding='utf-8')\n"
+            "else:\n"
+            "    sys.stderr.write('Error: usage_limit_reached - Codex CLI quota exhausted\\n')\n"
+            "    sys.exit(1)\n"
+        ),
+    )
+    agy_script = tmp_path / "fake_agy_approve_end.py"
+    agy_prefix = _write_fake_codex_script(
+        agy_script,
+        (
+            "import json, sys\n"
+            "args = sys.argv[1:]\n"
+            "prompt = args[args.index('-p') + 1]\n"
+            "lens = 'security_and_invariants' if 'security_and_invariants' in prompt else 'correctness_and_tests'\n"
+            f"payload = {{'revision_sha': {sha!r}, 'lens': lens, 'verdict': 'APPROVE', "
+            "'summary': 'agy approve', 'findings': [], 'test_quality_issues': [], 'unverified_areas': []}\n"
+            "print(json.dumps({'event': 'result', 'result': {'status': 'SUCCESS', 'structured_output': payload}}), flush=True)\n"
+        ),
+    )
+    monkeypatch.setattr(codex_room_review, "verify_role", lambda role, root: {"ok": True, "errors": []})
+    monkeypatch.setattr(codex_room_review, "resolve_codex_command", lambda: codex_prefix)
+    monkeypatch.setattr(codex_room_review, "resolve_agy_command", lambda: agy_prefix)
+
+    out_dir = tmp_path / "out_contradict_fallback"
+    rc = codex_room_review.main(
+        ["--commit", "HEAD", "--repo-root", str(repo_dir), "--out-dir", str(out_dir), "--backend", "auto"]
+    )
+    assert rc == 2
+    report = json.loads((out_dir / "consolidated-review.json").read_text(encoding="utf-8"))
+    assert report["review_gate_status"] == "BLOCKED"

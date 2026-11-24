@@ -149,13 +149,7 @@ def _run_git(
     binary: bool = False,
 ) -> subprocess.CompletedProcess[Any]:
     try:
-        return subprocess.run(
-            cmd,
-            capture_output=True,
-            text=not binary,
-            check=False,
-            timeout=timeout_sec if timeout_sec > 0 else None,
-        )
+        return run_managed_cmd(cmd, timeout_sec=timeout_sec, text=not binary)
     except subprocess.TimeoutExpired as exc:
         raise TimeoutError(f"Git command timed out after {timeout_sec:.1f}s: {' '.join(cmd)}") from exc
 
@@ -319,7 +313,7 @@ def _create_kill_on_close_job(k32: Any) -> int:
     return int(job)
 
 
-def spawn_managed_process(cmd: list[str], **popen_kwargs: Any) -> tuple[subprocess.Popen[str], int | None]:
+def spawn_managed_process(cmd: list[str], **popen_kwargs: Any) -> tuple[subprocess.Popen[Any], int | None]:
     """Spawn a subprocess contained in a Win32 Job Object (from CREATE_SUSPENDED) or POSIX session."""
     kwargs = dict(popen_kwargs)
     if os.name != "nt":
@@ -357,6 +351,49 @@ def spawn_managed_process(cmd: list[str], **popen_kwargs: Any) -> tuple[subproce
             except OSError:
                 pass
         raise
+
+
+def run_managed_cmd(
+    cmd: list[str],
+    *,
+    cwd: Path | None = None,
+    env: dict[str, str] | None = None,
+    timeout_sec: float = 60.0,
+    text: bool = True,
+    errors: str = "replace",
+) -> subprocess.CompletedProcess[Any]:
+    """Run a command inside a managed process tree, killing descendants on timeout."""
+    popen_kwargs: dict[str, Any] = {
+        "cwd": str(cwd) if cwd is not None else None,
+        "stdout": subprocess.PIPE,
+        "stderr": subprocess.PIPE,
+        "text": text,
+        "env": env,
+    }
+    if text:
+        popen_kwargs["encoding"] = "utf-8"
+        popen_kwargs["errors"] = errors
+
+    proc, job_handle = spawn_managed_process(cmd, **popen_kwargs)
+    try:
+        effective_timeout = timeout_sec if timeout_sec > 0 else None
+        stdout, stderr = proc.communicate(timeout=effective_timeout)
+        return subprocess.CompletedProcess(
+            args=cmd,
+            returncode=proc.returncode if proc.returncode is not None else 1,
+            stdout=stdout,
+            stderr=stderr,
+        )
+    except subprocess.TimeoutExpired:
+        terminate_process_tree(proc, job_handle=job_handle)
+        job_handle = None
+        try:
+            proc.communicate(timeout=2.0)
+        except subprocess.TimeoutExpired:
+            pass
+        raise
+    finally:
+        close_job_handle(job_handle)
 
 
 def close_job_handle(job_handle: int | None) -> None:

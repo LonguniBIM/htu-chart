@@ -20,9 +20,9 @@ from pathlib import Path
 from typing import Any
 
 try:
-    from harness.scripts.schema_utils import is_hex_sha40, is_strict_bool, is_strict_int, resolve_git_toplevel
+    from harness.scripts.schema_utils import is_hex_sha40, is_strict_bool, is_strict_int, resolve_git_toplevel, run_managed_cmd
 except ImportError:
-    from schema_utils import is_hex_sha40, is_strict_bool, is_strict_int, resolve_git_toplevel
+    from schema_utils import is_hex_sha40, is_strict_bool, is_strict_int, resolve_git_toplevel, run_managed_cmd
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
@@ -222,26 +222,16 @@ def _verify_evidence_ref(evidence_ref: str, candidate_sha: str, repo_root: Path)
         return False, f"evidence_ref requires a valid git repository: {exc}"
 
     try:
-        cat = subprocess.run(
-            ["git", "-C", str(git_top), "cat-file", "-e", f"{candidate_sha}^{{commit}}"],
-            capture_output=True,
-            check=False,
-            timeout=60.0,
-        )
+        cat = run_managed_cmd(["git", "-C", str(git_top), "cat-file", "-e", f"{candidate_sha}^{{commit}}"], timeout_sec=60.0)
     except subprocess.TimeoutExpired:
         return False, f"git timed out checking commit {candidate_sha[:12]}"
     if cat.returncode != 0:
         return False, f"evidence_ref commit {candidate_sha[:12]} does not exist in git repository"
 
     try:
-        obj_type = subprocess.run(
+        obj_type = run_managed_cmd(
             ["git", "-C", str(git_top), "cat-file", "-t", f"{candidate_sha}:{raw_path}"],
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            check=False,
-            timeout=60.0,
+            timeout_sec=60.0,
         )
     except subprocess.TimeoutExpired:
         return False, f"git timed out checking object type for {raw_path!r}"
@@ -249,14 +239,9 @@ def _verify_evidence_ref(evidence_ref: str, candidate_sha: str, repo_root: Path)
         return False, f"evidence_ref {raw_path!r} does not point to a file blob at commit {candidate_sha[:12]}"
 
     try:
-        blob = subprocess.run(
+        blob = run_managed_cmd(
             ["git", "-C", str(git_top), "show", f"{candidate_sha}:{raw_path}"],
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            check=False,
-            timeout=60.0,
+            timeout_sec=60.0,
         )
     except subprocess.TimeoutExpired:
         return False, f"git timed out reading {raw_path!r} at commit {candidate_sha[:12]}"
@@ -436,24 +421,22 @@ def _evaluate_verifier_gate(
         if s_status != "PASSED" or not is_strict_int(s_exit) or s_exit != 0:
             return "BLOCKED", [], [f"build_verifier step '{s_name}' did not pass cleanly (status={s_status!r}, exit_code={s_exit!r})."]
 
+    required_steps: set[str] = {"arch_check", "harness_ruff", "harness_pytest"}
+    if require_frozen or verifier_data.get("source_mode") == "frozen_commit_archive":
+        required_steps.add("upstream_fork_clean")
     if phase in {1, 2, 4, 5, 6}:
-        has_backend = any(
-            str(s.get("name", "")).startswith("backend")
-            or "backend" in " ".join(str(x) for x in s.get("command", []))
-            for s in steps
-        )
-        if not has_backend:
-            return "BLOCKED", [], [f"build_verifier missing required backend step(s) for phase {phase}."]
-
+        required_steps.update({"backend_ruff", "backend_pytest"})
     if phase in {3, 4, 6}:
-        has_frontend = any(
-            str(s.get("name", "")).startswith("frontend")
-            or "frontend" in " ".join(str(x) for x in s.get("command", []))
-            or "pnpm" in " ".join(str(x) for x in s.get("command", []))
-            for s in steps
+        required_steps.update({"frontend_typecheck", "frontend_build"})
+
+    passed_step_names = {str(s.get("name", "")) for s in steps}
+    missing_steps = sorted(required_steps - passed_step_names)
+    if missing_steps:
+        return (
+            "BLOCKED",
+            [],
+            [f"build_verifier missing required step(s) for phase {phase}: {', '.join(missing_steps)}."],
         )
-        if not has_frontend:
-            return "BLOCKED", [], [f"build_verifier missing required frontend step(s) for phase {phase}."]
 
     if require_frozen:
         if verifier_data.get("source_mode") != "frozen_commit_archive":

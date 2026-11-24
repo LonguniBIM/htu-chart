@@ -37,6 +37,7 @@ try:
         is_strict_int,
         materialize_frozen_tree,
         resolve_git_toplevel,
+        run_managed_cmd,
         spawn_managed_process,
         terminate_process_tree,
         validate_instance_against_schema,
@@ -50,6 +51,7 @@ except ImportError:
         is_strict_int,
         materialize_frozen_tree,
         resolve_git_toplevel,
+        run_managed_cmd,
         spawn_managed_process,
         terminate_process_tree,
         validate_instance_against_schema,
@@ -219,13 +221,7 @@ def _archive_failed_codex_logs(out_dir: Path, pass_names: tuple[str, ...] = ("pa
 
 def _git_output(repo_root: Path, args: list[str], *, timeout_sec: float = 60.0) -> subprocess.CompletedProcess[str]:
     try:
-        return subprocess.run(
-            ["git", "-C", str(repo_root), *args],
-            capture_output=True,
-            text=True,
-            check=False,
-            timeout=timeout_sec if timeout_sec > 0 else None,
-        )
+        return run_managed_cmd(["git", "-C", str(repo_root), *args], timeout_sec=timeout_sec)
     except subprocess.TimeoutExpired as exc:
         raise TimeoutError(f"Git command timed out after {timeout_sec:.1f}s: git {' '.join(args)}") from exc
 
@@ -881,13 +877,26 @@ def _merge_prior_pass_findings(
     """Preserve findings/issues from a completed Codex pass when falling back to agy."""
     if not isinstance(prior_payload, dict):
         return fallback_payload
+    schema = json.loads(SCHEMA_PATH.read_text(encoding="utf-8"))
+    if validate_instance_against_schema(prior_payload, schema):
+        return prior_payload
     if str(prior_payload.get("revision_sha", "")).strip() != expected_sha:
-        return fallback_payload
+        return prior_payload
+    if prior_payload.get("verdict") == "BLOCKED":
+        return prior_payload
+
+    prior_findings = list(prior_payload.get("findings", []))
+    prior_has_blocking = any(
+        str(f.get("severity", "")).lower() in BLOCKING_SEVERITIES
+        for f in prior_findings
+        if isinstance(f, dict)
+    )
+    if prior_payload.get("verdict") == "CHANGES_REQUESTED" and not prior_has_blocking:
+        return prior_payload
     if not isinstance(fallback_payload, dict):
         return prior_payload
 
     merged = dict(fallback_payload)
-    prior_findings = list(prior_payload.get("findings", []))
     fb_findings = list(fallback_payload.get("findings", []))
     merged["findings"] = [*prior_findings, *fb_findings]
     merged["test_quality_issues"] = _dedup_ordered(

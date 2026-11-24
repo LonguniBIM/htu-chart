@@ -12,26 +12,41 @@ from harness.scripts.receipt import evaluate_receipt, render_receipt_markdown
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
-def _verifier(sha: str, status: str = "VERIFIED", phase: int = 1) -> dict:
+def _verifier(sha: str, status: str = "VERIFIED", phase: int = 1, frozen: bool = False) -> dict:
     step_ok = status == "VERIFIED"
-    if phase == 0:
-        steps = [{"name": "harness_pytest", "command": ["pytest", "harness/tests"], "status": "PASSED" if step_ok else "FAILED", "exit_code": 0 if step_ok else 1}]
-    elif phase == 3:
-        steps = [{"name": "frontend_build", "command": ["pnpm", "--dir", "frontend", "build"], "status": "PASSED" if step_ok else "FAILED", "exit_code": 0 if step_ok else 1}]
-    elif phase in {4, 6}:
-        steps = [
-            {"name": "backend_pytest", "command": ["pytest", "backend/tests"], "status": "PASSED" if step_ok else "FAILED", "exit_code": 0 if step_ok else 1},
-            {"name": "frontend_build", "command": ["pnpm", "--dir", "frontend", "build"], "status": "PASSED" if step_ok else "FAILED", "exit_code": 0 if step_ok else 1},
-        ]
-    else:
-        steps = [{"name": "backend_pytest", "command": ["pytest", "backend/tests"], "status": "PASSED" if step_ok else "FAILED", "exit_code": 0 if step_ok else 1}]
-    return {
+    step_status = "PASSED" if step_ok else "FAILED"
+    step_exit = 0 if step_ok else 1
+    steps = [
+        {"name": "arch_check", "command": ["python", "harness/scripts/arch_check.py"], "status": step_status, "exit_code": step_exit},
+        {"name": "harness_ruff", "command": ["ruff", "check", "harness"], "status": step_status, "exit_code": step_exit},
+        {"name": "harness_pytest", "command": ["pytest", "harness/tests", "-q"], "status": step_status, "exit_code": step_exit},
+    ]
+    if frozen:
+        steps.append({"name": "upstream_fork_clean", "command": ["git", "status"], "status": "PASSED", "exit_code": 0})
+    if phase in {1, 2, 4, 5, 6}:
+        steps.extend(
+            [
+                {"name": "backend_ruff", "command": ["ruff", "check", "backend"], "status": step_status, "exit_code": step_exit},
+                {"name": "backend_pytest", "command": ["pytest", "backend/tests", "-q"], "status": step_status, "exit_code": step_exit},
+            ]
+        )
+    if phase in {3, 4, 6}:
+        steps.extend(
+            [
+                {"name": "frontend_typecheck", "command": ["pnpm", "--dir", "frontend", "typecheck"], "status": step_status, "exit_code": step_exit},
+                {"name": "frontend_build", "command": ["pnpm", "--dir", "frontend", "build"], "status": step_status, "exit_code": step_exit},
+            ]
+        )
+    payload: dict = {
         "status": status,
         "phase": phase,
         "git_sha": sha,
         "worktree_dirty": False,
         "steps": steps,
     }
+    if frozen:
+        payload["source_mode"] = "frozen_commit_archive"
+    return payload
 
 
 def _review(sha: str, passes: int = 2, independent: bool = True, findings: list[dict] | None = None) -> dict:
@@ -361,10 +376,28 @@ def test_receipt_blocks_dirty_worktree_empty_steps_and_failed_step_despite_verif
     assert res_step["conclusion"] == "FAILED"
 
 
-def test_receipt_rejects_refuted_disposition_with_nonexistent_file_or_line() -> None:
-    """NC-05: REFUTED_WITH_EVIDENCE must point to an existing file and valid line range."""
-    base = "1" * 40
-    cand = "2" * 40
+def test_receipt_rejects_refuted_disposition_with_nonexistent_file_or_line(tmp_path: Path) -> None:
+    """NC-05: REFUTED_WITH_EVIDENCE must point to an existing blob and valid line range in candidate_sha."""
+    repo = tmp_path / "git_nc05"
+    sec_file = repo / "backend" / "app" / "security.py"
+    sec_file.parent.mkdir(parents=True, exist_ok=True)
+    sec_file.write_text("# base\n", encoding="utf-8")
+    subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=repo, check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.name", "Test User"], cwd=repo, check=True, capture_output=True)
+    subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+    subprocess.run(["git", "commit", "-m", "base"], cwd=repo, check=True, capture_output=True)
+    base = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=repo, check=True, capture_output=True, text=True
+    ).stdout.strip()
+
+    sec_file.write_text("\n".join(f"# line {i}" for i in range(1, 21)) + "\n", encoding="utf-8")
+    subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+    subprocess.run(["git", "commit", "-m", "cand"], cwd=repo, check=True, capture_output=True)
+    cand = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=repo, check=True, capture_output=True, text=True
+    ).stdout.strip()
+
     finding = {"id": "P1-55", "severity": "high", "blocking": True, "title": "Real bug"}
 
     bad_file_res = evaluate_receipt(
@@ -384,8 +417,9 @@ def test_receipt_rejects_refuted_disposition_with_nonexistent_file_or_line() -> 
                 }
             ]
         },
+        repo_root=repo,
     )
-    assert bad_file_res["conclusion"] != "VERIFIED"
+    assert bad_file_res["conclusion"] == "FAILED"
 
     bad_line_res = evaluate_receipt(
         task_id="NC-05B",
@@ -404,8 +438,10 @@ def test_receipt_rejects_refuted_disposition_with_nonexistent_file_or_line() -> 
                 }
             ]
         },
+        repo_root=repo,
     )
-    assert bad_line_res["conclusion"] != "VERIFIED"
+    assert bad_line_res["conclusion"] == "FAILED"
+    assert any("exceeds" in msg for msg in bad_line_res["failures"])
 
 
 def test_receipt_blocks_invalid_red_proof_shas_and_boolean_exit_codes() -> None:
@@ -699,6 +735,40 @@ def test_receipt_preserves_root_and_drive_root_directory_targets() -> None:
     assert drive_root_vs_rel["conclusion"] == "BLOCKED"
 
 
+def test_receipt_blocks_when_mandatory_phase_steps_are_missing() -> None:
+    """P1-002: Missing mandatory step names for the given phase must return BLOCKED."""
+    base = "1" * 40
+    cand = "2" * 40
+
+    phase0_only_arch = _verifier(cand, phase=0)
+    phase0_only_arch["steps"] = [s for s in phase0_only_arch["steps"] if s["name"] == "arch_check"]
+    res_p0 = evaluate_receipt(
+        task_id="P1-002-P0",
+        phase=0,
+        base_sha=base,
+        candidate_sha=cand,
+        verifier_data=phase0_only_arch,
+        review_data=_review(cand),
+    )
+    assert res_p0["conclusion"] == "BLOCKED"
+    assert any("harness_ruff" in b or "harness_pytest" in b for b in res_p0["blockers"])
+
+    phase1_missing_be_pytest = _verifier(cand, phase=1)
+    phase1_missing_be_pytest["steps"] = [
+        s for s in phase1_missing_be_pytest["steps"] if s["name"] != "backend_pytest"
+    ]
+    res_p1 = evaluate_receipt(
+        task_id="P1-002-P1",
+        phase=1,
+        base_sha=base,
+        candidate_sha=cand,
+        verifier_data=phase1_missing_be_pytest,
+        review_data=_review(cand),
+    )
+    assert res_p1["conclusion"] == "BLOCKED"
+    assert any("backend_pytest" in b for b in res_p1["blockers"])
+
+
 def test_receipt_blocks_none_verifier_steps_without_crashing() -> None:
     """P1-07: verifier_data with steps=None must return BLOCKED without TypeError."""
     base = "1" * 40
@@ -862,8 +932,7 @@ def test_receipt_task_manifest_require_frozen_and_git_commit_evidence(tmp_path: 
     assert mismatch_cmd_res["conclusion"] == "BLOCKED"
 
     # --require-frozen rejects worktree mode and mismatched hashes
-    frozen_v = _verifier(cand_sha)
-    frozen_v["source_mode"] = "frozen_commit_archive"
+    frozen_v = _verifier(cand_sha, frozen=True)
     frozen_v["frozen_tree_sha256"] = "a" * 64
     frozen_r = _review(cand_sha)
     frozen_r["frozen_tree_sha256"] = "b" * 64
