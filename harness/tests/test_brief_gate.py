@@ -502,3 +502,104 @@ def test_p2_007_strips_html_comments_and_rejects_template_placeholders(tmp_path:
     tpl_file = tpl / "task-packet-template.md"
     res_tpl = brief_gate.validate_brief(tpl_file, repo_root=tmp_path)
     assert res_tpl["status"] != "VALID"
+
+
+def test_p1_003_zero_depth_globstar_and_nested_headings_and_policy_union(tmp_path: Path) -> None:
+    """Zero-depth **/ globstars overlap, nested headings stay intact, policy keeps defaults."""
+    base_sha = _init_git_repo(
+        tmp_path,
+        extra_files={
+            "secret.py": "S = 1\n",
+            "backend/cfg.py": "C = 1\n",
+            "backend/app/security.py": "SEC = 1\n",
+            "backend_extra/x.py": "X = 1\n",
+        },
+    )
+
+    # Zero-depth **/ globstars: **/secret.py vs secret.py and backend/**/cfg.py vs backend/cfg.py
+    p_glob1 = tmp_path / "p_glob1.md"
+    p_glob1.write_text(
+        _render_packet(
+            base_sha,
+            owned_lines=["  - `secret.py` (modify)"],
+            denied_lines=["  - `**/secret.py`", "  - `../lightweight-charts/**`"],
+        ),
+        encoding="utf-8",
+    )
+    assert brief_gate.validate_brief(p_glob1, repo_root=tmp_path)["status"] == "BLOCKED_BRIEF"
+
+    p_glob2 = tmp_path / "p_glob2.md"
+    p_glob2.write_text(
+        _render_packet(
+            base_sha,
+            owned_lines=["  - `backend/cfg.py` (modify)"],
+            denied_lines=["  - `backend/**/cfg.py`", "  - `../lightweight-charts/**`"],
+        ),
+        encoding="utf-8",
+    )
+    assert brief_gate.validate_brief(p_glob2, repo_root=tmp_path)["status"] == "BLOCKED_BRIEF"
+
+    # backend/** must NOT block backend_extra/x.py
+    p_extra = tmp_path / "p_extra.md"
+    p_extra.write_text(
+        _render_packet(
+            base_sha,
+            owned_lines=["  - `backend_extra/x.py` (modify)"],
+            denied_lines=["  - `backend/**`", "  - `../lightweight-charts/**`"],
+        ),
+        encoding="utf-8",
+    )
+    assert brief_gate.validate_brief(p_extra, repo_root=tmp_path)["status"] == "VALID"
+
+    # Nested heading + numbered bold item must not pop enclosing ### Security heading
+    nested_sec = (
+        "\n### Security / Read-Only Invariants\n"
+        "1. **Boundary**: Loopback bind only.\n"
+        "2. **Read-Only**: Enforce SEC-001.\n"
+    )
+    p_nested = tmp_path / "p_nested.md"
+    p_nested.write_text(
+        _render_packet(
+            base_sha,
+            owned_lines=["  - `backend/app/security.py` (modify)"],
+            extra_sections=nested_sec,
+        ),
+        encoding="utf-8",
+    )
+    assert brief_gate.validate_brief(p_nested, repo_root=tmp_path)["status"] == "VALID"
+
+    # Policy with excluded_model_prefixes=[] still retains DEFAULT_EXCLUDED_MODEL_PREFIXES
+    policy = tmp_path / "harness" / "model-policy.json"
+    policy.parent.mkdir(parents=True, exist_ok=True)
+    policy.write_text(json.dumps({"excluded_model_prefixes": ["custom-banned"]}), encoding="utf-8")
+    prefixes, sha, err = brief_gate._load_policy(tmp_path, policy)
+    assert err is None and sha is not None
+    assert "gemini-3.8-flash" in prefixes
+    assert "custom-banned" in prefixes
+
+    # Template with Layer 1 headers filled but Layer 2 boilerplate left unedited -> NEEDS_REPLAN
+    tpl_file = (
+        REPO_ROOT / ".agents" / "skills" / "slp-orchestrator" / "references"
+        / "task-packet-template.md"
+    )
+    tpl_text = tpl_file.read_text(encoding="utf-8")
+    filled = (
+        tpl_text.replace("<TASK_ID>", "T-TPL-01")
+        .replace("<ROOT_TASK_ID>", "T-TPL-01")
+        .replace("<0..6>", "1")
+        .replace("<F01..F08 / R01..R06 / None>", "None")
+        .replace("<40-char lowercase git SHA>", base_sha)
+        .replace("<Yes | No>", "Yes")
+        .replace(
+            "<None | persistence, concurrency, websocket, security, auth, session_calendar>",
+            "concurrency",
+        )
+        .replace("<positive float, e.g. 6.00>", "6.00")
+        .replace("  - `<path/to/new_file.py>` (new)\n", "")
+        .replace("  - `backend/**`\n", "")
+        .replace("<path/to/existing_file.py>", "backend/app/domain.py")
+    )
+    p_tpl_l1 = tmp_path / "p_tpl_l1.md"
+    p_tpl_l1.write_text(filled, encoding="utf-8")
+    rc_tpl = brief_gate.main(["--packet", str(p_tpl_l1), "--repo-root", str(tmp_path)])
+    assert rc_tpl == 1

@@ -653,3 +653,179 @@ def test_p2_005_006_concurrent_reservations_and_nan_bool_guards(tmp_path: Path) 
     )
     assert rc_refuse == 2
     assert l_refuse["state"] == "PAUSED_BUDGET"
+
+
+def test_p1_001_003_004_005_006_007_hardening(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Cover 0-token BLOCKED stderr, prose signal, crash, exact scope, policy, idempotency."""
+    base_sha, pkt, readiness = _setup_repo_with_valid_packet(tmp_path, budget_usd=3.0)
+
+    # P1-006: root_task_id path traversal rejected
+    with pytest.raises(ValueError, match="Invalid root_task_id"):
+        task_runner.default_ledger_path("../escape", repo_root=tmp_path)
+
+    # P1-003: exact owned-file match rejects parent/prefix paths
+    scope_errs = task_runner._check_write_scope(
+        ["backend/app"],
+        ["backend/app/feature.py"],
+        ["**/secret.py"],
+    )
+    assert scope_errs and any("outside Owned Paths" in e for e in scope_errs)
+    glob_errs = task_runner._check_write_scope(
+        ["secret.py"],
+        ["secret.py"],
+        ["**/secret.py"],
+    )
+    assert glob_errs and any("Denied Paths" in e for e in glob_errs)
+
+    ledger_path = tmp_path / "ledger.json"
+    task_runner.init_or_load_ledger(
+        ledger_path, root_task_id="T-RUN-01", base_sha=base_sha, budget_usd=3.0
+    )
+
+    # P1-005: idempotent reservation_id does not double-count on retry
+    ok1, l_d1, rc_d1, _ = task_runner.check_dispatch(
+        ledger_path,
+        readiness,
+        pkt,
+        "gemini-4-hydrogen-high",
+        repo_root=tmp_path,
+        reserve_usd=2.0,
+        reservation_id="peer-r1",
+    )
+    assert ok1 and rc_d1 == 0
+    assert l_d1["active_reservations"]["peer-r1"] == pytest.approx(2.0)
+    ok2, l_d2, rc_d2, _ = task_runner.check_dispatch(
+        ledger_path,
+        readiness,
+        pkt,
+        "gemini-4-hydrogen-high",
+        repo_root=tmp_path,
+        reserve_usd=2.0,
+        reservation_id="peer-r1",
+    )
+    assert ok2 and rc_d2 == 0
+    assert sum(l_d2["active_reservations"].values()) == pytest.approx(2.0)
+
+    # P1-001: 0-token startup error with "BLOCKED" in stderr still classifies as INFRA_STARTUP_ERROR
+    out_inf, l_inf, rc_inf = task_runner.record_peer_outcome(
+        ledger_path,
+        raw_output="ERROR: BLOCKED by backend empty conversation id",
+        exit_code=1,
+        total_tokens=0,
+        repo_root=tmp_path,
+    )
+    assert out_inf == "INFRA_STARTUP_ERROR" and rc_inf == 0
+    assert l_inf["state"] == "ACTIVE_PEER_G1"
+
+    # P1-001: non-zero-token Peer crash classifies as PEER_ROUND_FAILED and counts failure
+    out_crash, l_crash, rc_crash = task_runner.record_peer_outcome(
+        ledger_path,
+        raw_output="Traceback: crashed mid-round",
+        exit_code=1,
+        total_tokens=250,
+        repo_root=tmp_path,
+    )
+    assert out_crash == "PEER_ROUND_FAILED" and rc_crash == 1
+    assert l_crash["total_candidates"] == 1
+    assert l_crash["consecutive_failed_candidates"] == 1
+
+    # P1-001: prose mentioning REOPEN_REQUEST must NOT override CANDIDATE_READY + candidate_sha
+    (tmp_path / "backend" / "app" / "feature.py").write_text("VALUE = 7\n", encoding="utf-8")
+    _git(tmp_path, "add", "backend/app/feature.py")
+    _git(tmp_path, "commit", "-m", "cand prose")
+    c_sha = _git(tmp_path, "rev-parse", "HEAD")
+
+    out_prose, l_prose, rc_prose = task_runner.record_peer_outcome(
+        ledger_path,
+        raw_output="Note: do not raise REOPEN_REQUEST lightly.\nCANDIDATE_READY",
+        candidate_sha=c_sha,
+        readiness_path=readiness,
+        packet_path=pkt,
+        repo_root=tmp_path,
+    )
+    assert out_prose == "CANDIDATE_READY" and rc_prose == 0
+    assert l_prose["state"] == "VERIFY_FROZEN_G3"
+
+    # P1-004: stale SHA at G3 is rejected; G3 BLOCKED transitions to BLOCKED
+    l_stale_g3, rc_stale_g3 = task_runner.record_gate_outcome(
+        ledger_path, gate="G3", outcome="PASSED", candidate_sha="0" * 40
+    )
+    assert rc_stale_g3 == 2 and l_stale_g3["state"] == "VERIFY_FROZEN_G3"
+
+    l_blk_g3, rc_blk_g3 = task_runner.record_gate_outcome(
+        ledger_path, gate="G3", outcome="BLOCKED", candidate_sha=c_sha
+    )
+    assert rc_blk_g3 == 2 and l_blk_g3["state"] == "BLOCKED"
+
+    # P1-005: post-VERIFIED record_usage keeps state == VERIFIED & reserve_budget refuses
+    l_v = task_runner.load_ledger(ledger_path)
+    l_v["state"] = "VERIFIED"
+    task_runner.save_ledger(ledger_path, l_v)
+    l_post_u, _, rc_post_u = task_runner.record_usage(
+        ledger_path, model="gemini-4-neon-high", input_tokens=2_000_000
+    )
+    assert rc_post_u == 0 and l_post_u["state"] == "VERIFIED"
+    ok_post_r, l_post_r, rc_post_r = task_runner.reserve_budget(ledger_path, "after-done", 0.1)
+    assert not ok_post_r and rc_post_r == 2 and l_post_r["state"] == "VERIFIED"
+
+    # P1-007: malformed model-policy.json fails closed in check_dispatch
+    ledger_pol = tmp_path / "ledger_pol.json"
+    task_runner.init_or_load_ledger(
+        ledger_pol, root_task_id="T-RUN-01", base_sha=base_sha, budget_usd=3.0
+    )
+    pol_file = tmp_path / "harness" / "model-policy.json"
+    pol_file.parent.mkdir(parents=True, exist_ok=True)
+    pol_file.write_text("{invalid", encoding="utf-8")
+    ok_pol, l_pol, rc_pol, _ = task_runner.check_dispatch(
+        ledger_pol, readiness, pkt, "gemini-4-hydrogen-high", repo_root=tmp_path
+    )
+    assert not ok_pol and rc_pol == 2 and l_pol["state"] == "BLOCKED"
+
+    # P1-006: run_review_gate_step command construction & outer timeout
+    captured: list[tuple[list[str], float]] = []
+
+    def _fake_run(cmd: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        captured.append((cmd, float(_kwargs.get("timeout_sec", 0.0))))
+        return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(task_runner, "run_managed_cmd", _fake_run)
+    task_runner.run_brief_gate_step(
+        pkt, tmp_path / "r_out.json", repo_root=tmp_path, ledger=l_v
+    )
+    task_runner.run_verifier_gate_step(
+        phase=0, commit_sha=c_sha, out_json=tmp_path / "v.json", repo_root=tmp_path, ledger=l_v
+    )
+    task_runner.run_review_gate_step(
+        commit_sha=c_sha,
+        task_id="T-RUN-01",
+        packet_path=pkt,
+        out_dir=tmp_path / "rev_out",
+        base_sha=base_sha,
+        repo_root=tmp_path,
+        ledger=l_v,
+    )
+    task_runner.run_receipt_gate_step(
+        task_id="T-RUN-01",
+        phase=0,
+        base_sha=base_sha,
+        candidate_sha=c_sha,
+        verifier_json=tmp_path / "v.json",
+        review_json=tmp_path / "rev_out" / "consolidated-review.json",
+        readiness_json=readiness,
+        out_dir=tmp_path / "rec_out",
+        repo_root=tmp_path,
+        ledger=l_v,
+    )
+    brief_cmd, _ = captured[0]
+    ver_cmd, _ = captured[1]
+    rev_cmd, rev_timeout = captured[2]
+    rec_cmd, _ = captured[3]
+    assert "--out" in brief_cmd and "--json" in brief_cmd
+    assert "--strict-clean" in ver_cmd and "--commit" in ver_cmd
+    assert "--repo-root" in rev_cmd and "--base" in rev_cmd
+    assert "--timeout" in rev_cmd and "--idle-timeout" in rev_cmd
+    assert rev_timeout >= 1260.0
+    assert "--task-manifest" in rec_cmd and "--candidate-sha" in rec_cmd

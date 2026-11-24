@@ -82,6 +82,11 @@ DEFAULT_PRICING_PER_1M: dict[str, dict[str, float]] = {
 OPAQUE_MODEL_ALIASES = frozenset({"flash", "flash_lite", "pro", "inherit"})
 DISPATCH_ALLOWED_STATES = frozenset({"INTAKE_G0", "BRIEF_GATE_G05", "ACTIVE_PEER_G1"})
 PEER_ESCALATION_SIGNALS = frozenset({"REOPEN_REQUEST", "DEPENDENCY_REQUEST", "BLOCKED"})
+SAFE_TASK_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+SIGNAL_HEADER_RE = re.compile(
+    r"^\s*(?:@\S+\s+)?(?:\[[^\]]+\]\s+)?(?:#+\s*|\*\*|`)*"
+    r"\b(CANDIDATE_READY|REOPEN_REQUEST|DEPENDENCY_REQUEST|BLOCKED)\b"
+)
 
 
 def _now_utc() -> datetime:
@@ -199,9 +204,19 @@ def _ledger_lock(ledger_path: Path) -> Iterator[None]:
             fh.close()
 
 
+def _validate_safe_task_id(task_id: str, label: str = "root_task_id") -> str:
+    cleaned = task_id.strip() if isinstance(task_id, str) else ""
+    if not cleaned or not SAFE_TASK_ID_RE.fullmatch(cleaned):
+        raise ValueError(
+            f"Invalid {label} {task_id!r} (must match {SAFE_TASK_ID_RE.pattern})."
+        )
+    return cleaned
+
+
 def default_ledger_path(root_task_id: str, repo_root: Path | None = None) -> Path:
+    safe_id = _validate_safe_task_id(root_task_id, "root_task_id")
     root = (repo_root or REPO_ROOT).resolve()
-    return root / "harness" / "runs" / root_task_id / "ledger.json"
+    return root / "harness" / "runs" / safe_id / "ledger.json"
 
 
 def save_ledger(ledger_path: Path, ledger: dict[str, Any]) -> None:
@@ -274,8 +289,9 @@ def init_or_load_ledger(
     circuit_breakers: dict[str, int] | None = None,
 ) -> dict[str, Any]:
     """Create a new ledger keyed by ``root_task_id`` or load the existing one intact."""
-    if not root_task_id.strip():
-        raise ValueError("root_task_id must be a non-empty string.")
+    safe_root_id = _validate_safe_task_id(root_task_id, "root_task_id")
+    if task_id is not None:
+        _validate_safe_task_id(task_id, "task_id")
     valid_budget = _require_finite_number(budget_usd, "budget_usd", positive=True)
     if not is_strict_int(packet_version) or packet_version < 1:
         raise ValueError(f"packet_version must be integer >= 1, got {packet_version!r}.")
@@ -283,7 +299,7 @@ def init_or_load_ledger(
     resolved = ledger_path.resolve()
     with _ledger_lock(resolved):
         if resolved.is_file():
-            return load_ledger(resolved, expected_root_task_id=root_task_id)
+            return load_ledger(resolved, expected_root_task_id=safe_root_id)
 
         now_iso = _now_utc().isoformat()
         merged_deadlines = dict(DEFAULT_DEADLINES_SEC)
@@ -295,8 +311,8 @@ def init_or_load_ledger(
 
         ledger: dict[str, Any] = {
             "schema_version": 2,
-            "root_task_id": root_task_id,
-            "task_id": task_id or root_task_id,
+            "root_task_id": safe_root_id,
+            "task_id": task_id or safe_root_id,
             "packet_version": int(packet_version),
             "base_sha": base_sha,
             "candidate_sha": None,
@@ -425,12 +441,17 @@ def run_review_gate_step(
     task_id: str,
     packet_path: Path,
     out_dir: Path,
+    base_sha: str | None = None,
     repo_root: Path | None = None,
     ledger: dict[str, Any] | None = None,
 ) -> subprocess.CompletedProcess[str]:
-    """Execute ``codex_room_review.py`` via managed subprocess with reviewer deadline."""
+    """Execute ``codex_room_review.py`` via managed subprocess with reviewer deadlines."""
     root = (repo_root or REPO_ROOT).resolve()
     script = Path(__file__).resolve().parent / "codex_room_review.py"
+    deadlines = (ledger or {}).get("deadlines_sec", DEFAULT_DEADLINES_SEC)
+    pass_total = int(deadlines.get("reviewer_pass_total", 600))
+    pass_idle = int(deadlines.get("reviewer_pass_idle", 180))
+    effective_base = base_sha or (str(ledger.get("base_sha", "")) if ledger else "")
     cmd = [
         sys.executable,
         str(script),
@@ -440,11 +461,26 @@ def run_review_gate_step(
         task_id,
         "--task-packet",
         str(packet_path),
+        "--repo-root",
+        str(root),
         "--out-dir",
         str(out_dir),
+        "--timeout",
+        str(pass_total),
+        "--idle-timeout",
+        str(pass_idle),
         "--fail-on-blocking",
     ]
-    return run_managed_stage_cmd("reviewer_pass_total", cmd, ledger=ledger, cwd=root)
+    if effective_base:
+        cmd.extend(["--base", effective_base])
+    outer_timeout = float(max(pass_total * 2 + 60, pass_total + 60))
+    return run_managed_stage_cmd(
+        "reviewer_pass_total",
+        cmd,
+        ledger=ledger,
+        cwd=root,
+        timeout_override=outer_timeout,
+    )
 
 
 def run_receipt_gate_step(
@@ -521,18 +557,40 @@ def _is_model_excluded(
     return any(norm.startswith(p.lower()) for p in excluded_prefixes)
 
 
-def _load_excluded_prefixes(repo_root: Path) -> tuple[str, ...]:
+def _load_policy_state(repo_root: Path) -> tuple[tuple[str, ...], str | None, str | None]:
     policy_file = repo_root / "harness" / "model-policy.json"
     if not policy_file.is_file():
-        return DEFAULT_EXCLUDED_MODEL_PREFIXES
+        return DEFAULT_EXCLUDED_MODEL_PREFIXES, None, None
     try:
-        data = json.loads(policy_file.read_text(encoding="utf-8"))
-        prefixes = data.get("excluded_model_prefixes")
-        if isinstance(prefixes, list) and all(isinstance(p, str) for p in prefixes):
-            return tuple(p.strip() for p in prefixes if p.strip())
-    except (OSError, json.JSONDecodeError):
-        pass
-    return DEFAULT_EXCLUDED_MODEL_PREFIXES
+        raw_bytes = policy_file.read_bytes()
+        data = json.loads(raw_bytes.decode("utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        return (
+            DEFAULT_EXCLUDED_MODEL_PREFIXES,
+            None,
+            f"Malformed model-policy.json ({policy_file}): {exc}",
+        )
+    if not isinstance(data, dict):
+        return DEFAULT_EXCLUDED_MODEL_PREFIXES, None, "model-policy.json must be a JSON object."
+
+    prefixes = data.get("excluded_model_prefixes", [])
+    if not isinstance(prefixes, list) or not all(
+        isinstance(p, str) and p.strip() for p in prefixes
+    ):
+        return (
+            DEFAULT_EXCLUDED_MODEL_PREFIXES,
+            None,
+            "model-policy.json 'excluded_model_prefixes' must be a list of non-empty strings.",
+        )
+
+    merged: list[str] = list(DEFAULT_EXCLUDED_MODEL_PREFIXES)
+    seen = {p.lower() for p in merged}
+    for raw_p in prefixes:
+        cleaned = raw_p.strip()
+        if cleaned.lower() not in seen:
+            merged.append(cleaned)
+            seen.add(cleaned.lower())
+    return tuple(merged), _sha256_bytes(raw_bytes), None
 
 
 def check_dispatch(
@@ -549,6 +607,8 @@ def check_dispatch(
     """Validate state, readiness hash, model policy, breakers, and budget before Peer launch."""
     root = (repo_root or REPO_ROOT).resolve()
     valid_reserve = _require_finite_number(reserve_usd, "reserve_usd")
+    if valid_reserve > 0 and (not reservation_id or not reservation_id.strip()):
+        raise ValueError("reservation_id must be non-empty when reserve_usd > 0.")
 
     with _ledger_lock(ledger_path):
         return _check_dispatch_locked(
@@ -700,7 +760,23 @@ def _check_dispatch_locked(
         save_ledger(ledger_path, ledger)
         return False, ledger, 2, msg
 
-    excluded_prefixes = _load_excluded_prefixes(root)
+    excluded_prefixes, current_policy_sha, policy_err = _load_policy_state(root)
+    if policy_err:
+        ledger["state"] = "BLOCKED"
+        _append_event(ledger, "MODEL_POLICY_BLOCKED", {"reason": policy_err})
+        save_ledger(ledger_path, ledger)
+        return False, ledger, 2, policy_err
+
+    if readiness.get("policy_sha256") != current_policy_sha:
+        ledger["state"] = "BLOCKED_BRIEF"
+        msg = (
+            f"Stale readiness.json: policy_sha256 mismatch "
+            f"({readiness.get('policy_sha256')!r} != {current_policy_sha!r})."
+        )
+        _append_event(ledger, "DISPATCH_BLOCKED_BRIEF", {"reason": msg})
+        save_ledger(ledger_path, ledger)
+        return False, ledger, 2, msg
+
     eligible = readiness.get("eligible_peer_models", [])
     if (
         _is_model_excluded(peer_model, excluded_prefixes)
@@ -751,13 +827,19 @@ def _check_dispatch_locked(
         save_ledger(ledger_path, ledger)
         return False, ledger, 2, msg
 
-    committed = _refresh_budget_warning(ledger)
+    _refresh_budget_warning(ledger)
+    spent = float(ledger.get("spent_api_equiv_usd", 0.0))
+    reservations = ledger.get("active_reservations", {})
+    other_reserved = sum(
+        float(v) for k, v in reservations.items() if k != reservation_id
+    )
+    projected_committed = round(spent + other_reserved + reserve_usd, 8)
     limit = float(ledger["budget_limit_usd"])
-    if round(committed + reserve_usd, 8) > round(limit, 8):
+    if projected_committed > round(limit, 8):
         ledger["state"] = "PAUSED_BUDGET"
         msg = (
-            f"Budget exceeded: committed ${committed:.4f} + reserve ${reserve_usd:.4f} > "
-            f"limit ${limit:.4f}."
+            f"Budget exceeded: committed ${spent + other_reserved:.4f} + "
+            f"reserve ${reserve_usd:.4f} > limit ${limit:.4f}."
         )
         _append_event(ledger, "BUDGET_EXCEEDED", {"reason": msg})
         save_ledger(ledger_path, ledger)
@@ -786,13 +868,56 @@ def _apply_candidate_failure_breakers(ledger: dict[str, Any]) -> str:
     return str(ledger["state"])
 
 
-def _extract_peer_signal(raw_output: str | None) -> str | None:
+def _extract_peer_signals(raw_output: str | None) -> list[str]:
     if not raw_output:
+        return []
+    stripped = raw_output.strip()
+    if stripped.startswith("{"):
+        try:
+            payload = json.loads(stripped)
+            if isinstance(payload, dict) and isinstance(payload.get("signal"), str):
+                sig_val = payload["signal"].strip().upper()
+                allowed_sigs = PEER_ESCALATION_SIGNALS | {
+                    "CANDIDATE_READY",
+                    "INFRA_STARTUP_ERROR",
+                }
+                if sig_val in allowed_sigs:
+                    return [sig_val]
+        except json.JSONDecodeError:
+            pass
+
+    found: list[str] = []
+    for line in raw_output.splitlines():
+        l_strip = line.strip()
+        if l_strip.startswith("{"):
+            try:
+                payload = json.loads(l_strip)
+                if isinstance(payload, dict) and isinstance(payload.get("signal"), str):
+                    sig_val = payload["signal"].strip().upper()
+                    if sig_val in (
+                        PEER_ESCALATION_SIGNALS | {"CANDIDATE_READY", "INFRA_STARTUP_ERROR"}
+                    ):
+                        found.append(sig_val)
+                        continue
+            except json.JSONDecodeError:
+                pass
+        match = SIGNAL_HEADER_RE.match(line)
+        if match:
+            found.append(match.group(1).upper())
+    return found
+
+
+def _extract_peer_signal(raw_output: str | None, *, has_candidate_sha: bool = False) -> str | None:
+    signals = _extract_peer_signals(raw_output)
+    if not signals:
         return None
-    for sig in ("REOPEN_REQUEST", "DEPENDENCY_REQUEST", "CANDIDATE_READY", "BLOCKED"):
-        if re.search(rf"\b{sig}\b", raw_output):
-            return sig
-    return None
+    if has_candidate_sha:
+        if "CANDIDATE_READY" in signals:
+            return "CANDIDATE_READY"
+        for sig in signals:
+            if sig in PEER_ESCALATION_SIGNALS:
+                return sig
+    return signals[0]
 
 
 def _normalize_owned_and_denied(
@@ -827,6 +952,7 @@ def _check_write_scope(
     if not changed_files:
         violations.append("Candidate diff is empty (no files changed vs base_sha).")
         return violations
+    owned_lower = {_normalize_rel_path(o).lower() for o in owned_paths}
     for rel in changed_files:
         norm = _normalize_rel_path(rel)
         path_err = _validate_rel_path(norm, is_owned=True)
@@ -836,7 +962,7 @@ def _check_write_scope(
         if any(_paths_overlap(norm, d) for d in denied_paths):
             violations.append(f"Changed file {norm!r} matches Denied Paths.")
             continue
-        if not any(_paths_overlap(norm, o) for o in owned_paths):
+        if norm.lower() not in owned_lower:
             violations.append(f"Changed file {norm!r} is outside Owned Paths.")
     return violations
 
@@ -906,16 +1032,16 @@ def _record_peer_outcome_locked(
             f"(expected 'ACTIVE_PEER_G1')."
         )
 
-    detected_signal = (signal or _extract_peer_signal(raw_output) or "").strip().upper()
     norm_status = str(status or "").strip().upper()
+    explicit_sig = signal.strip().upper() if signal is not None else ""
 
+    # Evaluate 0-token startup failure BEFORE scanning raw_output prose/stderr
     is_infra_zero_tok = (
-        detected_signal not in PEER_ESCALATION_SIGNALS
-        and detected_signal != "CANDIDATE_READY"
-        and (exit_code != 0 or norm_status == "ERROR")
+        explicit_sig in {"", "INFRA_STARTUP_ERROR"}
+        and (norm_status == "ERROR" or (exit_code is not None and exit_code != 0))
         and total_tokens == 0
     )
-    if detected_signal == "INFRA_STARTUP_ERROR" or is_infra_zero_tok:
+    if explicit_sig == "INFRA_STARTUP_ERROR" or is_infra_zero_tok:
         max_retries = int(
             ledger["circuit_breakers"]["max_transient_retries_per_provider_pass"]
         )
@@ -940,6 +1066,13 @@ def _record_peer_outcome_locked(
         save_ledger(ledger_path, ledger)
         return "INFRA_STARTUP_ERROR", ledger, 2
 
+    has_cand = candidate_sha is not None
+    detected_signal = explicit_sig or (
+        _extract_peer_signal(raw_output, has_candidate_sha=has_cand) or ""
+    )
+    if not detected_signal and has_cand:
+        detected_signal = "CANDIDATE_READY"
+
     if detected_signal in PEER_ESCALATION_SIGNALS:
         ledger["transient_retries_in_stage"] = 0
         ledger["state"] = "NEEDS_REPLAN"
@@ -951,7 +1084,7 @@ def _record_peer_outcome_locked(
         save_ledger(ledger_path, ledger)
         return detected_signal, ledger, 0
 
-    if detected_signal == "CANDIDATE_READY" or candidate_sha:
+    if detected_signal == "CANDIDATE_READY" or candidate_sha is not None:
         if readiness_path is None or not readiness_path.is_file():
             raise ValueError("CANDIDATE_READY requires a valid readiness.json path.")
         readiness = json.loads(readiness_path.read_text(encoding="utf-8"))
@@ -997,22 +1130,43 @@ def _record_peer_outcome_locked(
             save_ledger(ledger_path, ledger)
             return "BLOCKED_BRIEF", ledger, 2
 
-        if candidate_sha is None or not is_hex_sha40(candidate_sha):
-            raise ValueError(
-                f"CANDIDATE_READY requires 40-hex candidate_sha ({candidate_sha!r})."
-            )
-        if candidate_sha == r_base:
-            raise ValueError(f"candidate_sha must differ from base_sha ({candidate_sha}).")
-
         git_top = resolve_git_toplevel(root, timeout_sec=30.0)
-        cat = run_managed_stage_cmd(
-            "peer_round",
-            ["git", "-C", str(git_top), "cat-file", "-t", candidate_sha],
-            ledger=ledger,
-            timeout_override=30.0,
+        cand_valid = (
+            candidate_sha is not None
+            and is_hex_sha40(candidate_sha)
+            and candidate_sha != r_base
+            and (exit_code == 0 and norm_status != "ERROR")
         )
-        if cat.returncode != 0 or cat.stdout.strip() != "commit":
-            raise ValueError(f"Unreachable candidate commit {candidate_sha} in git.")
+        if cand_valid and candidate_sha is not None:
+            cat = run_managed_stage_cmd(
+                "peer_round",
+                ["git", "-C", str(git_top), "cat-file", "-t", candidate_sha],
+                ledger=ledger,
+                timeout_override=30.0,
+            )
+            cand_valid = cat.returncode == 0 and cat.stdout.strip() == "commit"
+
+        if not cand_valid:
+            ledger["transient_retries_in_stage"] = 0
+            ledger["candidate_sha"] = None
+            ledger["total_candidates"] = int(ledger["total_candidates"]) + 1
+            ledger["candidates_in_packet"] = int(ledger["candidates_in_packet"]) + 1
+            ledger["consecutive_failed_candidates"] = (
+                int(ledger["consecutive_failed_candidates"]) + 1
+            )
+            new_state = _apply_candidate_failure_breakers(ledger)
+            _append_event(
+                ledger,
+                "PEER_ROUND_FAILED",
+                {
+                    "candidate_sha": candidate_sha,
+                    "exit_code": exit_code,
+                    "total_tokens": total_tokens,
+                    "error_message": error_message or (raw_output or ""),
+                },
+            )
+            save_ledger(ledger_path, ledger)
+            return "PEER_ROUND_FAILED", ledger, (2 if new_state == "PAUSED_BUDGET" else 1)
 
         ledger["transient_retries_in_stage"] = 0
         ledger["total_candidates"] = int(ledger["total_candidates"]) + 1
@@ -1066,6 +1220,27 @@ def _record_peer_outcome_locked(
         save_ledger(ledger_path, ledger)
         return "CANDIDATE_READY", ledger, 0
 
+    if norm_status == "ERROR" or (exit_code is not None and exit_code != 0):
+        ledger["transient_retries_in_stage"] = 0
+        ledger["candidate_sha"] = None
+        ledger["total_candidates"] = int(ledger["total_candidates"]) + 1
+        ledger["candidates_in_packet"] = int(ledger["candidates_in_packet"]) + 1
+        ledger["consecutive_failed_candidates"] = (
+            int(ledger["consecutive_failed_candidates"]) + 1
+        )
+        new_state = _apply_candidate_failure_breakers(ledger)
+        _append_event(
+            ledger,
+            "PEER_ROUND_FAILED",
+            {
+                "exit_code": exit_code,
+                "total_tokens": total_tokens,
+                "error_message": error_message or (raw_output or ""),
+            },
+        )
+        save_ledger(ledger_path, ledger)
+        return "PEER_ROUND_FAILED", ledger, (2 if new_state == "PAUSED_BUDGET" else 1)
+
     raise ValueError(
         f"Unable to classify Peer outcome (signal={signal!r}, status={status!r}, "
         f"exit_code={exit_code}, total_tokens={total_tokens})."
@@ -1096,6 +1271,14 @@ def record_gate_outcome(
         if ledger["state"] != expected_state:
             return ledger, 2
 
+        expected_sha = ledger.get("candidate_sha")
+        if (
+            not is_hex_sha40(candidate_sha)
+            or not is_hex_sha40(expected_sha)
+            or candidate_sha != expected_sha
+        ):
+            return ledger, 2
+
         ledger["transient_retries_in_stage"] = 0
 
         if norm_gate in {"G3", "G4"} and norm_outcome in {"FAILED", "CHANGES_REQUESTED"}:
@@ -1112,11 +1295,17 @@ def record_gate_outcome(
             save_ledger(ledger_path, ledger)
             return ledger, (2 if new_state == "PAUSED_BUDGET" else 1)
 
-        if norm_gate == "G3" and norm_outcome in {"PASSED", "VERIFIED"}:
-            ledger["state"] = "REVIEW_FROZEN_G4"
-            _append_event(ledger, "G3_PASSED", {"candidate_sha": candidate_sha})
-            save_ledger(ledger_path, ledger)
-            return ledger, 0
+        if norm_gate == "G3":
+            if norm_outcome in {"PASSED", "VERIFIED"}:
+                ledger["state"] = "REVIEW_FROZEN_G4"
+                _append_event(ledger, "G3_PASSED", {"candidate_sha": candidate_sha})
+                save_ledger(ledger_path, ledger)
+                return ledger, 0
+            if norm_outcome == "BLOCKED":
+                ledger["state"] = "BLOCKED"
+                _append_event(ledger, "G3_BLOCKED", {"details": details or {}})
+                save_ledger(ledger_path, ledger)
+                return ledger, 2
 
         if norm_gate == "G4":
             if norm_outcome in {"BLOCKED_AUTH", "BLOCKED_INFRA", "BLOCKED"}:
@@ -1132,13 +1321,6 @@ def record_gate_outcome(
 
         if norm_gate == "G5":
             if norm_outcome == "VERIFIED":
-                expected_sha = ledger.get("candidate_sha")
-                if (
-                    not is_hex_sha40(candidate_sha)
-                    or not is_hex_sha40(expected_sha)
-                    or candidate_sha != expected_sha
-                ):
-                    return ledger, 2
                 ledger["consecutive_failed_candidates"] = 0
                 ledger["state"] = "VERIFIED"
                 _append_event(ledger, "G5_VERIFIED", {"candidate_sha": candidate_sha})
@@ -1168,6 +1350,7 @@ def record_replan(
     *,
     packet_path: Path | None = None,
     human_approved: bool = False,
+    repo_root: Path | None = None,
 ) -> tuple[dict[str, Any], int, str]:
     """Advance ledger to a bumped ``packet_version`` after validated ``readiness.json``."""
     with _ledger_lock(ledger_path):
@@ -1209,11 +1392,54 @@ def record_replan(
                 f"(got {new_version!r}).",
             )
 
-        if packet_path is not None:
-            if not packet_path.is_file():
-                return ledger, 2, f"Packet missing at {packet_path}."
-            if _sha256_bytes(packet_path.read_bytes()) != readiness.get("packet_sha256"):
-                return ledger, 2, "Packet SHA-256 does not match readiness.json."
+        effective_pkt = packet_path or (
+            Path(str(readiness["packet_path"])) if readiness.get("packet_path") else None
+        )
+        if effective_pkt is None or not effective_pkt.is_file():
+            return ledger, 2, f"Packet missing at {effective_pkt}."
+        if _sha256_bytes(effective_pkt.read_bytes()) != readiness.get("packet_sha256"):
+            return ledger, 2, "Packet SHA-256 does not match readiness.json."
+
+        new_base_sha = str(readiness.get("base_sha", ""))
+        if not is_hex_sha40(new_base_sha):
+            return ledger, 2, f"Invalid base_sha in readiness.json: {new_base_sha!r}."
+
+        active_root = (repo_root or REPO_ROOT).resolve()
+        if repo_root is None:
+            try:
+                active_root = resolve_git_toplevel(effective_pkt.parent, timeout_sec=10.0)
+            except (ValueError, TimeoutError):
+                active_root = REPO_ROOT.resolve()
+
+        _, current_policy_sha, policy_err = _load_policy_state(active_root)
+        if policy_err:
+            return ledger, 2, policy_err
+        if readiness.get("policy_sha256") != current_policy_sha:
+            return (
+                ledger,
+                2,
+                f"Stale readiness.json: policy_sha256 mismatch "
+                f"({readiness.get('policy_sha256')!r} != {current_policy_sha!r}).",
+            )
+
+        try:
+            git_top = resolve_git_toplevel(active_root, timeout_sec=30.0)
+            rev = run_managed_stage_cmd(
+                "brief_generation",
+                ["git", "-C", str(git_top), "rev-parse", "--verify", f"{new_base_sha}^{{commit}}"],
+                ledger=ledger,
+                timeout_override=30.0,
+            )
+            if rev.returncode != 0:
+                return ledger, 2, f"Base SHA {new_base_sha} does not resolve in git."
+        except (ValueError, TimeoutError, subprocess.TimeoutExpired) as exc:
+            return ledger, 2, f"Unable to verify base_sha {new_base_sha} in git: {exc}"
+
+        new_budget = _require_finite_number(
+            readiness.get("budget_usd"),
+            "budget_usd",
+            positive=True,
+        )
 
         max_auto = int(ledger["circuit_breakers"]["max_auto_replans_per_root_task"])
         if int(ledger["auto_replans_used"]) >= max_auto and not human_approved:
@@ -1225,9 +1451,11 @@ def record_replan(
 
         if not human_approved:
             ledger["auto_replans_used"] = int(ledger["auto_replans_used"]) + 1
+        else:
+            ledger["budget_limit_usd"] = new_budget
         ledger["packet_version"] = new_version
         ledger["task_id"] = str(readiness.get("task_id", ledger["task_id"]))
-        ledger["base_sha"] = str(readiness.get("base_sha", ledger["base_sha"]))
+        ledger["base_sha"] = new_base_sha
         ledger["candidate_sha"] = None
         ledger["candidates_in_packet"] = 0
         ledger["consecutive_failed_candidates"] = 0
@@ -1370,13 +1598,14 @@ def record_usage(
         limit = float(ledger["budget_limit_usd"])
         rc = 0
         if round(committed, 8) > round(limit, 8):
-            ledger["state"] = "PAUSED_BUDGET"
+            if ledger["state"] != "VERIFIED":
+                ledger["state"] = "PAUSED_BUDGET"
+                rc = 2
             _append_event(
                 ledger,
                 "BUDGET_EXCEEDED_USAGE",
                 {"committed_usd": committed, "limit_usd": limit},
             )
-            rc = 2
         save_ledger(ledger_path, ledger)
         return ledger, delta_usd, rc
 
@@ -1393,6 +1622,8 @@ def reserve_budget(
 
     with _ledger_lock(ledger_path):
         ledger = load_ledger(ledger_path)
+        if ledger["state"] == "VERIFIED":
+            return False, ledger, 2
         reservations = ledger.setdefault("active_reservations", {})
         other_reserved = sum(
             float(v) for k, v in reservations.items() if k != reservation_id
@@ -1488,6 +1719,7 @@ def _build_parser() -> argparse.ArgumentParser:
     p_rep.add_argument("--readiness", type=Path, required=True)
     p_rep.add_argument("--packet", type=Path, default=None)
     p_rep.add_argument("--human-approved", action="store_true")
+    p_rep.add_argument("--repo-root", type=Path, default=None)
     p_rep.add_argument("--json", action="store_true")
 
     p_use = sub.add_parser("record-usage", help="Record model token usage with deduplication.")
@@ -1608,6 +1840,7 @@ def _dispatch_cli(args: argparse.Namespace) -> int:
             args.readiness,
             packet_path=args.packet,
             human_approved=args.human_approved,
+            repo_root=args.repo_root,
         )
         if args.json:
             print(json.dumps({"message": msg, "ledger": ledger}, indent=2))

@@ -11,7 +11,6 @@ Writes an immutable write-once readiness.json compatible with receipt.py.
 from __future__ import annotations
 
 import argparse
-import fnmatch
 import hashlib
 import json
 import math
@@ -48,6 +47,7 @@ DEFAULT_EXCLUDED_MODEL_PREFIXES = (
 ALLOWED_PEER_HIGH = "gemini-4-hydrogen-high"
 ALLOWED_PEER_LOW = "gemini-4-hydrogen-low"
 HEX_SHA64_RE = re.compile(r"^[0-9a-f]{64}$")
+SAFE_TASK_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 
 METADATA_BULLET_RE = re.compile(
     r"^(?P<indent>[ \t]*)[-*]\s*(?:\*\*|__)?(?P<key>[A-Za-z0-9 _/()-]+?)"
@@ -96,21 +96,13 @@ CALENDAR_PATH_MARKERS = (
     "vwap",
 )
 HTML_COMMENT_RE = re.compile(r"<!--.*?-->", re.DOTALL)
-TEMPLATE_PLACEHOLDER_PATTERNS = (
-    "<TASK_ID>",
-    "<ROOT_TASK_ID>",
-    "<0..6>",
-    "<40-char",
-    "<Yes | No>",
-    "<positive float",
-    "<F01..F08",
-    "<None |",
-    "<path/",
-    "<scenario>",
-    "<specific defect>",
-    "<assertion>",
-    "<expected>",
-    "<ruff / pytest",
+TEMPLATE_PLACEHOLDER_RE = re.compile(
+    r"<(?:"
+    r"TASK_ID|ROOT_TASK_ID|0\.\.6|40-char[^>\n]*|F01\.\.F08[^>\n]*|"
+    r"None\s*\|[^>\n]*|Yes\s*\|[^>\n]*|positive float[^>\n]*|"
+    r"DESCRIBE_[^>\n]*|scenario|specific defect|assertion|expected|"
+    r"path/[^>\n]*|ruff\s*/\s*pytest[^>\n]*"
+    r")>"
 )
 
 KNOWN_META_KEYS = frozenset(
@@ -209,12 +201,54 @@ def _has_glob(pattern: str) -> bool:
     return any(ch in pattern for ch in ("*", "?", "[", "]"))
 
 
+def _glob_to_regex(pattern: str) -> re.Pattern[str]:
+    parts: list[str] = ["^"]
+    idx = 0
+    length = len(pattern)
+    while idx < length:
+        if pattern.startswith("**/", idx):
+            parts.append("(?:.+/)?")
+            idx += 3
+        elif pattern.startswith("/**", idx):
+            parts.append("(?:/.*)?")
+            idx += 3
+        elif pattern.startswith("**", idx):
+            parts.append(".*")
+            idx += 2
+        elif pattern[idx] == "*":
+            parts.append("[^/]*")
+            idx += 1
+        elif pattern[idx] == "?":
+            parts.append("[^/]")
+            idx += 1
+        elif pattern[idx] == "[":
+            end = pattern.find("]", idx + 1)
+            if end == -1:
+                parts.append(r"\[")
+                idx += 1
+            else:
+                body = pattern[idx + 1 : end]
+                if body.startswith("!"):
+                    body = "^" + body[1:]
+                parts.append(f"[{body}]")
+                idx = end + 1
+        else:
+            parts.append(re.escape(pattern[idx]))
+            idx += 1
+    parts.append("$")
+    return re.compile("".join(parts))
+
+
+def _glob_matches(path_lower: str, pattern_lower: str) -> bool:
+    return bool(_glob_to_regex(pattern_lower).fullmatch(path_lower))
+
+
 def _paths_overlap(owned: str, denied: str) -> bool:
     o = owned.rstrip("/").lower()
     d = denied.rstrip("/").lower()
     if o == d:
         return True
-    if fnmatch.fnmatchcase(o, d) or fnmatch.fnmatchcase(d, o):
+    if _glob_matches(o, d) or _glob_matches(d, o):
         return True
 
     d_base = _glob_base(d)
@@ -288,7 +322,7 @@ def _iter_non_fenced_lines(text: str) -> list[tuple[int, str]]:
 def _parse_packet_structure(
     text: str,
 ) -> tuple[dict[str, str], list[str], list[str], dict[str, str]]:
-    """Parse metadata bullets, owned_paths raw entries, denied_paths, and named sections."""
+    """Parse metadata bullets, owned/denied paths, and hierarchical sections."""
     lines = _iter_non_fenced_lines(text)
     metadata: dict[str, str] = {}
     owned_raw: list[str] = []
@@ -297,8 +331,13 @@ def _parse_packet_structure(
 
     active_scope: str | None = None
     active_scope_indent: int = -1
-    active_section: str | None = None
-    active_section_level: int = 99
+    heading_stack: list[tuple[int, str]] = []
+    active_item_key: str | None = None
+    active_item_indent: int = -1
+
+    def _append_to_headings(line_text: str) -> None:
+        for _, h_key in heading_stack:
+            sections.setdefault(h_key, []).append(line_text)
 
     for _, line in lines:
         stripped = line.strip()
@@ -309,6 +348,8 @@ def _parse_packet_structure(
             norm_title = _normalize_key(title.replace("`", ""))
             active_scope = None
             active_scope_indent = -1
+            active_item_key = None
+            active_item_indent = -1
             if "owned paths" in norm_title:
                 active_scope = "owned"
                 active_scope_indent = -1
@@ -316,16 +357,11 @@ def _parse_packet_structure(
                 active_scope = "denied"
                 active_scope_indent = -1
 
-            if level <= active_section_level:
-                active_section = norm_title
-                active_section_level = level
-                sections.setdefault(active_section, [])
-            elif active_section is not None:
-                sections[active_section].append(stripped)
-                sub_key = norm_title
-                sections.setdefault(sub_key, [])
-                active_section = sub_key
-                active_section_level = level
+            while heading_stack and heading_stack[-1][0] >= level:
+                heading_stack.pop()
+            _append_to_headings(stripped)
+            heading_stack.append((level, norm_title))
+            sections.setdefault(norm_title, [])
             continue
 
         item_match = re.match(r"^(?P<indent>[ \t]*)[-*]\s+(?P<body>.+?)\s*$", line)
@@ -348,7 +384,7 @@ def _parse_packet_structure(
 
         if b_match:
             indent = len(b_match.group("indent").expandtabs(2))
-            key_norm = _normalize_key(b_match.group("key"))
+            key_norm = b_key_norm
             val = b_match.group("val").strip()
 
             if active_scope is not None and indent <= active_scope_indent:
@@ -357,36 +393,47 @@ def _parse_packet_structure(
 
             if key_norm in KNOWN_META_KEYS and indent <= 1 and key_norm not in metadata:
                 metadata[key_norm] = val
+                active_item_key = None
             elif key_norm.startswith("owned paths"):
                 active_scope = "owned"
                 active_scope_indent = indent
+                active_item_key = None
             elif key_norm.startswith("denied paths") or key_norm.startswith("do not touch"):
                 active_scope = "denied"
                 active_scope_indent = indent
+                active_item_key = None
             else:
-                if active_section is not None:
-                    sections[active_section].append(stripped)
+                _append_to_headings(stripped)
                 sections.setdefault(key_norm, []).append(val)
+                active_item_key = key_norm
+                active_item_indent = indent
             continue
 
         num_match = re.match(
-            r"^\s*\d+\.\s*\*\*(?P<title>[^*]+)\*\*\s*:?\s*(?P<rest>.*)$",
+            r"^(?P<indent>[ \t]*)\d+\.\s*\*\*(?P<title>[^*]+)\*\*\s*:?\s*(?P<rest>.*)$",
             line,
         )
         if num_match:
+            indent = len(num_match.group("indent").expandtabs(2))
             label_norm = _normalize_key(num_match.group("title"))
             rest = num_match.group("rest").strip()
-            if active_section is not None:
-                sections[active_section].append(stripped)
+            _append_to_headings(stripped)
             sections.setdefault(label_norm, [])
             if rest:
                 sections[label_norm].append(rest)
-            active_section = label_norm
-            active_section_level = 7
+            active_item_key = label_norm
+            active_item_indent = indent
             continue
 
-        if active_section is not None and stripped:
-            sections[active_section].append(stripped)
+        if stripped:
+            _append_to_headings(stripped)
+            if active_item_key is not None:
+                cur_indent = len(line[: len(line) - len(line.lstrip(" \t"))].expandtabs(2))
+                if cur_indent > active_item_indent:
+                    sections.setdefault(active_item_key, []).append(stripped)
+                else:
+                    active_item_key = None
+                    active_item_indent = -1
 
     section_text = {k: "\n".join(v).strip() for k, v in sections.items()}
     return metadata, owned_raw, denied_raw, section_text
@@ -419,7 +466,7 @@ def _load_policy(
     if not isinstance(data, dict):
         return DEFAULT_EXCLUDED_MODEL_PREFIXES, None, "Model policy JSON must be an object."
 
-    prefixes = data.get("excluded_model_prefixes", list(DEFAULT_EXCLUDED_MODEL_PREFIXES))
+    prefixes = data.get("excluded_model_prefixes", [])
     if not isinstance(prefixes, list) or not all(
         isinstance(p, str) and p.strip() for p in prefixes
     ):
@@ -428,7 +475,14 @@ def _load_policy(
             None,
             "Policy 'excluded_model_prefixes' must be a list of non-empty strings.",
         )
-    return tuple(p.strip() for p in prefixes), _sha256_bytes(raw_bytes), None
+    merged: list[str] = list(DEFAULT_EXCLUDED_MODEL_PREFIXES)
+    seen = {p.lower() for p in merged}
+    for raw_p in prefixes:
+        cleaned = raw_p.strip()
+        if cleaned.lower() not in seen:
+            merged.append(cleaned)
+            seen.add(cleaned.lower())
+    return tuple(merged), _sha256_bytes(raw_bytes), None
 
 
 def _compute_peer_prompt_sha256(
@@ -627,10 +681,23 @@ def validate_brief(
     root_task_id = _extract_scalar_value(metadata.get("root task id", ""))
     if not root_task_id:
         blocked_errors.append("Missing required metadata header: Root Task ID.")
+    elif not SAFE_TASK_ID_RE.fullmatch(root_task_id):
+        blocked_errors.append(
+            f"Invalid Root Task ID {root_task_id!r} (must match {SAFE_TASK_ID_RE.pattern})."
+        )
 
     task_id = _extract_scalar_value(metadata.get("task id", ""))
     if not task_id:
         blocked_errors.append("Missing required metadata header: Task ID.")
+    elif not SAFE_TASK_ID_RE.fullmatch(task_id):
+        blocked_errors.append(
+            f"Invalid Task ID {task_id!r} (must match {SAFE_TASK_ID_RE.pattern})."
+        )
+
+    for hdr_key, hdr_label in (("risk tags", "Risk Tags"), ("audit refs", "Audit Refs")):
+        raw_hdr = metadata.get(hdr_key, "")
+        if "<" in raw_hdr or ">" in raw_hdr:
+            blocked_errors.append(f"Unfilled template placeholder in {hdr_label}: {raw_hdr!r}.")
 
     packet_version = _parse_int_strict(metadata.get("packet version", ""))
     if packet_version is None or packet_version < 1:
@@ -782,14 +849,8 @@ def validate_brief(
     )
 
     non_fenced_lines = [line for _, line in _iter_non_fenced_lines(text)]
-    non_fenced_prose = re.sub(r"`[^`]*`", "", "\n".join(non_fenced_lines))
-    found_placeholders = [
-        pat for pat in TEMPLATE_PLACEHOLDER_PATTERNS if pat in non_fenced_prose
-    ]
-    if "<" in root_task_id or ">" in root_task_id:
-        blocked_errors.append(f"Unfilled placeholder in Root Task ID: {root_task_id!r}.")
-    if "<" in task_id or ">" in task_id:
-        blocked_errors.append(f"Unfilled placeholder in Task ID: {task_id!r}.")
+    non_fenced_text = "\n".join(non_fenced_lines)
+    found_placeholders = sorted(set(TEMPLATE_PLACEHOLDER_RE.findall(non_fenced_text)))
     if found_placeholders:
         replan_errors.append(
             f"Unfilled template placeholder(s) detected: {', '.join(found_placeholders)}."

@@ -12,23 +12,23 @@
 
 ## 1. Outcome & Behavioral Contract
 
-Describe the exact observable behavior, invariants, and edge cases required.
+<DESCRIBE_EXACT_BEHAVIOR_AND_EDGE_CASES>
 
-<!-- Required when Is Bugfix is Yes: -->
+<!-- Required when Is Bugfix is Yes (remove if No): -->
 ### Pre-Fix RED Reproduction (Required if `Is Bugfix: Yes`)
-Describe the exact failing test and command to observe legitimate pre-fix RED on `Base SHA` before any code edit.
+<DESCRIBE_PRE_FIX_RED_TEST_AND_COMMAND>
 
-<!-- Required when Risk Tags or Owned Paths touch persistence/concurrency/websocket: -->
+<!-- Required when Risk Tags or Owned Paths touch persistence/concurrency/websocket (remove if unused): -->
 ### Atomicity / Rollback / Concurrency Contract (Required if `persistence` or `concurrency` / `websocket`)
-Specify atomic write/rollback, locking, cancellation, timeout, and idempotency invariants.
+<DESCRIBE_ATOMICITY_ROLLBACK_CONCURRENCY_INVARIANTS>
 
-<!-- Required when Risk Tags or Owned Paths touch security/auth: -->
+<!-- Required when Risk Tags or Owned Paths touch security/auth (remove if unused): -->
 ### Security / Read-Only Invariants (Required if `security` or `auth`)
-Reference applicable boundaries (`SEC-001`, `SEC-002`, `SEC-003`, `F01`, hook/policy boundaries).
+<DESCRIBE_SECURITY_AND_READONLY_INVARIANTS>
 
-<!-- Required when Risk Tags or Owned Paths touch session_calendar: -->
+<!-- Required when Risk Tags or Owned Paths touch session_calendar (remove if unused): -->
 ### Session Calendar Contract (Required if `session_calendar`)
-Reference CME Globex session boundaries (`America/New_York`, `18:00`, `R05`).
+<DESCRIBE_SESSION_CALENDAR_INVARIANTS>
 
 ## 2. Write Scope & Do-Not-Touch
 
