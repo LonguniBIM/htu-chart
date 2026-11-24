@@ -604,3 +604,30 @@ async def test_layouts_update_sole_default_to_false_preserves_default_in_sqlite_
         assert len(after_layouts) == 1
         assert after_layouts[0]["id"] == seeded_id
         assert after_layouts[0]["is_default"] is True
+
+
+async def test_layouts_initial_post_with_is_default_false_sets_default_in_sqlite_store(
+    tmp_path: Path,
+) -> None:
+    """Contract: Creating first layout on fresh DB with is_default=False promotes it to default.
+
+    Defect caught: POST /api/layouts before GET /api/layouts persisting
+    zero-default state (P1-R6-03).
+    """
+    async with _async_client(tmp_path) as (client, app):
+        csrf = await _login(client)
+        headers = {"X-CSRF-Token": csrf}
+
+        resp = await client.post(
+            "/api/layouts",
+            json=_valid_layout_payload(name="First Layout", template_id="2-cols", is_default=False),
+            headers=headers,
+        )
+        assert resp.status_code == 201
+        created = resp.json()["layout"]
+        assert created["is_default"] is True
+
+        direct_rows = await app.state.sqlite_store.list_layouts()
+        assert len(direct_rows) == 1
+        assert direct_rows[0].id == created["id"]
+        assert direct_rows[0].is_default is True

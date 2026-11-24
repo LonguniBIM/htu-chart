@@ -175,6 +175,7 @@ describe("ChartPane (F06, P1-R3-01, P1-R3-02)", () => {
   });
 
   afterEach(() => {
+    vi.useRealTimers();
     cleanup();
     vi.unstubAllGlobals();
   });
@@ -635,5 +636,102 @@ describe("ChartPane (F06, P1-R3-01, P1-R3-02)", () => {
       | undefined;
     expect(lastCallBars?.map((b) => b.time)).toEqual([1000, 1060]);
     expect(screen.getByText("2 bars")).toBeTruthy();
+  });
+
+  it("keeps live bar_update unblocked and retries after post-ACK resync fetchBars rejection (P1-R6-02, P2-002)", async () => {
+    /**
+     * Contract: When initial snapshot succeeds ([1000]) and a subsequent post-ACK resync fetchBars
+     * rejects, ChartPane restores snapshotReadyGenRef so live bar_update (1060) immediately updates
+     * candleSeries.update(...) rather than freezing in the buffer, surfaces a Retry button, and
+     * schedules a bounded retry via scheduleRetry that recovers on a 3rd fetchBars call.
+     * Defect caught: Post-ACK resync failure leaving snapshotReadyGenRef != activeGenerationRef forever.
+     */
+    vi.useFakeTimers();
+    const firstFetch = createDeferred<BarsResponse>();
+    const failedResyncFetch = createDeferred<BarsResponse>();
+    const retryResyncFetch = createDeferred<BarsResponse>();
+    fetchBarsMock
+      .mockReturnValueOnce(firstFetch.promise)
+      .mockReturnValueOnce(failedResyncFetch.promise)
+      .mockReturnValueOnce(retryResyncFetch.promise);
+
+    const coordinator = new PaneFetchCoordinator();
+    const fakeWs = createFakeWsClient();
+    const pane: PaneConfig = {
+      pane_id: "pane-1",
+      root_symbol: "MES",
+      timeframe: "5m",
+      live_mode: false,
+      playback_mode: "live",
+    };
+
+    render(
+      <ChartPane
+        pane={pane}
+        contractId="CON.F.US.MES.H26"
+        activeFeedLive={false}
+        wsClient={fakeWs.client}
+        coordinator={coordinator}
+      />,
+    );
+
+    await act(async () => {
+      firstFetch.resolve(makeBarsResponse("CON.F.US.MES.H26", [makeBar(1000, 5000)]));
+      await firstFetch.promise;
+    });
+
+    // Subscribed ACK triggers 2nd fetchBars resync
+    act(() => {
+      fakeWs.emitSubscribed({
+        type: "subscribed",
+        contract_id: "CON.F.US.MES.H26",
+        timeframe: "5m",
+      });
+    });
+    expect(fetchBarsMock).toHaveBeenCalledTimes(2);
+
+    // 2nd fetchBars rejects with transient error
+    await act(async () => {
+      failedResyncFetch.reject(new Error("Transient upstream 503"));
+      await Promise.resolve();
+    });
+
+    expect(screen.getByText(/resync error: Transient upstream 503/)).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Retry" })).toBeTruthy();
+
+    // Live bar_update after failed resync must apply immediately (not freeze in buffer)
+    fakeWs.emitBarUpdate({
+      type: "bar_update",
+      contract_id: "CON.F.US.MES.H26",
+      live_mode: false,
+      timeframe: "5m",
+      is_recovered_historical: false,
+      recovery_tag: null,
+      bar: makeBar(1060, 5015),
+    });
+
+    expect(candleUpdate).toHaveBeenCalledWith(
+      expect.objectContaining({ time: 1060, close: 5015 }),
+    );
+    expect(volumeUpdate).toHaveBeenCalledWith(
+      expect.objectContaining({ time: 1060, value: 25 }),
+    );
+
+    // Advancing fake timers past 1500ms backoff triggers 3rd fetchBars retry
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1500);
+      await Promise.resolve();
+    });
+    expect(fetchBarsMock).toHaveBeenCalledTimes(3);
+
+    await act(async () => {
+      retryResyncFetch.resolve(
+        makeBarsResponse("CON.F.US.MES.H26", [makeBar(1000, 5000), makeBar(1060, 5015)]),
+      );
+      await retryResyncFetch.promise;
+    });
+
+    expect(screen.getByText("2 bars")).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Retry" })).toBeNull();
   });
 });

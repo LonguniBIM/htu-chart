@@ -217,9 +217,16 @@ export function App() {
         setRetrySchedule((prev) => ({ attempt: 0, nonce: prev.nonce + 1 }));
       }
 
+      const activeMissingModes = distinctPaneLiveModes(
+        activeLayoutRef.current?.panes ?? [],
+      ).filter((mode) => !resolvedModesRef.current.has(mode));
+      const modeSet = new Set<boolean>([
+        ...unresolvedModesRef.current,
+        ...activeMissingModes,
+      ]);
       const modes =
-        unresolvedModesRef.current.size > 0
-          ? Array.from(unresolvedModesRef.current)
+        modeSet.size > 0
+          ? Array.from(modeSet)
           : distinctPaneLiveModes(activeLayoutRef.current?.panes ?? []);
 
       try {

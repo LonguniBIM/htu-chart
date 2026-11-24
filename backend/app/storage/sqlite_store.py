@@ -1792,7 +1792,11 @@ class SqliteStore:
                 ).fetchone()
                 if existing is not None:
                     raise ValueError(f"Layout id {clean_id!r} already exists")
-                if is_default:
+                has_default = conn.execute(
+                    "SELECT 1 FROM layouts WHERE is_default = 1 LIMIT 1"
+                ).fetchone()
+                effective_default = bool(is_default) or (has_default is None)
+                if effective_default:
                     conn.execute("UPDATE layouts SET is_default = 0 WHERE is_default != 0")
                 conn.execute(
                     """
@@ -1807,7 +1811,7 @@ class SqliteStore:
                         clean_template,
                         panes_json,
                         sync_json,
-                        int(bool(is_default)),
+                        int(effective_default),
                         now_ts,
                         now_ts,
                     ),

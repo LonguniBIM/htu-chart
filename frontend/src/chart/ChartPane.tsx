@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import {
   CandlestickSeries,
   ColorType,
@@ -14,6 +14,7 @@ import {
   type UTCTimestamp,
 } from "lightweight-charts";
 import { fetchBars } from "../api/client";
+import { scheduleRetry } from "../api/retryTimer";
 import {
   ROOT_SYMBOLS,
   TIMEFRAMES,
@@ -42,6 +43,8 @@ export interface ChartPaneProps {
   onSymbolChange?: (paneId: string, symbol: RootSymbol) => void;
   onTimeframeChange?: (paneId: string, timeframe: Timeframe) => void;
 }
+
+const SNAPSHOT_RETRY_BACKOFF_MS = [1500, 3000, 6000] as const;
 
 function toCandleDatum(bar: OhlcvBar): CandlestickData<UTCTimestamp> {
   return {
@@ -98,6 +101,9 @@ export function ChartPane({
   const pendingWsBarsRef = useRef<OhlcvBar[]>([]);
   const bufferOverflowRef = useRef<boolean>(false);
   const lastTargetKeyRef = useRef<string>("");
+  const hasLoadedTargetKeyRef = useRef<string>("");
+  const snapshotRetryCountRef = useRef<number>(0);
+  const retryCancelRef = useRef<(() => void) | null>(null);
 
   const [loadStatus, setLoadStatus] = useState<string>("idle");
   const [resyncNonce, setResyncNonce] = useState<number>(0);
@@ -116,6 +122,31 @@ export function ChartPane({
   symbolRef.current = pane.root_symbol;
   const timeframeRef = useRef<Timeframe>(pane.timeframe);
   timeframeRef.current = pane.timeframe;
+
+  const applyLiveBarUpdate = useCallback((bar: OhlcvBar) => {
+    if (lastBarTimeRef.current !== null && bar.time < lastBarTimeRef.current) {
+      return;
+    }
+    if (
+      lastBarTimeRef.current !== null &&
+      bar.time === lastBarTimeRef.current &&
+      latestBarRef.current?.is_closed === true &&
+      !bar.is_closed
+    ) {
+      return;
+    }
+    candleSeriesRef.current?.update(toCandleDatum(bar));
+    volumeSeriesRef.current?.update(toVolumeDatum(bar));
+    latestBarRef.current = bar;
+    lastBarTimeRef.current = bar.time;
+    if (legendRef.current !== null) {
+      legendRef.current.textContent = formatLegendText(
+        symbolRef.current,
+        timeframeRef.current,
+        bar,
+      );
+    }
+  }, []);
 
   useEffect(() => {
     const container = containerRef.current;
@@ -233,6 +264,10 @@ export function ChartPane({
     const nextTargetKey = buildPaneTargetKey(target);
     if (nextTargetKey !== lastTargetKeyRef.current) {
       lastTargetKeyRef.current = nextTargetKey;
+      hasLoadedTargetKeyRef.current = "";
+      snapshotRetryCountRef.current = 0;
+      retryCancelRef.current?.();
+      retryCancelRef.current = null;
       candleSeriesRef.current?.setData([]);
       volumeSeriesRef.current?.setData([]);
       latestBarRef.current = null;
@@ -243,6 +278,10 @@ export function ChartPane({
     }
 
     if (!resolvedContractId) {
+      hasLoadedTargetKeyRef.current = "";
+      snapshotRetryCountRef.current = 0;
+      retryCancelRef.current?.();
+      retryCancelRef.current = null;
       coordinator.abortPane(pane.pane_id);
       activeGenerationRef.current += 1;
       pendingWsBarsRef.current = [];
@@ -254,6 +293,8 @@ export function ChartPane({
       return;
     }
 
+    retryCancelRef.current?.();
+    retryCancelRef.current = null;
     const ticket = coordinator.beginFetch(target);
     activeGenerationRef.current = ticket.generation;
     pendingWsBarsRef.current = [];
@@ -283,6 +324,10 @@ export function ChartPane({
         candleSeriesRef.current?.setData(candles);
         volumeSeriesRef.current?.setData(volumes);
         snapshotReadyGenRef.current = ticket.generation;
+        hasLoadedTargetKeyRef.current = nextTargetKey;
+        snapshotRetryCountRef.current = 0;
+        retryCancelRef.current?.();
+        retryCancelRef.current = null;
         pendingWsBarsRef.current = [];
         const didOverflow = bufferOverflowRef.current;
         bufferOverflowRef.current = false;
@@ -310,13 +355,38 @@ export function ChartPane({
           return;
         }
         const message = err instanceof Error ? err.message : "Failed to load bars";
-        setLoadStatus(`error: ${message}`);
+        if (hasLoadedTargetKeyRef.current === nextTargetKey) {
+          const buffered = [...pendingWsBarsRef.current].sort((a, b) => a.time - b.time);
+          for (const bar of buffered) {
+            applyLiveBarUpdate(bar);
+          }
+          pendingWsBarsRef.current = [];
+          bufferOverflowRef.current = false;
+          snapshotReadyGenRef.current = ticket.generation;
+          setLoadStatus(`resync error: ${message}`);
+        } else {
+          setLoadStatus(`error: ${message}`);
+        }
+
+        const attempt = snapshotRetryCountRef.current;
+        if (attempt < SNAPSHOT_RETRY_BACKOFF_MS.length) {
+          snapshotRetryCountRef.current = attempt + 1;
+          const delayMs = SNAPSHOT_RETRY_BACKOFF_MS[attempt]!;
+          retryCancelRef.current?.();
+          retryCancelRef.current = scheduleRetry(() => {
+            retryCancelRef.current = null;
+            setResyncNonce((n) => n + 1);
+          }, delayMs);
+        }
       });
 
     return () => {
+      retryCancelRef.current?.();
+      retryCancelRef.current = null;
       coordinator.abortPane(pane.pane_id);
     };
   }, [
+    applyLiveBarUpdate,
     contractId,
     coordinator,
     pane.live_mode,
@@ -350,28 +420,7 @@ export function ChartPane({
         }
         return;
       }
-      if (lastBarTimeRef.current !== null && msg.bar.time < lastBarTimeRef.current) {
-        return;
-      }
-      if (
-        lastBarTimeRef.current !== null &&
-        msg.bar.time === lastBarTimeRef.current &&
-        latestBarRef.current?.is_closed === true &&
-        !msg.bar.is_closed
-      ) {
-        return;
-      }
-      candleSeriesRef.current?.update(toCandleDatum(msg.bar));
-      volumeSeriesRef.current?.update(toVolumeDatum(msg.bar));
-      latestBarRef.current = msg.bar;
-      lastBarTimeRef.current = msg.bar.time;
-      if (legendRef.current !== null) {
-        legendRef.current.textContent = formatLegendText(
-          symbolRef.current,
-          timeframeRef.current,
-          msg.bar,
-        );
-      }
+      applyLiveBarUpdate(msg.bar);
     });
     const removeSubscribedListener = wsClient.onSubscribed((msg) => {
       if (
@@ -396,7 +445,7 @@ export function ChartPane({
       removeResyncListener();
       unsubscribeWs();
     };
-  }, [canSubscribeWs, contractId, pane.live_mode, pane.timeframe, wsClient]);
+  }, [applyLiveBarUpdate, canSubscribeWs, contractId, pane.live_mode, pane.timeframe, wsClient]);
 
   const histOnlyLabel = !isLiveTimeframe
     ? `Hist only (${pane.timeframe} no live feed)`
@@ -404,6 +453,8 @@ export function ChartPane({
       ? `Hist only (feed: ${activeFeedLive ? "Live" : "Sim"})`
       : null;
   const statusText = histOnlyLabel !== null ? `${histOnlyLabel} · ${loadStatus}` : loadStatus;
+  const showRetryButton =
+    loadStatus.startsWith("error:") || loadStatus.startsWith("resync error:");
 
   return (
     <section className="chart-pane" data-pane-id={pane.pane_id}>
@@ -433,7 +484,23 @@ export function ChartPane({
           </select>
           <span className="chart-pane__contract">{contractId ?? "Unresolved"}</span>
         </div>
-        <span className="chart-pane__status">{statusText}</span>
+        <div className="chart-pane__controls">
+          <span className="chart-pane__status">{statusText}</span>
+          {showRetryButton && (
+            <button
+              type="button"
+              className="terminal-button"
+              onClick={() => {
+                snapshotRetryCountRef.current = 0;
+                retryCancelRef.current?.();
+                retryCancelRef.current = null;
+                setResyncNonce((n) => n + 1);
+              }}
+            >
+              Retry
+            </button>
+          )}
+        </div>
       </header>
       <div className="chart-pane__canvas-wrap">
         <div ref={legendRef} className="chart-pane__legend">

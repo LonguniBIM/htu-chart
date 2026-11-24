@@ -1028,4 +1028,137 @@ describe("App bootstrap and R03 503 recovery (P1-R3-03, P1-R3-04, P2-005)", () =
     expect(screen.queryByText(/Incomplete contracts/)).toBeNull();
     expect(screen.queryByRole("button", { name: "Retry Contracts" })).toBeNull();
   });
+
+  it("adopts active Live layout unresolved modes when retryUnresolvedContracts aborts layout switch (P1-R6-01)", async () => {
+    /**
+     * Contract: When Sim bootstrap is incomplete (unresolvedModesRef has false) and user switches
+     * to a Live layout whose fetchContracts is in flight, the 2000ms auto-retry timer aborting
+     * layoutResolveControllerRef requests BOTH Sim (live=false) and Live (live=true) and resolves
+     * the active Live layout cleanly.
+     * Defect caught: retryUnresolvedContracts dropping active layout mode on mutual cancellation.
+     */
+    vi.useFakeTimers();
+    const liveLayout: LayoutRecord = {
+      ...SAMPLE_LAYOUT,
+      id: "layout-live",
+      name: "Live MNQ",
+      is_default: false,
+      panes: [
+        {
+          pane_id: "pane-live",
+          root_symbol: "MNQ",
+          timeframe: "5m",
+          live_mode: true,
+          playback_mode: "live",
+        },
+      ],
+    };
+
+    fetchSessionMock.mockResolvedValue({
+      authenticated: true,
+      csrf_token: "csrf-token-1234567890",
+    });
+    fetchStatusMock.mockResolvedValue({
+      connected: true,
+      live: true,
+      feed_state: "LIVE",
+    });
+    listLayoutsMock.mockResolvedValue([SAMPLE_LAYOUT, liveLayout]);
+
+    let liveSwitchSignal: AbortSignal | undefined;
+    const requestedLiveModes: boolean[] = [];
+
+    fetchContractsMock
+      .mockResolvedValueOnce({
+        live: false,
+        contracts: {
+          MES: {
+            selected: null,
+            error_type: "InitialTimeout",
+            error: "Timed out querying MES",
+          },
+        },
+      })
+      .mockImplementationOnce((_symbols, live, signal) => {
+        liveSwitchSignal = signal;
+        expect(live).toBe(true);
+        return new Promise<ContractsResponse>((_resolve, reject) => {
+          signal?.addEventListener("abort", () => {
+            reject(new DOMException("The operation was aborted.", "AbortError"));
+          });
+        });
+      })
+      .mockImplementation(async (_symbols, live) => {
+        const isLive = Boolean(live);
+        requestedLiveModes.push(isLive);
+        if (!isLive) {
+          return {
+            live: false,
+            contracts: {
+              MES: {
+                selected: { id: "CON.F.US.MES.H26" },
+                error_type: null,
+                error: null,
+              },
+            },
+          };
+        }
+        return {
+          live: true,
+          contracts: {
+            MNQ: {
+              selected: { id: "CON.F.US.MNQ.H26" },
+              error_type: null,
+              error: null,
+            },
+          },
+        };
+      });
+
+    fetchBarsMock.mockResolvedValue({
+      provider: "topstepx",
+      live: true,
+      contract_id: "CON.F.US.MNQ.H26",
+      root_symbol: "MNQ",
+      timeframe: "5m",
+      start_time: 1000,
+      end_time: 1000,
+      count: 0,
+      include_partial: true,
+      quality: {
+        is_complete: true,
+        truncated: false,
+        provider_gap: false,
+        quarantined_count: 0,
+      },
+      bars: [],
+    });
+
+    render(<App />);
+    await act(async () => {
+      await flushMicrotasks();
+    });
+
+    expect(screen.getByRole("button", { name: "Retry Contracts" })).toBeTruthy();
+
+    await act(async () => {
+      fireEvent.change(screen.getByLabelText("Active layout"), {
+        target: { value: "layout-live" },
+      });
+      await flushMicrotasks();
+    });
+    expect(liveSwitchSignal?.aborted).toBe(false);
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(2000);
+      await flushMicrotasks();
+    });
+
+    expect(liveSwitchSignal?.aborted).toBe(true);
+    expect(requestedLiveModes).toContain(false);
+    expect(requestedLiveModes).toContain(true);
+    expect(screen.getByText(/CON\.F\.US\.MNQ\.H26/)).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Retry Contracts" })).toBeNull();
+    expect(screen.queryByText(/Incomplete contracts/)).toBeNull();
+  });
 });
