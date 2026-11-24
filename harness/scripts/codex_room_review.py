@@ -1629,20 +1629,26 @@ def _preflight_g4_caps(
     git_top: Path,
     candidate_sha: str,
     ledger_path: Path | None,
-) -> int | None:
-    """Enforce filesystem attempts/ and ledger.json G4 ceilings before lock/frozen/CLI."""
+) -> tuple[int | None, Path | None, str | None]:
+    """Enforce tracker, attempts/, and ledger.json G4 ceilings + atomic reservation."""
     if args.require_ledger and (ledger_path is None or not ledger_path.is_file()):
         print(
             f"[codex_room_review] BLOCKED: Missing required ledger.json for {args.task_id!r}.",
             file=sys.stderr,
         )
-        return 2
+        return 2, None, None
     if args.ledger is not None and (ledger_path is None or not ledger_path.is_file()):
         print(
             f"[codex_room_review] BLOCKED: Ledger not found at {args.ledger}.",
             file=sys.stderr,
         )
-        return 2
+        return 2, None, None
+
+    try:
+        tracker_path = task_runner.default_g4_tracker_path(args.task_id, repo_root=git_top)
+    except ValueError as exc:
+        print(f"[codex_room_review] BLOCKED: {exc}", file=sys.stderr)
+        return 2, None, None
 
     policy_cb = task_runner.load_circuit_breakers(repo_root=git_top)
     max_g4_root = int(policy_cb["max_g4_rounds_per_root_task"])
@@ -1651,37 +1657,6 @@ def _preflight_g4_caps(
     attempt_roots = [git_top / "harness" / "runs" / args.task_id / "attempts"]
     if out_dir.parent.name == "attempts":
         attempt_roots.append(out_dir.parent)
-    fs_rounds, fs_sha = task_runner.count_review_attempts(
-        attempt_roots, candidate_sha=candidate_sha
-    )
-    if fs_rounds >= max_g4_root:
-        if ledger_path is not None and ledger_path.is_file():
-            with task_runner._ledger_lock(ledger_path):
-                led = task_runner.load_ledger(ledger_path, repo_root=git_top)
-                if led["state"] != "VERIFIED":
-                    led["state"] = "PAUSED_BUDGET"
-                    task_runner._append_event(
-                        led,
-                        "G4_ROUND_CAP_PAUSED",
-                        {"attempts_rounds": fs_rounds, "cap": max_g4_root},
-                    )
-                    task_runner.save_ledger(ledger_path, led)
-        print(
-            f"[codex_room_review] PAUSED_BUDGET: G4 round cap reached "
-            f"({fs_rounds} >= {max_g4_root}).",
-            file=sys.stderr,
-        )
-        return 2
-    if fs_sha >= max_g4_sha or (fs_sha >= 1 and args.resume_from is None):
-        print(
-            f"[codex_room_review] BLOCKED: Duplicate G4 invocation for candidate_sha "
-            f"{candidate_sha[:12]} (attempts={fs_sha}).",
-            file=sys.stderr,
-        )
-        return 2
-
-    if ledger_path is None:
-        return None
 
     halted_states = {
         "PAUSED_BUDGET",
@@ -1692,7 +1667,46 @@ def _preflight_g4_caps(
         "BLOCKED_INFRA",
         "VERIFIED",
     }
-    with task_runner._ledger_lock(ledger_path):
+    reservation_id = f"{os.getpid()}-{threading.get_ident()}-{time.time_ns()}"
+    now_iso = datetime.now(timezone.utc).isoformat()
+
+    def _check_and_reserve_locked() -> tuple[int | None, Path | None, str | None]:
+        fs_rounds, fs_sha = task_runner.count_review_attempts(
+            attempt_roots, candidate_sha=candidate_sha
+        )
+        tracker = task_runner.load_g4_tracker(tracker_path, task_id=args.task_id)
+        t_completed = int(tracker.get("completed_rounds", 0))
+        t_in_flight = len(tracker.get("in_flight", {}))
+        t_sha = int(tracker.get("sha_invocations", {}).get(candidate_sha, 0))
+
+        effective_rounds = max(t_completed + t_in_flight, fs_rounds)
+        effective_sha = max(t_sha, fs_sha)
+
+        if ledger_path is None:
+            if effective_rounds >= max_g4_root:
+                print(
+                    f"[codex_room_review] PAUSED_BUDGET: G4 round cap reached "
+                    f"({effective_rounds} >= {max_g4_root}).",
+                    file=sys.stderr,
+                )
+                return 2, None, None
+            if effective_sha >= max_g4_sha or (effective_sha >= 1 and args.resume_from is None):
+                print(
+                    f"[codex_room_review] BLOCKED: Duplicate G4 invocation for candidate_sha "
+                    f"{candidate_sha[:12]} (invocations={effective_sha}).",
+                    file=sys.stderr,
+                )
+                return 2, None, None
+            tracker["in_flight"][reservation_id] = {
+                "candidate_sha": candidate_sha,
+                "out_dir": str(out_dir),
+                "pid": os.getpid(),
+                "reserved_at_utc": now_iso,
+            }
+            tracker["sha_invocations"][candidate_sha] = effective_sha + 1
+            task_runner.save_g4_tracker(tracker_path, tracker)
+            return None, tracker_path, reservation_id
+
         ledger = task_runner.load_ledger(ledger_path, repo_root=git_top)
         cb = ledger.get("circuit_breakers", {})
         l_max_root = int(cb.get("max_g4_rounds_per_root_task", max_g4_root))
@@ -1704,26 +1718,34 @@ def _preflight_g4_caps(
         )
         l_max_sha = int(cb.get("max_g4_invocations_per_candidate_sha", max_g4_sha))
 
+        ledger_in_flight = len(ledger.get("active_g4_reservations", {}))
         g4_total = int(ledger.get("g4_rounds_total", 0))
-        if g4_total >= l_max_root:
-            if ledger["state"] != "VERIFIED":
+        if g4_total >= l_max_root or g4_total + ledger_in_flight >= l_max_root or (
+            effective_rounds >= l_max_root
+        ):
+            if ledger_in_flight == 0 and ledger["state"] != "VERIFIED":
                 ledger["state"] = "PAUSED_BUDGET"
                 task_runner._append_event(
                     ledger,
                     "G4_ROUND_CAP_PAUSED",
-                    {"g4_rounds_total": g4_total, "cap": l_max_root},
+                    {
+                        "g4_rounds_total": g4_total,
+                        "effective_rounds": effective_rounds,
+                        "cap": l_max_root,
+                    },
                 )
                 task_runner.save_ledger(ledger_path, ledger)
             print(
                 f"[codex_room_review] PAUSED_BUDGET: G4 round cap reached "
-                f"({g4_total} >= {l_max_root}).",
+                f"(ledger={g4_total}, in_flight={ledger_in_flight}, "
+                f"effective={effective_rounds}, cap={l_max_root}).",
                 file=sys.stderr,
             )
-            return 2
+            return 2, None, None
 
         g4_pkt = int(ledger.get("g4_rounds_in_packet", 0))
-        if g4_pkt >= l_max_pkt:
-            if ledger["state"] not in {"PAUSED_BUDGET", "VERIFIED"}:
+        if g4_pkt >= l_max_pkt or g4_pkt + ledger_in_flight >= l_max_pkt:
+            if ledger_in_flight == 0 and ledger["state"] not in {"PAUSED_BUDGET", "VERIFIED"}:
                 ledger["state"] = "NEEDS_REPLAN"
                 task_runner._append_event(
                     ledger,
@@ -1733,13 +1755,13 @@ def _preflight_g4_caps(
                 task_runner.save_ledger(ledger_path, ledger)
             print(
                 f"[codex_room_review] NEEDS_REPLAN: G4 packet cap reached "
-                f"({g4_pkt} >= {l_max_pkt}).",
+                f"(packet_rounds={g4_pkt}, in_flight={ledger_in_flight}, cap={l_max_pkt}).",
                 file=sys.stderr,
             )
-            return 2
+            return 2, None, None
 
         inv_map = ledger.setdefault("g4_invocations_by_sha", {})
-        sha_count = int(inv_map.get(candidate_sha, 0))
+        sha_count = max(int(inv_map.get(candidate_sha, 0)), effective_sha)
         allow_resume = (
             ledger["state"] == "BLOCKED_INFRA"
             and args.resume_from is not None
@@ -1751,7 +1773,7 @@ def _preflight_g4_caps(
                 f"[codex_room_review] BLOCKED: Ledger state is {ledger['state']!r}; G4 refused.",
                 file=sys.stderr,
             )
-            return 2
+            return 2, None, None
         if not allow_resume and (
             ledger["state"] != "REVIEW_FROZEN_G4" or ledger.get("candidate_sha") != candidate_sha
         ):
@@ -1760,7 +1782,7 @@ def _preflight_g4_caps(
                 f"(state={ledger['state']!r}, expected={ledger.get('candidate_sha')!r}).",
                 file=sys.stderr,
             )
-            return 2
+            return 2, None, None
 
         if sha_count >= l_max_sha or (sha_count >= 1 and args.resume_from is None):
             print(
@@ -1768,7 +1790,7 @@ def _preflight_g4_caps(
                 f"{candidate_sha[:12]} (count={sha_count}).",
                 file=sys.stderr,
             )
-            return 2
+            return 2, None, None
 
         spent = float(ledger.get("spent_api_equiv_usd", 0.0))
         limit = float(ledger.get("budget_limit_usd", 0.0))
@@ -1785,8 +1807,23 @@ def _preflight_g4_caps(
                 f"(${spent:.4f} > ${limit:.4f}).",
                 file=sys.stderr,
             )
-            return 2
+            return 2, None, None
 
+        tracker["in_flight"][reservation_id] = {
+            "candidate_sha": candidate_sha,
+            "out_dir": str(out_dir),
+            "pid": os.getpid(),
+            "reserved_at_utc": now_iso,
+        }
+        tracker["sha_invocations"][candidate_sha] = sha_count + 1
+        task_runner.save_g4_tracker(tracker_path, tracker)
+
+        active_g4 = ledger.setdefault("active_g4_reservations", {})
+        active_g4[reservation_id] = {
+            "candidate_sha": candidate_sha,
+            "out_dir": str(out_dir),
+            "reserved_at_utc": now_iso,
+        }
         inv_map[candidate_sha] = sha_count + 1
         ledger["last_g4_candidate_sha"] = candidate_sha
         task_runner._append_event(
@@ -1795,7 +1832,13 @@ def _preflight_g4_caps(
             {"candidate_sha": candidate_sha, "invocation": sha_count + 1},
         )
         task_runner.save_ledger(ledger_path, ledger)
-    return None
+        return None, tracker_path, reservation_id
+
+    with task_runner._ledger_lock(tracker_path):
+        if ledger_path is not None:
+            with task_runner._ledger_lock(ledger_path):
+                return _check_and_reserve_locked()
+        return _check_and_reserve_locked()
 
 
 def _extract_codex_usage_deltas(raw_path: Path) -> list[tuple[int, int, int]]:
@@ -1828,11 +1871,14 @@ def _extract_codex_usage_deltas(raw_path: Path) -> list[tuple[int, int, int]]:
     return deltas
 
 
-def _extract_agy_cumulative_usage(raw_path: Path) -> tuple[str | None, int, int, int]:
-    """Extract (conversation_id, input_tokens, cache_read_tokens, output_tokens) from AGY JSONL."""
+def _extract_agy_cumulative_usage(
+    raw_path: Path,
+) -> tuple[str | None, str | None, int, int, int]:
+    """Extract (conversation_id, model, input_tokens, cache_read, output_tokens) from AGY."""
     if not raw_path.is_file():
-        return None, 0, 0, 0
+        return None, None, 0, 0, 0
     conv_id: str | None = None
+    model_name: str | None = None
     max_in = 0
     max_cache = 0
     max_out = 0
@@ -1848,9 +1894,14 @@ def _extract_agy_cumulative_usage(raw_path: Path) -> tuple[str | None, int, int,
             continue
         if isinstance(ev.get("conversation_id"), str) and ev["conversation_id"].strip():
             conv_id = ev["conversation_id"].strip()
+        if isinstance(ev.get("model"), str) and ev["model"].strip():
+            model_name = ev["model"].strip()
         res = ev.get("result") if isinstance(ev.get("result"), dict) else None
-        if res and isinstance(res.get("conversation_id"), str) and res["conversation_id"].strip():
-            conv_id = res["conversation_id"].strip()
+        if res:
+            if isinstance(res.get("conversation_id"), str) and res["conversation_id"].strip():
+                conv_id = res["conversation_id"].strip()
+            if isinstance(res.get("model"), str) and res["model"].strip():
+                model_name = res["model"].strip()
         usage = (
             res.get("usage")
             if (res and isinstance(res.get("usage"), dict))
@@ -1864,11 +1915,113 @@ def _extract_agy_cumulative_usage(raw_path: Path) -> tuple[str | None, int, int,
             max(0, int(usage.get("cache_read_tokens") or usage.get("cached_input_tokens") or 0)),
         )
         max_out = max(max_out, max(0, int(usage.get("output_tokens") or 0)))
-    return conv_id, max_in, max_cache, max_out
+    return conv_id, model_name, max_in, max_cache, max_out
 
 
-def _record_g4_ledger_outcome(
+def _resolve_raw_log_model(
+    raw_path: Path,
+    *,
+    is_codex: bool,
+    pass_state: PassState,
+    active_backend: str,
+    active_model: str | None,
+    primary_model: str | None,
+    route_models_by_tag: dict[str, str],
+) -> str | None:
+    parts = raw_path.name.split(".")
+    tag = parts[1] if len(parts) >= 4 else ""
+    if is_codex:
+        if pass_state.backend == "codex" and pass_state.model:
+            return pass_state.model
+        if active_backend == "codex" and active_model:
+            return active_model
+        return primary_model or EXPECTED_REVIEW_MODEL
+    if tag in route_models_by_tag:
+        return route_models_by_tag[tag]
+    if pass_state.backend == "agy" and pass_state.model:
+        return pass_state.model
+    return active_model if active_backend == "agy" else None
+
+
+def _bill_pass_raw_logs(
     ledger_path: Path,
+    *,
+    out_dir: Path,
+    states: dict[str, PassState],
+    reused_passes: list[str],
+    active_backend: str,
+    active_model: str | None,
+    primary_model: str | None,
+    route_models_by_tag: dict[str, str],
+) -> None:
+    for pass_name in ("pass1", "pass2"):
+        if pass_name in reused_passes:
+            continue
+        p_state = states[pass_name]
+        for raw_path in sorted(out_dir.glob(f"{pass_name}*.raw.jsonl")):
+            codex_deltas = _extract_codex_usage_deltas(raw_path)
+            if codex_deltas:
+                c_model = _resolve_raw_log_model(
+                    raw_path,
+                    is_codex=True,
+                    pass_state=p_state,
+                    active_backend=active_backend,
+                    active_model=active_model,
+                    primary_model=primary_model,
+                    route_models_by_tag=route_models_by_tag,
+                )
+                if not c_model:
+                    continue
+                try:
+                    task_runner._resolve_pricing(c_model)
+                except ValueError:
+                    continue
+                for u_in, u_cache, u_out in codex_deltas:
+                    task_runner.record_usage(
+                        ledger_path,
+                        model=c_model,
+                        input_tokens=u_in,
+                        output_tokens=u_out,
+                        thinking_tokens=0,
+                        cache_read_tokens=u_cache,
+                        counter_mode="delta",
+                    )
+                continue
+
+            conv_id, ev_model, a_in, a_cache, a_out = _extract_agy_cumulative_usage(raw_path)
+            if not (a_in or a_cache or a_out):
+                continue
+            a_model = ev_model or _resolve_raw_log_model(
+                raw_path,
+                is_codex=False,
+                pass_state=p_state,
+                active_backend=active_backend,
+                active_model=active_model,
+                primary_model=primary_model,
+                route_models_by_tag=route_models_by_tag,
+            )
+            if not a_model:
+                continue
+            try:
+                task_runner._resolve_pricing(a_model)
+            except ValueError:
+                continue
+            task_runner.record_usage(
+                ledger_path,
+                model=a_model,
+                input_tokens=a_in,
+                output_tokens=a_out,
+                thinking_tokens=0,
+                cache_read_tokens=a_cache,
+                conversation_id=conv_id,
+                counter_mode="cumulative",
+            )
+
+
+def _record_g4_outcome(
+    tracker_path: Path | None,
+    ledger_path: Path | None,
+    reservation_id: str | None,
     *,
     git_top: Path,
     out_dir: Path,
@@ -1878,49 +2031,44 @@ def _record_g4_ledger_outcome(
     reused_passes: list[str],
     active_backend: str,
     active_model: str | None,
-) -> None:
-    """Record non-reused G4 pass token spend and transition ledger state atomically."""
-    for pass_name in ("pass1", "pass2"):
-        if pass_name in reused_passes:
-            continue
-        p_state = states[pass_name]
-        p_backend = p_state.backend or active_backend
-        p_model = p_state.model or active_model
-        if not p_model:
-            continue
-        try:
-            task_runner._resolve_pricing(p_model)
-        except ValueError:
-            continue
-        raw_path = out_dir / f"{pass_name}.raw.jsonl"
-        if p_backend == "codex":
-            for u_in, u_cache, u_out in _extract_codex_usage_deltas(raw_path):
-                task_runner.record_usage(
-                    ledger_path,
-                    model=p_model,
-                    input_tokens=u_in,
-                    output_tokens=u_out,
-                    thinking_tokens=0,
-                    cache_read_tokens=u_cache,
-                    counter_mode="delta",
-                )
-        else:
-            conv_id, a_in, a_cache, a_out = _extract_agy_cumulative_usage(raw_path)
-            if a_in or a_cache or a_out:
-                task_runner.record_usage(
-                    ledger_path,
-                    model=p_model,
-                    input_tokens=a_in,
-                    output_tokens=a_out,
-                    thinking_tokens=0,
-                    cache_read_tokens=a_cache,
-                    conversation_id=conv_id,
-                    counter_mode="cumulative",
-                )
-
+    primary_model: str | None,
+    route_models_by_tag: dict[str, str],
+) -> str | None:
+    """Release G4 in-flight reservation, record spend, and transition tracker + ledger."""
     gate_status = str(report.get("review_gate_status", "BLOCKED"))
-    with task_runner._ledger_lock(ledger_path):
+    count_round = gate_status in {"PASSED", "CHANGES_REQUESTED", "BLOCKED"}
+
+    def _update_locked() -> str | None:
+        if tracker_path is not None:
+            tracker = task_runner.load_g4_tracker(tracker_path)
+            if reservation_id:
+                tracker["in_flight"].pop(reservation_id, None)
+                tracker["attempts"][reservation_id] = {
+                    "candidate_sha": candidate_sha,
+                    "status": gate_status,
+                    "out_dir": str(out_dir),
+                    "completed_at_utc": datetime.now(timezone.utc).isoformat(),
+                }
+            if count_round:
+                tracker["completed_rounds"] = int(tracker.get("completed_rounds", 0)) + 1
+            task_runner.save_g4_tracker(tracker_path, tracker)
+
+        if ledger_path is None or not ledger_path.is_file():
+            return None
+
+        _bill_pass_raw_logs(
+            ledger_path,
+            out_dir=out_dir,
+            states=states,
+            reused_passes=reused_passes,
+            active_backend=active_backend,
+            active_model=active_model,
+            primary_model=primary_model,
+            route_models_by_tag=route_models_by_tag,
+        )
         ledger = task_runner.load_ledger(ledger_path, repo_root=git_top)
+        if reservation_id:
+            ledger.setdefault("active_g4_reservations", {}).pop(reservation_id, None)
         if gate_status in {"PASSED", "CHANGES_REQUESTED"}:
             ledger["g4_rounds_total"] = int(ledger.get("g4_rounds_total", 0)) + 1
             ledger["g4_rounds_in_packet"] = int(ledger.get("g4_rounds_in_packet", 0)) + 1
@@ -1960,27 +2108,63 @@ def _record_g4_ledger_outcome(
                 {"candidate_sha": candidate_sha, "errors": report.get("errors", [])},
             )
         task_runner.save_ledger(ledger_path, ledger)
+        return str(ledger["state"])
+
+    if tracker_path is not None:
+        with task_runner._ledger_lock(tracker_path):
+            if ledger_path is not None and ledger_path.is_file():
+                with task_runner._ledger_lock(ledger_path):
+                    return _update_locked()
+            return _update_locked()
+    if ledger_path is not None and ledger_path.is_file():
+        with task_runner._ledger_lock(ledger_path):
+            return _update_locked()
+    return None
 
 
-def _mark_ledger_infra_blocked(
+def _release_g4_reservation_on_abort(
+    tracker_path: Path | None,
     ledger_path: Path | None,
+    reservation_id: str | None,
+    *,
     git_top: Path,
     candidate_sha: str,
-    reason: str,
 ) -> None:
-    if ledger_path is None or not ledger_path.is_file():
+    """Release leaked in-flight reservation if G4 exits unexpectedly before finalize."""
+    if not reservation_id:
         return
-    with task_runner._ledger_lock(ledger_path):
-        ledger = task_runner.load_ledger(ledger_path, repo_root=git_top)
-        ledger["state"] = "BLOCKED_INFRA"
-        ledger["last_g4_candidate_sha"] = candidate_sha
-        ledger["last_g4_status"] = "BLOCKED_INFRA"
-        task_runner._append_event(
-            ledger,
-            "G4_BLOCKED_INFRA",
-            {"candidate_sha": candidate_sha, "reason": reason},
-        )
-        task_runner.save_ledger(ledger_path, ledger)
+
+    def _release_locked() -> None:
+        if tracker_path is not None and tracker_path.is_file():
+            tracker = task_runner.load_g4_tracker(tracker_path)
+            if reservation_id in tracker.get("in_flight", {}):
+                tracker["in_flight"].pop(reservation_id, None)
+                task_runner.save_g4_tracker(tracker_path, tracker)
+        if ledger_path is not None and ledger_path.is_file():
+            ledger = task_runner.load_ledger(ledger_path, repo_root=git_top)
+            active = ledger.get("active_g4_reservations", {})
+            if reservation_id in active:
+                active.pop(reservation_id, None)
+                ledger["state"] = "BLOCKED_INFRA"
+                ledger["last_g4_candidate_sha"] = candidate_sha
+                ledger["last_g4_status"] = "BLOCKED_INFRA"
+                task_runner._append_event(
+                    ledger,
+                    "G4_ABORTED_RELEASE",
+                    {"candidate_sha": candidate_sha, "reservation_id": reservation_id},
+                )
+                task_runner.save_ledger(ledger_path, ledger)
+
+    if tracker_path is not None:
+        with task_runner._ledger_lock(tracker_path):
+            if ledger_path is not None and ledger_path.is_file():
+                with task_runner._ledger_lock(ledger_path):
+                    _release_locked()
+            else:
+                _release_locked()
+    elif ledger_path is not None and ledger_path.is_file():
+        with task_runner._ledger_lock(ledger_path):
+            _release_locked()
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -2101,14 +2285,67 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     active_ledger_path: Path | None = None
+    active_tracker_path: Path | None = None
+    active_reservation_id: str | None = None
     if _should_enforce_g4_caps(args, out_dir, git_top):
         active_ledger_path = _resolve_g4_ledger_path(args, git_top)
-        preflight_rc = _preflight_g4_caps(
+        preflight_rc, active_tracker_path, active_reservation_id = _preflight_g4_caps(
             args, out_dir, git_top, candidate_sha, active_ledger_path
         )
         if preflight_rc is not None:
             return preflight_rc
 
+    def _run_after_preflight() -> int:
+        return _execute_after_preflight(
+            args=args,
+            git_top=git_top,
+            out_dir=out_dir,
+            info=info,
+            candidate_sha=candidate_sha,
+            policy_data=policy_data,
+            effective_prefixes=effective_prefixes,
+            qualified_routes=qualified_routes,
+            max_transient_retries=max_transient_retries,
+            policy_sha256=policy_sha256,
+            schema=schema,
+            schema_sha256=schema_sha256,
+            resume_dir=resume_dir,
+            active_ledger_path=active_ledger_path,
+            active_tracker_path=active_tracker_path,
+            active_reservation_id=active_reservation_id,
+        )
+
+    try:
+        return _run_after_preflight()
+    finally:
+        _release_g4_reservation_on_abort(
+            active_tracker_path,
+            active_ledger_path,
+            active_reservation_id,
+            git_top=git_top,
+            candidate_sha=candidate_sha,
+        )
+
+
+def _execute_after_preflight(
+    *,
+    args: argparse.Namespace,
+    git_top: Path,
+    out_dir: Path,
+    info: dict[str, Any],
+    candidate_sha: str,
+    policy_data: dict[str, Any] | None,
+    effective_prefixes: tuple[str, ...],
+    qualified_routes: list[str],
+    max_transient_retries: int,
+    policy_sha256: str,
+    schema: dict[str, Any],
+    schema_sha256: str,
+    resume_dir: Path | None,
+    active_ledger_path: Path | None,
+    active_tracker_path: Path | None,
+    active_reservation_id: str | None,
+) -> int:
     out_dir.mkdir(parents=True, exist_ok=True)
     lock_path = out_dir / ".review-attempt.lock"
     try:
@@ -2298,10 +2535,12 @@ def main(argv: list[str] | None = None) -> int:
 
     active_backend = "codex"
     active_model: str | None = args.model
+    primary_model: str | None = args.model
     fallback_used = False
     fallback_reason: str | None = None
     forced_gate_status: str | None = None
     stage_extra_errors: list[str] = []
+    route_models_by_tag: dict[str, str] = {}
 
     def _finalize_and_exit() -> int:
         report = consolidate_reviews(
@@ -2341,18 +2580,21 @@ def main(argv: list[str] | None = None) -> int:
         if not _write_once_outputs(out_dir, report):
             return 2
 
-        if active_ledger_path is not None and active_ledger_path.is_file():
-            _record_g4_ledger_outcome(
-                active_ledger_path,
-                git_top=git_top,
-                out_dir=out_dir,
-                candidate_sha=candidate_sha,
-                report=report,
-                states=states,
-                reused_passes=reused_passes,
-                active_backend=active_backend,
-                active_model=active_model,
-            )
+        resulting_ledger_state = _record_g4_outcome(
+            active_tracker_path,
+            active_ledger_path,
+            active_reservation_id,
+            git_top=git_top,
+            out_dir=out_dir,
+            candidate_sha=candidate_sha,
+            report=report,
+            states=states,
+            reused_passes=reused_passes,
+            active_backend=active_backend,
+            active_model=active_model,
+            primary_model=primary_model,
+            route_models_by_tag=route_models_by_tag,
+        )
 
         print(
             f"[codex_room_review] sha={candidate_sha[:12]} backend={active_backend} "
@@ -2361,6 +2603,17 @@ def main(argv: list[str] | None = None) -> int:
             f"blocking_open={report['blocking_open_count']} out={out_dir}"
         )
         if report["review_gate_status"] in {"BLOCKED", "BLOCKED_AUTH", "BLOCKED_INFRA"}:
+            return 2
+        if resulting_ledger_state == "PAUSED_BUDGET" or (
+            report["review_gate_status"] == "PASSED"
+            and resulting_ledger_state
+            in {"BLOCKED", "BLOCKED_AUTH", "BLOCKED_INFRA", "NEEDS_REPLAN"}
+        ):
+            print(
+                f"[codex_room_review] {resulting_ledger_state}: G4 review halted "
+                f"after ledger accounting (review_status={report['review_gate_status']}).",
+                file=sys.stderr,
+            )
             return 2
         if args.fail_on_blocking and report["blocking_open_count"] > 0:
             return 1
@@ -2573,8 +2826,9 @@ def main(argv: list[str] | None = None) -> int:
             agy_prefix = resolve_agy_command()
         except FileNotFoundError as exc:
             print(f"[codex_room_review] {exc}", file=sys.stderr)
-            _mark_ledger_infra_blocked(active_ledger_path, git_top, candidate_sha, str(exc))
-            return 2
+            forced_gate_status = "BLOCKED_INFRA"
+            stage_extra_errors.append(str(exc))
+            return _finalize_and_exit()
         outcome, st_errs, _ = _run_provider_stage("agy", agy_prefix, active_model)
         if outcome == "QUOTA_EXHAUSTED":
             _mark_pool_exhausted(active_model)
@@ -2598,6 +2852,7 @@ def main(argv: list[str] | None = None) -> int:
         return _finalize_and_exit()
 
     active_model = EXPECTED_REVIEW_MODEL
+    primary_model = EXPECTED_REVIEW_MODEL
     v1 = _call_verify_role("pass1", args.runtime_root, git_top)
     v2 = _call_verify_role("pass2", args.runtime_root, git_top)
     if not (v1["ok"] and v2["ok"]):
@@ -2618,8 +2873,9 @@ def main(argv: list[str] | None = None) -> int:
         if args.backend == "codex":
             msg = "[codex_room_review] Codex CLI (`codex`) not found on PATH."
             print(msg, file=sys.stderr)
-            _mark_ledger_infra_blocked(active_ledger_path, git_top, candidate_sha, msg)
-            return 2
+            forced_gate_status = "BLOCKED_INFRA"
+            stage_extra_errors.append(msg)
+            return _finalize_and_exit()
         fallback_reason = "codex_cli_not_found"
         _mark_pool_exhausted(EXPECTED_REVIEW_MODEL)
 
@@ -2680,8 +2936,9 @@ def main(argv: list[str] | None = None) -> int:
                 agy_prefix = resolve_agy_command()
             except FileNotFoundError as exc:
                 print(f"[codex_room_review] Fallback failed: {exc}", file=sys.stderr)
-                _mark_ledger_infra_blocked(active_ledger_path, git_top, candidate_sha, str(exc))
-                return 2
+                forced_gate_status = "BLOCKED_INFRA"
+                stage_extra_errors.append(str(exc))
+                return _finalize_and_exit()
 
             print(
                 f"[codex_room_review] Codex CLI unavailable ({fallback_reason}); "
@@ -2691,6 +2948,7 @@ def main(argv: list[str] | None = None) -> int:
             active_backend = "agy"
             active_model = route_model
             fallback_used = True
+            route_models_by_tag[f"agy-failed-{route_idx}"] = route_model
 
             outcome, st_errs, failed_passes = _run_provider_stage("agy", agy_prefix, route_model)
             if outcome == "OK":

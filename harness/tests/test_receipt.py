@@ -7,6 +7,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 from harness.scripts.receipt import evaluate_receipt, render_receipt_markdown
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -1350,5 +1352,196 @@ def test_g5_receipt_blocks_paused_halted_or_over_cap_ledger_and_attempts(
     assert disp_after["state"] == "VERIFIED"
     assert disp_after["candidate_sha"] == cand_sha
     assert disp_after["consecutive_failed_candidates"] == 0
+
+    # 6. g4-tracker.json > 6 blocks G5 even when attempts/ dir is empty (custom --out-dir).
+    tracker_path = task_runner.default_g4_tracker_path("T-G5-TRACKER", repo_root=repo)
+    tracker = task_runner.load_g4_tracker(tracker_path, task_id="T-G5-TRACKER")
+    tracker["completed_rounds"] = 7
+    task_runner.save_g4_tracker(tracker_path, tracker)
+    out_trk = tmp_path / "out_g5_tracker"
+    proc_trk = subprocess.run(
+        [
+            sys.executable,
+            str(REPO_ROOT / "harness" / "scripts" / "receipt.py"),
+            "--task-id",
+            "T-G5-TRACKER",
+            "--phase",
+            "1",
+            "--base-sha",
+            base_sha,
+            "--candidate-sha",
+            cand_sha,
+            "--verifier-json",
+            str(v_path),
+            "--review-json",
+            str(r_path),
+            "--repo-root",
+            str(repo),
+            "--out-dir",
+            str(out_trk),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert proc_trk.returncode == 2
+    rec_trk = json.loads((out_trk / "receipt.json").read_text(encoding="utf-8"))
+    assert rec_trk["conclusion"] == "BLOCKED"
+
+
+def test_g5_receipt_evaluates_and_writes_atomically_under_ledger_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Concurrent PAUSED_BUDGET mutation and receipt.main never emit VERIFIED on PAUSED ledger."""
+    import threading
+
+    from harness.scripts import receipt as receipt_mod
+    from harness.scripts import task_runner
+
+    repo = tmp_path / "repo_g5_atomic"
+    repo.mkdir()
+    subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+    subprocess.run(
+        ["git", "config", "user.email", "test@example.com"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.name", "Test User"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+    )
+    src = repo / "mod.py"
+    src.write_text("x = 1\n", encoding="utf-8")
+    subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+    subprocess.run(["git", "commit", "-m", "base"], cwd=repo, check=True, capture_output=True)
+    base_sha = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=repo, check=True, capture_output=True, text=True
+    ).stdout.strip()
+    src.write_text("x = 2\n", encoding="utf-8")
+    subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+    subprocess.run(["git", "commit", "-m", "cand"], cwd=repo, check=True, capture_output=True)
+    cand_sha = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=repo, check=True, capture_output=True, text=True
+    ).stdout.strip()
+
+    v_path = tmp_path / "v_atom.json"
+    r_path = tmp_path / "r_atom.json"
+    v_path.write_text(json.dumps(_verifier(cand_sha)), encoding="utf-8")
+    r_path.write_text(json.dumps(_review(cand_sha)), encoding="utf-8")
+
+    # 1. Deterministic check: mutation right before _ledger_lock acquisition makes G5 see PAUSED.
+    ledger_det = repo / "harness" / "runs" / "T-G5-DET" / "ledger.json"
+    l_det = task_runner.init_or_load_ledger(
+        ledger_det, root_task_id="T-G5-DET", base_sha=base_sha, budget_usd=1.0
+    )
+    l_det["state"] = "READY_FOR_ACCEPTANCE"
+    l_det["candidate_sha"] = cand_sha
+    task_runner.save_ledger(ledger_det, l_det)
+
+    orig_lock = task_runner._ledger_lock
+    mutated_once = False
+
+    def _mutating_lock_wrapper(p: Path):
+        nonlocal mutated_once
+        if not mutated_once and p.resolve() == ledger_det.resolve():
+            mutated_once = True
+            with orig_lock(ledger_det):
+                cur = task_runner.load_ledger(ledger_det)
+                cur["state"] = "PAUSED_BUDGET"
+                task_runner.save_ledger(ledger_det, cur)
+        return orig_lock(p)
+
+    monkeypatch.setattr(task_runner, "_ledger_lock", _mutating_lock_wrapper)
+    out_det = tmp_path / "out_g5_det"
+    rc_det = receipt_mod.main(
+        [
+            "--task-id",
+            "T-G5-DET",
+            "--phase",
+            "1",
+            "--base-sha",
+            base_sha,
+            "--candidate-sha",
+            cand_sha,
+            "--verifier-json",
+            str(v_path),
+            "--review-json",
+            str(r_path),
+            "--repo-root",
+            str(repo),
+            "--out-dir",
+            str(out_det),
+        ]
+    )
+    assert rc_det == 2
+    assert json.loads((out_det / "receipt.json").read_text(encoding="utf-8"))["conclusion"] == (
+        "BLOCKED"
+    )
+    monkeypatch.setattr(task_runner, "_ledger_lock", orig_lock)
+
+    # 2. Barrier race between receipt.main and concurrent record_usage exceeding budget.
+    ledger_race = repo / "harness" / "runs" / "T-G5-RACE" / "ledger.json"
+    l_race = task_runner.init_or_load_ledger(
+        ledger_race, root_task_id="T-G5-RACE", base_sha=base_sha, budget_usd=1.0
+    )
+    l_race["state"] = "READY_FOR_ACCEPTANCE"
+    l_race["candidate_sha"] = cand_sha
+    task_runner.save_ledger(ledger_race, l_race)
+
+    out_race = tmp_path / "out_g5_race"
+    barrier = threading.Barrier(2)
+    g5_rc_box: list[int] = []
+
+    def _run_g5() -> None:
+        barrier.wait(timeout=5.0)
+        g5_rc_box.append(
+            receipt_mod.main(
+                [
+                    "--task-id",
+                    "T-G5-RACE",
+                    "--phase",
+                    "1",
+                    "--base-sha",
+                    base_sha,
+                    "--candidate-sha",
+                    cand_sha,
+                    "--verifier-json",
+                    str(v_path),
+                    "--review-json",
+                    str(r_path),
+                    "--repo-root",
+                    str(repo),
+                    "--out-dir",
+                    str(out_race),
+                ]
+            )
+        )
+
+    def _run_over_budget() -> None:
+        barrier.wait(timeout=5.0)
+        task_runner.record_usage(
+            ledger_race, model="gpt-6.1-sol", input_tokens=1_000_000, counter_mode="delta"
+        )
+
+    t_g5 = threading.Thread(target=_run_g5)
+    t_spend = threading.Thread(target=_run_over_budget)
+    t_g5.start()
+    t_spend.start()
+    t_g5.join(timeout=10.0)
+    t_spend.join(timeout=10.0)
+
+    rec_race = json.loads((out_race / "receipt.json").read_text(encoding="utf-8"))
+    led_race_after = json.loads(ledger_race.read_text(encoding="utf-8"))
+    if led_race_after["state"] == "PAUSED_BUDGET":
+        assert g5_rc_box[0] == 2
+        assert rec_race["conclusion"] == "BLOCKED"
+    else:
+        assert led_race_after["state"] == "VERIFIED"
+        assert g5_rc_box[0] == 0
+        assert rec_race["conclusion"] == "VERIFIED"
+
 
 

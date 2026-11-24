@@ -101,9 +101,9 @@ stateDiagram-v2
 ```
 
 **Invariants (`G4 ↔ ledger.json ↔ G5` Hard Round Caps)**:
-- `codex_room_review.py` enforces `max_g4_rounds_per_root_task = 6`, `max_g4_rounds_per_packet_version = 3`, and `max_g4_invocations_per_candidate_sha = 2` (plus ledgerless `attempts/` ceiling checks) preflight before creating `out_dir`/`.review-attempt.lock`/`frozen/` or spawning any reviewer CLI, and records non-reused token usage and gate state transitions into `ledger.json`.
+- `codex_room_review.py` enforces `max_g4_rounds_per_root_task = 6`, `max_g4_rounds_per_packet_version = 3`, and `max_g4_invocations_per_candidate_sha = 2` via OS-locked canonical `g4-tracker.json` + `attempts/` + `ledger.json` with atomic in-flight slot reservations before creating `out_dir`/`.review-attempt.lock`/`frozen/` or spawning any reviewer CLI, bills all non-reused `pass{1,2}*.raw.jsonl` logs (including archived retries/failed fallbacks), and exits `2` if `PAUSED_BUDGET` is reached.
 - `record_replan` resets `g4_rounds_in_packet = 0` while keeping `g4_rounds_total` monotonic across replans.
-- `receipt.py` (`G5`) refuses `VERIFIED` (`BLOCKED`, `exit 2`) if `ledger.json` is halted/skipped or `attempts/` exceeds `max_g4_rounds_per_root_task`.
+- `receipt.py` (`G5`) evaluates `g4-tracker.json`, `attempts/`, and `ledger.json` atomically under `_ledger_lock` and refuses `VERIFIED` (`BLOCKED`, `exit 2`) if halted, skipped, or over-cap.
 
 ---
 

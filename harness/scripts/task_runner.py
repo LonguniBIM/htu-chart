@@ -178,6 +178,8 @@ def _ensure_ledger_defaults(
     data.setdefault("g4_rounds_in_packet", 0)
     if not isinstance(data.get("g4_invocations_by_sha"), dict):
         data["g4_invocations_by_sha"] = {}
+    if not isinstance(data.get("active_g4_reservations"), dict):
+        data["active_g4_reservations"] = {}
     data.setdefault("last_g4_candidate_sha", None)
     data.setdefault("last_g4_status", None)
     return data
@@ -330,20 +332,19 @@ def default_ledger_path(root_task_id: str, repo_root: Path | None = None) -> Pat
     return root / "harness" / "runs" / safe_id / "ledger.json"
 
 
-def save_ledger(ledger_path: Path, ledger: dict[str, Any]) -> None:
-    """Atomically write ``ledger`` to ``ledger_path`` via fsync + os.replace."""
-    resolved = ledger_path.resolve()
-    _require_finite_number(ledger.get("budget_limit_usd"), "budget_limit_usd", positive=True)
-    _require_finite_number(ledger.get("spent_api_equiv_usd", 0.0), "spent_api_equiv_usd")
-    for res_id, res_amt in ledger.get("active_reservations", {}).items():
-        _require_finite_number(res_amt, f"active_reservations[{res_id!r}]")
+def default_g4_tracker_path(task_id: str, repo_root: Path | None = None) -> Path:
+    """Return canonical ``harness/runs/<task_id>/g4-tracker.json`` path."""
+    safe_id = _validate_safe_task_id(task_id, "task_id")
+    root = (repo_root or REPO_ROOT).resolve()
+    return root / "harness" / "runs" / safe_id / "g4-tracker.json"
 
-    ledger["updated_at_utc"] = _now_utc().isoformat()
-    payload = json.dumps(ledger, indent=2, allow_nan=False) + "\n"
 
+def _atomic_write_json(target_path: Path, data: dict[str, Any]) -> None:
+    resolved = target_path.resolve()
+    payload = json.dumps(data, indent=2, allow_nan=False) + "\n"
     with _ledger_lock(resolved):
         resolved.parent.mkdir(parents=True, exist_ok=True)
-        tmp_name = f".ledger.{os.getpid()}.{threading.get_ident()}.tmp"
+        tmp_name = f".{resolved.name}.{os.getpid()}.{threading.get_ident()}.tmp"
         tmp_path = resolved.parent / tmp_name
         try:
             with tmp_path.open("w", encoding="utf-8") as fh:
@@ -365,6 +366,45 @@ def save_ledger(ledger_path: Path, ledger: dict[str, Any]) -> None:
                 except OSError:
                     pass
             raise
+
+
+def load_g4_tracker(tracker_path: Path, *, task_id: str = "") -> dict[str, Any]:
+    """Load canonical ``g4-tracker.json`` or initialize an empty tracker payload."""
+    resolved = tracker_path.resolve()
+    data: dict[str, Any] = {}
+    if resolved.is_file():
+        loaded = json.loads(resolved.read_text(encoding="utf-8"))
+        if not isinstance(loaded, dict):
+            raise ValueError(f"Invalid g4-tracker payload at {resolved}")
+        data = loaded
+    data.setdefault("schema_version", 1)
+    if task_id:
+        data.setdefault("task_id", task_id)
+    data.setdefault("completed_rounds", 0)
+    if not isinstance(data.get("sha_invocations"), dict):
+        data["sha_invocations"] = {}
+    if not isinstance(data.get("in_flight"), dict):
+        data["in_flight"] = {}
+    if not isinstance(data.get("attempts"), dict):
+        data["attempts"] = {}
+    return data
+
+
+def save_g4_tracker(tracker_path: Path, tracker: dict[str, Any]) -> None:
+    """Atomically persist ``g4-tracker.json`` under its OS lock."""
+    tracker["updated_at_utc"] = _now_utc().isoformat()
+    _atomic_write_json(tracker_path, tracker)
+
+
+def save_ledger(ledger_path: Path, ledger: dict[str, Any]) -> None:
+    """Atomically write ``ledger`` to ``ledger_path`` via fsync + os.replace."""
+    _require_finite_number(ledger.get("budget_limit_usd"), "budget_limit_usd", positive=True)
+    _require_finite_number(ledger.get("spent_api_equiv_usd", 0.0), "spent_api_equiv_usd")
+    for res_id, res_amt in ledger.get("active_reservations", {}).items():
+        _require_finite_number(res_amt, f"active_reservations[{res_id!r}]")
+
+    ledger["updated_at_utc"] = _now_utc().isoformat()
+    _atomic_write_json(ledger_path, ledger)
 
 
 def load_ledger(
@@ -448,6 +488,7 @@ def init_or_load_ledger(
             "g4_rounds_total": 0,
             "g4_rounds_in_packet": 0,
             "g4_invocations_by_sha": {},
+            "active_g4_reservations": {},
             "last_g4_candidate_sha": None,
             "last_g4_status": None,
             "auto_replans_used": 0,
@@ -951,12 +992,16 @@ def _check_dispatch_locked(
         save_ledger(ledger_path, ledger)
         return False, ledger, 2, msg
 
+    g4_in_flight = len(ledger.get("active_g4_reservations", {}))
     max_g4_root = int(breakers.get("max_g4_rounds_per_root_task", 6))
-    if int(ledger.get("g4_rounds_total", 0)) >= max_g4_root:
-        ledger["state"] = "PAUSED_BUDGET"
-        msg = "Circuit breaker: max_g4_rounds_per_root_task reached."
-        _append_event(ledger, "CIRCUIT_BREAKER_PAUSED", {"reason": msg})
-        save_ledger(ledger_path, ledger)
+    if int(ledger.get("g4_rounds_total", 0)) + g4_in_flight >= max_g4_root:
+        if g4_in_flight == 0:
+            ledger["state"] = "PAUSED_BUDGET"
+            msg = "Circuit breaker: max_g4_rounds_per_root_task reached."
+            _append_event(ledger, "CIRCUIT_BREAKER_PAUSED", {"reason": msg})
+            save_ledger(ledger_path, ledger)
+        else:
+            msg = "Circuit breaker: max_g4_rounds_per_root_task reached by in-flight G4."
         return False, ledger, 2, msg
 
     if int(ledger["candidates_in_packet"]) >= int(breakers["max_candidates_per_packet_version"]):
@@ -967,11 +1012,14 @@ def _check_dispatch_locked(
         return False, ledger, 2, msg
 
     max_g4_pkt = int(breakers.get("max_g4_rounds_per_packet_version", 3))
-    if int(ledger.get("g4_rounds_in_packet", 0)) >= max_g4_pkt:
-        ledger["state"] = "NEEDS_REPLAN"
-        msg = "Circuit breaker: max_g4_rounds_per_packet_version reached."
-        _append_event(ledger, "CIRCUIT_BREAKER_REPLAN", {"reason": msg})
-        save_ledger(ledger_path, ledger)
+    if int(ledger.get("g4_rounds_in_packet", 0)) + g4_in_flight >= max_g4_pkt:
+        if g4_in_flight == 0:
+            ledger["state"] = "NEEDS_REPLAN"
+            msg = "Circuit breaker: max_g4_rounds_per_packet_version reached."
+            _append_event(ledger, "CIRCUIT_BREAKER_REPLAN", {"reason": msg})
+            save_ledger(ledger_path, ledger)
+        else:
+            msg = "Circuit breaker: max_g4_rounds_per_packet_version reached by in-flight G4."
         return False, ledger, 2, msg
 
     if int(ledger["consecutive_failed_candidates"]) >= int(

@@ -89,7 +89,7 @@ G5   (Acceptance)  -> Coordinator adjudicates findings + generates write-once re
 
 `G4 ↔ ledger.json ↔ G5` Hard Round-Cap Invariants (`R03`):
 - `harness/model-policy.json` (`circuit_breakers`) and `task_runner.py` enforce `max_g4_rounds_per_root_task = 6` (`PAUSED_BUDGET`), `max_g4_rounds_per_packet_version = 3` (`NEEDS_REPLAN`, reset on `record_replan` while preserving `g4_rounds_total`), and `max_g4_invocations_per_candidate_sha = 2`.
-- `codex_room_review.py` enforces both OS-locked `ledger.json` caps and ledgerless `attempts/` filesystem caps **before** creating `out_dir`, `.review-attempt.lock`, or `frozen/`, or spawning any CLI subprocess, and accounts non-reused `pass{1,2}.raw.jsonl` token usage + `G4` state transitions back into `ledger.json`.
-- `receipt.py` (`G5`) blocks (`exit 2`, `conclusion="BLOCKED"`) whenever `ledger.json` is halted (`PAUSED_BUDGET`, `BLOCKED*`), skipped `G4`, or `g4_rounds_total` / `attempts/` exceeds policy caps.
+- `codex_room_review.py` enforces OS-locked canonical `harness/runs/<task_id>/g4-tracker.json` + `attempts/` caps and `ledger.json` caps with atomic in-flight slot reservations (`in_flight` / `active_g4_reservations`) **before** creating `out_dir`, `.review-attempt.lock`, or `frozen/`, or spawning any CLI subprocess (preventing custom `--out-dir` and concurrency bypasses). Post-run, it bills all non-reused `pass{1,2}*.raw.jsonl` logs (including archived transient-retry and failed-provider logs), transitions `ledger.json`, and exits `2` if `PAUSED_BUDGET` triggers.
+- `receipt.py` (`G5`) evaluates `g4-tracker.json`, `attempts/`, and `ledger.json` atomically under `_ledger_lock` before writing `receipt.json`, blocking (`exit 2`, `conclusion="BLOCKED"`) whenever `ledger.json` is halted (`PAUSED_BUDGET`, `BLOCKED*`), skipped `G4`, or `g4_rounds_total` / `g4-tracker.json` / `attempts/` exceeds policy caps.
 
 Only **`VERIFIED`** from `receipt.py` allows Coordinator to mark a task complete in `task.md`.

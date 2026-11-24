@@ -2439,7 +2439,7 @@ def test_g4_updates_ledger_usage_rounds_and_breakers_on_changes_requested(
     )
     updated = json.loads(ledger_path.read_text(encoding="utf-8"))
     assert rc == 1
-    assert updated["spent_api_equiv_usd"] > 0
+    assert updated["spent_api_equiv_usd"] == pytest.approx(0.077, abs=1e-6)
     assert updated["g4_rounds_total"] == 1
     assert updated["g4_rounds_in_packet"] == 1
     assert updated["last_g4_candidate_sha"] == sha1
@@ -2542,19 +2542,29 @@ def test_g4_require_ledger_agy_dedup_and_resume_reuse_no_double_charge(
         encoding="utf-8",
     )
 
+    agy_state_file = tmp_path / "agy_dedup_calls.txt"
     agy_script = tmp_path / "fake_agy_dedup.py"
     agy_prefix = _write_fake_codex_script(
         agy_script,
         (
-            "import json, sys\n"
-            "args = sys.argv[1:]\n"
+            "import json, pathlib, sys\n"
+            f"sf = pathlib.Path({str(agy_state_file)!r})\n"
+            "n = len(sf.read_text(encoding='utf-8').splitlines()) if sf.is_file() else 0\n"
+            "sf.write_text(('x\\n' * (n + 1)), encoding='utf-8')\n"
+            "if n == 0:\n"
+            "    print(json.dumps({'event': 'result', 'conversation_id': 'conv-agy-1', "
+            "'result': {'status': 'ERROR', 'conversation_id': 'conv-agy-1', "
+            "'error': '503 unavailable', "
+            "'usage': {'input_tokens': 100000, 'cache_read_tokens': 0, "
+            "'output_tokens': 10000, 'thinking_tokens': 4000}}}), flush=True)\n"
+            "    sys.exit(1)\n"
             f"payload = {{'revision_sha': {sha1!r}, 'lens': 'security_and_invariants', "
             "'verdict': 'APPROVE', 'summary': 'ok', 'findings': [], "
             "'test_quality_issues': [], 'unverified_areas': []}\n"
             "print(json.dumps({'event': 'result', 'conversation_id': 'conv-agy-1', "
             "'result': {'status': 'SUCCESS', 'conversation_id': 'conv-agy-1', "
             "'structured_output': payload, "
-            "'usage': {'input_tokens': 100000, 'cache_read_tokens': 0, "
+            "'usage': {'input_tokens': 150000, 'cache_read_tokens': 0, "
             "'output_tokens': 10000, 'thinking_tokens': 4000}}}), flush=True)\n"
         ),
     )
@@ -2589,12 +2599,282 @@ def test_g4_require_ledger_agy_dedup_and_resume_reuse_no_double_charge(
         ]
     )
     assert rc_agy == 0
+    att2_report = json.loads(
+        (
+            repo_dir / "harness" / "runs" / "T-AGY-DEDUP" / "attempts" / f"att2-{sha1[:12]}"
+            / "consolidated-review.json"
+        ).read_text(encoding="utf-8")
+    )
+    assert att2_report["reused_passes"] == ["pass1"]
     led_after = json.loads(ledger_agy.read_text(encoding="utf-8"))
     assert led_after["state"] == "READY_FOR_ACCEPTANCE"
     assert led_after["g4_rounds_total"] == 1
     assert led_after["last_g4_status"] == "PASSED"
-    # gemini-4-carbon-: 100k*$2.50/1M ($0.25) + 10k*$15/1M ($0.15) = $0.40 (no thinking dup)
-    assert led_after["spent_api_equiv_usd"] == pytest.approx(0.40)
+    # Retry reported 100k and final reported 150k on conv-agy-1 -> high-water 150k ($0.375) +
+    # 10k out ($0.15) = $0.525 (no 250k double-count, no thinking dup, no pass1 reuse charge).
+    assert led_after["spent_api_equiv_usd"] == pytest.approx(0.525, abs=1e-6)
+
+
+def test_g4_archived_retry_missing_fallback_usage_and_budget_pause_exit_two(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Bill archived transient retries + primary before missing fallback, and exit 2 on PAUSED."""
+    # 1. Codex pass1 hits transient error after emitting usage, retries & succeeds;
+    #    pass2 hits quota; fallback agy CLI missing -> primary + retry usage billed, rc == 2.
+    repo_dir, sha1 = _init_policy_repo(
+        tmp_path / "repo_retry_bill", qualified_routes=["gemini-4-carbon-high"]
+    )
+    retry_p1 = tmp_path / "p1_retried.flag"
+    retry_p2 = tmp_path / "p2_retried.flag"
+    codex_script = tmp_path / "fake_codex_retry_bill.py"
+    codex_prefix = _write_fake_codex_script(
+        codex_script,
+        (
+            "import json, pathlib, sys\n"
+            "args = sys.argv[1:]\n"
+            "out_path = pathlib.Path(args[args.index('-o') + 1])\n"
+            "_ = sys.stdin.read()\n"
+            f"rf1 = pathlib.Path({str(retry_p1)!r})\n"
+            f"rf2 = pathlib.Path({str(retry_p2)!r})\n"
+            "if out_path.name == 'pass1.json' and not rf1.is_file():\n"
+            "    rf1.write_text('1', encoding='utf-8')\n"
+            "    print(json.dumps({'type': 'turn.completed', 'usage': "
+            "{'input_tokens': 10000, 'cached_input_tokens': 0, 'output_tokens': 1000}}), "
+            "flush=True)\n"
+            "    sys.stderr.write('503 service unavailable\\n')\n"
+            "    sys.exit(1)\n"
+            "if out_path.name == 'pass2.json' and not rf2.is_file():\n"
+            "    rf2.write_text('1', encoding='utf-8')\n"
+            "    print(json.dumps({'type': 'turn.completed', 'usage': "
+            "{'input_tokens': 10000, 'cached_input_tokens': 0, 'output_tokens': 1000}}), "
+            "flush=True)\n"
+            "    sys.stderr.write('503 service unavailable\\n')\n"
+            "    sys.exit(1)\n"
+            "if out_path.name == 'pass1.json':\n"
+            f"    payload = {{'revision_sha': {sha1!r}, 'lens': 'correctness_and_tests', "
+            "'verdict': 'APPROVE', 'summary': 'ok', 'findings': [], "
+            "'test_quality_issues': [], 'unverified_areas': []}\n"
+            "    out_path.write_text(json.dumps(payload), encoding='utf-8')\n"
+            "    print(json.dumps({'type': 'turn.completed', 'usage': "
+            "{'input_tokens': 10000, 'cached_input_tokens': 0, 'output_tokens': 1000}}), "
+            "flush=True)\n"
+            "else:\n"
+            "    print(json.dumps({'type': 'turn.completed', 'usage': "
+            "{'input_tokens': 10000, 'cached_input_tokens': 0, 'output_tokens': 1000}}), "
+            "flush=True)\n"
+            "    print(json.dumps({'type': 'error', 'message': 'usage_limit_reached'}), "
+            "flush=True)\n"
+            "    sys.exit(1)\n"
+        ),
+    )
+    monkeypatch.setattr(
+        codex_room_review, "verify_role", lambda role, root: {"ok": True, "errors": []}
+    )
+    monkeypatch.setattr(codex_room_review, "resolve_codex_command", lambda: codex_prefix)
+    monkeypatch.setattr(
+        codex_room_review,
+        "resolve_agy_command",
+        lambda: (_ for _ in ()).throw(FileNotFoundError("agy missing")),
+    )
+
+    ledger_retry = _setup_ledger_for_g4_test(
+        repo_dir, "T-G4-RETRY-BILL", state="REVIEW_FROZEN_G4", candidate_sha=sha1
+    )
+    rc_retry = codex_room_review.main(
+        [
+            "--commit",
+            sha1,
+            "--task-id",
+            "T-G4-RETRY-BILL",
+            "--repo-root",
+            str(repo_dir),
+            "--backend",
+            "auto",
+        ]
+    )
+    assert rc_retry == 2
+    led_retry = json.loads(ledger_retry.read_text(encoding="utf-8"))
+    assert led_retry["state"] == "BLOCKED_INFRA"
+    assert led_retry["active_g4_reservations"] == {}
+    # 4 turn.completed logs (pass1.retry0 + pass1 + pass2.retry0 + pass2.codex-failed):
+    # each = 10k * $2.50/1M ($0.025) + 1k * $12/1M ($0.012) = $0.037 -> 4 * 0.037 = $0.148
+    assert led_retry["spent_api_equiv_usd"] == pytest.approx(0.148, abs=1e-6)
+
+    # 2. Both passes APPROVE (PASSED), yet G4 spend exceeds budget -> PAUSED_BUDGET & rc=2.
+    repo2, sha2 = _init_policy_repo(tmp_path / "repo_tight_budget", qualified_routes=[])
+    _install_counting_codex_stub(tmp_path, monkeypatch, sha2, emit_usage=True)
+    from harness.scripts import task_runner
+
+    ledger_tight = repo2 / "harness" / "runs" / "T-G4-TIGHT" / "ledger.json"
+    lt = task_runner.init_or_load_ledger(
+        ledger_tight, root_task_id="T-G4-TIGHT", base_sha="0" * 40, budget_usd=0.05
+    )
+    lt["state"] = "REVIEW_FROZEN_G4"
+    lt["candidate_sha"] = sha2
+    task_runner.save_ledger(ledger_tight, lt)
+
+    rc_tight = codex_room_review.main(
+        [
+            "--commit",
+            sha2,
+            "--task-id",
+            "T-G4-TIGHT",
+            "--repo-root",
+            str(repo2),
+            "--backend",
+            "codex",
+        ]
+    )
+    lt_after = json.loads(ledger_tight.read_text(encoding="utf-8"))
+    assert lt_after["spent_api_equiv_usd"] == pytest.approx(0.077, abs=1e-6)
+    assert lt_after["state"] == "PAUSED_BUDGET"
+    assert rc_tight == 2
+
+
+def test_g4_custom_out_dir_bypass_and_concurrent_race_at_cap_boundary(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Block ledgerless custom --out-dir bypass and serialize concurrent threads at cap=6."""
+    import threading
+
+    repo_dir, sha1 = _init_policy_repo(tmp_path / "repo_custom_out", qualified_routes=[])
+    calls_dir = _install_counting_codex_stub(tmp_path, monkeypatch, sha1)
+
+    # 1. Ledgerless task with custom --out-dir outside attempts/: 2nd call on same SHA -> rc=2.
+    rc1 = codex_room_review.main(
+        [
+            "--commit",
+            sha1,
+            "--task-id",
+            "T-CUSTOM-OUT",
+            "--out-dir",
+            str(tmp_path / "custom_1"),
+            "--repo-root",
+            str(repo_dir),
+            "--backend",
+            "codex",
+        ]
+    )
+    assert rc1 == 0
+    assert _count_calls(calls_dir) == 2
+
+    rc_dup = codex_room_review.main(
+        [
+            "--commit",
+            sha1,
+            "--task-id",
+            "T-CUSTOM-OUT",
+            "--out-dir",
+            str(tmp_path / "custom_2"),
+            "--repo-root",
+            str(repo_dir),
+            "--backend",
+            "codex",
+        ]
+    )
+    assert rc_dup == 2
+    assert _count_calls(calls_dir) == 2
+    assert not (tmp_path / "custom_2" / "frozen").exists()
+
+    # 2. Seed tracker to 5 completed rounds on T-RACE-CAP and race 2 threads on custom --out-dir.
+    from harness.scripts import task_runner
+
+    (repo_dir / "r5.txt").write_text("r5\n", encoding="utf-8")
+    sha_a = _commit_repo_change(repo_dir, "race sha a")
+    (repo_dir / "r6.txt").write_text("r6\n", encoding="utf-8")
+    sha_b = _commit_repo_change(repo_dir, "race sha b")
+
+    tracker_path = task_runner.default_g4_tracker_path("T-RACE-CAP", repo_root=repo_dir)
+    tracker = task_runner.load_g4_tracker(tracker_path, task_id="T-RACE-CAP")
+    tracker["completed_rounds"] = 5
+    task_runner.save_g4_tracker(tracker_path, tracker)
+
+    race_calls = tmp_path / "race_calls"
+    race_calls.mkdir()
+    race_script = tmp_path / "fake_codex_race.py"
+    race_prefix = _write_fake_codex_script(
+        race_script,
+        (
+            "import json, pathlib, sys, time\n"
+            "args = sys.argv[1:]\n"
+            "out_path = pathlib.Path(args[args.index('-o') + 1])\n"
+            "prompt = sys.stdin.read()\n"
+            "time.sleep(0.15)\n"
+            f"rcd = pathlib.Path({str(race_calls)!r})\n"
+            "(rcd / f'{out_path.parent.name}_{out_path.stem}.log').write_text('1', "
+            "encoding='utf-8')\n"
+            "is_p2 = 'security_and_invariants' in prompt\n"
+            "lens = 'security_and_invariants' if is_p2 else 'correctness_and_tests'\n"
+            "sha_val = None\n"
+            "for ln in prompt.splitlines():\n"
+            "    if ln.strip().startswith('- **Candidate SHA**:'):\n"
+            "        sha_val = ln.split('`')[1]\n"
+            "        break\n"
+            "payload = {'revision_sha': sha_val, 'lens': lens, 'verdict': 'APPROVE', "
+            "'summary': 'ok', 'findings': [], 'test_quality_issues': [], 'unverified_areas': []}\n"
+            "out_path.write_text(json.dumps(payload), encoding='utf-8')\n"
+        ),
+    )
+    monkeypatch.setattr(codex_room_review, "resolve_codex_command", lambda: race_prefix)
+
+    barrier = threading.Barrier(2)
+    results: dict[str, int] = {}
+    out_a = tmp_path / "race_out_a"
+    out_b = tmp_path / "race_out_b"
+
+    def _worker(tag: str, target_sha: str, target_out: Path) -> None:
+        barrier.wait(timeout=5.0)
+        results[tag] = codex_room_review.main(
+            [
+                "--commit",
+                target_sha,
+                "--task-id",
+                "T-RACE-CAP",
+                "--out-dir",
+                str(target_out),
+                "--repo-root",
+                str(repo_dir),
+                "--backend",
+                "codex",
+            ]
+        )
+
+    t1 = threading.Thread(target=_worker, args=("a", sha_a, out_a))
+    t2 = threading.Thread(target=_worker, args=("b", sha_b, out_b))
+    t1.start()
+    t2.start()
+    t1.join(timeout=15.0)
+    t2.join(timeout=15.0)
+
+    assert sorted(results.values()) == [0, 2]
+    loser_out = out_a if results["a"] == 2 else out_b
+    assert not (loser_out / "frozen").exists()
+    assert not (loser_out / ".review-attempt.lock").exists()
+    tracker_after = json.loads(tracker_path.read_text(encoding="utf-8"))
+    assert tracker_after["completed_rounds"] == 6
+    assert tracker_after["in_flight"] == {}
+
+    # 7th distinct-SHA call with custom --out-dir must also exit 2.
+    (repo_dir / "r7.txt").write_text("r7\n", encoding="utf-8")
+    sha_c = _commit_repo_change(repo_dir, "race sha c")
+    out_c = tmp_path / "race_out_c"
+    rc7 = codex_room_review.main(
+        [
+            "--commit",
+            sha_c,
+            "--task-id",
+            "T-RACE-CAP",
+            "--out-dir",
+            str(out_c),
+            "--repo-root",
+            str(repo_dir),
+            "--backend",
+            "codex",
+        ]
+    )
+    assert rc7 == 2
+    assert not (out_c / "frozen").exists()
+
 
 
 

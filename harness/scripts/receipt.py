@@ -485,6 +485,7 @@ def _evaluate_ledger_and_attempts(
     dispositions: dict[str, Any] | None,
     active_root: Path,
     ledger_data: dict[str, Any] | None,
+    tracker_data: dict[str, Any] | None,
     require_ledger: bool,
 ) -> list[str]:
     """Enforce G4/candidate ceilings and ledger state/SHA invariants for G5."""
@@ -495,9 +496,24 @@ def _evaluate_ledger_and_attempts(
 
     attempts_dir = active_root / "harness" / "runs" / task_id / "attempts"
     fs_rounds, _ = task_runner.count_review_attempts([attempts_dir])
-    if fs_rounds > max_g4_root:
+    effective_tracker = tracker_data
+    if effective_tracker is None:
+        try:
+            t_path = task_runner.default_g4_tracker_path(task_id, repo_root=active_root)
+            if t_path.is_file():
+                effective_tracker = task_runner.load_g4_tracker(t_path, task_id=task_id)
+        except (OSError, UnicodeDecodeError, ValueError, json.JSONDecodeError):
+            effective_tracker = None
+    tracker_rounds = 0
+    if isinstance(effective_tracker, dict):
+        tracker_rounds = int(effective_tracker.get("completed_rounds", 0)) + len(
+            effective_tracker.get("in_flight", {})
+        )
+    effective_attempts = max(fs_rounds, tracker_rounds)
+    if effective_attempts > max_g4_root:
         blockers.append(
-            f"Review attempts ({fs_rounds}) exceed max_g4_rounds_per_root_task ({max_g4_root})."
+            f"Review attempts ({effective_attempts}) exceed "
+            f"max_g4_rounds_per_root_task ({max_g4_root})."
         )
 
     if require_ledger and ledger_data is None:
@@ -513,6 +529,9 @@ def _evaluate_ledger_and_attempts(
         blockers.append(
             f"Task ledger is halted in state {state!r}; cannot issue VERIFIED receipt."
         )
+
+    if ledger_data.get("active_g4_reservations"):
+        blockers.append("Task ledger still has active in-flight G4 reservation(s).")
 
     g4_total = int(ledger_data.get("g4_rounds_total", 0))
     total_cand = int(ledger_data.get("total_candidates", 0))
@@ -566,6 +585,7 @@ def evaluate_receipt(
     repo_root: Path | None = None,
     require_frozen: bool = False,
     ledger_data: dict[str, Any] | None = None,
+    tracker_data: dict[str, Any] | None = None,
     require_ledger: bool = False,
 ) -> dict[str, Any]:
     """Evaluate all gates and build the immutable receipt payload."""
@@ -627,6 +647,7 @@ def evaluate_receipt(
             dispositions=dispositions,
             active_root=active_root,
             ledger_data=ledger_data,
+            tracker_data=tracker_data,
             require_ledger=require_ledger,
         )
     )
@@ -816,75 +837,98 @@ def main(argv: list[str] | None = None) -> int:
     else:
         ledger_path = None
 
-    ledger_data: dict[str, Any] | None = None
-    ledger_load_err: str | None = None
-    if ledger_path is not None and ledger_path.is_file():
-        try:
-            ledger_data = task_runner.load_ledger(ledger_path, repo_root=active_root)
-        except (OSError, UnicodeDecodeError, ValueError, json.JSONDecodeError) as exc:
-            ledger_load_err = f"Invalid ledger.json at {ledger_path}: {exc}"
-
-    artifact_hashes = {
-        "verifier_json_sha256": _sha256_file(args.verifier_json),
-        "review_json_sha256": _sha256_file(args.review_json),
-        "red_proof_json_sha256": _sha256_file(args.red_proof_json),
-        "dispositions_json_sha256": _sha256_file(args.dispositions_json),
-        "debate_json_sha256": _sha256_file(args.debate_json),
-        "task_manifest_json_sha256": _sha256_file(args.task_manifest),
-    }
-    if ledger_path is not None and ledger_path.is_file():
-        artifact_hashes["ledger_json_sha256"] = _sha256_file(ledger_path)
+    tracker_path: Path | None = None
+    try:
+        cand_tracker = task_runner.default_g4_tracker_path(args.task_id, repo_root=active_root)
+        if cand_tracker.is_file():
+            tracker_path = cand_tracker
+    except ValueError:
+        tracker_path = None
 
     dispositions_obj = _load_optional_json(args.dispositions_json)
     explicit_missing = args.ledger is not None and (
         ledger_path is None or not ledger_path.is_file()
     )
-    receipt = evaluate_receipt(
-        task_id=args.task_id,
-        phase=args.phase,
-        base_sha=args.base_sha,
-        candidate_sha=args.candidate_sha,
-        verifier_data=_load_optional_json(args.verifier_json),
-        review_data=_load_optional_json(args.review_json),
-        is_bugfix=args.bugfix,
-        red_proof=_load_optional_json(args.red_proof_json),
-        dispositions=dispositions_obj,
-        debate_data=_load_optional_json(args.debate_json),
-        behavior_summary=args.behavior,
-        artifact_hashes=artifact_hashes,
-        repo_root=active_root,
-        require_frozen=args.require_frozen,
-        ledger_data=ledger_data,
-        require_ledger=bool(args.require_ledger or explicit_missing),
-    )
-    if ledger_load_err and ledger_load_err not in receipt["blockers"]:
-        receipt["blockers"].append(ledger_load_err)
-        if not receipt["failures"]:
-            receipt["conclusion"] = "BLOCKED"
 
-    try:
-        with receipt_json_path.open("x", encoding="utf-8") as fh:
-            fh.write(json.dumps(receipt, indent=2) + "\n")
-    except FileExistsError:
-        print(f"[receipt] Write-once refusal: {receipt_json_path} already exists.", file=sys.stderr)
-        return 2
-    with receipt_md_path.open("x", encoding="utf-8") as fh:
-        fh.write(render_receipt_markdown(receipt))
+    def _eval_write_and_transition_locked() -> tuple[dict[str, Any] | None, int | None]:
+        ledger_data: dict[str, Any] | None = None
+        ledger_load_err: str | None = None
+        if ledger_path is not None and ledger_path.is_file():
+            try:
+                ledger_data = task_runner.load_ledger(ledger_path, repo_root=active_root)
+            except (OSError, UnicodeDecodeError, ValueError, json.JSONDecodeError) as exc:
+                ledger_load_err = f"Invalid ledger.json at {ledger_path}: {exc}"
 
-    if (
-        receipt["conclusion"] == "VERIFIED"
-        and ledger_path is not None
-        and ledger_path.is_file()
-    ):
-        with task_runner._ledger_lock(ledger_path):
+        tracker_data: dict[str, Any] | None = None
+        if tracker_path is not None and tracker_path.is_file():
+            try:
+                tracker_data = task_runner.load_g4_tracker(tracker_path, task_id=args.task_id)
+            except (OSError, UnicodeDecodeError, ValueError, json.JSONDecodeError) as exc:
+                if not ledger_load_err:
+                    ledger_load_err = f"Invalid g4-tracker.json at {tracker_path}: {exc}"
+
+        artifact_hashes: dict[str, str | None] = {
+            "verifier_json_sha256": _sha256_file(args.verifier_json),
+            "review_json_sha256": _sha256_file(args.review_json),
+            "red_proof_json_sha256": _sha256_file(args.red_proof_json),
+            "dispositions_json_sha256": _sha256_file(args.dispositions_json),
+            "debate_json_sha256": _sha256_file(args.debate_json),
+            "task_manifest_json_sha256": _sha256_file(args.task_manifest),
+        }
+        if ledger_path is not None and ledger_path.is_file():
+            artifact_hashes["ledger_json_sha256"] = _sha256_file(ledger_path)
+
+        receipt = evaluate_receipt(
+            task_id=args.task_id,
+            phase=args.phase,
+            base_sha=args.base_sha,
+            candidate_sha=args.candidate_sha,
+            verifier_data=_load_optional_json(args.verifier_json),
+            review_data=_load_optional_json(args.review_json),
+            is_bugfix=args.bugfix,
+            red_proof=_load_optional_json(args.red_proof_json),
+            dispositions=dispositions_obj,
+            debate_data=_load_optional_json(args.debate_json),
+            behavior_summary=args.behavior,
+            artifact_hashes=artifact_hashes,
+            repo_root=active_root,
+            require_frozen=args.require_frozen,
+            ledger_data=ledger_data,
+            tracker_data=tracker_data,
+            require_ledger=bool(args.require_ledger or explicit_missing),
+        )
+        if ledger_load_err and ledger_load_err not in receipt["blockers"]:
+            receipt["blockers"].append(ledger_load_err)
+            if not receipt["failures"]:
+                receipt["conclusion"] = "BLOCKED"
+
+        try:
+            with receipt_json_path.open("x", encoding="utf-8") as fh:
+                fh.write(json.dumps(receipt, indent=2) + "\n")
+        except FileExistsError:
+            print(
+                f"[receipt] Write-once refusal: {receipt_json_path} already exists.",
+                file=sys.stderr,
+            )
+            return None, 2
+        with receipt_md_path.open("x", encoding="utf-8") as fh:
+            fh.write(render_receipt_markdown(receipt))
+
+        if (
+            receipt["conclusion"] == "VERIFIED"
+            and ledger_path is not None
+            and ledger_path.is_file()
+        ):
             cur_ledger = task_runner.load_ledger(ledger_path, repo_root=active_root)
             if cur_ledger["state"] == "READY_FOR_ACCEPTANCE":
-                task_runner.record_gate_outcome(
+                _, g5_rc = task_runner.record_gate_outcome(
                     ledger_path,
                     gate="G5",
                     outcome="VERIFIED",
                     candidate_sha=args.candidate_sha,
                 )
+                if g5_rc != 0:
+                    return None, 2
             elif (
                 isinstance(dispositions_obj, dict)
                 and dispositions_obj.get("dispositions")
@@ -901,6 +945,23 @@ def main(argv: list[str] | None = None) -> int:
                     {"candidate_sha": args.candidate_sha, "via_dispositions": True},
                 )
                 task_runner.save_ledger(ledger_path, cur_ledger)
+        return receipt, None
+
+    if tracker_path is not None:
+        with task_runner._ledger_lock(tracker_path):
+            if ledger_path is not None:
+                with task_runner._ledger_lock(ledger_path):
+                    receipt, err_rc = _eval_write_and_transition_locked()
+            else:
+                receipt, err_rc = _eval_write_and_transition_locked()
+    elif ledger_path is not None:
+        with task_runner._ledger_lock(ledger_path):
+            receipt, err_rc = _eval_write_and_transition_locked()
+    else:
+        receipt, err_rc = _eval_write_and_transition_locked()
+
+    if err_rc is not None or receipt is None:
+        return err_rc if err_rc is not None else 2
 
     print(f"[receipt] conclusion={receipt['conclusion']} out={out_dir}")
 
