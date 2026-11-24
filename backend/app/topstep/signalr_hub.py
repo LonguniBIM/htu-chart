@@ -777,9 +777,8 @@ class SignalRMarketHub:
             self._pending_ack_futures[inv_id] = fut
             try:
                 await self._send_invocation(ws, target, [contract_id], invocation_id=inv_id)
-            except Exception:
-                self._pending_subscriptions.pop(inv_id, None)
-                self._pending_ack_futures.pop(inv_id, None)
+            except BaseException:
+                self._clear_pending_contract_subscriptions(contract_id)
                 raise
             futures.append(fut)
         return futures
@@ -801,13 +800,15 @@ class SignalRMarketHub:
                     return ack_futures
                 for removed in to_unsub:
                     self._subscribed_contracts.discard(removed)
+                    self._clear_pending_contract_subscriptions(removed)
                     with contextlib.suppress(Exception):
                         await self._unsubscribe_contract(ws, removed)
                 for added in to_sub:
                     self._subscribed_contracts.add(added)
                     try:
                         ack_futures.extend(await self._subscribe_contract(ws, added))
-                    except Exception:
+                    except BaseException:
+                        self._clear_pending_contract_subscriptions(added)
                         self._subscribed_contracts.discard(added)
                         raise
         return ack_futures
@@ -904,6 +905,19 @@ class SignalRMarketHub:
                     f"SignalR Market Hub heartbeat timeout after {self._heartbeat_timeout}s"
                 )
             await self._send_raw(ws, SIGNALR_PING_FRAME)
+
+    def _clear_pending_contract_subscriptions(self, contract_id: str) -> None:
+        norm = contract_id.strip().upper()
+        stale_ids = [
+            inv_id
+            for inv_id, (_tgt, cid, _ts) in self._pending_subscriptions.items()
+            if cid.strip().upper() == norm
+        ]
+        for inv_id in stale_ids:
+            self._pending_subscriptions.pop(inv_id, None)
+            fut = self._pending_ack_futures.pop(inv_id, None)
+            if fut is not None and not fut.done():
+                fut.cancel()
 
     def _clear_pending_subscriptions(self, exc: BaseException | None = None) -> None:
         self._pending_subscriptions.clear()

@@ -104,7 +104,7 @@ stateDiagram-v2
 stateDiagram-v2
     [*] --> HANDSHAKE: Upgrade /ws/market
     HANDSHAKE --> REJECTED_1008: "validate_ws_handshake fails (Host, Origin, or session cookie)"
-    HANDSHAKE --> REJECTED_1013: "len(_clients) >= ws_max_clients (per-process under --workers 1)"
+    HANDSHAKE --> REJECTED_1013: "len(_clients) >= ws_max_clients (per-process under --workers 1): accept() -> immediate close(1013)"
     HANDSHAKE --> CONNECTED: "register(defer_sender_start=True) -> accept() -> start_sender() -> feed_status"
     HANDSHAKE --> DISCONNECTED: "accept() raises -> finally unregister() releases slot"
     CONNECTED --> PENDING_ADMISSION: "subscribe: check_can_subscribe() passes (no subscription mutation)"
@@ -120,7 +120,7 @@ stateDiagram-v2
 ```
 
 **Invariants**:
-- Unauthenticated or foreign-`Origin`/`Host` probes always fail `validate_ws_handshake` with `1008` **before** `ws_max_clients` slot reservation (`1013`), so probes never consume capacity (`F01`, `NC-13`).
-- `ws_max_clients` (default `32`, bounded `1..256`) is enforced atomically per-process (valid under single-worker `--workers 1` `F03`) before allocating `_CoalescingClientQueue` or `ws-sender-*` tasks; `defer_sender_start=True` ensures `ws-sender-*` never sends before `accept()` completes, and `try / finally` releases the slot if `accept()` fails.
+- Unauthenticated or foreign-`Origin`/`Host` probes always fail `validate_ws_handshake` with `1008` (HTTP `403` pre-`accept()`) **before** `ws_max_clients` slot reservation (`1013`), so probes never consume capacity (`F01`, `NC-13`).
+- `ws_max_clients` (default `32`, bounded `1..256`) is enforced atomically per-process (valid under single-worker `--workers 1` `F03`) before allocating `_CoalescingClientQueue` or `ws-sender-*` tasks; authenticated `(N+1)`th connections hitting `WsCapacityExceededError` complete `accept() -> immediate close(1013)` with zero queue/task allocation so real RFC 6455 clients receive close frame `1013` instead of HTTP `403`. `defer_sender_start=True` ensures accepted clients never receive `ws-sender-*` frames before `accept()` completes, and `try / finally` releases the slot if `accept()` fails.
 - `subscribe` never mutates `session.subscriptions` or emits `{"type": "subscribed"}` until `subscribe_ws_contract(..., broadcast_status=False)` succeeds; `"subscribed"` confirms local + hub contract registration and always precedes the post-subscribe `"feed_status"` snapshot, while upstream SignalR connection health is conveyed via `"feed_status"` (`NC-12`).
 - Any `BaseException` during `subscribe_ws_contract` rolls back only newly added `_ws_contracts` / `_contracts` / pending tick / aggregator state while preserving pre-existing shared or `_explicit_contracts` entries.

@@ -1027,6 +1027,8 @@ async def test_r06_subscribe_ack_not_emitted_before_upstream_admission_rollback_
             new_cid = "CON.F.US.MNQ.Z26"
             await live_feed.set_active_contracts([shared_cid], live_mode=False)
 
+            orig_update = live_feed.hub.update_contracts
+
             async def fail_runtime(_contracts: Any, *, live_mode: bool) -> None:
                 raise RuntimeError("upstream boom")
 
@@ -1045,6 +1047,25 @@ async def test_r06_subscribe_ack_not_emitted_before_upstream_admission_rollback_
                 await live_feed.subscribe_ws_contract(shared_cid)
             assert shared_cid in live_feed.active_contracts
             assert shared_cid not in live_feed._ws_contracts
+
+            # Sub-case: shared_cid retained solely by an active WebSocket subscriber (ws1).
+            monkeypatch.setattr(live_feed.hub, "update_contracts", orig_update)
+            await live_feed.set_active_contracts([], live_mode=False)
+            ws1 = _FakeWsClient()
+            ws_sess1 = broadcaster.register(ws1)
+            await live_feed.subscribe_ws_contract(shared_cid)
+            broadcaster.subscribe(ws_sess1.client_id, shared_cid, "1m")
+            assert shared_cid in broadcaster.active_contract_ids()
+            assert shared_cid in live_feed.active_contracts
+
+            monkeypatch.setattr(live_feed.hub, "update_contracts", fail_runtime)
+            with pytest.raises(RuntimeError, match="upstream boom"):
+                await live_feed.subscribe_ws_contract(new_cid)
+            assert shared_cid in broadcaster.active_contract_ids()
+            assert shared_cid in live_feed.active_contracts
+            assert shared_cid in live_feed._ws_contracts
+            assert new_cid not in live_feed.active_contracts
+            assert new_cid not in live_feed._ws_contracts
 
             await broadcaster.close_all()
             await live_feed.stop()
@@ -1182,13 +1203,125 @@ def test_r06_ws_max_clients_cap_rejects_excess_and_releases_slot(tmp_path: Path)
 
                 # (N+1)th valid client must be rejected with 1013 Try Again Later.
                 with pytest.raises(WebSocketDisconnect) as exc_cap:
-                    with client.websocket_connect("/ws/market", headers=headers):
+                    with client.websocket_connect("/ws/market", headers=headers) as ws_cap:
+                        ws_cap.receive_json()
                         pytest.fail("Expected WebSocketDisconnect(1013) for (N+1)th client")
                 assert exc_cap.value.code == 1013
 
             # Once ws2 disconnects, slot opens and a new client can connect.
             with client.websocket_connect("/ws/market", headers=headers) as ws3:
                 assert ws3.receive_json()["type"] == "feed_status"
+
+
+async def test_r06_ws_max_clients_wire_1013_over_live_uvicorn(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Contract (P1-002 / NC-13): Authenticated (N+1)th client receives RFC 6455 close 1013.
+
+    Defect caught: Calling websocket.close(1013) before websocket.accept() causes Uvicorn to emit
+    HTTP 403 instead of completing the upgrade and sending wire close frame 1013, while
+    unauthenticated probes must still fail handshake pre-accept (HTTP 403) without slots/tasks.
+    """
+    import contextlib
+    import socket
+
+    import uvicorn
+    import websockets
+
+    from app.services import ws_broadcaster as ws_broadcaster_mod
+
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.bind(("127.0.0.1", 0))
+    sock.listen(16)
+    port = int(sock.getsockname()[1])
+
+    settings = Settings(
+        app_env="development",
+        app_password_hash=TEST_PASSWORD_HASH,
+        data_dir=tmp_path / "data",
+        signalr_enabled=False,
+        ws_max_clients=1,
+        app_port=port,
+        app_allowed_hosts=[f"127.0.0.1:{port}"],
+        app_allowed_origins=[f"http://127.0.0.1:{port}"],
+    )
+    app = create_app(settings=settings)
+    config = uvicorn.Config(app, host="127.0.0.1", port=port, log_level="warning")
+    server = uvicorn.Server(config)
+    server_task = asyncio.create_task(server.serve(sockets=[sock]))
+
+    try:
+        deadline = time.monotonic() + 5.0
+        while not server.started:
+            if server_task.done():
+                await server_task
+                pytest.fail("Uvicorn server exited prematurely")
+            assert time.monotonic() < deadline, "Timed out waiting for Uvicorn startup"
+            await asyncio.sleep(0.01)
+
+        base_http = f"http://127.0.0.1:{port}"
+        ws_url = f"ws://127.0.0.1:{port}/ws/market"
+        async with httpx.AsyncClient(base_url=base_http) as http_client:
+            login_resp = await http_client.post("/api/auth/login", json={"password": TEST_PASSWORD})
+            assert login_resp.status_code == 200
+            session_cookie = login_resp.cookies["topstep_session"]
+
+        broadcaster: WsBroadcaster = app.state.ws_broadcaster
+        queue_alloc_count = 0
+        orig_queue_cls = ws_broadcaster_mod._CoalescingClientQueue
+
+        def _counting_queue_factory(maxsize: int) -> Any:
+            nonlocal queue_alloc_count
+            queue_alloc_count += 1
+            return orig_queue_cls(maxsize)
+
+        monkeypatch.setattr(
+            ws_broadcaster_mod, "_CoalescingClientQueue", _counting_queue_factory
+        )
+
+        async with websockets.connect(
+            ws_url,
+            origin=base_http,
+            additional_headers={"Cookie": f"topstep_session={session_cookie}"},
+        ) as ws1:
+            initial = json.loads(await asyncio.wait_for(ws1.recv(), timeout=2.0))
+            assert initial["type"] == "feed_status"
+            assert broadcaster.client_count == 1
+            allocs_before_excess = queue_alloc_count
+            sender_tasks_before = [
+                t for t in asyncio.all_tasks() if t.get_name().startswith("ws-sender-")
+            ]
+            assert len(sender_tasks_before) == 1
+
+            # Unauthenticated probe at capacity must fail handshake pre-accept (HTTP 403).
+            with pytest.raises(websockets.exceptions.InvalidStatus) as exc_unauth:
+                async with websockets.connect(ws_url, origin=base_http):
+                    pytest.fail("Unauthenticated probe should fail pre-upgrade handshake")
+            assert exc_unauth.value.response.status_code == 403
+
+            # Authenticated (N+1)th client must upgrade and receive wire close code 1013.
+            async with websockets.connect(
+                ws_url,
+                origin=base_http,
+                additional_headers={"Cookie": f"topstep_session={session_cookie}"},
+            ) as ws_excess:
+                with pytest.raises(websockets.exceptions.ConnectionClosed) as exc_closed:
+                    await asyncio.wait_for(ws_excess.recv(), timeout=2.0)
+                assert exc_closed.value.rcvd is not None
+                assert exc_closed.value.rcvd.code == 1013
+
+            assert broadcaster.client_count == 1
+            assert queue_alloc_count == allocs_before_excess
+            sender_tasks_after = [
+                t for t in asyncio.all_tasks() if t.get_name().startswith("ws-sender-")
+            ]
+            assert len(sender_tasks_after) == 1
+    finally:
+        server.should_exit = True
+        with contextlib.suppress(Exception):
+            await asyncio.wait_for(server_task, timeout=5.0)
+        sock.close()
 
 
 def test_r06_subscribe_ack_concurrent_slot_contention_and_ordering(
@@ -1542,8 +1675,12 @@ async def test_r06_signalr_hub_cancel_rollback_resyncs_hub_contracts(
                             ack = {"type": 3, "invocationId": frame["invocationId"]}
                             await self.incoming.put(json.dumps(ack) + SIGNALR_RECORD_SEPARATOR)
 
+    transports: list[_WithholdMnqAckTransport] = []
+
     async def ws_factory(_url: str, _headers: dict[str, str]) -> _WithholdMnqAckTransport:
-        return _WithholdMnqAckTransport()
+        transport = _WithholdMnqAckTransport()
+        transports.append(transport)
+        return transport
 
     async def handler(request: httpx.Request) -> httpx.Response:
         if request.url.path == "/api/Auth/loginKey":
@@ -1556,7 +1693,11 @@ async def test_r06_signalr_hub_cancel_rollback_resyncs_hub_contracts(
             )
         return httpx.Response(404)
 
-    settings = Settings(data_dir=tmp_path / "data", signalr_enabled=True)
+    settings = Settings(
+        data_dir=tmp_path / "data",
+        signalr_enabled=True,
+        signalr_reconnect_initial_delay_sec=0.05,
+    )
     sqlite_store = SqliteStore(tmp_path / "meta.db")
     sqlite_store.initialize()
     try:
@@ -1567,7 +1708,13 @@ async def test_r06_signalr_hub_cancel_rollback_resyncs_hub_contracts(
             rest = TopstepRestClient(settings, auth, client)
             from app.topstep.signalr_hub import SignalRMarketHub
 
-            hub = SignalRMarketHub(settings, auth_service=auth, ws_factory=ws_factory)
+            hub = SignalRMarketHub(
+                settings,
+                auth_service=auth,
+                ws_factory=ws_factory,
+                connect_timeout_sec=0.15,
+                heartbeat_timeout_sec=0.5,
+            )
             live_feed = LiveFeedService(
                 settings,
                 auth,
@@ -1598,9 +1745,51 @@ async def test_r06_signalr_hub_cancel_rollback_resyncs_hub_contracts(
                 assert live_feed.active_contracts == (shared_cid,)
                 assert new_cid not in live_feed._ws_contracts
                 assert live_feed.hub.contracts == (shared_cid,)
+                assert not live_feed.hub.has_pending_subscription(new_cid)
+
+                await asyncio.sleep(0.25)
+                assert live_feed.feed_state == "LIVE"
+                assert live_feed.hub.is_connected is True
+                assert len(transports) == 1
             finally:
                 await live_feed.stop()
     finally:
         sqlite_store.close()
+
+
+async def test_r06_signalr_hub_mid_send_cancel_clears_pending_and_subscribed(
+    tmp_path: Path,
+) -> None:
+    """Contract (P1-001/P2-001): CancelledError mid-send clears partial pending & subscribed state.
+
+    Defect caught: except Exception missing asyncio.CancelledError between SubscribeContractQuotes
+    and SubscribeContractTrades, leaking orphaned pending ACK entries and _subscribed_contracts.
+    """
+    from app.topstep.signalr_hub import SignalRMarketHub
+
+    class _CancelOnTradesTransport(_MockSignalRTransport):
+        async def send(self, data: str) -> None:
+            for chunk in data.split(SIGNALR_RECORD_SEPARATOR):
+                if chunk.strip():
+                    frame = json.loads(chunk)
+                    self.sent_frames.append(frame)
+                    if frame.get("target") == "SubscribeContractTrades":
+                        raise asyncio.CancelledError()
+
+    settings = Settings(data_dir=tmp_path / "data", signalr_enabled=True)
+    hub = SignalRMarketHub(settings, token_provider=lambda: asyncio.sleep(0, result="tok"))
+    ws = _CancelOnTradesTransport()
+    cid = "CON.F.US.MNQ.Z26"
+    hub._contracts = [cid]
+    hub._ws = ws
+    hub._connected = True
+
+    with pytest.raises(asyncio.CancelledError):
+        await hub._sync_session_subscriptions(ws)
+
+    assert not hub.has_pending_subscription(cid)
+    assert not hub.has_pending_subscriptions
+    assert hub._pending_ack_futures == {}
+    assert cid not in hub._subscribed_contracts
 
 

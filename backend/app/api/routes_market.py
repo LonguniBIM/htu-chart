@@ -293,10 +293,12 @@ async def market_websocket(websocket: WebSocket) -> None:
             defer_sender_start=True,
         )
     except WsCapacityExceededError:
-        await websocket.close(
-            code=WS_CLOSE_TRY_AGAIN_LATER,
-            reason="WebSocket client limit reached",
-        )
+        with contextlib.suppress(Exception):
+            await websocket.accept()
+            await websocket.close(
+                code=WS_CLOSE_TRY_AGAIN_LATER,
+                reason="WebSocket client limit reached",
+            )
         return
 
     def _active_redaction_secrets() -> tuple[str, ...]:
