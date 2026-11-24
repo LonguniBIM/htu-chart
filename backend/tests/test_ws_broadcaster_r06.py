@@ -1660,6 +1660,13 @@ async def test_r06_signalr_hub_cancel_rollback_resyncs_hub_contracts(
                             self.subscribed_contracts.add(arg)
                         if new_cid in args:
                             mnq_sub_sent.set()
+                            if frame.get("target") == "SubscribeContractTrades":
+                                # Wake recv_task once while MNQ is pending so the receive loop
+                                # arms ack_wait_timeout, then let rollback clear pending without
+                                # any further incoming frames.
+                                await self.incoming.put(
+                                    json.dumps({"type": 6}) + SIGNALR_RECORD_SEPARATOR
+                                )
                             continue
                         if frame.get("invocationId") is not None:
                             ack = {"type": 3, "invocationId": frame["invocationId"]}
@@ -1671,9 +1678,8 @@ async def test_r06_signalr_hub_cancel_rollback_resyncs_hub_contracts(
                     }:
                         for arg in frame.get("arguments", []):
                             self.subscribed_contracts.discard(str(arg))
-                        if frame.get("invocationId") is not None:
-                            ack = {"type": 3, "invocationId": frame["invocationId"]}
-                            await self.incoming.put(json.dumps(ack) + SIGNALR_RECORD_SEPARATOR)
+                        # Intentionally do NOT emit an incoming ACK frame on unsubscribe
+                        # so the receive loop exercises a stale ack_wait_timeout wakeup.
 
     transports: list[_WithholdMnqAckTransport] = []
 
@@ -1712,8 +1718,8 @@ async def test_r06_signalr_hub_cancel_rollback_resyncs_hub_contracts(
                 settings,
                 auth_service=auth,
                 ws_factory=ws_factory,
-                connect_timeout_sec=0.15,
-                heartbeat_timeout_sec=0.5,
+                connect_timeout_sec=0.12,
+                heartbeat_timeout_sec=2.0,
             )
             live_feed = LiveFeedService(
                 settings,
@@ -1747,7 +1753,7 @@ async def test_r06_signalr_hub_cancel_rollback_resyncs_hub_contracts(
                 assert live_feed.hub.contracts == (shared_cid,)
                 assert not live_feed.hub.has_pending_subscription(new_cid)
 
-                await asyncio.sleep(0.25)
+                await asyncio.sleep(0.30)
                 assert live_feed.feed_state == "LIVE"
                 assert live_feed.hub.is_connected is True
                 assert len(transports) == 1
@@ -1760,36 +1766,68 @@ async def test_r06_signalr_hub_cancel_rollback_resyncs_hub_contracts(
 async def test_r06_signalr_hub_mid_send_cancel_clears_pending_and_subscribed(
     tmp_path: Path,
 ) -> None:
-    """Contract (P1-001/P2-001): CancelledError mid-send clears partial pending & subscribed state.
+    """Contract (P1-002/P2-001): CancelledError mid-send sends compensatory unsubscribe
+    and clears pending state while preserving shared active contracts.
 
-    Defect caught: except Exception missing asyncio.CancelledError between SubscribeContractQuotes
-    and SubscribeContractTrades, leaking orphaned pending ACK entries and _subscribed_contracts.
+    Defect caught: Discarding added from _subscribed_contracts on CancelledError between
+    SubscribeContractQuotes and SubscribeContractTrades without unsubscribing upstream,
+    leaving Quotes permanently subscribed upstream even after rollback.
     """
     from app.topstep.signalr_hub import SignalRMarketHub
 
+    shared_cid = "CON.F.US.MES.Z26"
+    new_cid = "CON.F.US.MNQ.Z26"
+
     class _CancelOnTradesTransport(_MockSignalRTransport):
+        def __init__(self) -> None:
+            super().__init__()
+            self.upstream_quotes_subs: set[str] = set()
+            self.upstream_trades_subs: set[str] = set()
+
         async def send(self, data: str) -> None:
             for chunk in data.split(SIGNALR_RECORD_SEPARATOR):
                 if chunk.strip():
                     frame = json.loads(chunk)
                     self.sent_frames.append(frame)
-                    if frame.get("target") == "SubscribeContractTrades":
-                        raise asyncio.CancelledError()
+                    target = frame.get("target")
+                    args = [str(a) for a in frame.get("arguments", [])]
+                    if target == "SubscribeContractQuotes":
+                        self.upstream_quotes_subs.update(args)
+                    elif target == "SubscribeContractTrades":
+                        if new_cid in args:
+                            raise asyncio.CancelledError()
+                        self.upstream_trades_subs.update(args)
+                    elif target == "UnsubscribeContractQuotes":
+                        self.upstream_quotes_subs.difference_update(args)
+                    elif target == "UnsubscribeContractTrades":
+                        self.upstream_trades_subs.difference_update(args)
 
     settings = Settings(data_dir=tmp_path / "data", signalr_enabled=True)
     hub = SignalRMarketHub(settings, token_provider=lambda: asyncio.sleep(0, result="tok"))
     ws = _CancelOnTradesTransport()
-    cid = "CON.F.US.MNQ.Z26"
-    hub._contracts = [cid]
     hub._ws = ws
     hub._connected = True
+    hub._contracts = [shared_cid]
+    hub._subscribed_contracts = {shared_cid}
+    ws.upstream_quotes_subs.add(shared_cid)
+    ws.upstream_trades_subs.add(shared_cid)
 
+    hub._contracts = [shared_cid, new_cid]
     with pytest.raises(asyncio.CancelledError):
         await hub._sync_session_subscriptions(ws)
 
-    assert not hub.has_pending_subscription(cid)
+    # Simulate LiveFeedService rollback restoring shared_cid only.
+    hub._contracts = [shared_cid]
+    await hub._sync_session_subscriptions(ws)
+
+    assert not hub.has_pending_subscription(new_cid)
     assert not hub.has_pending_subscriptions
     assert hub._pending_ack_futures == {}
-    assert cid not in hub._subscribed_contracts
+    assert new_cid not in hub._subscribed_contracts
+    assert new_cid not in ws.upstream_quotes_subs
+    assert new_cid not in ws.upstream_trades_subs
+    assert shared_cid in hub._subscribed_contracts
+    assert shared_cid in ws.upstream_quotes_subs
+    assert shared_cid in ws.upstream_trades_subs
 
 

@@ -809,7 +809,18 @@ class SignalRMarketHub:
                         ack_futures.extend(await self._subscribe_contract(ws, added))
                     except BaseException:
                         self._clear_pending_contract_subscriptions(added)
-                        self._subscribed_contracts.discard(added)
+                        unsub_task = asyncio.create_task(
+                            self._unsubscribe_contract(ws, added)
+                        )
+                        unsub_task.add_done_callback(
+                            lambda t: t.exception() if not t.cancelled() else None
+                        )
+                        unsub_ok = False
+                        with contextlib.suppress(Exception):
+                            await asyncio.shield(unsub_task)
+                            unsub_ok = True
+                        if unsub_ok:
+                            self._subscribed_contracts.discard(added)
                         raise
         return ack_futures
 
@@ -1144,13 +1155,28 @@ class SignalRMarketHub:
                         recv_task.cancel()
                     with contextlib.suppress(asyncio.CancelledError, Exception):
                         await recv_task
-                    pending_desc = ", ".join(
-                        f"{tgt}({cid})" for tgt, cid, _ts in self._pending_subscriptions.values()
-                    )
-                    raise TimeoutError(
-                        f"SignalR dynamic subscribe completion timed out after {ack_timeout}s "
-                        f"waiting for: {pending_desc}"
-                    )
+                    now_mono = time.monotonic()
+                    last_mono = self._last_event_monotonic
+                    if (
+                        last_mono is not None
+                        and (now_mono - last_mono) > self._heartbeat_timeout
+                    ):
+                        raise TimeoutError(
+                            "SignalR Market Hub heartbeat timeout "
+                            f"after {self._heartbeat_timeout}s"
+                        )
+                    overdue = [
+                        f"{tgt}({cid})"
+                        for tgt, cid, sent_ts in self._pending_subscriptions.values()
+                        if (now_mono - sent_ts) >= ack_timeout
+                    ]
+                    if overdue:
+                        pending_desc = ", ".join(overdue)
+                        raise TimeoutError(
+                            "SignalR dynamic subscribe completion timed out "
+                            f"after {ack_timeout}s waiting for: {pending_desc}"
+                        )
+                    continue
 
                 if heartbeat_task in done:
                     if not recv_task.done():
