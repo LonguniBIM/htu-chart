@@ -139,6 +139,20 @@ def compute_tree_sha256(root_dir: Path) -> tuple[str, int]:
     return tree_hasher.hexdigest(), len(files)
 
 
+def resolve_git_toplevel(repo_root: Path) -> Path:
+    """Resolve the git repository root even when ``repo_root`` is a nested/gitignored subdir."""
+    resolved = repo_root.resolve()
+    top = subprocess.run(
+        ["git", "-C", str(resolved), "rev-parse", "--show-toplevel"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if top.returncode != 0 or not top.stdout.strip():
+        raise ValueError(f"Cannot resolve git repository root from '{resolved}': {top.stderr.strip()}")
+    return Path(top.stdout.strip()).resolve()
+
+
 def materialize_frozen_tree(
     repo_root: Path,
     candidate_sha: str,
@@ -146,11 +160,11 @@ def materialize_frozen_tree(
     base_sha: str | None = None,
 ) -> dict[str, Any]:
     """Extract an immutable ``git archive`` snapshot into ``dest_dir`` and mark files read-only."""
-    repo_root = repo_root.resolve()
+    git_top = resolve_git_toplevel(repo_root)
     dest_dir = dest_dir.resolve()
 
     rev = subprocess.run(
-        ["git", "-C", str(repo_root), "rev-parse", "--verify", f"{candidate_sha}^{{commit}}"],
+        ["git", "-C", str(git_top), "rev-parse", "--verify", f"{candidate_sha}^{{commit}}"],
         capture_output=True,
         text=True,
         check=False,
@@ -163,7 +177,7 @@ def materialize_frozen_tree(
     dest_dir.mkdir(parents=True, exist_ok=True)
 
     arch = subprocess.run(
-        ["git", "-C", str(repo_root), "archive", "--format=tar", resolved_sha],
+        ["git", "-C", str(git_top), "archive", "--format=tar", resolved_sha],
         capture_output=True,
         check=False,
     )
@@ -183,7 +197,7 @@ def materialize_frozen_tree(
     patch_path: Path | None = None
     if base_sha and base_sha != "ROOT_COMMIT":
         base_rev = subprocess.run(
-            ["git", "-C", str(repo_root), "rev-parse", "--verify", f"{base_sha}^{{commit}}"],
+            ["git", "-C", str(git_top), "rev-parse", "--verify", f"{base_sha}^{{commit}}"],
             capture_output=True,
             text=True,
             check=False,
@@ -192,7 +206,7 @@ def materialize_frozen_tree(
             raise ValueError(f"Cannot resolve base commit '{base_sha}': {base_rev.stderr.strip()}")
         resolved_base = base_rev.stdout.strip()
         diff_proc = subprocess.run(
-            ["git", "-C", str(repo_root), "diff", "--binary", f"{resolved_base}..{resolved_sha}"],
+            ["git", "-C", str(git_top), "diff", "--binary", f"{resolved_base}..{resolved_sha}"],
             capture_output=True,
             check=False,
         )

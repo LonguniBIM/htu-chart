@@ -89,6 +89,30 @@ def test_build_verifier_commit_runs_against_frozen_snapshot_not_dirty_worktree(t
     assert report["source_mode"] == "frozen_commit_archive"
     assert report["worktree_dirty"] is True
     assert len(report["frozen_tree_sha256"]) == 64
+    assert (tmp_path / "out" / "frozen" / "topstep-chart-app").is_dir()
+    pytest_step = next(s for s in report["steps"] if s["name"] == "harness_pytest")
+    assert Path(pytest_step["cwd"]).name == "topstep-chart-app"
+
+
+def test_build_verifier_commit_inside_gitignored_runs_dir_succeeds(tmp_path: Path) -> None:
+    """Reject-fix 2: build_verifier --commit works when --out is inside a gitignored subdirectory of repo."""
+    _setup_mini_repo(tmp_path, test_code="def test_ok():\n    assert 2 + 2 == 4\n")
+    (tmp_path / ".gitignore").write_text("harness/runs/\n", encoding="utf-8")
+    subprocess.run(["git", "init"], cwd=tmp_path, check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=tmp_path, check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.name", "Test User"], cwd=tmp_path, check=True, capture_output=True)
+    subprocess.run(["git", "add", "."], cwd=tmp_path, check=True, capture_output=True)
+    subprocess.run(["git", "commit", "-m", "init"], cwd=tmp_path, check=True, capture_output=True)
+    sha = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=tmp_path, check=True, capture_output=True, text=True
+    ).stdout.strip()
+
+    nested_out = tmp_path / "harness" / "runs" / "g3-check" / "verifier.json"
+    rc = build_verifier.main(["--root", str(tmp_path), "--phase", "0", "--commit", sha, "--out", str(nested_out)])
+    assert rc == 0
+    report = json.loads(nested_out.read_text(encoding="utf-8"))
+    assert report["status"] == "VERIFIED"
+    assert (nested_out.parent / "frozen" / "topstep-chart-app").is_dir()
 
 
 def test_build_verifier_terminates_timed_out_subprocess_with_exit_124(tmp_path: Path, monkeypatch) -> None:

@@ -240,7 +240,7 @@ def run_verifier(
                 dest_dir = frozen_dir.resolve()
             else:
                 temp_holder = tempfile.TemporaryDirectory(prefix="bv-frozen-")
-                dest_dir = Path(temp_holder.name) / "frozen-src"
+                dest_dir = Path(temp_holder.name) / "topstep-chart-app"
             try:
                 mat = materialize_frozen_tree(root, commit_sha, dest_dir)
             except (ValueError, RuntimeError) as exc:
@@ -483,7 +483,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
-    frozen_dir = (args.out.resolve().parent / "frozen-src") if (args.commit and args.out) else None
+    frozen_dir = (args.out.resolve().parent / "frozen" / "topstep-chart-app") if (args.commit and args.out) else None
     report = run_verifier(
         args.root,
         phase=args.phase,

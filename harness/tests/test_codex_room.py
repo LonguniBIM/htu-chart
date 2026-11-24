@@ -782,5 +782,74 @@ def test_agy_backend_runs_in_frozen_src_and_detects_candidate_patch(
     assert rc == 0
     pass1_res = json.loads((out_dir / "pass1.json").read_text(encoding="utf-8"))
     assert pass1_res["summary"] == "V = 2"
-    assert (out_dir / "candidate.patch").is_file()
-    assert "V = 2" in (out_dir / "candidate.patch").read_text(encoding="utf-8")
+    assert (out_dir / "frozen" / "topstep-chart-app").is_dir()
+    assert (out_dir / "frozen" / "candidate.patch").is_file()
+    assert "V = 2" in (out_dir / "frozen" / "candidate.patch").read_text(encoding="utf-8")
+
+
+def test_materialize_frozen_tree_from_gitignored_nested_subdir_and_codex_skip_git_check(
+    tmp_path: Path,
+) -> None:
+    """Reject-fixes 1-3: gitignored nested repo_root must still archive full repo, use topstep-chart-app basename, and pass --skip-git-repo-check."""
+    import subprocess
+
+    from harness.scripts.schema_utils import materialize_frozen_tree
+
+    repo = tmp_path / "topstep-chart-app"
+    repo.mkdir()
+    subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=repo, check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.name", "Test User"], cwd=repo, check=True, capture_output=True)
+    (repo / ".gitignore").write_text("harness/runs/\n", encoding="utf-8")
+    (repo / "tracked.txt").write_text("HELLO\n", encoding="utf-8")
+    subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+    subprocess.run(["git", "commit", "-m", "init"], cwd=repo, check=True, capture_output=True)
+    sha = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=repo, check=True, capture_output=True, text=True
+    ).stdout.strip()
+
+    nested_repo_root = repo / "harness" / "runs" / "attempt-1" / "frozen" / "topstep-chart-app"
+    nested_repo_root.mkdir(parents=True)
+
+    info = codex_room_review.resolve_commit_info(nested_repo_root, "HEAD", None)
+    assert info["candidate_sha"] == sha
+
+    dest = tmp_path / "out" / "frozen" / "topstep-chart-app"
+    mat = materialize_frozen_tree(nested_repo_root, sha, dest)
+    assert (dest / "tracked.txt").read_text(encoding="utf-8") == "HELLO\n"
+    assert mat["file_count"] == 2
+
+    args_capture = tmp_path / "codex_args.json"
+    codex_script = tmp_path / "fake_codex_args.py"
+    prefix = _write_fake_codex_script(
+        codex_script,
+        (
+            "import json, pathlib, sys\n"
+            "args = sys.argv[1:]\n"
+            f"pathlib.Path({str(args_capture)!r}).write_text(json.dumps(args), encoding='utf-8')\n"
+            "out_path = pathlib.Path(args[args.index('-o') + 1])\n"
+            "_ = sys.stdin.read()\n"
+            f"payload = {{'revision_sha': {sha!r}, 'lens': 'correctness_and_tests', 'verdict': 'APPROVE', "
+            "'summary': 'ok', 'findings': [], 'test_quality_issues': [], 'unverified_areas': []}\n"
+            "out_path.write_text(json.dumps(payload), encoding='utf-8')\n"
+        ),
+    )
+    run_out = tmp_path / "codex_run"
+    run_out.mkdir()
+    res = _run_codex_pass(
+        codex_prefix=prefix,
+        role="pass1",
+        runtime_dir=tmp_path / "rt",
+        repo_root=dest,
+        schema_path=SCHEMA_PATH,
+        prompt_text="review",
+        out_dir=run_out,
+        pass_name="pass1",
+        model=None,
+        timeout_sec=10.0,
+        idle_timeout_sec=5.0,
+    )
+    assert res is not None
+    captured = json.loads(args_capture.read_text(encoding="utf-8"))
+    assert "--skip-git-repo-check" in captured
+    assert captured[captured.index("-C") + 1] == str(dest)

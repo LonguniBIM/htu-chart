@@ -35,6 +35,7 @@ try:
         is_hex_sha40,
         is_strict_int,
         materialize_frozen_tree,
+        resolve_git_toplevel,
         validate_instance_against_schema,
     )
 except ImportError:
@@ -44,6 +45,7 @@ except ImportError:
         is_hex_sha40,
         is_strict_int,
         materialize_frozen_tree,
+        resolve_git_toplevel,
         validate_instance_against_schema,
     )
 
@@ -220,19 +222,20 @@ def _git_output(repo_root: Path, args: list[str]) -> subprocess.CompletedProcess
 
 def resolve_commit_info(repo_root: Path, commit_ref: str, base_ref: str | None) -> dict[str, Any]:
     """Resolve immutable candidate SHA, base SHA, diff stat, and dirty status."""
-    rev = _git_output(repo_root, ["rev-parse", "--verify", f"{commit_ref}^{{commit}}"])
+    git_top = resolve_git_toplevel(repo_root)
+    rev = _git_output(git_top, ["rev-parse", "--verify", f"{commit_ref}^{{commit}}"])
     if rev.returncode != 0:
         raise ValueError(f"Cannot resolve commit '{commit_ref}': {rev.stderr.strip()}")
     candidate_sha = rev.stdout.strip()
 
     if base_ref:
-        base_rev = _git_output(repo_root, ["rev-parse", "--verify", f"{base_ref}^{{commit}}"])
+        base_rev = _git_output(git_top, ["rev-parse", "--verify", f"{base_ref}^{{commit}}"])
         if base_rev.returncode != 0:
             raise ValueError(f"Cannot resolve base commit '{base_ref}': {base_rev.stderr.strip()}")
         base_sha = base_rev.stdout.strip()
         diff_range = f"{base_sha}..{candidate_sha}"
     else:
-        parent_rev = _git_output(repo_root, ["rev-parse", "--verify", f"{candidate_sha}^"])
+        parent_rev = _git_output(git_top, ["rev-parse", "--verify", f"{candidate_sha}^"])
         if parent_rev.returncode == 0:
             base_sha = parent_rev.stdout.strip()
             diff_range = f"{base_sha}..{candidate_sha}"
@@ -240,17 +243,18 @@ def resolve_commit_info(repo_root: Path, commit_ref: str, base_ref: str | None) 
             base_sha = "ROOT_COMMIT"
             diff_range = candidate_sha
 
-    stat_proc = _git_output(repo_root, ["show", "--stat", "--format=", candidate_sha])
+    stat_proc = _git_output(git_top, ["show", "--stat", "--format=", candidate_sha])
     if base_sha != "ROOT_COMMIT":
-        stat_proc = _git_output(repo_root, ["diff", "--stat", diff_range])
-        files_proc = _git_output(repo_root, ["diff", "--name-status", diff_range])
+        stat_proc = _git_output(git_top, ["diff", "--stat", diff_range])
+        files_proc = _git_output(git_top, ["diff", "--name-status", diff_range])
     else:
-        files_proc = _git_output(repo_root, ["show", "--name-status", "--format=", candidate_sha])
+        files_proc = _git_output(git_top, ["show", "--name-status", "--format=", candidate_sha])
 
-    status_proc = _git_output(repo_root, ["status", "--porcelain"])
+    status_proc = _git_output(git_top, ["status", "--porcelain"])
     dirty_lines = [ln for ln in status_proc.stdout.splitlines() if ln.strip()]
 
     return {
+        "git_top": str(git_top),
         "candidate_sha": candidate_sha,
         "base_sha": base_sha,
         "diff_stat": stat_proc.stdout.strip() or "(no diff stat)",
@@ -674,6 +678,7 @@ def _run_codex_pass(
         "exec",
         "-s",
         "read-only",
+        "--skip-git-repo-check",
         "--ephemeral",
         "-C",
         str(repo_root),
@@ -914,12 +919,13 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     info = resolve_commit_info(repo_root, args.commit, args.base)
+    git_top = Path(info["git_top"])
     candidate_sha = info["candidate_sha"]
     if args.out_dir is not None:
         out_dir = args.out_dir
     else:
         attempt_id = args.attempt_id or datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-        out_dir = repo_root / "harness" / "runs" / args.task_id / "attempts" / f"{attempt_id}-{candidate_sha[:12]}"
+        out_dir = git_top / "harness" / "runs" / args.task_id / "attempts" / f"{attempt_id}-{candidate_sha[:12]}"
 
     if not args.dry_run and (out_dir / "consolidated-review.json").exists():
         print(
@@ -944,8 +950,8 @@ def main(argv: list[str] | None = None) -> int:
             return 1
         return 0
 
-    frozen_src_dir = out_dir / "frozen-src"
-    frozen_meta = materialize_frozen_tree(repo_root, candidate_sha, frozen_src_dir, base_sha=info["base_sha"])
+    frozen_src_dir = out_dir / "frozen" / "topstep-chart-app"
+    frozen_meta = materialize_frozen_tree(git_top, candidate_sha, frozen_src_dir, base_sha=info["base_sha"])
     info["frozen_src_dir"] = frozen_meta["dest_dir"]
     info["patch_path"] = frozen_meta["patch_path"]
 
@@ -996,7 +1002,7 @@ def main(argv: list[str] | None = None) -> int:
 
     def _run_agy_review_pair(agy_model: str) -> tuple[dict[str, Any] | None, dict[str, Any] | None, str | None]:
         agy_prefix = resolve_agy_command()
-        before_status = _git_output(repo_root, ["status", "--porcelain"]).stdout
+        before_status = _git_output(git_top, ["status", "--porcelain"]).stdout
         p1_kw = dict(
             agy_prefix=agy_prefix,
             role="pass1",
@@ -1024,7 +1030,7 @@ def main(argv: list[str] | None = None) -> int:
             idle_timeout_sec=args.idle_timeout,
         )
         res1, res2 = _execute_two_passes(_run_agy_pass, p1_kw, p2_kw, sequential=args.sequential)
-        after_status = _git_output(repo_root, ["status", "--porcelain"]).stdout
+        after_status = _git_output(git_top, ["status", "--porcelain"]).stdout
         frozen_hash_after, _ = compute_tree_sha256(frozen_src_dir)
         if after_status != before_status:
             violation: str | None = "Read-only violation: git worktree changed during agy review pass."
