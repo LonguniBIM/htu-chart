@@ -209,7 +209,7 @@ def test_build_verifier_backend_isolation_uses_frozen_commit_not_dirty_worktree(
     (app_pkg / "__init__.py").write_text("", encoding="utf-8")
     (app_pkg / "val.py").write_text("VALUE = 'COMMITTED'\n", encoding="utf-8")
     (tests_dir / "test_val.py").write_text(
-        "from app.val import VALUE\n\ndef test_committed_value():\n    assert VALUE == 'COMMITTED'\n",
+        "from app.val import VALUE\n\n\ndef test_committed_value():\n    assert VALUE == 'COMMITTED'\n",
         encoding="utf-8",
     )
 
