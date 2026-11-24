@@ -162,6 +162,10 @@ def collect_g4_attempt_union(
             elif lock_data is not None:
                 status_str = "IN_PROGRESS"
                 round_dirs.add(norm_dir)
+                discovered_entries[norm_dir] = {
+                    "candidate_sha": lock_sha,
+                    "status": status_str,
+                }
 
             if candidate_sha:
                 matched_sha = (
@@ -187,7 +191,7 @@ def collect_g4_attempt_union(
                     continue
                 norm_dir = _norm_attempt_dir(raw_out)
                 st = str(entry.get("status") or "")
-                if st in completed_statuses:
+                if st in completed_statuses or st == "IN_PROGRESS":
                     round_dirs.add(norm_dir)
                     tracker_completed_round_dirs.add(norm_dir)
                 if candidate_sha and entry.get("candidate_sha") == candidate_sha:

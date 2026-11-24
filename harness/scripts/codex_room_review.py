@@ -1647,7 +1647,11 @@ def _seed_tracker_from_union(
     changed = False
     completed_map = tracker.setdefault("completed_attempts", {})
     for norm_dir, meta in union.get("discovered_entries", {}).items():
-        if norm_dir not in completed_map:
+        existing = completed_map.get(norm_dir)
+        existing_st = existing.get("status") if isinstance(existing, dict) else None
+        if existing is None or (
+            existing_st == "IN_PROGRESS" and meta.get("status") != "IN_PROGRESS"
+        ):
             completed_map[norm_dir] = {
                 "candidate_sha": meta.get("candidate_sha"),
                 "status": meta.get("status"),
@@ -1858,7 +1862,20 @@ def _preflight_g4_caps(
             and not non_infra_statuses
             and resume_err is None
         )
-        if ledger["state"] in halted_states and not allow_resume:
+        if ledger["state"] in (halted_states - {"BLOCKED_INFRA"}):
+            print(
+                f"[codex_room_review] BLOCKED: Ledger state is {ledger['state']!r}; G4 refused.",
+                file=sys.stderr,
+            )
+            return 2, None, None
+        if sha_count >= l_max_sha or (sha_count >= 1 and args.resume_from is None):
+            print(
+                f"[codex_room_review] BLOCKED: Duplicate G4 invocation for candidate_sha "
+                f"{candidate_sha[:12]} (count={sha_count}).",
+                file=sys.stderr,
+            )
+            return 2, None, None
+        if ledger["state"] == "BLOCKED_INFRA" and not allow_resume:
             print(
                 f"[codex_room_review] BLOCKED: Ledger state is {ledger['state']!r}; G4 refused.",
                 file=sys.stderr,
@@ -1870,14 +1887,6 @@ def _preflight_g4_caps(
             print(
                 f"[codex_room_review] BLOCKED: Ledger state/SHA mismatch "
                 f"(state={ledger['state']!r}, expected={ledger.get('candidate_sha')!r}).",
-                file=sys.stderr,
-            )
-            return 2, None, None
-
-        if sha_count >= l_max_sha or (sha_count >= 1 and args.resume_from is None):
-            print(
-                f"[codex_room_review] BLOCKED: Duplicate G4 invocation for candidate_sha "
-                f"{candidate_sha[:12]} (count={sha_count}).",
                 file=sys.stderr,
             )
             return 2, None, None
@@ -2210,12 +2219,22 @@ def _record_g4_outcome(
 
         spent = float(ledger.get("spent_api_equiv_usd", 0.0))
         limit = float(ledger.get("budget_limit_usd", 0.0))
-        if limit > 0 and round(spent, 8) > round(limit, 8):
+        reserved = task_runner._active_reserved_usd(ledger)
+        committed = round(spent + reserved, 8)
+        if ledger.get("state") == "PAUSED_BUDGET" or (
+            limit > 0 and committed > round(limit, 8)
+        ):
             ledger["state"] = "PAUSED_BUDGET"
             task_runner._append_event(
                 ledger,
                 "G4_BUDGET_PAUSED",
-                {"candidate_sha": candidate_sha, "spent_usd": spent, "limit_usd": limit},
+                {
+                    "candidate_sha": candidate_sha,
+                    "spent_usd": spent,
+                    "reserved_usd": reserved,
+                    "committed_usd": committed,
+                    "limit_usd": limit,
+                },
             )
         elif gate_status == "PASSED":
             if prior_changes_requested:

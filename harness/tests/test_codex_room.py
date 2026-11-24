@@ -2276,7 +2276,9 @@ def test_g4_hard_cap_blocks_packet_ceiling_and_needs_replan_without_spawning_cli
 
 
 def test_g4_hard_cap_blocks_duplicate_same_sha_and_third_resume(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     """Reject 2nd invocation on same SHA without --resume-from and 3rd even with --resume-from."""
     repo_dir, sha1 = _init_policy_repo(tmp_path / "repo_dup_sha", qualified_routes=[])
@@ -2327,24 +2329,37 @@ def test_g4_hard_cap_blocks_duplicate_same_sha_and_third_resume(
     assert rc_second == 2
     assert _count_calls(calls_file) == 2
 
-    # Resume case: 2 invocations already spent on sha2 -> 3rd with --resume-from must fail rc=2.
+    # Resume case: 2 completed BLOCKED_INFRA attempts on sha2 -> 3rd fails on per-SHA cap.
     (repo_dir / "file2.txt").write_text("v2\n", encoding="utf-8")
     sha2 = _commit_repo_change(repo_dir, "commit sha2")
     calls_file2 = _install_counting_codex_stub(tmp_path, monkeypatch, sha2)
-    prior_dir = repo_dir / "harness" / "runs" / "T-G4-RES" / "attempts" / f"att-1-{sha2[:12]}"
-    prior_dir.mkdir(parents=True, exist_ok=True)
-    (prior_dir / ".review-attempt.lock").write_text(
-        json.dumps({"candidate_sha": sha2, "task_id": "T-G4-RES"}),
-        encoding="utf-8",
-    )
+    prior_dir1 = repo_dir / "harness" / "runs" / "T-G4-RES" / "attempts" / f"att-1-{sha2[:12]}"
+    prior_dir2 = repo_dir / "harness" / "runs" / "T-G4-RES" / "attempts" / f"att-2-{sha2[:12]}"
+    for p_dir in (prior_dir1, prior_dir2):
+        p_dir.mkdir(parents=True, exist_ok=True)
+        (p_dir / "consolidated-review.json").write_text(
+            json.dumps(
+                {
+                    "revision_sha": sha2,
+                    "passes_completed": 1,
+                    "independent_contexts": False,
+                    "review_gate_status": "BLOCKED_INFRA",
+                    "blocking_open_count": 0,
+                    "consolidated_findings": [],
+                }
+            ),
+            encoding="utf-8",
+        )
     _setup_ledger_for_g4_test(
         repo_dir,
         "T-G4-RES",
         state="BLOCKED_INFRA",
         candidate_sha=sha2,
         last_g4_candidate_sha=sha2,
+        last_g4_status="BLOCKED_INFRA",
         g4_invocations_by_sha={sha2: 2},
     )
+    _ = capsys.readouterr()
     rc_third = codex_room_review.main(
         [
             "--commit",
@@ -2354,15 +2369,18 @@ def test_g4_hard_cap_blocks_duplicate_same_sha_and_third_resume(
             "--attempt-id",
             "att-3",
             "--resume-from",
-            str(prior_dir),
+            str(prior_dir2),
             "--repo-root",
             str(repo_dir),
             "--backend",
             "codex",
         ]
     )
+    err_third = capsys.readouterr().err
     assert rc_third == 2
     assert _count_calls(calls_file2) == 0
+    assert "Duplicate G4 invocation" in err_third
+    assert "count=2" in err_third
 
 
 def test_g4_hard_cap_blocks_ledgerless_attempts_ceiling(
@@ -3538,6 +3556,206 @@ def test_g4_rejects_resume_from_missing_consolidated_review(
     )
     assert rc_nolog == 2
     assert _count_calls(calls) == 0
+
+
+def test_g4_persists_lock_only_attempts_across_out_dir_switch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """5 lock-only attempts under custom_x/attempts persist in tracker across --out-dir switch."""
+    from harness.scripts import receipt as receipt_mod
+    from harness.scripts import task_runner
+
+    repo_dir, sha1 = _init_policy_repo(tmp_path / "repo_lock_ext", qualified_routes=[])
+    custom_x_attempts = tmp_path / "custom_lock_x" / "attempts"
+    for idx in range(5):
+        p_sha = f"{idx + 1}" * 40
+        p_dir = custom_x_attempts / f"a{idx + 1}-{p_sha[:12]}"
+        p_dir.mkdir(parents=True, exist_ok=True)
+        (p_dir / ".review-attempt.lock").write_text(
+            json.dumps({"candidate_sha": p_sha, "task_id": "T-EXT-LOCK"}),
+            encoding="utf-8",
+        )
+
+    calls1 = _install_counting_codex_stub(tmp_path, monkeypatch, sha1)
+    out6 = custom_x_attempts / f"a6-{sha1[:12]}"
+    rc6 = codex_room_review.main(
+        [
+            "--commit",
+            sha1,
+            "--task-id",
+            "T-EXT-LOCK",
+            "--out-dir",
+            str(out6),
+            "--repo-root",
+            str(repo_dir),
+            "--backend",
+            "codex",
+        ]
+    )
+    assert rc6 == 0
+    assert _count_calls(calls1) == 2
+
+    (repo_dir / "l7.txt").write_text("l7\n", encoding="utf-8")
+    sha2 = _commit_repo_change(repo_dir, "lock ext commit 7")
+    calls2 = _install_counting_codex_stub(tmp_path, monkeypatch, sha2)
+    rc7 = codex_room_review.main(
+        [
+            "--commit",
+            sha2,
+            "--task-id",
+            "T-EXT-LOCK",
+            "--out-dir",
+            str(tmp_path / "custom_lock_y" / "a7"),
+            "--repo-root",
+            str(repo_dir),
+            "--backend",
+            "codex",
+        ]
+    )
+    assert rc7 == 2
+    assert _count_calls(calls2) == 0
+
+    t_path = task_runner.default_g4_tracker_path("T-EXT-LOCK", repo_root=repo_dir)
+    t_data = task_runner.load_g4_tracker(t_path, task_id="T-EXT-LOCK")
+    canon_attempts = repo_dir / "harness" / "runs" / "T-EXT-LOCK" / "attempts"
+    assert task_runner.collect_g4_attempt_union([canon_attempts], t_data)["total_rounds"] >= 6
+
+    extra = canon_attempts / f"att-extra-{sha2[:12]}"
+    extra.mkdir(parents=True, exist_ok=True)
+    (extra / "consolidated-review.json").write_text(
+        json.dumps(
+            {
+                "revision_sha": sha2,
+                "passes_completed": 2,
+                "independent_contexts": True,
+                "review_gate_status": "PASSED",
+                "blocking_open_count": 0,
+                "consolidated_findings": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    rec = receipt_mod.evaluate_receipt(
+        task_id="T-EXT-LOCK",
+        phase=1,
+        base_sha="0" * 40,
+        candidate_sha=sha2,
+        verifier_data={"status": "VERIFIED", "phase": 1, "git_sha": sha2, "steps": []},
+        review_data={
+            "revision_sha": sha2,
+            "passes_completed": 2,
+            "independent_contexts": True,
+            "review_gate_status": "PASSED",
+            "blocking_open_count": 0,
+            "consolidated_findings": [],
+        },
+        repo_root=repo_dir,
+    )
+    assert rec["conclusion"] == "BLOCKED"
+    assert any("7" in b and "max_g4_rounds_per_root_task" in b for b in rec["blockers"])
+
+
+def test_g4_pauses_budget_when_committed_spend_with_active_reservations_exceeds_limit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """spent + active_reservations > limit pauses G4 at finalize and blocks G5 receipt."""
+    from harness.scripts import receipt as receipt_mod
+    from harness.scripts import task_runner
+
+    repo_dir, sha1 = _init_policy_repo(tmp_path / "repo_committed_bud", qualified_routes=[])
+    _install_counting_codex_stub(tmp_path, monkeypatch, sha1, emit_usage=True)
+
+    ledger_path = repo_dir / "harness" / "runs" / "T-COMMITTED-BUD" / "ledger.json"
+    led = task_runner.init_or_load_ledger(
+        ledger_path, root_task_id="T-COMMITTED-BUD", base_sha="0" * 40, budget_usd=10.0
+    )
+    led["state"] = "REVIEW_FROZEN_G4"
+    led["candidate_sha"] = sha1
+    led["spent_api_equiv_usd"] = 9.0
+    led["active_reservations"] = {"res-1": 0.99}
+    task_runner.save_ledger(ledger_path, led)
+
+    rc = codex_room_review.main(
+        [
+            "--commit",
+            sha1,
+            "--task-id",
+            "T-COMMITTED-BUD",
+            "--repo-root",
+            str(repo_dir),
+            "--backend",
+            "codex",
+        ]
+    )
+    assert rc == 2
+    led_after = json.loads(ledger_path.read_text(encoding="utf-8"))
+    assert led_after["spent_api_equiv_usd"] == pytest.approx(9.077, abs=1e-6)
+    assert led_after["state"] == "PAUSED_BUDGET"
+
+    # Even if state were coerced back to READY_FOR_ACCEPTANCE, G5 still blocks on committed > limit.
+    led_tamper = task_runner.load_ledger(ledger_path)
+    led_tamper["state"] = "READY_FOR_ACCEPTANCE"
+    led_tamper["candidate_sha"] = sha1
+    task_runner.save_ledger(ledger_path, led_tamper)
+    v_path = tmp_path / "v_comm.json"
+    r_path = tmp_path / "r_comm.json"
+    v_path.write_text(
+        json.dumps(
+            {
+                "status": "VERIFIED",
+                "phase": 1,
+                "git_sha": sha1,
+                "worktree_dirty": False,
+                "steps": [
+                    {"name": "arch_check", "status": "PASSED", "exit_code": 0},
+                    {"name": "harness_ruff", "status": "PASSED", "exit_code": 0},
+                    {"name": "harness_pytest", "status": "PASSED", "exit_code": 0},
+                    {"name": "backend_ruff", "status": "PASSED", "exit_code": 0},
+                    {"name": "backend_pytest", "status": "PASSED", "exit_code": 0},
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    r_path.write_text(
+        json.dumps(
+            {
+                "revision_sha": sha1,
+                "passes_completed": 2,
+                "independent_contexts": True,
+                "review_gate_status": "PASSED",
+                "blocking_open_count": 0,
+                "consolidated_findings": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    out_g5 = tmp_path / "out_g5_comm"
+    rc_g5 = receipt_mod.main(
+        [
+            "--task-id",
+            "T-COMMITTED-BUD",
+            "--phase",
+            "1",
+            "--base-sha",
+            "0" * 40,
+            "--candidate-sha",
+            sha1,
+            "--verifier-json",
+            str(v_path),
+            "--review-json",
+            str(r_path),
+            "--repo-root",
+            str(repo_dir),
+            "--out-dir",
+            str(out_g5),
+        ]
+    )
+    assert rc_g5 == 2
+    rec_g5 = json.loads((out_g5 / "receipt.json").read_text(encoding="utf-8"))
+    assert rec_g5["conclusion"] == "BLOCKED"
+    assert any("committed spend" in b for b in rec_g5["blockers"])
+
 
 
 

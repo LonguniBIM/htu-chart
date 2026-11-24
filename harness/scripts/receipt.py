@@ -563,9 +563,12 @@ def _evaluate_ledger_and_attempts(
 
     budget_limit = float(ledger_data.get("budget_limit_usd", 0.0) or 0.0)
     spent_usd = float(ledger_data.get("spent_api_equiv_usd", 0.0) or 0.0)
-    if budget_limit > 0 and round(spent_usd, 8) > round(budget_limit, 8):
+    reserved_usd = task_runner._active_reserved_usd(ledger_data)
+    committed_usd = round(spent_usd + reserved_usd, 8)
+    if budget_limit > 0 and committed_usd > round(budget_limit, 8):
         blockers.append(
-            f"Task ledger spent_api_equiv_usd (${spent_usd:.4f}) exceeds "
+            f"Task ledger committed spend (${committed_usd:.4f} = "
+            f"${spent_usd:.4f} spent + ${reserved_usd:.4f} reserved) exceeds "
             f"budget_limit_usd (${budget_limit:.4f})."
         )
 
