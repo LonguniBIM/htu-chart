@@ -82,14 +82,14 @@ function createDeferred<T>(): Deferred<T> {
   return { promise, resolve, reject };
 }
 
-function makeBar(time: number, close: number, isClosed = true): OhlcvBar {
+function makeBar(time: number, close: number, isClosed = true, volume = 25): OhlcvBar {
   return {
     time,
     open: close - 1,
     high: close + 1,
     low: close - 2,
     close,
-    volume: 25,
+    volume,
     is_closed: isClosed,
   };
 }
@@ -791,7 +791,7 @@ describe("ChartPane (F06, P1-R3-01, P1-R3-02)", () => {
       timeframe: "5m",
       is_recovered_historical: false,
       recovery_tag: null,
-      bar: makeBar(1120, 5030, false),
+      bar: makeBar(1120, 5030, false, 55),
     });
     fakeWs.emitBarUpdate({
       type: "bar_update",
@@ -800,7 +800,7 @@ describe("ChartPane (F06, P1-R3-01, P1-R3-02)", () => {
       timeframe: "5m",
       is_recovered_historical: false,
       recovery_tag: null,
-      bar: makeBar(1060, 5020, true),
+      bar: makeBar(1060, 5020, true, 84),
     });
     fakeWs.emitBarUpdate({
       type: "bar_update",
@@ -809,7 +809,7 @@ describe("ChartPane (F06, P1-R3-01, P1-R3-02)", () => {
       timeframe: "5m",
       is_recovered_historical: false,
       recovery_tag: null,
-      bar: makeBar(1060, 5010, false),
+      bar: makeBar(1060, 5010, false, 17),
     });
 
     expect(candleUpdate).not.toHaveBeenCalled();
@@ -838,9 +838,12 @@ describe("ChartPane (F06, P1-R3-01, P1-R3-02)", () => {
       low: 5028,
       close: 5030,
     });
-    expect(volumeUpdate.mock.calls.map((call) => (call[0] as { time: number }).time)).toEqual([
-      1060, 1120,
-    ]);
+    expect(volumeUpdate.mock.calls[0]?.[0]).toEqual(
+      expect.objectContaining({ time: 1060, value: 84 }),
+    );
+    expect(volumeUpdate.mock.calls[1]?.[0]).toEqual(
+      expect.objectContaining({ time: 1120, value: 55 }),
+    );
 
     // Subsequent live update after flush continues applying immediately
     fakeWs.emitBarUpdate({
@@ -1051,6 +1054,7 @@ describe("ChartPane (F06, P1-R3-01, P1-R3-02)", () => {
       mesResyncFail.reject(new Error("mes-resync-fail"));
       await Promise.resolve();
     });
+    expect(vi.getTimerCount()).toBe(1);
 
     // Switch target MES -> MNQ while 1500ms MES retry timer is pending
     const mnqPane: PaneConfig = { ...mesPane, root_symbol: "MNQ" };
@@ -1063,6 +1067,7 @@ describe("ChartPane (F06, P1-R3-01, P1-R3-02)", () => {
         coordinator={coordinator}
       />,
     );
+    expect(vi.getTimerCount()).toBe(0);
     expect(fetchBarsMock).toHaveBeenCalledTimes(3);
 
     await act(async () => {
@@ -1090,8 +1095,10 @@ describe("ChartPane (F06, P1-R3-01, P1-R3-02)", () => {
       mnqResyncFail.reject(new Error("mnq-resync-fail"));
       await Promise.resolve();
     });
+    expect(vi.getTimerCount()).toBe(1);
 
     unmount();
+    expect(vi.getTimerCount()).toBe(0);
 
     await act(async () => {
       await vi.advanceTimersByTimeAsync(15000);
