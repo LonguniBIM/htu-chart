@@ -415,3 +415,90 @@ def test_self_validate_r2_brief_gate_runner_schema_and_cli(tmp_path: Path) -> No
     data = json.loads(proc.stdout)
     assert data["status"] == "VALID"
     assert data["eligible_peer_models"] == ["gemini-4-hydrogen-high"]
+
+
+def test_p2_004_glob_dot_env_and_case_insensitive_overlap_block(tmp_path: Path) -> None:
+    """P2-004: Reject globs, //, internal '.', .env secrets, and case-variant overlaps."""
+    base_sha = _init_git_repo(tmp_path)
+
+    # 1. Glob in owned_paths
+    p_glob = tmp_path / "p_glob.md"
+    p_glob.write_text(
+        _render_packet(base_sha, owned_lines=["  - `backend/app/*.py` (modify)"]),
+        encoding="utf-8",
+    )
+    assert brief_gate.validate_brief(p_glob, repo_root=tmp_path)["status"] == "BLOCKED_BRIEF"
+
+    # 2. Internal '.' or '//'
+    p_dot = tmp_path / "p_dot.md"
+    p_dot.write_text(
+        _render_packet(base_sha, owned_lines=["  - `backend/./app//domain.py` (modify)"]),
+        encoding="utf-8",
+    )
+    assert brief_gate.validate_brief(p_dot, repo_root=tmp_path)["status"] == "BLOCKED_BRIEF"
+
+    # 3. Forbidden .env in owned_paths (while .env.example is allowed if valid)
+    p_env = tmp_path / "p_env.md"
+    p_env.write_text(
+        _render_packet(base_sha, owned_lines=["  - `.env.local` (new)"]),
+        encoding="utf-8",
+    )
+    assert brief_gate.validate_brief(p_env, repo_root=tmp_path)["status"] == "BLOCKED_BRIEF"
+
+    # 4. Case-insensitive overlap (Backend/App/Domain.py vs backend/**)
+    p_case = tmp_path / "p_case.md"
+    p_case.write_text(
+        _render_packet(
+            base_sha,
+            owned_lines=["  - `Backend/App/Domain.py` (modify)"],
+            denied_lines=["  - `backend/**`", "  - `../lightweight-charts/**`"],
+        ),
+        encoding="utf-8",
+    )
+    res_case = brief_gate.validate_brief(p_case, repo_root=tmp_path)
+    assert res_case["status"] == "BLOCKED_BRIEF"
+    assert any("overlap" in err.lower() for err in res_case["errors"])
+
+
+def test_p2_007_strips_html_comments_and_rejects_template_placeholders(tmp_path: Path) -> None:
+    """P2-007: HTML-commented contracts cannot satisfy Layer 2; template placeholders fail."""
+    base_sha = _init_git_repo(
+        tmp_path,
+        extra_files={"backend/app/ws_broadcaster.py": "def run():\n    pass\n"},
+    )
+    commented_contract = (
+        "\n<!--\n### Atomicity / Rollback / Concurrency Contract\n"
+        "Locking inside comment must be ignored.\n-->\n"
+    )
+    p_comment = tmp_path / "p_comment.md"
+    p_comment.write_text(
+        _render_packet(
+            base_sha,
+            owned_lines=["  - `backend/app/ws_broadcaster.py` (modify)"],
+            extra_sections=commented_contract,
+        ),
+        encoding="utf-8",
+    )
+    res_comment = brief_gate.validate_brief(p_comment, repo_root=tmp_path)
+    assert res_comment["status"] == "NEEDS_REPLAN"
+
+    # Sensitivity placeholder must fail even when other headers are valid
+    p_placeholder = tmp_path / "p_placeholder.md"
+    p_placeholder.write_text(
+        _render_packet(
+            base_sha,
+            sensitivity_line=(
+                '- "When <scenario>, if <specific defect>, '
+                'test fails at <assertion>, because contract requires <expected>."'
+            ),
+        ),
+        encoding="utf-8",
+    )
+    res_ph = brief_gate.validate_brief(p_placeholder, repo_root=tmp_path)
+    assert res_ph["status"] == "NEEDS_REPLAN"
+
+    # Unedited task-packet-template.md must never validate as VALID
+    tpl = REPO_ROOT / ".agents" / "skills" / "slp-orchestrator" / "references"
+    tpl_file = tpl / "task-packet-template.md"
+    res_tpl = brief_gate.validate_brief(tpl_file, repo_root=tmp_path)
+    assert res_tpl["status"] != "VALID"

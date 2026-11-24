@@ -79,6 +79,7 @@ CONCURRENCY_PATH_MARKERS = (
     "watchdog",
 )
 SECURITY_PATH_MARKERS = (
+    ".env",
     "security",
     "auth",
     "config.py",
@@ -93,6 +94,23 @@ CALENDAR_PATH_MARKERS = (
     "globex",
     "aggregation",
     "vwap",
+)
+HTML_COMMENT_RE = re.compile(r"<!--.*?-->", re.DOTALL)
+TEMPLATE_PLACEHOLDER_PATTERNS = (
+    "<TASK_ID>",
+    "<ROOT_TASK_ID>",
+    "<0..6>",
+    "<40-char",
+    "<Yes | No>",
+    "<positive float",
+    "<F01..F08",
+    "<None |",
+    "<path/",
+    "<scenario>",
+    "<specific defect>",
+    "<assertion>",
+    "<expected>",
+    "<ruff / pytest",
 )
 
 KNOWN_META_KEYS = frozenset(
@@ -145,20 +163,38 @@ def _normalize_rel_path(raw: str) -> str:
     return cleaned
 
 
-def _has_traversal(path_str: str, *, allow_sibling_charts: bool = False) -> bool:
+def _validate_rel_path(path_str: str, *, is_owned: bool) -> str | None:
     if not path_str:
-        return True
+        return "Path cannot be empty."
     if path_str.startswith("/") or re.match(r"^[A-Za-z]:", path_str):
-        return True
-    parts = [p for p in path_str.split("/") if p]
-    if ".." not in parts:
-        return False
-    if allow_sibling_charts and (
-        path_str == "../lightweight-charts"
-        or path_str.startswith("../lightweight-charts/")
-    ):
-        return ".." in parts[1:]
-    return True
+        return f"Absolute paths are forbidden: {path_str!r}"
+    if "//" in path_str:
+        return f"Empty '//' path segment is forbidden: {path_str!r}"
+    if "<" in path_str or ">" in path_str:
+        return f"Unfilled template placeholder in path: {path_str!r}"
+
+    trimmed = path_str[:-1] if (not is_owned and path_str.endswith("/")) else path_str
+    parts = trimmed.split("/")
+    if is_owned:
+        if _has_glob(trimmed):
+            return f"Glob metacharacters are forbidden in Owned Paths: {path_str!r}"
+        if any(p in {"", ".", ".."} for p in parts):
+            return f"Invalid segment ('.', '..', or empty) in Owned Paths: {path_str!r}"
+        base_lower = parts[-1].lower()
+        if base_lower == ".env" or (
+            base_lower.startswith(".env.") and base_lower != ".env.example"
+        ):
+            return f"Forbidden secret env file in Owned Paths: {path_str!r}"
+        return None
+
+    if len(parts) >= 2 and parts[0] == ".." and parts[1].lower() == "lightweight-charts":
+        if any(p in {"", ".", ".."} for p in parts[2:]):
+            return f"Invalid traversal segment in Denied Paths: {path_str!r}"
+        return None
+
+    if any(p in {"", ".", ".."} for p in parts):
+        return f"Unsafe or invalid path segment in Denied Paths: {path_str!r}"
+    return None
 
 
 def _glob_base(pattern: str) -> str | None:
@@ -170,12 +206,12 @@ def _glob_base(pattern: str) -> str | None:
 
 
 def _has_glob(pattern: str) -> bool:
-    return any(ch in pattern for ch in ("*", "?", "["))
+    return any(ch in pattern for ch in ("*", "?", "[", "]"))
 
 
 def _paths_overlap(owned: str, denied: str) -> bool:
-    o = owned.rstrip("/")
-    d = denied.rstrip("/")
+    o = owned.rstrip("/").lower()
+    d = denied.rstrip("/").lower()
     if o == d:
         return True
     if fnmatch.fnmatchcase(o, d) or fnmatch.fnmatchcase(d, o):
@@ -236,15 +272,17 @@ def _parse_risk_tags(raw: str | None) -> list[str]:
 
 def _iter_non_fenced_lines(text: str) -> list[tuple[int, str]]:
     in_fence = False
-    result: list[tuple[int, str]] = []
+    raw_lines: list[tuple[int, str]] = []
     for idx, line in enumerate(text.splitlines(), start=1):
         stripped = line.strip()
         if stripped.startswith("```"):
             in_fence = not in_fence
             continue
         if not in_fence:
-            result.append((idx, line))
-    return result
+            raw_lines.append((idx, line))
+    joined = "\n".join(ln for _, ln in raw_lines)
+    cleaned = HTML_COMMENT_RE.sub("", joined)
+    return list(enumerate(cleaned.splitlines(), start=1))
 
 
 def _parse_packet_structure(
@@ -655,8 +693,9 @@ def validate_brief(
             continue
         rel_p = _normalize_rel_path(mode_match.group("path"))
         mode = mode_match.group("mode").lower()
-        if _has_traversal(rel_p, allow_sibling_charts=False):
-            blocked_errors.append(f"Unsafe or traversal path in Owned Paths: {rel_p!r}")
+        path_err = _validate_rel_path(rel_p, is_owned=True)
+        if path_err:
+            blocked_errors.append(path_err)
             continue
         owned_paths.append({"path": rel_p, "mode": mode})
 
@@ -666,8 +705,9 @@ def validate_brief(
     denied_paths: list[str] = []
     for entry in denied_raw:
         rel_d = _normalize_rel_path(entry)
-        if _has_traversal(rel_d, allow_sibling_charts=True):
-            blocked_errors.append(f"Unsafe or traversal path in Denied Paths: {rel_d!r}")
+        path_err = _validate_rel_path(rel_d, is_owned=False)
+        if path_err:
+            blocked_errors.append(path_err)
             continue
         denied_paths.append(rel_d)
 
@@ -742,9 +782,32 @@ def validate_brief(
     )
 
     non_fenced_lines = [line for _, line in _iter_non_fenced_lines(text)]
-    if not any(TEST_SENSITIVITY_RE.search(line) for line in non_fenced_lines):
+    non_fenced_prose = re.sub(r"`[^`]*`", "", "\n".join(non_fenced_lines))
+    found_placeholders = [
+        pat for pat in TEMPLATE_PLACEHOLDER_PATTERNS if pat in non_fenced_prose
+    ]
+    if "<" in root_task_id or ">" in root_task_id:
+        blocked_errors.append(f"Unfilled placeholder in Root Task ID: {root_task_id!r}.")
+    if "<" in task_id or ">" in task_id:
+        blocked_errors.append(f"Unfilled placeholder in Task ID: {task_id!r}.")
+    if found_placeholders:
+        replan_errors.append(
+            f"Unfilled template placeholder(s) detected: {', '.join(found_placeholders)}."
+        )
+
+    matched_sensitivity = [
+        line for line in non_fenced_lines if TEST_SENSITIVITY_RE.search(line)
+    ]
+    if not matched_sensitivity:
         replan_errors.append(
             "Missing test sensitivity statement matching 'When ... if ... test fails at ...'."
+        )
+    elif all(
+        any(tok in line.lower() for tok in ("<scenario>", "<specific defect>", "<assertion>"))
+        for line in matched_sensitivity
+    ):
+        replan_errors.append(
+            "Test sensitivity statement still contains unfilled template placeholders."
         )
 
     if risk_flags["is_bugfix"]:

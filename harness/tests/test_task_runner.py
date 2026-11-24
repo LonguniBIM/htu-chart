@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import concurrent.futures
+import math
 import shutil
 import subprocess
 import sys
@@ -273,6 +275,10 @@ def test_scope_violation_circuit_breakers_and_replan_durability(tmp_path: Path) 
     )
 
     # Candidate 1: touches denied file -> SCOPE_VIOLATION (1st failure, still ACTIVE_PEER_G1)
+    ok_d1, _, _, _ = task_runner.check_dispatch(
+        ledger_path, readiness1, pkt1, "gemini-4-hydrogen-high", repo_root=tmp_path
+    )
+    assert ok_d1
     (tmp_path / "backend" / "app" / "protected.py").write_text("SECRET = 2\n", encoding="utf-8")
     _git(tmp_path, "add", "backend/app/protected.py")
     _git(tmp_path, "commit", "-m", "bad scope")
@@ -283,12 +289,14 @@ def test_scope_violation_circuit_breakers_and_replan_durability(tmp_path: Path) 
         signal="CANDIDATE_READY",
         candidate_sha=c1,
         readiness_path=readiness1,
+        packet_path=pkt1,
         base_sha=base_sha,
         repo_root=tmp_path,
     )
     assert out1 == "SCOPE_VIOLATION"
     assert rc1 == 1
     assert l1["state"] == "ACTIVE_PEER_G1"
+    assert l1["candidate_sha"] is None
     assert l1["total_candidates"] == 1
     assert l1["consecutive_failed_candidates"] == 1
 
@@ -304,11 +312,13 @@ def test_scope_violation_circuit_breakers_and_replan_durability(tmp_path: Path) 
         signal="CANDIDATE_READY",
         candidate_sha=c2,
         readiness_path=readiness1,
+        packet_path=pkt1,
         base_sha=base_sha,
         repo_root=tmp_path,
     )
     assert out2 == "CANDIDATE_READY"
     assert rc2 == 0
+    assert l2["candidate_sha"] == c2
     assert l2["state"] == "VERIFY_FROZEN_G3"
 
     lg3, rc_g3 = task_runner.record_gate_outcome(
@@ -320,7 +330,8 @@ def test_scope_violation_circuit_breakers_and_replan_durability(tmp_path: Path) 
     assert lg3["total_candidates"] == 2
 
     # Apply auto-replan #1 (packet_version=2): preserves total_candidates=2, resets per-packet
-    _, pkt2, readiness2 = _setup_repo_with_valid_packet(tmp_path, packet_version=2)
+    _git(tmp_path, "reset", "--hard", base_sha)
+    b2, pkt2, readiness2 = _setup_repo_with_valid_packet(tmp_path, packet_version=2)
     l_rep1, rc_rep1, _ = task_runner.record_replan(ledger_path, readiness2, packet_path=pkt2)
     assert rc_rep1 == 0
     assert l_rep1["auto_replans_used"] == 1
@@ -329,19 +340,22 @@ def test_scope_violation_circuit_breakers_and_replan_durability(tmp_path: Path) 
     assert l_rep1["consecutive_failed_candidates"] == 0
     assert l_rep1["state"] == "ACTIVE_PEER_G1"
 
-    # Attempt 2nd auto-replan without human approval -> PAUSED_BUDGET
-    _, pkt3, readiness3 = _setup_repo_with_valid_packet(tmp_path, packet_version=3)
+    # Attempt auto-replan #2 when NOT in NEEDS_REPLAN / auto-replan exhausted -> rejected (rc=2)
+    b3, pkt3, readiness3 = _setup_repo_with_valid_packet(tmp_path, packet_version=3)
     l_rep2, rc_rep2, _ = task_runner.record_replan(
         ledger_path, readiness3, packet_path=pkt3, human_approved=False
     )
     assert rc_rep2 == 2
-    assert l_rep2["state"] == "PAUSED_BUDGET"
+    assert l_rep2["state"] == "ACTIVE_PEER_G1"
 
     # Human-approved replan resumes, then hitting 6 total_candidates triggers PAUSED_BUDGET
     l_hum, rc_hum, _ = task_runner.record_replan(
         ledger_path, readiness3, packet_path=pkt3, human_approved=True
     )
     assert rc_hum == 0 and l_hum["state"] == "ACTIVE_PEER_G1"
+    active_base = b3
+    active_pkt = pkt3
+    active_readiness = readiness3
     for idx in range(3, 7):
         (tmp_path / "backend" / "app" / "feature.py").write_text(
             f"VALUE = {idx}\n", encoding="utf-8"
@@ -353,25 +367,34 @@ def test_scope_violation_circuit_breakers_and_replan_durability(tmp_path: Path) 
             ledger_path,
             signal="CANDIDATE_READY",
             candidate_sha=c_sha,
-            readiness_path=readiness3,
-            base_sha=base_sha,
+            readiness_path=active_readiness,
+            packet_path=active_pkt,
+            base_sha=active_base,
             repo_root=tmp_path,
         )
+        _, rc_p3 = task_runner.record_gate_outcome(
+            ledger_path, gate="G3", outcome="PASSED", candidate_sha=c_sha
+        )
+        assert rc_p3 == 0
         l_fail, rc_fail = task_runner.record_gate_outcome(
             ledger_path, gate="G4", outcome="CHANGES_REQUESTED", candidate_sha=c_sha
         )
         if idx == 4:
             assert l_fail["state"] == "NEEDS_REPLAN"
-            _, pkt4, readiness4 = _setup_repo_with_valid_packet(tmp_path, packet_version=4)
+            b4, pkt4, readiness4 = _setup_repo_with_valid_packet(tmp_path, packet_version=4)
             l_hum2, rc_hum2, _ = task_runner.record_replan(
                 ledger_path, readiness4, packet_path=pkt4, human_approved=True
             )
             assert rc_hum2 == 0 and l_hum2["state"] == "ACTIVE_PEER_G1"
             assert l_hum2["total_candidates"] == 4
+            active_base = b4
+            active_pkt = pkt4
+            active_readiness = readiness4
         if idx == 6:
             assert rc_fail == 2
             assert l_fail["total_candidates"] == 6
             assert l_fail["state"] == "PAUSED_BUDGET"
+            assert b2 == base_sha
 
 
 def test_cumulative_usage_dedup_and_80_100_budget_reservation(tmp_path: Path) -> None:
@@ -473,3 +496,160 @@ def test_wall_clock_deadline_and_managed_subprocess_timeout(tmp_path: Path) -> N
             [sys.executable, "-c", "import time; time.sleep(5)"],
             timeout_override=0.2,
         )
+
+
+def test_p2_001_002_003_state_preconditions_and_path_normalization(tmp_path: Path) -> None:
+    """P2-001/002/003: Enforce dotfile normalization, state preconditions, and G5 SHA."""
+    base_sha, pkt, readiness = _setup_repo_with_valid_packet(tmp_path)
+    ledger_path = tmp_path / "ledger.json"
+    task_runner.init_or_load_ledger(
+        ledger_path,
+        root_task_id="T-RUN-01",
+        base_sha=base_sha,
+        budget_usd=6.0,
+    )
+
+    # P2-001: leading dot on .env / .agents must NOT be stripped by normalization
+    scope_errs = task_runner._check_write_scope(
+        [".env.local"],
+        ["backend/app/feature.py"],
+        [".env*"],
+    )
+    assert scope_errs and any("Forbidden secret env" in e or "Denied" in e for e in scope_errs)
+
+    # P2-003: record_peer_outcome must fail while still in INTAKE_G0 (before check_dispatch)
+    with pytest.raises(ValueError, match="ACTIVE_PEER_G1"):
+        task_runner.record_peer_outcome(
+            ledger_path,
+            signal="CANDIDATE_READY",
+            candidate_sha="2" * 40,
+            readiness_path=readiness,
+            packet_path=pkt,
+            repo_root=tmp_path,
+        )
+
+    # P2-002: G3/G4/G5 from INTAKE_G0 must return rc=2 and leave state untouched
+    l_bad_gate, rc_bad_gate = task_runner.record_gate_outcome(
+        ledger_path, gate="G5", outcome="VERIFIED", candidate_sha="2" * 40
+    )
+    assert rc_bad_gate == 2
+    assert l_bad_gate["state"] == "INTAKE_G0"
+
+    # Dispatch -> CANDIDATE_READY -> G3 PASSED -> G4 PASSED -> G5 VERIFIED
+    ok, _, rc_d, _ = task_runner.check_dispatch(
+        ledger_path, readiness, pkt, "gemini-4-hydrogen-high", repo_root=tmp_path
+    )
+    assert ok and rc_d == 0
+
+    (tmp_path / "backend" / "app" / "feature.py").write_text("VALUE = 99\n", encoding="utf-8")
+    _git(tmp_path, "add", "backend/app/feature.py")
+    _git(tmp_path, "commit", "-m", "good cand")
+    cand_sha = _git(tmp_path, "rev-parse", "HEAD")
+
+    # P2-003: diverged base_sha must be rejected
+    with pytest.raises(ValueError, match="diverges from readiness"):
+        task_runner.record_peer_outcome(
+            ledger_path,
+            signal="CANDIDATE_READY",
+            candidate_sha=cand_sha,
+            readiness_path=readiness,
+            packet_path=pkt,
+            base_sha="9" * 40,
+            repo_root=tmp_path,
+        )
+
+    out_c, l_c, rc_c = task_runner.record_peer_outcome(
+        ledger_path,
+        signal="CANDIDATE_READY",
+        candidate_sha=cand_sha,
+        readiness_path=readiness,
+        packet_path=pkt,
+        repo_root=tmp_path,
+    )
+    assert out_c == "CANDIDATE_READY" and rc_c == 0
+    assert l_c["state"] == "VERIFY_FROZEN_G3"
+
+    # G4 cannot run before G3 passes
+    l_skip_g3, rc_skip = task_runner.record_gate_outcome(
+        ledger_path, gate="G4", outcome="PASSED", candidate_sha=cand_sha
+    )
+    assert rc_skip == 2 and l_skip_g3["state"] == "VERIFY_FROZEN_G3"
+
+    l_g3, rc_g3 = task_runner.record_gate_outcome(
+        ledger_path, gate="G3", outcome="PASSED", candidate_sha=cand_sha
+    )
+    assert rc_g3 == 0 and l_g3["state"] == "REVIEW_FROZEN_G4"
+
+    l_g4, rc_g4 = task_runner.record_gate_outcome(
+        ledger_path, gate="G4", outcome="PASSED", candidate_sha=cand_sha
+    )
+    assert rc_g4 == 0 and l_g4["state"] == "READY_FOR_ACCEPTANCE"
+
+    # G5 without candidate_sha or mismatched SHA must NOT transition to VERIFIED
+    l_no_sha, rc_no_sha = task_runner.record_gate_outcome(
+        ledger_path, gate="G5", outcome="VERIFIED", candidate_sha=None
+    )
+    assert rc_no_sha == 2 and l_no_sha["state"] == "READY_FOR_ACCEPTANCE"
+
+    l_g5, rc_g5 = task_runner.record_gate_outcome(
+        ledger_path, gate="G5", outcome="VERIFIED", candidate_sha=cand_sha
+    )
+    assert rc_g5 == 0 and l_g5["state"] == "VERIFIED"
+
+    # Neither human_approved=False nor human_approved=True can overwrite VERIFIED
+    _, pkt2, r2 = _setup_repo_with_valid_packet(tmp_path, packet_version=2)
+    l_rep_v, rc_rep_v, _ = task_runner.record_replan(
+        ledger_path, r2, packet_path=pkt2, human_approved=True
+    )
+    assert rc_rep_v == 2 and l_rep_v["state"] == "VERIFIED"
+
+
+def test_p2_005_006_concurrent_reservations_and_nan_bool_guards(tmp_path: Path) -> None:
+    """P2-005/006: Concurrent reserve_budget never exceeds 100%; NaN/Inf/bool rejected."""
+    base_sha, _, _ = _setup_repo_with_valid_packet(tmp_path, budget_usd=5.0)
+    ledger_path = tmp_path / "ledger.json"
+
+    bad_bool_true: object = True
+    bad_bool_false: object = False
+    with pytest.raises(ValueError):
+        task_runner.init_or_load_ledger(
+            ledger_path,
+            root_task_id="T-BAD",
+            base_sha=base_sha,
+            budget_usd=bad_bool_true,  # non-numeric bool
+        )
+    with pytest.raises(ValueError):
+        task_runner.init_or_load_ledger(
+            ledger_path, root_task_id="T-BAD", base_sha=base_sha, budget_usd=math.nan
+        )
+
+    task_runner.init_or_load_ledger(
+        ledger_path, root_task_id="T-CONC", base_sha=base_sha, budget_usd=5.0
+    )
+    with pytest.raises(ValueError):
+        task_runner.reserve_budget(ledger_path, "bad-inf", math.inf)
+    with pytest.raises(ValueError):
+        task_runner.reserve_budget(ledger_path, "bad-bool", bad_bool_false)
+
+    # 8 concurrent workers each trying to reserve $1.00 against $5.00 budget -> max 5 succeed
+    def _worker(idx: int) -> bool:
+        ok, _, _ = task_runner.reserve_budget(ledger_path, f"worker-{idx}", 1.0)
+        return ok
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+        results = list(pool.map(_worker, range(8)))
+
+    final_ledger = task_runner.load_ledger(ledger_path)
+    total_reserved = sum(final_ledger["active_reservations"].values())
+    assert sum(1 for r in results if r) == 5
+    assert total_reserved == pytest.approx(5.0)
+    assert total_reserved <= 5.0
+    assert final_ledger["state"] == "PAUSED_BUDGET"
+
+    # P2-002: auto-replan (human_approved=False) must NOT overwrite PAUSED_BUDGET
+    _, pkt2, r2 = _setup_repo_with_valid_packet(tmp_path, packet_version=2)
+    l_refuse, rc_refuse, _ = task_runner.record_replan(
+        ledger_path, r2, packet_path=pkt2, human_approved=False
+    )
+    assert rc_refuse == 2
+    assert l_refuse["state"] == "PAUSED_BUDGET"

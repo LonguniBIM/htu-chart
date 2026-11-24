@@ -11,11 +11,15 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import os
 import re
 import subprocess
 import sys
 import threading
+import time
+from collections.abc import Iterator
+from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -23,7 +27,9 @@ from typing import Any
 try:
     from harness.scripts.brief_gate import (
         DEFAULT_EXCLUDED_MODEL_PREFIXES,
+        _normalize_rel_path,
         _paths_overlap,
+        _validate_rel_path,
     )
     from harness.scripts.schema_utils import (
         is_hex_sha40,
@@ -34,7 +40,9 @@ try:
 except ImportError:
     from brief_gate import (
         DEFAULT_EXCLUDED_MODEL_PREFIXES,
+        _normalize_rel_path,
         _paths_overlap,
+        _validate_rel_path,
     )
     from schema_utils import (
         is_hex_sha40,
@@ -84,6 +92,113 @@ def _sha256_bytes(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
+_THREAD_LOCKS_GUARD = threading.Lock()
+_THREAD_LOCKS: dict[Path, threading.RLock] = {}
+_LOCK_STATE = threading.local()
+
+
+def _require_finite_number(
+    value: Any,
+    name: str,
+    *,
+    allow_zero: bool = True,
+    positive: bool = False,
+) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"{name} must be a finite number, got {value!r}.")
+    num = float(value)
+    if not math.isfinite(num):
+        raise ValueError(f"{name} must be finite (not NaN/Inf), got {value!r}.")
+    if positive and num <= 0.0:
+        raise ValueError(f"{name} must be > 0, got {value!r}.")
+    if not allow_zero and num <= 0.0:
+        raise ValueError(f"{name} must be > 0, got {value!r}.")
+    if num < 0.0:
+        raise ValueError(f"{name} must be non-negative, got {value!r}.")
+    return num
+
+
+def _get_thread_lock(resolved: Path) -> threading.RLock:
+    with _THREAD_LOCKS_GUARD:
+        lock = _THREAD_LOCKS.get(resolved)
+        if lock is None:
+            lock = threading.RLock()
+            _THREAD_LOCKS[resolved] = lock
+        return lock
+
+
+def _acquire_os_lock(fh: Any, timeout_sec: float = 10.0) -> None:
+    if os.name == "nt":
+        import msvcrt
+
+        deadline = time.monotonic() + timeout_sec
+        while True:
+            try:
+                fh.seek(0)
+                msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
+                return
+            except OSError as exc:
+                if time.monotonic() >= deadline:
+                    raise TimeoutError("Timed out acquiring Windows ledger file lock.") from exc
+                time.sleep(0.01)
+    else:
+        import fcntl
+
+        fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+
+
+def _release_os_lock(fh: Any) -> None:
+    if os.name == "nt":
+        import msvcrt
+
+        fh.seek(0)
+        msvcrt.locking(fh.fileno(), msvcrt.LK_UNLCK, 1)
+    else:
+        import fcntl
+
+        fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+
+
+@contextmanager
+def _ledger_lock(ledger_path: Path) -> Iterator[None]:
+    resolved = ledger_path.resolve()
+    resolved.parent.mkdir(parents=True, exist_ok=True)
+    tlock = _get_thread_lock(resolved)
+    depths: dict[Path, int] = getattr(_LOCK_STATE, "depths", {})
+    if not hasattr(_LOCK_STATE, "depths"):
+        _LOCK_STATE.depths = depths
+
+    with tlock:
+        depth = depths.get(resolved, 0)
+        if depth > 0:
+            depths[resolved] = depth + 1
+            try:
+                yield
+            finally:
+                depths[resolved] = depth
+            return
+
+        lock_path = resolved.parent / f"{resolved.name}.lock"
+        fh = lock_path.open("a+b")
+        try:
+            fh.seek(0, os.SEEK_END)
+            if fh.tell() == 0:
+                fh.write(b"\0")
+                fh.flush()
+            _acquire_os_lock(fh)
+            depths[resolved] = 1
+            try:
+                yield
+            finally:
+                depths.pop(resolved, None)
+                try:
+                    _release_os_lock(fh)
+                except OSError:
+                    pass
+        finally:
+            fh.close()
+
+
 def default_ledger_path(root_task_id: str, repo_root: Path | None = None) -> Path:
     root = (repo_root or REPO_ROOT).resolve()
     return root / "harness" / "runs" / root_task_id / "ledger.json"
@@ -92,25 +207,38 @@ def default_ledger_path(root_task_id: str, repo_root: Path | None = None) -> Pat
 def save_ledger(ledger_path: Path, ledger: dict[str, Any]) -> None:
     """Atomically write ``ledger`` to ``ledger_path`` via fsync + os.replace."""
     resolved = ledger_path.resolve()
-    ledger["updated_at_utc"] = _now_utc().isoformat()
-    payload = json.dumps(ledger, indent=2) + "\n"
+    _require_finite_number(ledger.get("budget_limit_usd"), "budget_limit_usd", positive=True)
+    _require_finite_number(ledger.get("spent_api_equiv_usd", 0.0), "spent_api_equiv_usd")
+    for res_id, res_amt in ledger.get("active_reservations", {}).items():
+        _require_finite_number(res_amt, f"active_reservations[{res_id!r}]")
 
-    resolved.parent.mkdir(parents=True, exist_ok=True)
-    tmp_name = f".ledger.{os.getpid()}.{threading.get_ident()}.tmp"
-    tmp_path = resolved.parent / tmp_name
-    try:
-        with tmp_path.open("w", encoding="utf-8") as fh:
-            fh.write(payload)
-            fh.flush()
-            os.fsync(fh.fileno())
-        os.replace(tmp_path, resolved)
-    except Exception:
-        if tmp_path.exists():
-            try:
-                tmp_path.unlink()
-            except OSError:
-                pass
-        raise
+    ledger["updated_at_utc"] = _now_utc().isoformat()
+    payload = json.dumps(ledger, indent=2, allow_nan=False) + "\n"
+
+    with _ledger_lock(resolved):
+        resolved.parent.mkdir(parents=True, exist_ok=True)
+        tmp_name = f".ledger.{os.getpid()}.{threading.get_ident()}.tmp"
+        tmp_path = resolved.parent / tmp_name
+        try:
+            with tmp_path.open("w", encoding="utf-8") as fh:
+                fh.write(payload)
+                fh.flush()
+                os.fsync(fh.fileno())
+            for attempt in range(10):
+                try:
+                    os.replace(tmp_path, resolved)
+                    break
+                except PermissionError:
+                    if attempt == 9:
+                        raise
+                    time.sleep(0.01 * (attempt + 1))
+        except Exception:
+            if tmp_path.exists():
+                try:
+                    tmp_path.unlink()
+                except OSError:
+                    pass
+            raise
 
 
 def load_ledger(
@@ -125,6 +253,7 @@ def load_ledger(
     data = json.loads(resolved.read_text(encoding="utf-8"))
     if not isinstance(data, dict) or not data.get("root_task_id"):
         raise ValueError(f"Invalid ledger payload at {resolved}")
+    _require_finite_number(data.get("budget_limit_usd"), "budget_limit_usd", positive=True)
     if expected_root_task_id is not None and data["root_task_id"] != expected_root_task_id:
         raise ValueError(
             f"Root task mismatch: ledger belongs to {data['root_task_id']!r}, "
@@ -147,44 +276,49 @@ def init_or_load_ledger(
     """Create a new ledger keyed by ``root_task_id`` or load the existing one intact."""
     if not root_task_id.strip():
         raise ValueError("root_task_id must be a non-empty string.")
+    valid_budget = _require_finite_number(budget_usd, "budget_usd", positive=True)
+    if not is_strict_int(packet_version) or packet_version < 1:
+        raise ValueError(f"packet_version must be integer >= 1, got {packet_version!r}.")
+
     resolved = ledger_path.resolve()
-    if resolved.is_file():
-        return load_ledger(resolved, expected_root_task_id=root_task_id)
+    with _ledger_lock(resolved):
+        if resolved.is_file():
+            return load_ledger(resolved, expected_root_task_id=root_task_id)
 
-    now_iso = _now_utc().isoformat()
-    merged_deadlines = dict(DEFAULT_DEADLINES_SEC)
-    if deadlines_sec:
-        merged_deadlines.update(deadlines_sec)
-    merged_breakers = dict(DEFAULT_CIRCUIT_BREAKERS)
-    if circuit_breakers:
-        merged_breakers.update(circuit_breakers)
+        now_iso = _now_utc().isoformat()
+        merged_deadlines = dict(DEFAULT_DEADLINES_SEC)
+        if deadlines_sec:
+            merged_deadlines.update(deadlines_sec)
+        merged_breakers = dict(DEFAULT_CIRCUIT_BREAKERS)
+        if circuit_breakers:
+            merged_breakers.update(circuit_breakers)
 
-    ledger: dict[str, Any] = {
-        "schema_version": 2,
-        "root_task_id": root_task_id,
-        "task_id": task_id or root_task_id,
-        "packet_version": int(packet_version),
-        "base_sha": base_sha,
-        "candidate_sha": None,
-        "state": "INTAKE_G0",
-        "created_at_utc": now_iso,
-        "updated_at_utc": now_iso,
-        "deadlines_sec": merged_deadlines,
-        "circuit_breakers": merged_breakers,
-        "total_candidates": 0,
-        "candidates_in_packet": 0,
-        "consecutive_failed_candidates": 0,
-        "auto_replans_used": 0,
-        "transient_retries_in_stage": 0,
-        "budget_limit_usd": float(budget_usd),
-        "spent_api_equiv_usd": 0.0,
-        "active_reservations": {},
-        "budget_warning": False,
-        "usage_by_conversation": {},
-        "events": [],
-    }
-    save_ledger(resolved, ledger)
-    return ledger
+        ledger: dict[str, Any] = {
+            "schema_version": 2,
+            "root_task_id": root_task_id,
+            "task_id": task_id or root_task_id,
+            "packet_version": int(packet_version),
+            "base_sha": base_sha,
+            "candidate_sha": None,
+            "state": "INTAKE_G0",
+            "created_at_utc": now_iso,
+            "updated_at_utc": now_iso,
+            "deadlines_sec": merged_deadlines,
+            "circuit_breakers": merged_breakers,
+            "total_candidates": 0,
+            "candidates_in_packet": 0,
+            "consecutive_failed_candidates": 0,
+            "auto_replans_used": 0,
+            "transient_retries_in_stage": 0,
+            "budget_limit_usd": valid_budget,
+            "spent_api_equiv_usd": 0.0,
+            "active_reservations": {},
+            "budget_warning": False,
+            "usage_by_conversation": {},
+            "events": [],
+        }
+        save_ledger(resolved, ledger)
+        return ledger
 
 
 def _append_event(
@@ -414,6 +548,32 @@ def check_dispatch(
 ) -> tuple[bool, dict[str, Any], int, str]:
     """Validate state, readiness hash, model policy, breakers, and budget before Peer launch."""
     root = (repo_root or REPO_ROOT).resolve()
+    valid_reserve = _require_finite_number(reserve_usd, "reserve_usd")
+
+    with _ledger_lock(ledger_path):
+        return _check_dispatch_locked(
+            ledger_path,
+            readiness_path,
+            packet_path,
+            peer_model,
+            root=root,
+            reserve_usd=valid_reserve,
+            reservation_id=reservation_id,
+            now_utc=now_utc,
+        )
+
+
+def _check_dispatch_locked(
+    ledger_path: Path,
+    readiness_path: Path,
+    packet_path: Path,
+    peer_model: str,
+    *,
+    root: Path,
+    reserve_usd: float,
+    reservation_id: str | None,
+    now_utc: datetime | None,
+) -> tuple[bool, dict[str, Any], int, str]:
     ledger = load_ledger(ledger_path)
 
     if ledger["state"] not in DISPATCH_ALLOWED_STATES:
@@ -450,6 +610,16 @@ def check_dispatch(
         msg = (
             f"readiness root_task_id ({readiness.get('root_task_id')!r}) != "
             f"ledger root_task_id ({ledger['root_task_id']!r})."
+        )
+        _append_event(ledger, "DISPATCH_BLOCKED_BRIEF", {"reason": msg})
+        save_ledger(ledger_path, ledger)
+        return False, ledger, 2, msg
+
+    if readiness.get("packet_version") != ledger["packet_version"]:
+        ledger["state"] = "BLOCKED_BRIEF"
+        msg = (
+            f"readiness packet_version ({readiness.get('packet_version')!r}) != "
+            f"ledger packet_version ({ledger['packet_version']!r})."
         )
         _append_event(ledger, "DISPATCH_BLOCKED_BRIEF", {"reason": msg})
         save_ledger(ledger_path, ledger)
@@ -497,6 +667,16 @@ def check_dispatch(
         _append_event(ledger, "DISPATCH_BLOCKED_BRIEF", {"reason": msg})
         save_ledger(ledger_path, ledger)
         return False, ledger, 2, msg
+
+    ledger_base = str(ledger.get("base_sha", ""))
+    if ledger_base and ledger_base != base_sha:
+        ledger["state"] = "BLOCKED_BRIEF"
+        msg = f"readiness base_sha ({base_sha}) != ledger base_sha ({ledger_base})."
+        _append_event(ledger, "DISPATCH_BLOCKED_BRIEF", {"reason": msg})
+        save_ledger(ledger_path, ledger)
+        return False, ledger, 2, msg
+    if not ledger_base:
+        ledger["base_sha"] = base_sha
 
     try:
         git_top = resolve_git_toplevel(root, timeout_sec=30.0)
@@ -571,8 +751,6 @@ def check_dispatch(
         save_ledger(ledger_path, ledger)
         return False, ledger, 2, msg
 
-    if reserve_usd < 0:
-        raise ValueError("reserve_usd must be non-negative.")
     committed = _refresh_budget_warning(ledger)
     limit = float(ledger["budget_limit_usd"])
     if round(committed + reserve_usd, 8) > round(limit, 8):
@@ -624,19 +802,19 @@ def _normalize_owned_and_denied(
 ) -> tuple[list[str], list[str]]:
     owned: list[str] = []
     if owned_paths is not None:
-        owned = [p.replace("\\", "/").lstrip("./") for p in owned_paths]
+        owned = [_normalize_rel_path(p) for p in owned_paths]
     elif readiness and isinstance(readiness.get("owned_paths"), list):
         for item in readiness["owned_paths"]:
             if isinstance(item, dict) and item.get("path"):
-                owned.append(str(item["path"]).replace("\\", "/").lstrip("./"))
+                owned.append(_normalize_rel_path(str(item["path"])))
             elif isinstance(item, str):
-                owned.append(item.replace("\\", "/").lstrip("./"))
+                owned.append(_normalize_rel_path(item))
 
     denied: list[str] = []
     if denied_paths is not None:
-        denied = [p.replace("\\", "/").lstrip("./") for p in denied_paths]
+        denied = [_normalize_rel_path(p) for p in denied_paths]
     elif readiness and isinstance(readiness.get("denied_paths"), list):
-        denied = [str(p).replace("\\", "/").lstrip("./") for p in readiness["denied_paths"]]
+        denied = [_normalize_rel_path(str(p)) for p in readiness["denied_paths"]]
     return owned, denied
 
 
@@ -650,7 +828,11 @@ def _check_write_scope(
         violations.append("Candidate diff is empty (no files changed vs base_sha).")
         return violations
     for rel in changed_files:
-        norm = rel.replace("\\", "/").lstrip("./")
+        norm = _normalize_rel_path(rel)
+        path_err = _validate_rel_path(norm, is_owned=True)
+        if path_err:
+            violations.append(path_err)
+            continue
         if any(_paths_overlap(norm, d) for d in denied_paths):
             violations.append(f"Changed file {norm!r} matches Denied Paths.")
             continue
@@ -670,6 +852,7 @@ def record_peer_outcome(
     error_message: str = "",
     candidate_sha: str | None = None,
     readiness_path: Path | None = None,
+    packet_path: Path | None = None,
     base_sha: str | None = None,
     owned_paths: list[str] | None = None,
     denied_paths: list[str] | None = None,
@@ -678,10 +861,49 @@ def record_peer_outcome(
 ) -> tuple[str, dict[str, Any], int]:
     """Classify and record Peer outcome, escalation, infra startup error, or candidate SHA."""
     root = (repo_root or REPO_ROOT).resolve()
+    with _ledger_lock(ledger_path):
+        return _record_peer_outcome_locked(
+            ledger_path,
+            signal=signal,
+            raw_output=raw_output,
+            status=status,
+            exit_code=exit_code,
+            total_tokens=total_tokens,
+            error_message=error_message,
+            candidate_sha=candidate_sha,
+            readiness_path=readiness_path,
+            packet_path=packet_path,
+            base_sha=base_sha,
+            owned_paths=owned_paths,
+            denied_paths=denied_paths,
+            root=root,
+            signal_payload=signal_payload,
+        )
+
+
+def _record_peer_outcome_locked(
+    ledger_path: Path,
+    *,
+    signal: str | None,
+    raw_output: str | None,
+    status: str | None,
+    exit_code: int,
+    total_tokens: int | None,
+    error_message: str,
+    candidate_sha: str | None,
+    readiness_path: Path | None,
+    packet_path: Path | None,
+    base_sha: str | None,
+    owned_paths: list[str] | None,
+    denied_paths: list[str] | None,
+    root: Path,
+    signal_payload: dict[str, Any] | None,
+) -> tuple[str, dict[str, Any], int]:
     ledger = load_ledger(ledger_path)
-    if ledger["state"] not in DISPATCH_ALLOWED_STATES:
+    if ledger["state"] != "ACTIVE_PEER_G1":
         raise ValueError(
-            f"Cannot record Peer outcome while ledger is in state {ledger['state']!r}."
+            f"Cannot record Peer outcome while ledger is in state {ledger['state']!r} "
+            f"(expected 'ACTIVE_PEER_G1')."
         )
 
     detected_signal = (signal or _extract_peer_signal(raw_output) or "").strip().upper()
@@ -730,21 +952,56 @@ def record_peer_outcome(
         return detected_signal, ledger, 0
 
     if detected_signal == "CANDIDATE_READY" or candidate_sha:
-        readiness: dict[str, Any] | None = None
-        if readiness_path is not None and readiness_path.is_file():
-            readiness = json.loads(readiness_path.read_text(encoding="utf-8"))
-
-        effective_base = base_sha or (
-            str(readiness.get("base_sha", "")) if readiness else str(ledger.get("base_sha", ""))
-        )
-        if candidate_sha is None or not is_hex_sha40(candidate_sha) or not is_hex_sha40(
-            effective_base
-        ):
+        if readiness_path is None or not readiness_path.is_file():
+            raise ValueError("CANDIDATE_READY requires a valid readiness.json path.")
+        readiness = json.loads(readiness_path.read_text(encoding="utf-8"))
+        if not isinstance(readiness, dict):
+            raise ValueError("readiness.json must be a JSON object.")
+        if readiness.get("status") != "VALID":
+            raise ValueError(f"readiness status is {readiness.get('status')!r}, expected 'VALID'.")
+        if readiness.get("root_task_id") != ledger["root_task_id"]:
             raise ValueError(
-                f"CANDIDATE_READY requires 40-hex base_sha ({effective_base!r}) and "
-                f"candidate_sha ({candidate_sha!r})."
+                f"readiness root_task_id ({readiness.get('root_task_id')!r}) != "
+                f"ledger root_task_id ({ledger['root_task_id']!r})."
             )
-        if candidate_sha == effective_base:
+        if readiness.get("packet_version") != ledger["packet_version"]:
+            raise ValueError(
+                f"readiness packet_version ({readiness.get('packet_version')!r}) != "
+                f"ledger packet_version ({ledger['packet_version']!r})."
+            )
+
+        r_base = str(readiness.get("base_sha", ""))
+        if not is_hex_sha40(r_base):
+            raise ValueError(f"Invalid base_sha in readiness.json: {r_base!r}.")
+        if base_sha is not None and base_sha != r_base:
+            raise ValueError(
+                f"base_sha ({base_sha!r}) diverges from readiness base_sha ({r_base!r})."
+            )
+        if ledger.get("base_sha") and ledger["base_sha"] != r_base:
+            raise ValueError(
+                f"ledger base_sha ({ledger['base_sha']!r}) != readiness base_sha ({r_base!r})."
+            )
+
+        effective_pkt = packet_path or (
+            Path(str(readiness["packet_path"])) if readiness.get("packet_path") else None
+        )
+        if effective_pkt is None or not effective_pkt.is_file():
+            raise ValueError(f"Packet file missing for readiness verification: {effective_pkt}.")
+        if _sha256_bytes(effective_pkt.read_bytes()) != readiness.get("packet_sha256"):
+            ledger["state"] = "BLOCKED_BRIEF"
+            _append_event(
+                ledger,
+                "CANDIDATE_BLOCKED_STALE_PACKET",
+                {"packet_path": str(effective_pkt)},
+            )
+            save_ledger(ledger_path, ledger)
+            return "BLOCKED_BRIEF", ledger, 2
+
+        if candidate_sha is None or not is_hex_sha40(candidate_sha):
+            raise ValueError(
+                f"CANDIDATE_READY requires 40-hex candidate_sha ({candidate_sha!r})."
+            )
+        if candidate_sha == r_base:
             raise ValueError(f"candidate_sha must differ from base_sha ({candidate_sha}).")
 
         git_top = resolve_git_toplevel(root, timeout_sec=30.0)
@@ -760,7 +1017,6 @@ def record_peer_outcome(
         ledger["transient_retries_in_stage"] = 0
         ledger["total_candidates"] = int(ledger["total_candidates"]) + 1
         ledger["candidates_in_packet"] = int(ledger["candidates_in_packet"]) + 1
-        ledger["candidate_sha"] = candidate_sha
 
         diff_cmd = [
             "git",
@@ -768,7 +1024,7 @@ def record_peer_outcome(
             str(git_top),
             "diff",
             "--name-only",
-            f"{effective_base}..{candidate_sha}",
+            f"{r_base}..{candidate_sha}",
         ]
         diff_proc = run_managed_stage_cmd(
             "peer_round",
@@ -783,6 +1039,7 @@ def record_peer_outcome(
         owned_list, denied_list = _normalize_owned_and_denied(readiness, owned_paths, denied_paths)
         scope_errors = _check_write_scope(changed_files, owned_list, denied_list)
         if scope_errors:
+            ledger["candidate_sha"] = None
             ledger["consecutive_failed_candidates"] = (
                 int(ledger["consecutive_failed_candidates"]) + 1
             )
@@ -791,7 +1048,7 @@ def record_peer_outcome(
                 ledger,
                 "SCOPE_VIOLATION",
                 {
-                    "candidate_sha": candidate_sha,
+                    "rejected_candidate_sha": candidate_sha,
                     "changed_files": changed_files,
                     "violations": scope_errors,
                 },
@@ -799,6 +1056,7 @@ def record_peer_outcome(
             save_ledger(ledger_path, ledger)
             return "SCOPE_VIOLATION", ledger, (2 if new_state == "PAUSED_BUDGET" else 1)
 
+        ledger["candidate_sha"] = candidate_sha
         ledger["state"] = "VERIFY_FROZEN_G3"
         _append_event(
             ledger,
@@ -822,72 +1080,84 @@ def record_gate_outcome(
     candidate_sha: str | None = None,
     details: dict[str, Any] | None = None,
 ) -> tuple[dict[str, Any], int]:
-    """Record G3/G4/G5 gate verdict and enforce circuit-breaker transitions."""
-    ledger = load_ledger(ledger_path)
+    """Record G3/G4/G5 gate verdict strictly from its matching active state."""
     norm_gate = gate.strip().upper()
     norm_outcome = outcome.strip().upper()
-    ledger["transient_retries_in_stage"] = 0
+    expected_state = {
+        "G3": "VERIFY_FROZEN_G3",
+        "G4": "REVIEW_FROZEN_G4",
+        "G5": "READY_FOR_ACCEPTANCE",
+    }.get(norm_gate)
+    if expected_state is None:
+        raise ValueError(f"Unsupported gate {gate!r}; expected G3, G4, or G5.")
 
-    if norm_gate in {"G3", "G4"} and norm_outcome in {"FAILED", "CHANGES_REQUESTED"}:
-        ledger["consecutive_failed_candidates"] = int(ledger["consecutive_failed_candidates"]) + 1
-        new_state = _apply_candidate_failure_breakers(ledger)
-        _append_event(
-            ledger,
-            f"{norm_gate}_{norm_outcome}",
-            {"candidate_sha": candidate_sha, "details": details or {}},
-        )
-        save_ledger(ledger_path, ledger)
-        return ledger, (2 if new_state == "PAUSED_BUDGET" else 1)
-
-    if norm_gate == "G3" and norm_outcome in {"PASSED", "VERIFIED"}:
-        ledger["state"] = "REVIEW_G4"
-        _append_event(ledger, "G3_PASSED", {"candidate_sha": candidate_sha})
-        save_ledger(ledger_path, ledger)
-        return ledger, 0
-
-    if norm_gate == "G4":
-        if norm_outcome in {"BLOCKED_AUTH", "BLOCKED_INFRA", "BLOCKED"}:
-            ledger["state"] = norm_outcome
-            _append_event(ledger, f"G4_{norm_outcome}", {"details": details or {}})
-            save_ledger(ledger_path, ledger)
+    with _ledger_lock(ledger_path):
+        ledger = load_ledger(ledger_path)
+        if ledger["state"] != expected_state:
             return ledger, 2
-        if norm_outcome == "PASSED":
-            ledger["state"] = "RECEIPT_G5"
-            _append_event(ledger, "G4_PASSED", {"candidate_sha": candidate_sha})
-            save_ledger(ledger_path, ledger)
-            return ledger, 0
 
-    if norm_gate == "G5":
-        if norm_outcome == "VERIFIED":
-            if candidate_sha and ledger.get("candidate_sha") and (
-                candidate_sha != ledger["candidate_sha"]
-            ):
-                ledger["state"] = "BLOCKED"
-                _append_event(
-                    ledger,
-                    "G5_SHA_MISMATCH",
-                    {"expected": ledger.get("candidate_sha"), "got": candidate_sha},
-                )
-                save_ledger(ledger_path, ledger)
-                return ledger, 2
-            ledger["consecutive_failed_candidates"] = 0
-            ledger["state"] = "VERIFIED"
-            _append_event(ledger, "G5_VERIFIED", {"candidate_sha": candidate_sha})
-            save_ledger(ledger_path, ledger)
-            return ledger, 0
-        if norm_outcome == "FAILED":
+        ledger["transient_retries_in_stage"] = 0
+
+        if norm_gate in {"G3", "G4"} and norm_outcome in {"FAILED", "CHANGES_REQUESTED"}:
+            ledger["candidate_sha"] = None
             ledger["consecutive_failed_candidates"] = (
                 int(ledger["consecutive_failed_candidates"]) + 1
             )
             new_state = _apply_candidate_failure_breakers(ledger)
-            _append_event(ledger, "G5_FAILED", {"details": details or {}})
+            _append_event(
+                ledger,
+                f"{norm_gate}_{norm_outcome}",
+                {"candidate_sha": candidate_sha, "details": details or {}},
+            )
             save_ledger(ledger_path, ledger)
             return ledger, (2 if new_state == "PAUSED_BUDGET" else 1)
-        if norm_outcome == "BLOCKED":
-            ledger["state"] = "BLOCKED"
-            _append_event(ledger, "G5_BLOCKED", {"details": details or {}})
+
+        if norm_gate == "G3" and norm_outcome in {"PASSED", "VERIFIED"}:
+            ledger["state"] = "REVIEW_FROZEN_G4"
+            _append_event(ledger, "G3_PASSED", {"candidate_sha": candidate_sha})
             save_ledger(ledger_path, ledger)
-            return ledger, 2
+            return ledger, 0
+
+        if norm_gate == "G4":
+            if norm_outcome in {"BLOCKED_AUTH", "BLOCKED_INFRA", "BLOCKED"}:
+                ledger["state"] = norm_outcome
+                _append_event(ledger, f"G4_{norm_outcome}", {"details": details or {}})
+                save_ledger(ledger_path, ledger)
+                return ledger, 2
+            if norm_outcome == "PASSED":
+                ledger["state"] = "READY_FOR_ACCEPTANCE"
+                _append_event(ledger, "G4_PASSED", {"candidate_sha": candidate_sha})
+                save_ledger(ledger_path, ledger)
+                return ledger, 0
+
+        if norm_gate == "G5":
+            if norm_outcome == "VERIFIED":
+                expected_sha = ledger.get("candidate_sha")
+                if (
+                    not is_hex_sha40(candidate_sha)
+                    or not is_hex_sha40(expected_sha)
+                    or candidate_sha != expected_sha
+                ):
+                    return ledger, 2
+                ledger["consecutive_failed_candidates"] = 0
+                ledger["state"] = "VERIFIED"
+                _append_event(ledger, "G5_VERIFIED", {"candidate_sha": candidate_sha})
+                save_ledger(ledger_path, ledger)
+                return ledger, 0
+            if norm_outcome == "FAILED":
+                ledger["candidate_sha"] = None
+                ledger["consecutive_failed_candidates"] = (
+                    int(ledger["consecutive_failed_candidates"]) + 1
+                )
+                new_state = _apply_candidate_failure_breakers(ledger)
+                _append_event(ledger, "G5_FAILED", {"details": details or {}})
+                save_ledger(ledger_path, ledger)
+                return ledger, (2 if new_state == "PAUSED_BUDGET" else 1)
+            if norm_outcome == "BLOCKED":
+                ledger["state"] = "BLOCKED"
+                _append_event(ledger, "G5_BLOCKED", {"details": details or {}})
+                save_ledger(ledger_path, ledger)
+                return ledger, 2
 
     raise ValueError(f"Unsupported gate/outcome combination: gate={gate!r}, outcome={outcome!r}")
 
@@ -900,66 +1170,76 @@ def record_replan(
     human_approved: bool = False,
 ) -> tuple[dict[str, Any], int, str]:
     """Advance ledger to a bumped ``packet_version`` after validated ``readiness.json``."""
-    ledger = load_ledger(ledger_path)
-    if not readiness_path.is_file():
-        ledger["state"] = "BLOCKED_BRIEF"
-        save_ledger(ledger_path, ledger)
-        return ledger, 2, f"Missing readiness.json at {readiness_path}."
+    with _ledger_lock(ledger_path):
+        ledger = load_ledger(ledger_path)
+        current_state = ledger["state"]
+        if current_state == "VERIFIED":
+            return ledger, 2, "Refusing replan: ledger is already VERIFIED."
+        if not human_approved and current_state != "NEEDS_REPLAN":
+            return (
+                ledger,
+                2,
+                f"Auto-replan requires state 'NEEDS_REPLAN', got {current_state!r}.",
+            )
 
-    readiness = json.loads(readiness_path.read_text(encoding="utf-8"))
-    if readiness.get("root_task_id") != ledger["root_task_id"]:
-        raise ValueError(
-            f"Root task mismatch in readiness.json: {readiness.get('root_task_id')!r} != "
-            f"{ledger['root_task_id']!r}."
-        )
-    if readiness.get("status") != "VALID":
-        ledger["state"] = "BLOCKED_BRIEF"
-        save_ledger(ledger_path, ledger)
-        return ledger, 2, f"Cannot replan from non-VALID readiness ({readiness.get('status')!r})."
+        if not readiness_path.is_file():
+            return ledger, 2, f"Missing readiness.json at {readiness_path}."
 
-    new_version = readiness.get("packet_version")
-    if not is_strict_int(new_version) or new_version <= int(ledger["packet_version"]):
-        return (
+        readiness = json.loads(readiness_path.read_text(encoding="utf-8"))
+        if not isinstance(readiness, dict):
+            return ledger, 2, "readiness.json must be a JSON object."
+        if readiness.get("root_task_id") != ledger["root_task_id"]:
+            raise ValueError(
+                f"Root task mismatch in readiness.json: {readiness.get('root_task_id')!r} != "
+                f"{ledger['root_task_id']!r}."
+            )
+        if readiness.get("status") != "VALID":
+            return (
+                ledger,
+                2,
+                f"Cannot replan from non-VALID readiness ({readiness.get('status')!r}).",
+            )
+
+        new_version = readiness.get("packet_version")
+        if not is_strict_int(new_version) or new_version <= int(ledger["packet_version"]):
+            return (
+                ledger,
+                2,
+                f"Replan requires bumped packet_version > {ledger['packet_version']} "
+                f"(got {new_version!r}).",
+            )
+
+        if packet_path is not None:
+            if not packet_path.is_file():
+                return ledger, 2, f"Packet missing at {packet_path}."
+            if _sha256_bytes(packet_path.read_bytes()) != readiness.get("packet_sha256"):
+                return ledger, 2, "Packet SHA-256 does not match readiness.json."
+
+        max_auto = int(ledger["circuit_breakers"]["max_auto_replans_per_root_task"])
+        if int(ledger["auto_replans_used"]) >= max_auto and not human_approved:
+            ledger["state"] = "PAUSED_BUDGET"
+            msg = "Auto-replan limit reached; human approval required."
+            _append_event(ledger, "AUTO_REPLAN_LIMIT_PAUSED", {"reason": msg})
+            save_ledger(ledger_path, ledger)
+            return ledger, 2, msg
+
+        if not human_approved:
+            ledger["auto_replans_used"] = int(ledger["auto_replans_used"]) + 1
+        ledger["packet_version"] = new_version
+        ledger["task_id"] = str(readiness.get("task_id", ledger["task_id"]))
+        ledger["base_sha"] = str(readiness.get("base_sha", ledger["base_sha"]))
+        ledger["candidate_sha"] = None
+        ledger["candidates_in_packet"] = 0
+        ledger["consecutive_failed_candidates"] = 0
+        ledger["transient_retries_in_stage"] = 0
+        ledger["state"] = "ACTIVE_PEER_G1"
+        _append_event(
             ledger,
-            2,
-            f"Replan requires bumped packet_version > {ledger['packet_version']} "
-            f"(got {new_version!r}).",
+            "REPLAN_APPLIED",
+            {"packet_version": new_version, "human_approved": human_approved},
         )
-
-    if packet_path is not None:
-        if not packet_path.is_file():
-            ledger["state"] = "BLOCKED_BRIEF"
-            save_ledger(ledger_path, ledger)
-            return ledger, 2, f"Packet missing at {packet_path}."
-        if _sha256_bytes(packet_path.read_bytes()) != readiness.get("packet_sha256"):
-            ledger["state"] = "BLOCKED_BRIEF"
-            save_ledger(ledger_path, ledger)
-            return ledger, 2, "Packet SHA-256 does not match readiness.json."
-
-    max_auto = int(ledger["circuit_breakers"]["max_auto_replans_per_root_task"])
-    if int(ledger["auto_replans_used"]) >= max_auto and not human_approved:
-        ledger["state"] = "PAUSED_BUDGET"
-        msg = "Auto-replan limit reached; human approval required."
-        _append_event(ledger, "AUTO_REPLAN_LIMIT_PAUSED", {"reason": msg})
         save_ledger(ledger_path, ledger)
-        return ledger, 2, msg
-
-    if not human_approved:
-        ledger["auto_replans_used"] = int(ledger["auto_replans_used"]) + 1
-    ledger["packet_version"] = new_version
-    ledger["task_id"] = str(readiness.get("task_id", ledger["task_id"]))
-    ledger["base_sha"] = str(readiness.get("base_sha", ledger["base_sha"]))
-    ledger["candidates_in_packet"] = 0
-    ledger["consecutive_failed_candidates"] = 0
-    ledger["transient_retries_in_stage"] = 0
-    ledger["state"] = "ACTIVE_PEER_G1"
-    _append_event(
-        ledger,
-        "REPLAN_APPLIED",
-        {"packet_version": new_version, "human_approved": human_approved},
-    )
-    save_ledger(ledger_path, ledger)
-    return ledger, 0, f"Replan applied (packet_version={new_version})."
+        return ledger, 0, f"Replan applied (packet_version={new_version})."
 
 
 def _resolve_pricing(
@@ -1017,53 +1297,12 @@ def record_usage(
     if counter_mode not in {"cumulative", "delta"}:
         raise ValueError(f"counter_mode must be 'cumulative' or 'delta', got {counter_mode!r}.")
 
-    ledger = load_ledger(ledger_path)
-    usage_map = ledger.setdefault("usage_by_conversation", {})
-    conv_key = (conversation_id or "").strip()
+    with _ledger_lock(ledger_path):
+        ledger = load_ledger(ledger_path)
+        usage_map = ledger.setdefault("usage_by_conversation", {})
+        conv_key = (conversation_id or "").strip()
 
-    if counter_mode == "cumulative" and conv_key:
-        prev = usage_map.get(
-            conv_key,
-            {
-                "model": model,
-                "input_tokens": 0,
-                "output_tokens": 0,
-                "thinking_tokens": 0,
-                "cache_read_tokens": 0,
-                "billed_usd": 0.0,
-            },
-        )
-        d_in = max(0, input_tokens - int(prev["input_tokens"]))
-        d_out = max(0, output_tokens - int(prev["output_tokens"]))
-        d_think = max(0, thinking_tokens - int(prev["thinking_tokens"]))
-        d_cache = max(0, cache_read_tokens - int(prev["cache_read_tokens"]))
-
-        delta_usd = compute_usage_cost_usd(
-            model,
-            input_tokens=d_in,
-            output_tokens=d_out,
-            thinking_tokens=d_think,
-            cache_read_tokens=d_cache,
-            pricing=pricing,
-        )
-        usage_map[conv_key] = {
-            "model": model,
-            "input_tokens": max(int(prev["input_tokens"]), input_tokens),
-            "output_tokens": max(int(prev["output_tokens"]), output_tokens),
-            "thinking_tokens": max(int(prev["thinking_tokens"]), thinking_tokens),
-            "cache_read_tokens": max(int(prev["cache_read_tokens"]), cache_read_tokens),
-            "billed_usd": round(float(prev["billed_usd"]) + delta_usd, 8),
-        }
-    else:
-        delta_usd = compute_usage_cost_usd(
-            model,
-            input_tokens=input_tokens,
-            output_tokens=output_tokens,
-            thinking_tokens=thinking_tokens,
-            cache_read_tokens=cache_read_tokens,
-            pricing=pricing,
-        )
-        if conv_key:
+        if counter_mode == "cumulative" and conv_key:
             prev = usage_map.get(
                 conv_key,
                 {
@@ -1075,29 +1314,71 @@ def record_usage(
                     "billed_usd": 0.0,
                 },
             )
+            d_in = max(0, input_tokens - int(prev["input_tokens"]))
+            d_out = max(0, output_tokens - int(prev["output_tokens"]))
+            d_think = max(0, thinking_tokens - int(prev["thinking_tokens"]))
+            d_cache = max(0, cache_read_tokens - int(prev["cache_read_tokens"]))
+
+            delta_usd = compute_usage_cost_usd(
+                model,
+                input_tokens=d_in,
+                output_tokens=d_out,
+                thinking_tokens=d_think,
+                cache_read_tokens=d_cache,
+                pricing=pricing,
+            )
             usage_map[conv_key] = {
                 "model": model,
-                "input_tokens": int(prev["input_tokens"]) + input_tokens,
-                "output_tokens": int(prev["output_tokens"]) + output_tokens,
-                "thinking_tokens": int(prev["thinking_tokens"]) + thinking_tokens,
-                "cache_read_tokens": int(prev["cache_read_tokens"]) + cache_read_tokens,
+                "input_tokens": max(int(prev["input_tokens"]), input_tokens),
+                "output_tokens": max(int(prev["output_tokens"]), output_tokens),
+                "thinking_tokens": max(int(prev["thinking_tokens"]), thinking_tokens),
+                "cache_read_tokens": max(int(prev["cache_read_tokens"]), cache_read_tokens),
                 "billed_usd": round(float(prev["billed_usd"]) + delta_usd, 8),
             }
+        else:
+            delta_usd = compute_usage_cost_usd(
+                model,
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                thinking_tokens=thinking_tokens,
+                cache_read_tokens=cache_read_tokens,
+                pricing=pricing,
+            )
+            if conv_key:
+                prev = usage_map.get(
+                    conv_key,
+                    {
+                        "model": model,
+                        "input_tokens": 0,
+                        "output_tokens": 0,
+                        "thinking_tokens": 0,
+                        "cache_read_tokens": 0,
+                        "billed_usd": 0.0,
+                    },
+                )
+                usage_map[conv_key] = {
+                    "model": model,
+                    "input_tokens": int(prev["input_tokens"]) + input_tokens,
+                    "output_tokens": int(prev["output_tokens"]) + output_tokens,
+                    "thinking_tokens": int(prev["thinking_tokens"]) + thinking_tokens,
+                    "cache_read_tokens": int(prev["cache_read_tokens"]) + cache_read_tokens,
+                    "billed_usd": round(float(prev["billed_usd"]) + delta_usd, 8),
+                }
 
-    ledger["spent_api_equiv_usd"] = round(float(ledger["spent_api_equiv_usd"]) + delta_usd, 8)
-    committed = _refresh_budget_warning(ledger)
-    limit = float(ledger["budget_limit_usd"])
-    rc = 0
-    if round(committed, 8) > round(limit, 8):
-        ledger["state"] = "PAUSED_BUDGET"
-        _append_event(
-            ledger,
-            "BUDGET_EXCEEDED_USAGE",
-            {"committed_usd": committed, "limit_usd": limit},
-        )
-        rc = 2
-    save_ledger(ledger_path, ledger)
-    return ledger, delta_usd, rc
+        ledger["spent_api_equiv_usd"] = round(float(ledger["spent_api_equiv_usd"]) + delta_usd, 8)
+        committed = _refresh_budget_warning(ledger)
+        limit = float(ledger["budget_limit_usd"])
+        rc = 0
+        if round(committed, 8) > round(limit, 8):
+            ledger["state"] = "PAUSED_BUDGET"
+            _append_event(
+                ledger,
+                "BUDGET_EXCEEDED_USAGE",
+                {"committed_usd": committed, "limit_usd": limit},
+            )
+            rc = 2
+        save_ledger(ledger_path, ledger)
+        return ledger, delta_usd, rc
 
 
 def reserve_budget(
@@ -1108,48 +1389,53 @@ def reserve_budget(
     """Atomically reserve USD against remaining budget; pause on >100% exhaustion."""
     if not reservation_id.strip():
         raise ValueError("reservation_id must be non-empty.")
-    if amount_usd < 0:
-        raise ValueError("amount_usd must be non-negative.")
+    valid_amt = _require_finite_number(amount_usd, "amount_usd")
 
-    ledger = load_ledger(ledger_path)
-    reservations = ledger.setdefault("active_reservations", {})
-    other_reserved = sum(
-        float(v) for k, v in reservations.items() if k != reservation_id
-    )
-    spent = float(ledger.get("spent_api_equiv_usd", 0.0))
-    limit = float(ledger.get("budget_limit_usd", 0.0))
-    projected = round(spent + other_reserved + float(amount_usd), 8)
+    with _ledger_lock(ledger_path):
+        ledger = load_ledger(ledger_path)
+        reservations = ledger.setdefault("active_reservations", {})
+        other_reserved = sum(
+            float(v) for k, v in reservations.items() if k != reservation_id
+        )
+        spent = float(ledger.get("spent_api_equiv_usd", 0.0))
+        limit = float(ledger.get("budget_limit_usd", 0.0))
+        projected = round(spent + other_reserved + valid_amt, 8)
 
-    if projected > round(limit, 8):
-        ledger["state"] = "PAUSED_BUDGET"
+        if projected > round(limit, 8):
+            ledger["state"] = "PAUSED_BUDGET"
+            _append_event(
+                ledger,
+                "BUDGET_RESERVATION_REJECTED",
+                {
+                    "reservation_id": reservation_id,
+                    "projected_usd": projected,
+                    "limit_usd": limit,
+                },
+            )
+            save_ledger(ledger_path, ledger)
+            return False, ledger, 2
+
+        reservations[reservation_id] = valid_amt
+        _refresh_budget_warning(ledger)
         _append_event(
             ledger,
-            "BUDGET_RESERVATION_REJECTED",
-            {"reservation_id": reservation_id, "projected_usd": projected, "limit_usd": limit},
+            "BUDGET_RESERVED",
+            {"reservation_id": reservation_id, "amount_usd": valid_amt},
         )
         save_ledger(ledger_path, ledger)
-        return False, ledger, 2
-
-    reservations[reservation_id] = float(amount_usd)
-    _refresh_budget_warning(ledger)
-    _append_event(
-        ledger,
-        "BUDGET_RESERVED",
-        {"reservation_id": reservation_id, "amount_usd": float(amount_usd)},
-    )
-    save_ledger(ledger_path, ledger)
-    return True, ledger, 0
+        return True, ledger, 0
 
 
 def release_reservation(ledger_path: Path, reservation_id: str) -> dict[str, Any]:
     """Release an active budget reservation if present."""
-    ledger = load_ledger(ledger_path)
-    reservations = ledger.setdefault("active_reservations", {})
-    if reservation_id in reservations:
-        reservations.pop(reservation_id)
-        _append_event(ledger, "BUDGET_RELEASED", {"reservation_id": reservation_id})
-        save_ledger(ledger_path, ledger)
-    return ledger
+    with _ledger_lock(ledger_path):
+        ledger = load_ledger(ledger_path)
+        reservations = ledger.setdefault("active_reservations", {})
+        if reservation_id in reservations:
+            reservations.pop(reservation_id)
+            _append_event(ledger, "BUDGET_RELEASED", {"reservation_id": reservation_id})
+            save_ledger(ledger_path, ledger)
+        return ledger
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -1185,6 +1471,7 @@ def _build_parser() -> argparse.ArgumentParser:
     p_peer.add_argument("--error-message", default="")
     p_peer.add_argument("--candidate-sha", default=None)
     p_peer.add_argument("--readiness", type=Path, default=None)
+    p_peer.add_argument("--packet", type=Path, default=None)
     p_peer.add_argument("--base-sha", default=None)
     p_peer.add_argument("--repo-root", type=Path, default=REPO_ROOT)
     p_peer.add_argument("--json", action="store_true")
@@ -1234,6 +1521,14 @@ def _build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
+    try:
+        return _dispatch_cli(args)
+    except ValueError as exc:
+        print(f"[task_runner] ERROR: {exc}", file=sys.stderr)
+        return 2
+
+
+def _dispatch_cli(args: argparse.Namespace) -> int:
     cmd = args.command
 
     if cmd == "init":
@@ -1246,7 +1541,7 @@ def main(argv: list[str] | None = None) -> int:
             budget_usd=args.budget_usd,
         )
         if args.json:
-            print(json.dumps(ledger, indent=2))
+            print(json.dumps(ledger, indent=2, allow_nan=False))
         else:
             print(f"[task_runner] state={ledger['state']} root_task_id={ledger['root_task_id']}")
         return 0
@@ -1262,7 +1557,13 @@ def main(argv: list[str] | None = None) -> int:
             reservation_id=args.reservation_id,
         )
         if args.json:
-            print(json.dumps({"allowed": ok, "message": msg, "ledger": ledger}, indent=2))
+            print(
+                json.dumps(
+                    {"allowed": ok, "message": msg, "ledger": ledger},
+                    indent=2,
+                    allow_nan=False,
+                )
+            )
         else:
             print(f"[task_runner] allowed={ok} state={ledger['state']} msg={msg}")
         return rc
@@ -1278,11 +1579,12 @@ def main(argv: list[str] | None = None) -> int:
             error_message=args.error_message,
             candidate_sha=args.candidate_sha,
             readiness_path=args.readiness,
+            packet_path=args.packet,
             base_sha=args.base_sha,
             repo_root=args.repo_root,
         )
         if args.json:
-            print(json.dumps({"outcome": outcome, "ledger": ledger}, indent=2))
+            print(json.dumps({"outcome": outcome, "ledger": ledger}, indent=2, allow_nan=False))
         else:
             print(f"[task_runner] outcome={outcome} state={ledger['state']}")
         return rc
