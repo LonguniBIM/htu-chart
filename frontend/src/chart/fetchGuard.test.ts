@@ -10,7 +10,7 @@ import {
   type PaneFetchTarget,
 } from "./fetchGuard";
 
-function makeBar(time: number, close: number): OhlcvBar {
+function makeBar(time: number, close: number, isClosed = true): OhlcvBar {
   return {
     time,
     open: close - 1,
@@ -18,7 +18,7 @@ function makeBar(time: number, close: number): OhlcvBar {
     low: close - 2,
     close,
     volume: 10,
-    is_closed: true,
+    is_closed: isClosed,
   };
 }
 
@@ -153,14 +153,14 @@ describe("ChartPane dataset isolation and REST/WS reconciliation (P1-01, P1-02, 
      * Defect caught: In-flight WS ticks lost or duplicated when REST snapshot resolves.
      */
     const restBars: OhlcvBar[] = [
-      makeBar(900, 5000),
-      makeBar(1000, 5005),
+      makeBar(900, 5000, true),
+      makeBar(1000, 5005, false),
     ];
     const bufferedBars: OhlcvBar[] = [
-      makeBar(500, 4990), // older than lastRestTime=1000 -> ignored
-      makeBar(1000, 5007), // forming tail bar update -> overwrites REST bar at 1000
-      makeBar(2000, 5012), // newer bar arrived while REST in flight -> appended
-      makeBar(2000, 5015), // later tick on 2000 -> overwrites earlier 2000
+      makeBar(500, 4990, true), // older than lastRestTime=1000 -> ignored
+      makeBar(1000, 5007, false), // forming tail bar update -> overwrites provisional REST bar at 1000
+      makeBar(2000, 5012, false), // newer bar arrived while REST in flight -> appended
+      makeBar(2000, 5015, true), // later closed tick on 2000 -> upgrades earlier 2000
     ];
 
     const merged = reconcileSnapshotWithBufferedBars(restBars, bufferedBars);
@@ -168,6 +168,31 @@ describe("ChartPane dataset isolation and REST/WS reconciliation (P1-01, P1-02, 
     expect(merged.map((b) => b.time)).toContain(2000);
     expect(merged[1]?.close).toBe(5007);
     expect(merged[2]?.close).toBe(5015);
+    expect(merged[2]?.is_closed).toBe(true);
+  });
+
+  it("preserves closed REST bars over delayed provisional WS bars while upgrading provisional REST bars (P2-001)", () => {
+    /**
+     * Contract: Finalized closed REST bars (is_closed=true) must never be overwritten by
+     * delayed provisional WS bars (is_closed=false) at the same timestamp, whereas a
+     * provisional REST bar (is_closed=false) must upgrade to a closed WS bar (is_closed=true).
+     * Defect caught: Closed historical/tail bar regressing to stale provisional WS tick.
+     */
+    const closedRestKept = reconcileSnapshotWithBufferedBars(
+      [makeBar(1000, 108, true)],
+      [makeBar(1000, 102, false)],
+    );
+    expect(closedRestKept).toHaveLength(1);
+    expect(closedRestKept[0]?.close).toBe(108);
+    expect(closedRestKept[0]?.is_closed).toBe(true);
+
+    const provisionalRestUpgraded = reconcileSnapshotWithBufferedBars(
+      [makeBar(1000, 102, false)],
+      [makeBar(1000, 108, true)],
+    );
+    expect(provisionalRestUpgraded).toHaveLength(1);
+    expect(provisionalRestUpgraded[0]?.close).toBe(108);
+    expect(provisionalRestUpgraded[0]?.is_closed).toBe(true);
   });
 
   it("reconcileSnapshotWithBufferedBars handles empty REST snapshots without dropping buffered WS bars", () => {

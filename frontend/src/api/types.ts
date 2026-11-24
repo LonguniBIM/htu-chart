@@ -40,6 +40,19 @@ export const TIMEFRAMES: readonly Timeframe[] = [
   "1d",
 ];
 
+export const LIVE_WS_TIMEFRAMES: readonly Timeframe[] = [
+  "1m",
+  "5m",
+  "15m",
+  "1h",
+  "4h",
+  "1d",
+];
+
+export function isLiveWsTimeframe(tf: Timeframe): boolean {
+  return LIVE_WS_TIMEFRAMES.includes(tf);
+}
+
 export const LAYOUT_TEMPLATE_PANE_COUNTS: Record<LayoutTemplateId, number> = {
   "1-single": 1,
   "2-cols": 2,

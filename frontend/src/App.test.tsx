@@ -10,6 +10,7 @@ import type {
   StatusResponse,
   Timeframe,
   WsBarUpdateMessage,
+  WsErrorMessage,
   WsFeedStatusMessage,
   WsResyncRequiredMessage,
 } from "./api/types";
@@ -26,6 +27,7 @@ let feedStatusListeners = new Set<(msg: WsFeedStatusMessage) => void>();
 let connectionStateListeners = new Set<(state: WsConnectionState) => void>();
 let barUpdateListeners = new Set<(msg: WsBarUpdateMessage) => void>();
 let resyncListeners = new Set<(msg: WsResyncRequiredMessage) => void>();
+let errorListeners = new Set<(msg: WsErrorMessage) => void>();
 
 vi.mock("./api/wsClient", () => ({
   MarketWsClient: class MockMarketWsClient {
@@ -60,6 +62,13 @@ vi.mock("./api/wsClient", () => ({
         resyncListeners.delete(listener);
       };
     }
+
+    onError(listener: (msg: WsErrorMessage) => void) {
+      errorListeners.add(listener);
+      return () => {
+        errorListeners.delete(listener);
+      };
+    }
   },
 }));
 
@@ -89,6 +98,7 @@ vi.mock("lightweight-charts", () => {
 const loginMock = vi.fn<
   (password: string, signal?: AbortSignal) => Promise<{ authenticated: boolean; csrf_token: string }>
 >();
+const logoutMock = vi.fn<(signal?: AbortSignal) => Promise<{ authenticated: boolean }>>();
 const fetchSessionMock = vi.fn<
   (signal?: AbortSignal) => Promise<{ authenticated: boolean; csrf_token: string }>
 >();
@@ -110,6 +120,7 @@ vi.mock("./api/client", async (importOriginal) => {
   return {
     ...actual,
     login: (password: string, signal?: AbortSignal) => loginMock(password, signal),
+    logout: (signal?: AbortSignal) => logoutMock(signal),
     fetchSession: (signal?: AbortSignal) => fetchSessionMock(signal),
     fetchStatus: (signal?: AbortSignal) => fetchStatusMock(signal),
     listLayouts: (signal?: AbortSignal) => listLayoutsMock(signal),
@@ -166,6 +177,7 @@ describe("App bootstrap and R03 503 recovery (P1-R3-03, P1-R3-04, P2-005)", () =
   beforeEach(() => {
     vi.clearAllMocks();
     loginMock.mockReset();
+    logoutMock.mockReset();
     fetchSessionMock.mockReset();
     fetchStatusMock.mockReset();
     listLayoutsMock.mockReset();
@@ -175,6 +187,7 @@ describe("App bootstrap and R03 503 recovery (P1-R3-03, P1-R3-04, P2-005)", () =
     connectionStateListeners = new Set();
     barUpdateListeners = new Set();
     resyncListeners = new Set();
+    errorListeners = new Set();
     vi.stubGlobal("ResizeObserver", MockResizeObserver);
   });
 
@@ -619,5 +632,232 @@ describe("App bootstrap and R03 503 recovery (P1-R3-03, P1-R3-04, P2-005)", () =
     } finally {
       window.removeEventListener("unhandledrejection", onWindowUnhandled);
     }
+  });
+
+  it("aborts and epoch-guards pending layout-switch fetchContracts across Logout -> Login (P1-02)", async () => {
+    /**
+     * Contract: Switching layouts passes a dedicated layoutResolveControllerRef AbortSignal to
+     * fetchContractsForModes and binds completion to sessionEpochRef. Across Logout -> Login,
+     * the stale signal is aborted and a late-resolving stale response never overwrites new
+     * session contracts, loadError, or contractsPendingRetry.
+     * Defect caught: Un-cancelled layout switch request mutating state after session change.
+     */
+    const liveLayout: LayoutRecord = {
+      ...SAMPLE_LAYOUT,
+      id: "layout-live",
+      name: "Live MNQ",
+      is_default: false,
+      panes: [
+        {
+          pane_id: "pane-live",
+          root_symbol: "MNQ",
+          timeframe: "5m",
+          live_mode: true,
+          playback_mode: "live",
+        },
+      ],
+    };
+    const newSessionLayout: LayoutRecord = {
+      ...SAMPLE_LAYOUT,
+      id: "layout-new-session",
+      name: "New Session Live",
+      is_default: true,
+      panes: [
+        {
+          pane_id: "pane-new",
+          root_symbol: "MNQ",
+          timeframe: "5m",
+          live_mode: true,
+          playback_mode: "live",
+        },
+      ],
+    };
+
+    fetchSessionMock.mockResolvedValue({
+      authenticated: true,
+      csrf_token: "csrf-token-session-1",
+    });
+    fetchStatusMock.mockResolvedValue({
+      connected: true,
+      live: true,
+      feed_state: "LIVE",
+    });
+    listLayoutsMock
+      .mockResolvedValueOnce([SAMPLE_LAYOUT, liveLayout])
+      .mockResolvedValueOnce([newSessionLayout]);
+    logoutMock.mockResolvedValue({ authenticated: false });
+    loginMock.mockResolvedValue({
+      authenticated: true,
+      csrf_token: "csrf-token-session-2",
+    });
+
+    let staleSignal: AbortSignal | undefined;
+    let resolveStaleLayout!: (value: ContractsResponse) => void;
+    fetchContractsMock
+      .mockResolvedValueOnce({
+        live: false,
+        contracts: {
+          MES: {
+            selected: { id: "CON.F.US.MES.H26" },
+            error_type: null,
+            error: null,
+          },
+        },
+      })
+      .mockImplementationOnce((_symbols, _live, signal) => {
+        staleSignal = signal;
+        return new Promise<ContractsResponse>((resolve) => {
+          resolveStaleLayout = resolve;
+        });
+      })
+      .mockResolvedValueOnce({
+        live: true,
+        contracts: {
+          MNQ: {
+            selected: { id: "CON.F.US.MNQ.NEW" },
+            error_type: null,
+            error: null,
+          },
+        },
+      });
+    fetchBarsMock.mockResolvedValue({
+      provider: "topstepx",
+      live: true,
+      contract_id: "CON.F.US.MNQ.NEW",
+      root_symbol: "MNQ",
+      timeframe: "5m",
+      start_time: 1000,
+      end_time: 1000,
+      count: 0,
+      include_partial: true,
+      quality: {
+        is_complete: true,
+        truncated: false,
+        provider_gap: false,
+        quarantined_count: 0,
+      },
+      bars: [],
+    });
+
+    render(<App />);
+    await act(async () => {
+      await flushMicrotasks();
+    });
+
+    expect(screen.getByText("CON.F.US.MES.H26")).toBeTruthy();
+
+    // Switch layout -> starts pending fetchContracts for live_mode=true
+    await act(async () => {
+      fireEvent.change(screen.getByLabelText("Active layout"), {
+        target: { value: "layout-live" },
+      });
+      await flushMicrotasks();
+    });
+    expect(fetchContractsMock).toHaveBeenCalledTimes(2);
+    expect(staleSignal).toBeDefined();
+    expect(staleSignal?.aborted).toBe(false);
+
+    // Logout -> aborts staleSignal and advances sessionEpochRef
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Logout" }));
+      await flushMicrotasks();
+    });
+    expect(staleSignal?.aborted).toBe(true);
+
+    // Login into new session -> resolves CON.F.US.MNQ.NEW
+    fireEvent.change(screen.getByLabelText("Terminal password"), {
+      target: { value: "terminal-secret" },
+    });
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Unlock Terminal" }));
+      await flushMicrotasks();
+    });
+    expect(fetchContractsMock).toHaveBeenCalledTimes(3);
+    expect(screen.getByText(/CON\.F\.US\.MNQ\.NEW/)).toBeTruthy();
+
+    // Late resolution of stale layout switch with partial failure & stale contract ID
+    await act(async () => {
+      resolveStaleLayout({
+        live: true,
+        contracts: {
+          MNQ: {
+            selected: { id: "CON.F.US.MNQ.STALE" },
+            error_type: null,
+            error: null,
+          },
+          MYM: {
+            selected: null,
+            error_type: "StaleLayoutError",
+            error: "Should be ignored across sessions",
+          },
+        },
+      });
+      await flushMicrotasks();
+    });
+
+    expect(staleSignal?.aborted).toBe(true);
+    expect(screen.getByText(/CON\.F\.US\.MNQ\.NEW/)).toBeTruthy();
+    expect(screen.queryByText(/CON\.F\.US\.MNQ\.STALE/)).toBeNull();
+    expect(screen.queryByText(/StaleLayoutError/)).toBeNull();
+    expect(screen.queryByRole("button", { name: "Retry Contracts" })).toBeNull();
+  });
+
+  it("surfaces inbound WS error frames via wsClient.onError in loadError (P1-01)", async () => {
+    /**
+     * Contract: When /ws/market emits { type: "error", detail }, App surfaces detail
+     * visibly in the header error banner via wsClient.onError.
+     * Defect caught: Server WS error frames silently dropped without user visibility.
+     */
+    fetchSessionMock.mockResolvedValue({
+      authenticated: true,
+      csrf_token: "csrf-token-1234567890",
+    });
+    fetchStatusMock.mockResolvedValue({
+      connected: true,
+      live: false,
+      feed_state: "LIVE",
+    });
+    listLayoutsMock.mockResolvedValue([SAMPLE_LAYOUT]);
+    fetchContractsMock.mockResolvedValue({
+      live: false,
+      contracts: {
+        MES: {
+          selected: { id: "CON.F.US.MES.H26" },
+          error_type: null,
+          error: null,
+        },
+      },
+    });
+    fetchBarsMock.mockResolvedValue({
+      provider: "topstepx",
+      live: false,
+      contract_id: "CON.F.US.MES.H26",
+      root_symbol: "MES",
+      timeframe: "5m",
+      start_time: 1000,
+      end_time: 1000,
+      count: 0,
+      include_partial: true,
+      quality: {
+        is_complete: true,
+        truncated: false,
+        provider_gap: false,
+        quarantined_count: 0,
+      },
+      bars: [],
+    });
+
+    render(<App />);
+    await act(async () => {
+      await flushMicrotasks();
+    });
+
+    act(() => {
+      for (const listener of errorListeners) {
+        listener({ type: "error", detail: "Timeframe '3m' is not enabled" });
+      }
+    });
+
+    expect(screen.getByText("Timeframe '3m' is not enabled")).toBeTruthy();
   });
 });

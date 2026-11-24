@@ -17,6 +17,7 @@ import { fetchBars } from "../api/client";
 import {
   ROOT_SYMBOLS,
   TIMEFRAMES,
+  isLiveWsTimeframe,
   type OhlcvBar,
   type PaneConfig,
   type RootSymbol,
@@ -327,7 +328,9 @@ export function ChartPane({
   ]);
 
   const isModeMismatch = activeFeedLive !== null && pane.live_mode !== activeFeedLive;
-  const canSubscribeWs = activeFeedLive !== null && pane.live_mode === activeFeedLive;
+  const isLiveTimeframe = isLiveWsTimeframe(pane.timeframe);
+  const canSubscribeWs =
+    activeFeedLive !== null && pane.live_mode === activeFeedLive && isLiveTimeframe;
 
   useEffect(() => {
     const resolvedContractId = contractId?.trim() ?? "";
@@ -348,6 +351,14 @@ export function ChartPane({
         return;
       }
       if (lastBarTimeRef.current !== null && msg.bar.time < lastBarTimeRef.current) {
+        return;
+      }
+      if (
+        lastBarTimeRef.current !== null &&
+        msg.bar.time === lastBarTimeRef.current &&
+        latestBarRef.current?.is_closed === true &&
+        !msg.bar.is_closed
+      ) {
         return;
       }
       candleSeriesRef.current?.update(toCandleDatum(msg.bar));
@@ -378,10 +389,12 @@ export function ChartPane({
     };
   }, [canSubscribeWs, contractId, pane.live_mode, pane.timeframe, wsClient]);
 
-  const modeMismatchLabel = isModeMismatch
-    ? `Hist only (feed: ${activeFeedLive ? "Live" : "Sim"})`
-    : null;
-  const statusText = modeMismatchLabel !== null ? `${modeMismatchLabel} · ${loadStatus}` : loadStatus;
+  const histOnlyLabel = !isLiveTimeframe
+    ? `Hist only (${pane.timeframe} no live feed)`
+    : isModeMismatch
+      ? `Hist only (feed: ${activeFeedLive ? "Live" : "Sim"})`
+      : null;
+  const statusText = histOnlyLabel !== null ? `${histOnlyLabel} · ${loadStatus}` : loadStatus;
 
   return (
     <section className="chart-pane" data-pane-id={pane.pane_id}>

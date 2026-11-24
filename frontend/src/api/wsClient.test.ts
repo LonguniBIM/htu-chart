@@ -1,5 +1,9 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { WsResyncRequiredMessage } from "./types";
+import {
+  LIVE_WS_TIMEFRAMES,
+  isLiveWsTimeframe,
+  type WsResyncRequiredMessage,
+} from "./types";
 import { MarketWsClient } from "./wsClient";
 
 class FakeWebSocket {
@@ -269,5 +273,49 @@ describe("MarketWsClient (P1-04, P1-05, P2-003)", () => {
 
     expect(barListener).toHaveBeenCalledTimes(1);
     expect(feedStatusListener).toHaveBeenCalledTimes(1);
+  });
+
+  it("dispatches inbound error frames to onError, ignores stale sockets, and classifies live WS timeframes (P1-01)", () => {
+    /**
+     * Contract: MarketWsClient.onError delivers { type: "error", detail } frames from the
+     * active socket while ignoring stale-socket errors, and isLiveWsTimeframe matches
+     * BarAggregator DEFAULT_AGGREGATION_TIMEFRAMES.
+     * Defect caught: Silent WS error swallowing and subscribing to unsupported 3m/30m feeds.
+     */
+    expect(LIVE_WS_TIMEFRAMES).toEqual(["1m", "5m", "15m", "1h", "4h", "1d"]);
+    expect(isLiveWsTimeframe("3m")).toBe(false);
+    expect(isLiveWsTimeframe("30m")).toBe(false);
+    for (const tf of LIVE_WS_TIMEFRAMES) {
+      expect(isLiveWsTimeframe(tf)).toBe(true);
+    }
+
+    const client = new MarketWsClient(() => "ws://127.0.0.1:8000/ws/market");
+    const errors: string[] = [];
+    const unsubscribe = client.onError((msg) => {
+      errors.push(msg.detail);
+    });
+
+    client.connect();
+    const ws1 = FakeWebSocket.instances[0];
+    expect(ws1).toBeDefined();
+    ws1?.emitOpen();
+
+    client.disconnect();
+    client.connect();
+    const ws2 = FakeWebSocket.instances[1];
+    expect(ws2).toBeDefined();
+    ws2?.emitOpen();
+
+    // Replaced stale socket error must be ignored
+    ws1?.emitMessage({ type: "error", detail: "stale socket error" });
+    expect(errors).toEqual([]);
+
+    // Active socket error must reach onError listener
+    ws2?.emitMessage({ type: "error", detail: "Timeframe '3m' is not enabled" });
+    expect(errors).toEqual(["Timeframe '3m' is not enabled"]);
+
+    unsubscribe();
+    ws2?.emitMessage({ type: "error", detail: "after unsubscribe" });
+    expect(errors).toEqual(["Timeframe '3m' is not enabled"]);
   });
 });

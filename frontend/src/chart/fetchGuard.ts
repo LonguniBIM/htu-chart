@@ -124,6 +124,10 @@ export function appendBoundedWsBar(
   }
   const existingIndex = buffer.findIndex((entry) => entry.time === bar.time);
   if (existingIndex !== -1) {
+    const existing = buffer[existingIndex];
+    if (existing?.is_closed === true && !bar.is_closed) {
+      return { overflowed: false };
+    }
     buffer[existingIndex] = bar;
     return { overflowed: false };
   }
@@ -156,6 +160,10 @@ export function reconcileSnapshotWithBufferedBars(
 
   for (const wsBar of bufferedBars) {
     if (lastRestTime === null || wsBar.time >= lastRestTime) {
+      const existing = byTime.get(wsBar.time);
+      if (existing?.is_closed === true && !wsBar.is_closed) {
+        continue;
+      }
       byTime.set(wsBar.time, wsBar);
     }
   }

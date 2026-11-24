@@ -81,7 +81,7 @@ function createDeferred<T>(): Deferred<T> {
   return { promise, resolve, reject };
 }
 
-function makeBar(time: number, close: number): OhlcvBar {
+function makeBar(time: number, close: number, isClosed = true): OhlcvBar {
   return {
     time,
     open: close - 1,
@@ -89,7 +89,7 @@ function makeBar(time: number, close: number): OhlcvBar {
     low: close - 2,
     close,
     volume: 25,
-    is_closed: true,
+    is_closed: isClosed,
   };
 }
 
@@ -392,5 +392,158 @@ describe("ChartPane (F06, P1-R3-01, P1-R3-02)", () => {
     });
 
     expect(screen.getByText("2 bars")).toBeTruthy();
+  });
+
+  it("ignores late-resolving MES fetchBars response after MNQ switch even if AbortSignal is ignored (P1-03)", async () => {
+    /**
+     * Contract: Even when an underlying transport ignores AbortSignal, resolving a stale MES
+     * fetchBars promise after switching to MNQ and applying mnqBars must be rejected by
+     * coordinator.isResponseCurrent and never overwrite candleSeries or volumeSeries.
+     * Defect caught: Out-of-order late fetchBars response overwriting newer symbol chart data.
+     */
+    const mesDeferred = createDeferred<BarsResponse>();
+    const mnqBars = [makeBar(2000, 20001)];
+    const mesBars = [makeBar(1000, 5001)];
+
+    fetchBarsMock
+      .mockImplementationOnce(() => mesDeferred.promise)
+      .mockImplementationOnce(() => Promise.resolve(makeBarsResponse("CON.F.US.MNQ.H26", mnqBars)));
+
+    const coordinator = new PaneFetchCoordinator();
+    const fakeWs = createFakeWsClient();
+    const mesPane: PaneConfig = {
+      pane_id: "pane-1",
+      root_symbol: "MES",
+      timeframe: "5m",
+      live_mode: false,
+      playback_mode: "live",
+    };
+
+    const { rerender } = render(
+      <ChartPane
+        pane={mesPane}
+        contractId="CON.F.US.MES.H26"
+        activeFeedLive={false}
+        wsClient={fakeWs.client}
+        coordinator={coordinator}
+      />,
+    );
+
+    const mnqPane: PaneConfig = { ...mesPane, root_symbol: "MNQ" };
+    await act(async () => {
+      rerender(
+        <ChartPane
+          pane={mnqPane}
+          contractId="CON.F.US.MNQ.H26"
+          activeFeedLive={false}
+          wsClient={fakeWs.client}
+          coordinator={coordinator}
+        />,
+      );
+      await Promise.resolve();
+    });
+
+    await act(async () => {
+      mesDeferred.resolve(makeBarsResponse("CON.F.US.MES.H26", mesBars));
+      await mesDeferred.promise;
+    });
+
+    const lastCandleCall = candleSetData.mock.calls[candleSetData.mock.calls.length - 1]?.[0] as
+      | Array<{ time: number; close: number }>
+      | undefined;
+    const lastVolumeCall = volumeSetData.mock.calls[volumeSetData.mock.calls.length - 1]?.[0] as
+      | Array<{ time: number; value: number }>
+      | undefined;
+    const lastSetDataPrices = lastCandleCall?.map((bar) => bar.close);
+    expect(lastSetDataPrices).toEqual([20001]);
+    expect(lastVolumeCall?.map((bar) => bar.time)).toEqual([2000]);
+  });
+
+  it("skips WS subscription and shows Hist only status for 3m timeframe (P1-01)", async () => {
+    /**
+     * Contract: Non-aggregated timeframes (3m, 30m) must not subscribe over /ws/market and must
+     * display explicit "Hist only (3m no live feed)" status alongside bar count.
+     * Defect caught: Subscribing to unsupported 3m/30m live feeds causing server WS error frames.
+     */
+    const pendingFetch = createDeferred<BarsResponse>();
+    fetchBarsMock.mockReturnValueOnce(pendingFetch.promise);
+
+    const coordinator = new PaneFetchCoordinator();
+    const fakeWs = createFakeWsClient();
+    const pane3m: PaneConfig = {
+      pane_id: "pane-1",
+      root_symbol: "MES",
+      timeframe: "3m",
+      live_mode: false,
+      playback_mode: "live",
+    };
+
+    render(
+      <ChartPane
+        pane={pane3m}
+        contractId="CON.F.US.MES.H26"
+        activeFeedLive={false}
+        wsClient={fakeWs.client}
+        coordinator={coordinator}
+      />,
+    );
+
+    expect(fakeWs.subscribe).not.toHaveBeenCalled();
+    expect(screen.getByText(/Hist only \(3m no live feed\)/)).toBeTruthy();
+
+    await act(async () => {
+      pendingFetch.resolve(makeBarsResponse("CON.F.US.MES.H26", [makeBar(1000, 5000)]));
+      await pendingFetch.promise;
+    });
+
+    expect(screen.getByText(/Hist only \(3m no live feed\) · 1 bars/)).toBeTruthy();
+  });
+
+  it("ignores delayed provisional WS tick when latest chart bar at same timestamp is already closed (P2-001)", async () => {
+    /**
+     * Contract: When the latest applied bar at timestamp T has is_closed=true, an inbound
+     * provisional bar_update at timestamp T (is_closed=false) must be ignored.
+     * Defect caught: Stale provisional WS bar overwriting a finalized closed bar on live chart.
+     */
+    const snapshotFetch = createDeferred<BarsResponse>();
+    fetchBarsMock.mockReturnValueOnce(snapshotFetch.promise);
+
+    const coordinator = new PaneFetchCoordinator();
+    const fakeWs = createFakeWsClient();
+    const pane: PaneConfig = {
+      pane_id: "pane-1",
+      root_symbol: "MES",
+      timeframe: "5m",
+      live_mode: false,
+      playback_mode: "live",
+    };
+
+    render(
+      <ChartPane
+        pane={pane}
+        contractId="CON.F.US.MES.H26"
+        activeFeedLive={false}
+        wsClient={fakeWs.client}
+        coordinator={coordinator}
+      />,
+    );
+
+    await act(async () => {
+      snapshotFetch.resolve(makeBarsResponse("CON.F.US.MES.H26", [makeBar(1000, 5008, true)]));
+      await snapshotFetch.promise;
+    });
+
+    fakeWs.emitBarUpdate({
+      type: "bar_update",
+      contract_id: "CON.F.US.MES.H26",
+      live_mode: false,
+      timeframe: "5m",
+      is_recovered_historical: false,
+      recovery_tag: null,
+      bar: makeBar(1000, 5001, false),
+    });
+
+    expect(candleUpdate).not.toHaveBeenCalled();
+    expect(volumeUpdate).not.toHaveBeenCalled();
   });
 });
