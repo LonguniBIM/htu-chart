@@ -515,6 +515,25 @@ def _check_upstream_fork(root: Path) -> list[Violation]:
     return []
 
 
+def _normalize_model_slug(val: str) -> str:
+    return re.sub(r"[\s_()]+", "-", val.strip().lower()).strip("-")
+
+
+def _is_excluded_model(model: str, prefixes: tuple[str, ...]) -> bool:
+    low = model.strip().lower()
+    if not low:
+        return False
+    slug = _normalize_model_slug(model)
+    if "orchestrator-argon" in slug:
+        return True
+    for prefix in prefixes:
+        p_low = prefix.strip().lower()
+        p_slug = _normalize_model_slug(prefix)
+        if low.startswith(p_low) or slug.startswith(p_slug):
+            return True
+    return False
+
+
 def _validate_model_policy_file(
     root: Path,
 ) -> tuple[tuple[str, ...], list[Violation]]:
@@ -610,9 +629,7 @@ def _validate_model_policy_file(
                 "internal_executor_label",
             ):
                 val = role_val.get(field)
-                if isinstance(val, str) and any(
-                    val.strip().lower().startswith(p.lower()) for p in merged
-                ):
+                if isinstance(val, str) and _is_excluded_model(val, merged):
                     violations.append(
                         Violation(
                             rule_id="MOD-001",
@@ -630,9 +647,7 @@ def _validate_model_policy_file(
                 if isinstance(routes, list):
                     for item in routes:
                         m_val = item.get("model") if isinstance(item, dict) else item
-                        if isinstance(m_val, str) and any(
-                            m_val.strip().lower().startswith(p.lower()) for p in merged
-                        ):
+                        if isinstance(m_val, str) and _is_excluded_model(m_val, merged):
                             violations.append(
                                 Violation(
                                     rule_id="MOD-001",
@@ -667,8 +682,13 @@ def _collect_mod001_targets(root: Path) -> list[Path]:
 
 def _scan_model_policy_compliance(root: Path, today: date) -> list[Violation]:
     prefixes, violations = _validate_model_policy_file(root)
-    escaped = "|".join(re.escape(p) for p in prefixes)
-    excl_re = re.compile(rf"\b(?:{escaped})(?:-[a-z0-9._-]+)?\b", re.IGNORECASE)
+    flex_parts = [re.escape(p).replace(r"\-", r"[-\s_]+") for p in prefixes]
+    flex_parts.append(r"orchestrator\s*\(\s*argon\s*\)")
+    escaped = "|".join(flex_parts)
+    excl_re = re.compile(
+        rf"\b(?:{escaped})(?:[-\s_()]+[a-z0-9._-]+)?\b",
+        re.IGNORECASE,
+    )
     fix_msg = (
         "Replace excluded models and discontinued peer-coder/flash dispatch with "
         "qualified models from harness/model-policy.json (e.g. swarm with gemini-4-hydrogen-high)."

@@ -12,6 +12,7 @@ import copy
 import hashlib
 import json
 import os
+import re
 import shutil
 import sys
 import tempfile
@@ -40,14 +41,26 @@ MANDATORY_EXCLUDED_MODEL_PREFIXES = (
 BARE_KEY_CHARS = frozenset("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-")
 
 
+def _normalize_model_slug(val: str) -> str:
+    return re.sub(r"[\s_()]+", "-", val.strip().lower()).strip("-")
+
+
 def is_excluded_model(model: str | None, prefixes: tuple[str, ...]) -> bool:
-    """Return True if ``model`` matches any excluded model prefix."""
+    """Return True if ``model`` (ID or display name) matches any excluded prefix."""
     if not isinstance(model, str):
         return False
     low = model.strip().lower()
     if not low:
         return False
-    return any(low.startswith(p.lower()) for p in prefixes)
+    slug = _normalize_model_slug(model)
+    if "orchestrator-argon" in slug:
+        return True
+    for p in prefixes:
+        p_low = p.strip().lower()
+        p_slug = _normalize_model_slug(p)
+        if low.startswith(p_low) or slug.startswith(p_slug):
+            return True
+    return False
 
 
 def load_model_policy(
@@ -423,15 +436,16 @@ def sync_role(
     role: str,
     base_home: Path,
     runtime_root: Path,
-    overlays_dir: Path = OVERLAYS_DIR,
+    overlays_dir: Path | None = None,
     model_override: str | None = None,
     dry_run: bool = False,
+    repo_root: Path = REPO_ROOT,
 ) -> dict[str, Any]:
     """Merge base Codex config + role overlay and write isolated runtime dir."""
     if role not in ROLE_MAP:
         raise ValueError(f"Unknown Codex Room role '{role}'. Expected one of: {sorted(ROLE_MAP)}")
 
-    _, excluded_prefixes, policy_err = load_model_policy(REPO_ROOT, require_exists=False)
+    _, excluded_prefixes, policy_err = load_model_policy(repo_root, require_exists=False)
     if policy_err:
         raise ValueError(policy_err)
     if is_excluded_model(EXPECTED_REVIEW_MODEL, excluded_prefixes):
@@ -440,7 +454,12 @@ def sync_role(
         raise ValueError(f"Requested model {model_override!r} is excluded by model-policy.json.")
 
     runtime_name, overlay_filename = ROLE_MAP[role]
-    overlay_path = overlays_dir / overlay_filename
+    active_overlays_dir = (
+        overlays_dir
+        if overlays_dir is not None
+        else (repo_root / "harness" / "codex-room" / "overlays")
+    )
+    overlay_path = active_overlays_dir / overlay_filename
     if not overlay_path.is_file():
         raise FileNotFoundError(f"Missing Codex Room overlay: {overlay_path}")
 
@@ -496,20 +515,25 @@ def sync_role(
     return receipt
 
 
-def verify_role(role: str, runtime_root: Path) -> dict[str, Any]:
+def verify_role(
+    role: str,
+    runtime_root: Path,
+    *,
+    repo_root: Path = REPO_ROOT,
+) -> dict[str, Any]:
     """Verify an existing isolated Codex Room runtime satisfies all safety invariants."""
     runtime_name, overlay_filename = ROLE_MAP[role]
     runtime_dir = runtime_root / runtime_name
     cfg_path = runtime_dir / "config.toml"
     errors: list[str] = []
 
-    _, excluded_prefixes, policy_err = load_model_policy(REPO_ROOT, require_exists=False)
+    _, excluded_prefixes, policy_err = load_model_policy(repo_root, require_exists=False)
     if policy_err:
         errors.append(policy_err)
     if is_excluded_model(EXPECTED_REVIEW_MODEL, excluded_prefixes):
         errors.append(f"EXPECTED_REVIEW_MODEL {EXPECTED_REVIEW_MODEL!r} is excluded by policy.")
 
-    overlay_path = OVERLAYS_DIR / overlay_filename
+    overlay_path = repo_root / "harness" / "codex-room" / "overlays" / overlay_filename
     if overlay_path.is_file():
         try:
             overlay_cfg = loads_toml(overlay_path.read_text(encoding="utf-8"))

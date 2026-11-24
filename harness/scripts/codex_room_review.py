@@ -1224,8 +1224,8 @@ def main(argv: list[str] | None = None) -> int:
             return 2
 
         active_model = EXPECTED_REVIEW_MODEL
-        v1 = verify_role("pass1", args.runtime_root)
-        v2 = verify_role("pass2", args.runtime_root)
+        v1 = verify_role("pass1", args.runtime_root, repo_root=git_top)
+        v2 = verify_role("pass2", args.runtime_root, repo_root=git_top)
         if not (v1["ok"] and v2["ok"]):
             preflight_err = (
                 "Codex Room runtime failed safety/model preflight: "

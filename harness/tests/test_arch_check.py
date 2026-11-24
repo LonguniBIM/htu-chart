@@ -183,20 +183,23 @@ def _write_valid_policy(root: Path) -> None:
 def test_mod001_detects_active_excluded_models_and_allows_prohibition_prose(tmp_path: Path) -> None:
     """Contract: MOD-001 flags active excluded models while allowing denylists/prohibitions.
 
-    Defect caught: Active SKILL.md/docs recommending gemini-3.8-flash-high or invoke_subagent flash.
+    Defect caught: Active SKILL.md/docs recommending excluded IDs/display names or flash dispatch.
     """
     _write_valid_policy(tmp_path)
     _write(
         tmp_path,
         ".agents/skills/slp-orchestrator/SKILL.md",
-        "\n".join(
-            [
-                "# S-L-P Orchestrator",
-                '- Default single-writer: `invoke_subagent(..., Model: "flash")`',
-                '- Parallel: `swarm{action: "add", model: "gemini-3.8-flash-high"}`',
-            ]
-        )
-        + "\n",
+        '# S-L-P Orchestrator\n- Default: `invoke_subagent(..., Model: "flash")`\n',
+    )
+    _write(
+        tmp_path,
+        ".agents/skills/other-skill/SKILL.md",
+        '- Parallel: `swarm{action: "add", model: "gemini-3.8-flash-high"}`\n',
+    )
+    _write(
+        tmp_path,
+        ".agents/skills/display-skill/SKILL.md",
+        "- Coordinator: Gemini 4 Argon Medium\n- Alt: Orchestrator (Argon)\n",
     )
     _write(
         tmp_path,
@@ -212,9 +215,39 @@ def test_mod001_detects_active_excluded_models_and_allows_prohibition_prose(tmp_
     mod001 = [v for v in res["violations"] if v["rule_id"] == "MOD-001"]
     flagged_files = {v["file"] for v in mod001}
     assert ".agents/skills/slp-orchestrator/SKILL.md" in flagged_files
+    assert ".agents/skills/other-skill/SKILL.md" in flagged_files
+    assert ".agents/skills/display-skill/SKILL.md" in flagged_files
     assert "harness/README.md" in flagged_files
     assert "AGENTS.md" not in flagged_files
     assert "harness/model-policy.json" not in flagged_files
+
+
+def test_mod001_flags_excluded_model_in_active_policy_roles_or_routes(tmp_path: Path) -> None:
+    """Contract: Valid excluded_model_prefixes cannot mask excluded models in active roles/routes.
+
+    Defect caught: MOD-001 policy role/route validation skipped when prefixes list looks valid.
+    """
+    bad_policy = {
+        "schema_version": "2.0.0",
+        "excluded_model_prefixes": [
+            "gemini-3.8-flash",
+            "gemini-4-argon",
+            "gemini-pro-orchestrator-argon",
+            "gemini-3.7-flash",
+            "gemini-2.5-pro",
+        ],
+        "roles": {
+            "peer_default": {"selected_model": "gemini-3.8-flash-high"},
+            "independent_reviewer_fallbacks": {
+                "qualified_routes": [{"model": "Gemini 4 Argon Medium"}]
+            },
+        },
+    }
+    _write(tmp_path, "harness/model-policy.json", json.dumps(bad_policy, indent=2) + "\n")
+    res = run_checks(tmp_path, use_baseline=False, today=FIXED_TODAY)
+    mod001 = [v for v in res["violations"] if v["rule_id"] == "MOD-001"]
+    assert len(mod001) == 2
+    assert all(v["file"] == "harness/model-policy.json" for v in mod001)
 
 
 def test_mod001_flags_missing_or_corrupt_model_policy_json(tmp_path: Path) -> None:

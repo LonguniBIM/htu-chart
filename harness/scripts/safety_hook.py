@@ -35,11 +35,12 @@ NET_CLIENT_RE = re.compile(
     re.IGNORECASE,
 )
 SHELL_WRITE_OP_RE = re.compile(
-    r"(>>?|\bOut-File\b|\bSet-Content\b|\bAdd-Content\b|\bCopy-Item\b|"
-    r"\bMove-Item\b|\bRemove-Item\b|\brm\b|\bdel\b)",
+    r"(?<![-=>&])>>?(?![=&>])|\b(?:Out-File|Set-Content|Add-Content|"
+    r"Copy-Item|Move-Item|Remove-Item|rm|del)\b",
     re.IGNORECASE,
 )
 ENV_TARGET_RE = re.compile(r"(?<![A-Za-z0-9_])\.env(?:\.[A-Za-z0-9_-]+)?", re.IGNORECASE)
+GIT_COMMIT_HEAD_RE = re.compile(r"^\s*git\b(?:\s+-C\s+\S+)?\s+commit\b", re.IGNORECASE)
 
 
 def _deny(reason: str) -> dict[str, str]:
@@ -95,11 +96,23 @@ def _resolve_target_path(raw_path: str, base_cwd: Path) -> Path:
     return candidate.resolve(strict=False)
 
 
+def _normalize_model_slug(val: str) -> str:
+    return re.sub(r"[\s_()]+", "-", val.strip().lower()).strip("-")
+
+
 def _matches_excluded_model(model: str, prefixes: tuple[str, ...]) -> bool:
     low = model.strip().lower()
     if not low:
         return False
-    return any(low.startswith(p.lower()) for p in prefixes)
+    slug = _normalize_model_slug(model)
+    if "orchestrator-argon" in slug:
+        return True
+    for prefix in prefixes:
+        p_low = prefix.strip().lower()
+        p_slug = _normalize_model_slug(prefix)
+        if low.startswith(p_low) or slug.startswith(p_slug):
+            return True
+    return False
 
 
 def _validate_policy_obj(data: Any) -> str | None:
@@ -175,31 +188,60 @@ def _compute_resulting_policy_text(
     args: dict[str, Any],
     resolved: Path,
 ) -> str | None:
-    if tool_name in {"write_file", "write_to_file"} or "Content" in args or "CodeContent" in args:
-        val = args.get("Content") or args.get("CodeContent") or args.get("content")
-        return val if isinstance(val, str) else None
+    is_write_op = (
+        tool_name in {"write_file", "write_to_file"}
+        or "Content" in args
+        or "CodeContent" in args
+        or "content" in args
+    )
+    if is_write_op:
+        if bool(args.get("Append") or args.get("append")):
+            return None
+        for key in ("Content", "CodeContent", "content"):
+            if key in args:
+                val = args.get(key)
+                return val if isinstance(val, str) else None
+        return None
 
     if not resolved.is_file():
-        return _extract_written_text(args) or None
+        return None
 
     text = resolved.read_text(encoding="utf-8", errors="replace")
     if "Target" in args and "Replacement" in args:
-        target = str(args["Target"])
-        replacement = str(args["Replacement"])
-        if target in text:
-            return text.replace(target, replacement)
-        return None
+        target = args["Target"]
+        replacement = args["Replacement"]
+        if not isinstance(target, str) or not isinstance(replacement, str):
+            return None
+        if target not in text:
+            return None
+        return text.replace(target, replacement)
 
     chunks = args.get("ReplacementChunks")
     if isinstance(chunks, list):
+        if not chunks:
+            return None
         for chunk in chunks:
             if not isinstance(chunk, dict):
-                continue
+                return None
             target = chunk.get("TargetContent")
             repl = chunk.get("ReplacementContent")
-            if isinstance(target, str) and isinstance(repl, str) and target in text:
+            if not isinstance(target, str) or not isinstance(repl, str) or target not in text:
+                return None
+            if chunk.get("AllowMultiple") is True:
+                text = text.replace(target, repl)
+            else:
                 text = text.replace(target, repl, 1)
         return text
+
+    if "TargetContent" in args and "ReplacementContent" in args:
+        target = args["TargetContent"]
+        repl = args["ReplacementContent"]
+        if not isinstance(target, str) or not isinstance(repl, str) or target not in text:
+            return None
+        if args.get("AllowMultiple") is True:
+            return text.replace(target, repl)
+        return text.replace(target, repl, 1)
+
     return None
 
 
@@ -252,17 +294,6 @@ def _evaluate_file_tool(
             return _deny("Peer worktrees must never tamper with .agents/hooks.json.")
         return _ask("Hook configuration .agents/hooks.json is protected. Confirm intentional edit.")
 
-    if (
-        rel_posix == "harness/runs"
-        or rel_posix.startswith("harness/runs/")
-        or "/harness/runs/" in norm_resolved
-    ):
-        if is_peer:
-            return _deny(
-                "Peer worktrees must never modify Coordinator/Runner artifacts in harness/runs/."
-            )
-        return _allow()
-
     if rel_posix == "harness/model-policy.json" or norm_resolved.endswith(
         "/harness/model-policy.json"
     ):
@@ -287,6 +318,23 @@ def _evaluate_file_tool(
                 "Prop Firm Hard Read-Only Violation: TopstepX order/position/user-hub "
                 "endpoints and order mutation calls are strictly forbidden."
             )
+
+    is_harness_runs = (
+        rel_posix == "harness/runs"
+        or rel_posix.startswith("harness/runs/")
+        or (
+            rel_posix == ""
+            and "/harness/runs/" in norm_resolved
+            and "/backend/app/" not in norm_resolved
+            and "/frontend/src/" not in norm_resolved
+        )
+    )
+    if is_harness_runs:
+        if is_peer:
+            return _deny(
+                "Peer worktrees must never modify Coordinator/Runner artifacts in harness/runs/."
+            )
+        return _allow()
 
     return _allow()
 
@@ -334,9 +382,36 @@ def _evaluate_invoke_subagent_tool(
     return _allow()
 
 
+def _has_unquoted_shell_chain(cmd: str) -> bool:
+    quote: str | None = None
+    i = 0
+    n = len(cmd)
+    while i < n:
+        ch = cmd[i]
+        if quote is not None:
+            if quote == '"' and ch == "\\" and i + 1 < n:
+                i += 2
+                continue
+            if ch == quote:
+                quote = None
+            i += 1
+            continue
+        if ch in ('"', "'"):
+            quote = ch
+            i += 1
+            continue
+        if ch in (";", "|") or cmd.startswith("&&", i):
+            return True
+        i += 1
+    return False
+
+
 def _evaluate_run_command_tool(args: dict[str, Any]) -> dict[str, str]:
     cmd = str(args.get("CommandLine") or args.get("command") or args.get("Command") or "").strip()
     if not cmd:
+        return _allow()
+
+    if GIT_COMMIT_HEAD_RE.match(cmd) and not _has_unquoted_shell_chain(cmd):
         return _allow()
 
     if NET_CLIENT_RE.search(cmd) and FORBIDDEN_READONLY_URL_RE.search(cmd):
@@ -362,8 +437,14 @@ def evaluate_hook_payload(payload: dict[str, Any]) -> dict[str, str]:
     """Evaluate a PreToolUse hook payload and return allow/ask/deny decision."""
     raw_cwd = payload.get("cwd")
     cwd_str = raw_cwd.strip() if isinstance(raw_cwd, str) else ""
-    base_cwd = Path(cwd_str) if cwd_str else REPO_ROOT
-    is_peer = _is_peer_worktree(cwd_str)
+    if cwd_str:
+        cwd_path = Path(cwd_str)
+        base_cwd = (
+            cwd_path if cwd_path.is_absolute() else (REPO_ROOT / cwd_path)
+        ).resolve(strict=False)
+    else:
+        base_cwd = REPO_ROOT.resolve(strict=False)
+    is_peer = _is_peer_worktree(base_cwd.as_posix())
 
     excluded_prefixes, policy_err = _load_disk_policy(base_cwd)
     if policy_err:

@@ -206,7 +206,11 @@ def _seed_doctor_workspace(base: Path, *, hook_cmd: str | None = None) -> Path:
             "topstep-safety-guard": {
                 "PreToolUse": [
                     {
-                        "matcher": "write_file|edit_file|run_command|swarm|invoke_subagent",
+                        "matcher": (
+                            "write_file|edit_file|replace_file_content|"
+                            "multi_replace_file_content|write_to_file|"
+                            "run_command|swarm|invoke_subagent"
+                        ),
                         "hooks": [{"type": "command", "command": hook_cmd, "timeout": 10}],
                     }
                 ]
@@ -253,7 +257,7 @@ def test_doctor_validates_hooks_and_model_policy_fail_closed(
     monkeypatch.setattr(
         verify_app,
         "verify_role",
-        lambda role, rt: {"role": role, "ok": True, "errors": []},
+        lambda role, rt, **kw: {"role": role, "ok": True, "errors": []},
     )
 
     app_missing = _seed_doctor_workspace(tmp_path / "case_missing")
@@ -275,21 +279,47 @@ def test_doctor_validates_hooks_and_model_policy_fail_closed(
     assert rep_ok["model_policy"]["ok"] is True
     assert rep_ok["ok"] is True
 
+    # P1-004: display-name excluded model in active role fails model_policy check
+    bad_display_pol = _valid_model_policy_dict()
+    bad_display_pol["roles"]["peer_default"]["selected_model"] = "Gemini 4 Argon Medium"
+    (app_ok / "harness" / "model-policy.json").write_text(
+        json.dumps(bad_display_pol, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    rep_disp = verify_app.run_doctor(app_ok, tmp_path / "rt2")
+    assert rep_disp["model_policy"]["ok"] is False
+    assert rep_disp["ok"] is False
+
     (app_ok / "harness" / "model-policy.json").write_text("{bad json", encoding="utf-8")
     rep_bad_policy = verify_app.run_doctor(app_ok, tmp_path / "rt2")
     assert rep_bad_policy["model_policy"]["ok"] is False
     assert rep_bad_policy["ok"] is False
 
-    # Restore valid policy, break hook command so it allows /api/Order/place
+    # Restore valid policy, narrow matcher regex (P1-006)
     (app_ok / "harness" / "model-policy.json").write_text(
         json.dumps(_valid_model_policy_dict(), indent=2) + "\n",
         encoding="utf-8",
     )
+    hooks_narrow = json.loads((app_ok / ".agents" / "hooks.json").read_text(encoding="utf-8"))
+    hooks_narrow["topstep-safety-guard"]["PreToolUse"][0]["matcher"] = "write_file"
+    (app_ok / ".agents" / "hooks.json").write_text(
+        json.dumps(hooks_narrow, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    rep_narrow = verify_app.run_doctor(app_ok, tmp_path / "rt2")
+    assert rep_narrow["hooks"]["ok"] is False
+    assert rep_narrow["ok"] is False
+
+    # Restore full matcher, break hook command so it allows /api/Order/place
     (app_ok / "harness" / "scripts" / "permissive_hook.py").write_text(
         'import json; print(json.dumps({"decision": "allow"}))\n',
         encoding="utf-8",
     )
     hooks_broken = json.loads((app_ok / ".agents" / "hooks.json").read_text(encoding="utf-8"))
+    hooks_broken["topstep-safety-guard"]["PreToolUse"][0]["matcher"] = (
+        "write_file|edit_file|replace_file_content|multi_replace_file_content|"
+        "write_to_file|run_command|swarm|invoke_subagent"
+    )
     hooks_broken["topstep-safety-guard"]["PreToolUse"][0]["hooks"][0]["command"] = (
         "python ../harness/scripts/permissive_hook.py"
     )
@@ -335,11 +365,10 @@ def test_policy_consumers_fail_closed_on_excluded_models_and_corrupt_policy(
 ) -> None:
     """Contract: codex_room_sync, codex_room_review, and receipt reject excluded models.
 
-    Defect caught: Excluded review_model or corrupt model-policy.json allowed through gates.
+    Defect caught: Excluded review_model, display names, or corrupt policy allowed through gates.
     """
     repo = _init_mini_git_repo(tmp_path / "repo")
     repo_path = tmp_path / "repo"
-    monkeypatch.setattr(codex_room_sync, "REPO_ROOT", repo_path)
 
     def _forbid_cli() -> list[str]:
         raise AssertionError("External CLI must not be invoked when policy rejects model")
@@ -347,21 +376,22 @@ def test_policy_consumers_fail_closed_on_excluded_models_and_corrupt_policy(
     monkeypatch.setattr(codex_room_review, "resolve_agy_command", _forbid_cli)
     monkeypatch.setattr(codex_room_review, "resolve_codex_command", _forbid_cli)
 
-    rc_fb = codex_room_review.main(
-        [
-            "--commit",
-            "HEAD",
-            "--repo-root",
-            str(repo_path),
-            "--backend",
-            "agy",
-            "--fallback-model",
-            "gemini-3.8-flash-high",
-            "--out-dir",
-            str(tmp_path / "out_fb"),
-        ]
-    )
-    assert rc_fb == 2
+    for idx, fb_model in enumerate(("gemini-3.8-flash-high", "Gemini 4 Argon Medium")):
+        rc_fb = codex_room_review.main(
+            [
+                "--commit",
+                "HEAD",
+                "--repo-root",
+                str(repo_path),
+                "--backend",
+                "agy",
+                "--fallback-model",
+                fb_model,
+                "--out-dir",
+                str(tmp_path / f"out_fb_{idx}"),
+            ]
+        )
+        assert rc_fb == 2
 
     rc_mod = codex_room_review.main(
         [
@@ -388,25 +418,26 @@ def test_policy_consumers_fail_closed_on_excluded_models_and_corrupt_policy(
             {"name": "harness_pytest", "command": ["pytest"], "status": "PASSED", "exit_code": 0},
         ],
     }
-    review_excl = {
-        "revision_sha": repo,
-        "passes_completed": 2,
-        "independent_contexts": True,
-        "review_gate_status": "PASSED",
-        "review_backend": "agy",
-        "review_model": "gemini-3.8-flash-high",
-        "consolidated_findings": [],
-    }
-    rec = receipt.evaluate_receipt(
-        task_id="T-POL",
-        phase=0,
-        base_sha="0" * 40,
-        candidate_sha=repo,
-        verifier_data=verifier_ok,
-        review_data=review_excl,
-        repo_root=repo_path,
-    )
-    assert rec["conclusion"] == "BLOCKED"
+    for bad_rev_model in ("gemini-3.8-flash-high", "Gemini 3.8 Flash (High)"):
+        review_excl = {
+            "revision_sha": repo,
+            "passes_completed": 2,
+            "independent_contexts": True,
+            "review_gate_status": "PASSED",
+            "review_backend": "agy",
+            "review_model": bad_rev_model,
+            "consolidated_findings": [],
+        }
+        rec = receipt.evaluate_receipt(
+            task_id="T-POL",
+            phase=0,
+            base_sha="0" * 40,
+            candidate_sha=repo,
+            verifier_data=verifier_ok,
+            review_data=review_excl,
+            repo_root=repo_path,
+        )
+        assert rec["conclusion"] == "BLOCKED"
 
     base_home = tmp_path / "base_codex"
     rt = tmp_path / "rt"
@@ -416,8 +447,9 @@ def test_policy_consumers_fail_closed_on_excluded_models_and_corrupt_policy(
         base_home=base_home,
         runtime_root=rt,
         overlays_dir=OVERLAYS_DIR,
+        repo_root=repo_path,
     )
-    assert codex_room_sync.verify_role("pass1", rt)["ok"] is True
+    assert codex_room_sync.verify_role("pass1", rt, repo_root=repo_path)["ok"] is True
 
     (repo_path / "harness" / "model-policy.json").write_text("{corrupt", encoding="utf-8")
-    assert codex_room_sync.verify_role("pass1", rt)["ok"] is False
+    assert codex_room_sync.verify_role("pass1", rt, repo_root=repo_path)["ok"] is False

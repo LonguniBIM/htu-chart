@@ -209,6 +209,31 @@ def _check_hooks(root: Path) -> dict[str, Any]:
             errors.append(".agents/hooks.json missing topstep-safety-guard.PreToolUse array.")
         else:
             first_group = pre_groups[0] if isinstance(pre_groups[0], dict) else {}
+            matcher = first_group.get("matcher") if isinstance(first_group, dict) else None
+            required_tools = (
+                "write_file",
+                "edit_file",
+                "replace_file_content",
+                "multi_replace_file_content",
+                "write_to_file",
+                "run_command",
+                "swarm",
+                "invoke_subagent",
+            )
+            if not isinstance(matcher, str) or not matcher.strip():
+                errors.append(".agents/hooks.json PreToolUse group missing matcher regex.")
+            else:
+                try:
+                    matcher_re = re.compile(matcher)
+                except re.error as exc:
+                    errors.append(f".agents/hooks.json invalid matcher regex: {exc}")
+                else:
+                    missing_tools = [t for t in required_tools if not matcher_re.fullmatch(t)]
+                    if missing_tools:
+                        errors.append(
+                            ".agents/hooks.json matcher misses required tools: "
+                            f"{missing_tools}"
+                        )
             hooks_list = first_group.get("hooks") if isinstance(first_group, dict) else None
             if not isinstance(hooks_list, list) or not hooks_list:
                 errors.append(".agents/hooks.json PreToolUse group missing hooks list.")
@@ -285,8 +310,8 @@ def run_doctor(root: Path, runtime_root: Path) -> dict[str, Any]:
         text=True,
         check=False,
     )
-    pass1_runtime = verify_role("pass1", runtime_root)
-    pass2_runtime = verify_role("pass2", runtime_root)
+    pass1_runtime = verify_role("pass1", runtime_root, repo_root=root)
+    pass2_runtime = verify_role("pass2", runtime_root, repo_root=root)
     hooks_report = _check_hooks(root)
     policy_report = _check_model_policy(root)
 
