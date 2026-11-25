@@ -3268,6 +3268,160 @@ describe("App bootstrap and R03 503 recovery (P1-R3-03, P1-R3-04, P2-005)", () =
     expect(screen.getByText("CON.F.US.MNQ.SIM")).toBeTruthy();
     expect(screen.queryByRole("button", { name: /retry contracts/i })).toBeNull();
   });
+
+  it("re-dispatches Sim fetchContracts(false) when shrinking mixed [Sim, Live] layout to 1-single aborts pending batch after auto-retry exhaustion (P1-001)", async () => {
+    /**
+     * Contract: After exhausting MAX_AUTO_CONTRACT_RETRIES (12) on Sim (503), switching to a
+     * mixed [Sim, Live] layout starts a pending [false, true] batch on fetchContracts(false);
+     * shrinking the template to 1-single (Sim only) aborts the [false, true] batch because true
+     * left the layout, and immediately dispatches a replacement fetchContracts(..., false) that
+     * resolves the Sim pane's contract even though false is still in unresolvedModesRef.
+     * Defect caught: Aborting a mixed batch leaving still-needed unresolved modes stranded without re-dispatch.
+     */
+    vi.useFakeTimers();
+    const simLayout: LayoutRecord = {
+      ...SAMPLE_LAYOUT,
+      id: "layout-sim-only",
+      name: "Sim Only",
+      is_default: true,
+    };
+    const mixedLayout: LayoutRecord = {
+      ...SAMPLE_LAYOUT,
+      id: "layout-mixed",
+      name: "Mixed Sim Live",
+      template_id: "2-cols",
+      is_default: false,
+      panes: [
+        {
+          pane_id: "pane-1",
+          root_symbol: "MES",
+          timeframe: "5m",
+          live_mode: false,
+          playback_mode: "live",
+        },
+        {
+          pane_id: "pane-2",
+          root_symbol: "MNQ",
+          timeframe: "5m",
+          live_mode: true,
+          playback_mode: "live",
+        },
+      ],
+    };
+
+    fetchSessionMock.mockResolvedValue({
+      authenticated: true,
+      csrf_token: "csrf-token-p1-001-mixed-shrink",
+    });
+    fetchStatusMock.mockResolvedValue({
+      connected: true,
+      live: false,
+      feed_state: "LIVE",
+    });
+    listLayoutsMock.mockResolvedValue([simLayout, mixedLayout]);
+    fetchBarsMock.mockResolvedValue({
+      provider: "topstepx",
+      live: false,
+      contract_id: "CON.F.US.MES.SIM",
+      root_symbol: "MES",
+      timeframe: "5m",
+      start_time: 1000,
+      end_time: 1000,
+      count: 0,
+      include_partial: true,
+      quality: {
+        is_complete: true,
+        truncated: false,
+        provider_gap: false,
+        quarantined_count: 0,
+      },
+      bars: [],
+    });
+
+    fetchContractsMock.mockRejectedValue(new ApiError(503, "TopstepX Sim unavailable"));
+
+    render(<App />);
+    await act(async () => {
+      await flushMicrotasks();
+    });
+    expect(screen.getByRole("button", { name: "Retry Contracts" })).toBeTruthy();
+
+    const expectedDelays = [
+      2000, 4000, 8000, 15000, 15000, 15000, 15000, 15000, 15000, 15000, 15000, 15000,
+    ];
+    for (const delay of expectedDelays) {
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(delay);
+        await flushMicrotasks();
+      });
+    }
+    const callsAfterExhaustion = fetchContractsMock.mock.calls.length;
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(15000);
+      await flushMicrotasks();
+    });
+    expect(fetchContractsMock.mock.calls.length).toBe(callsAfterExhaustion);
+
+    let mixedSimSignal: AbortSignal | undefined;
+    let replacementSimSignal: AbortSignal | undefined;
+    let resolveReplacementSim!: (value: ContractsResponse) => void;
+    fetchContractsMock
+      .mockImplementationOnce((_symbols, live, signal) => {
+        expect(live).toBe(false);
+        mixedSimSignal = signal;
+        return new Promise<ContractsResponse>(() => {});
+      })
+      .mockImplementationOnce((_symbols, live, signal) => {
+        expect(live).toBe(false);
+        replacementSimSignal = signal;
+        return new Promise<ContractsResponse>((resolve) => {
+          resolveReplacementSim = resolve;
+        });
+      });
+
+    // Switch via handleLayoutChange to mixed [Sim, Live] layout, leaving batch pending on fetchContracts(false)
+    await act(async () => {
+      fireEvent.change(screen.getByLabelText("Active layout"), {
+        target: { value: "layout-mixed" },
+      });
+      await flushMicrotasks();
+    });
+    expect(fetchContractsMock).toHaveBeenCalledTimes(callsAfterExhaustion + 1);
+    expect(mixedSimSignal).toBeDefined();
+    expect(mixedSimSignal?.aborted).toBe(false);
+
+    // Shrink template to 1-single (Sim only), aborting the [false, true] batch and re-dispatching Sim
+    fireEvent.click(screen.getByRole("button", { name: "Layout picker" }));
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "1 Pane" }));
+      await flushMicrotasks();
+    });
+    expect(mixedSimSignal?.aborted).toBe(true);
+    expect(fetchContractsMock).toHaveBeenCalledTimes(callsAfterExhaustion + 2);
+    expect(fetchContractsMock).toHaveBeenLastCalledWith(
+      ["MES", "MNQ", "MYM", "MGC"],
+      false,
+      expect.any(AbortSignal),
+    );
+    expect(replacementSimSignal).toBeDefined();
+    expect(replacementSimSignal?.aborted).toBe(false);
+
+    // Resolve replacement Sim request and verify the Sim pane's contract resolves cleanly
+    await act(async () => {
+      resolveReplacementSim({
+        live: false,
+        contracts: {
+          MES: { selected: { id: "CON.F.US.MES.SIM" }, error_type: null, error: null },
+        },
+      });
+      await flushMicrotasks();
+    });
+
+    expect(replacementSimSignal?.aborted).toBe(false);
+    expect(screen.getByText("CON.F.US.MES.SIM")).toBeTruthy();
+    expect(screen.queryByRole("button", { name: /retry contracts/i })).toBeNull();
+    expect(fetchContractsMock).toHaveBeenCalledTimes(callsAfterExhaustion + 2);
+  });
 });
 
 function setupPreOpenWsIntegrationMocks(secondSessionError: ApiError) {

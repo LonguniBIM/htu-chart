@@ -217,7 +217,13 @@ describe("useLayoutStore (Phase 3 Part 2)", () => {
     const created = await useLayoutStore.getState().saveLayoutAs("  Scalp MNQ ", true);
     expect(created?.id).toBe("layout-scalp");
     expect(createLayoutMock).toHaveBeenCalledWith(
-      expect.objectContaining({ name: "Scalp MNQ", is_default: true }),
+      {
+        name: "Scalp MNQ",
+        template_id: base.template_id,
+        panes: base.panes.map((p) => (p.pane_id === "pane-1" ? { ...p, root_symbol: "MNQ" } : p)),
+        sync_config: base.sync_config,
+        is_default: true,
+      },
       expect.any(AbortSignal),
     );
     expect(useLayoutStore.getState().dirty).toBe(false);

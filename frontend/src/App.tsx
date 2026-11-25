@@ -814,9 +814,15 @@ export function App() {
       return;
     }
     const distinctModes = distinctPaneLiveModes(activeLayout.panes);
+    const cancelledStillNeededModes = new Set<boolean>();
     for (const controller of Array.from(inFlightLayoutControllersRef.current)) {
       const inFlightModes = inFlightContractControllersRef.current.get(controller) ?? [];
       if (inFlightModes.some((mode) => !distinctModes.includes(mode))) {
+        for (const mode of inFlightModes) {
+          if (distinctModes.includes(mode) && !resolvedModesRef.current.has(mode)) {
+            cancelledStillNeededModes.add(mode);
+          }
+        }
         inFlightLayoutControllersRef.current.delete(controller);
         inFlightContractControllersRef.current.delete(controller);
         controller.abort();
@@ -833,7 +839,7 @@ export function App() {
       : distinctModes.filter(
           (mode) =>
             !resolvedModesRef.current.has(mode) &&
-            !unresolvedModesRef.current.has(mode) &&
+            (!unresolvedModesRef.current.has(mode) || cancelledStillNeededModes.has(mode)) &&
             !isContractModeInFlight(mode),
         );
 
