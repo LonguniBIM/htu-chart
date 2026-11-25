@@ -2097,6 +2097,185 @@ def test_g5_ledgerless_root_packet_blocks_child_over_cap(tmp_path: Path) -> None
     assert any("7" in b and "max_g4_rounds_per_root_task" in b for b in rec["blockers"])
 
 
+def test_g5_receipt_blocks_per_packet_ledger_and_ledgerless_ceilings(tmp_path: Path) -> None:
+    """G5 blocks when ledger or ledgerless tracker exceeds per-packet round/candidate caps."""
+    from harness.scripts import receipt as receipt_mod
+    from harness.scripts import task_runner
+
+    cand_sha = "c" * 40
+    base_sha = "b" * 40
+    rec_g4 = receipt_mod.evaluate_receipt(
+        task_id="T-PKT-CAP",
+        phase=1,
+        base_sha=base_sha,
+        candidate_sha=cand_sha,
+        verifier_data=_verifier(cand_sha),
+        review_data=_review(cand_sha),
+        repo_root=tmp_path,
+        ledger_data={
+            "schema_version": 1,
+            "root_task_id": "T-PKT-CAP",
+            "task_id": "T-PKT-CAP",
+            "state": "READY_FOR_ACCEPTANCE",
+            "candidate_sha": cand_sha,
+            "g4_rounds_total": 4,
+            "g4_rounds_in_packet": 4,
+            "candidates_in_packet": 2,
+            "total_candidates": 4,
+            "g4_invocations_by_sha": {cand_sha: 1},
+            "active_g4_reservations": {},
+        },
+        require_ledger=True,
+    )
+    assert rec_g4["conclusion"] == "BLOCKED"
+    assert any("g4_rounds_in_packet=4/3" in b for b in rec_g4["blockers"])
+
+    rec_cand = receipt_mod.evaluate_receipt(
+        task_id="T-PKT-CAND",
+        phase=1,
+        base_sha=base_sha,
+        candidate_sha=cand_sha,
+        verifier_data=_verifier(cand_sha),
+        review_data=_review(cand_sha),
+        repo_root=tmp_path,
+        ledger_data={
+            "schema_version": 1,
+            "root_task_id": "T-PKT-CAND",
+            "task_id": "T-PKT-CAND",
+            "state": "READY_FOR_ACCEPTANCE",
+            "candidate_sha": cand_sha,
+            "g4_rounds_total": 2,
+            "g4_rounds_in_packet": 2,
+            "candidates_in_packet": 4,
+            "total_candidates": 4,
+            "g4_invocations_by_sha": {cand_sha: 1},
+            "active_g4_reservations": {},
+        },
+        require_ledger=True,
+    )
+    assert rec_cand["conclusion"] == "BLOCKED"
+    assert any("candidates_in_packet=4/3" in b for b in rec_cand["blockers"])
+
+    pkt = tmp_path / "harness" / "runs" / "T-NOLOG-PKT" / "packet.md"
+    pkt.parent.mkdir(parents=True, exist_ok=True)
+    pkt.write_text("# Packet\n\n- **Packet Version**: `1`\n", encoding="utf-8")
+    epoch = task_runner.extract_packet_epoch(pkt)
+    assert epoch is not None
+    trk_path = task_runner.default_g4_tracker_path("T-NOLOG-PKT", repo_root=tmp_path)
+    trk = task_runner.load_g4_tracker(trk_path, task_id="T-NOLOG-PKT")
+    trk["packet_rounds"][epoch] = 4
+    task_runner.save_g4_tracker(trk_path, trk)
+
+    rec_nolog = receipt_mod.evaluate_receipt(
+        task_id="T-NOLOG-PKT",
+        phase=1,
+        base_sha=base_sha,
+        candidate_sha=cand_sha,
+        verifier_data=_verifier(cand_sha),
+        review_data=_review(cand_sha),
+        repo_root=tmp_path,
+        packet_candidate=pkt,
+    )
+    assert rec_nolog["conclusion"] == "BLOCKED"
+    assert any("max_g4_rounds_per_packet_version" in b for b in rec_nolog["blockers"])
+
+
+def test_g5_receipt_blocks_corrupt_root_and_sibling_g4_tracker(tmp_path: Path) -> None:
+    """Corrupt root or sibling g4-tracker.json fails closed with rc=2 (BLOCKED)."""
+    from harness.scripts import receipt as receipt_mod
+
+    repo = tmp_path / "repo_corrupt_g5"
+    repo.mkdir()
+    base_sha = "1" * 40
+    cand_sha = "2" * 40
+    root_dir = repo / "harness" / "runs" / "ROOT-CORR"
+    root_dir.mkdir(parents=True, exist_ok=True)
+    (root_dir / "g4-tracker.json").write_text("{corrupt", encoding="utf-8")
+    v_path = tmp_path / "v_corr.json"
+    r_path = tmp_path / "r_corr.json"
+    v_path.write_text(json.dumps(_verifier(cand_sha)), encoding="utf-8")
+    r_path.write_text(json.dumps(_review(cand_sha)), encoding="utf-8")
+
+    out_root = tmp_path / "out_corr_root"
+    rc_root = receipt_mod.main(
+        [
+            "--task-id",
+            "ROOT-CORR",
+            "--phase",
+            "1",
+            "--base-sha",
+            base_sha,
+            "--candidate-sha",
+            cand_sha,
+            "--verifier-json",
+            str(v_path),
+            "--review-json",
+            str(r_path),
+            "--repo-root",
+            str(repo),
+            "--out-dir",
+            str(out_root),
+        ]
+    )
+    assert rc_root == 2
+    rec_root = json.loads((out_root / "receipt.json").read_text(encoding="utf-8"))
+    assert rec_root["conclusion"] == "BLOCKED"
+    assert any("g4-tracker.json" in b for b in rec_root["blockers"])
+
+    # Valid root tracker, corrupt sibling tracker discovered via packet.md.
+    (root_dir / "g4-tracker.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "task_id": "ROOT-CORR",
+                "completed_rounds": 1,
+                "sha_invocations": {},
+                "in_flight": {},
+                "completed_attempts": {},
+                "attempts": {},
+            }
+        ),
+        encoding="utf-8",
+    )
+    sib_dir = repo / "harness" / "runs" / "SIB-CORR"
+    sib_dir.mkdir(parents=True, exist_ok=True)
+    (sib_dir / "packet.md").write_text(
+        "# P\n\n- **Root Task ID**: `ROOT-CORR`\n", encoding="utf-8"
+    )
+    (sib_dir / "g4-tracker.json").write_text("{bad-sibling", encoding="utf-8")
+    child_pkt = tmp_path / "child_v2.md"
+    child_pkt.write_text("# P\n\n- **Root Task ID**: `ROOT-CORR`\n", encoding="utf-8")
+
+    out_sib = tmp_path / "out_corr_sib"
+    rc_sib = receipt_mod.main(
+        [
+            "--task-id",
+            "CHILD-CLEAN",
+            "--phase",
+            "1",
+            "--base-sha",
+            base_sha,
+            "--candidate-sha",
+            cand_sha,
+            "--verifier-json",
+            str(v_path),
+            "--review-json",
+            str(r_path),
+            "--task-packet",
+            str(child_pkt),
+            "--repo-root",
+            str(repo),
+            "--out-dir",
+            str(out_sib),
+        ]
+    )
+    assert rc_sib == 2
+    rec_sib = json.loads((out_sib / "receipt.json").read_text(encoding="utf-8"))
+    assert rec_sib["conclusion"] == "BLOCKED"
+    assert any("sibling g4-tracker.json" in b for b in rec_sib["blockers"])
+
+
+
 
 
 

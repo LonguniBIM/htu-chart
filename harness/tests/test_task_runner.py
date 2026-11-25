@@ -1264,4 +1264,61 @@ def test_record_replan_refuses_in_flight_g4_and_forwards_task_packet(
     assert "--task-packet" in cmds[0] and str(pkt2) in cmds[0]
 
 
+def test_packet_epoch_discover_child_runs_and_merge_packet_rounds(tmp_path: Path) -> None:
+    """extract_packet_epoch, discover_child_runs_for_root, and merge preserve epochs."""
+    p1 = tmp_path / "p1.md"
+    p1.write_text("# Packet\n\n- **Packet Version**: `1`\nBody A\n", encoding="utf-8")
+    p1_edit = tmp_path / "p1_edit.md"
+    p1_edit.write_text("# Packet\n\n- **Packet Version**: `1`\nBody B\n", encoding="utf-8")
+    p2 = tmp_path / "p2.md"
+    p2.write_text("# Packet\n\n- **Packet Version**: `2`\nBody A\n", encoding="utf-8")
+
+    e1 = task_runner.extract_packet_epoch(p1)
+    e1_edit = task_runner.extract_packet_epoch(p1_edit)
+    e2 = task_runner.extract_packet_epoch(p2)
+    assert e1 is not None and e1.startswith("v1:")
+    assert e1_edit is not None and e1_edit != e1
+    assert e2 is not None and e2.startswith("v2:")
+    assert task_runner.extract_packet_epoch(tmp_path / "missing.md") is None
+
+    runs = tmp_path / "harness" / "runs"
+    (runs / "ROOT").mkdir(parents=True)
+    (runs / "SIB-PKT" / "attempts").mkdir(parents=True)
+    (runs / "SIB-PKT" / "packet-v2.md").write_text(
+        "# P\n\n- **Root Task ID**: `ROOT`\n", encoding="utf-8"
+    )
+    (runs / "SIB-READY").mkdir(parents=True)
+    (runs / "SIB-READY" / "readiness.json").write_text(
+        json.dumps({"root_task_id": "ROOT"}), encoding="utf-8"
+    )
+    (runs / "OTHER").mkdir(parents=True)
+    (runs / "OTHER" / "packet.md").write_text(
+        "# P\n\n- **Root Task ID**: `OTHER`\n", encoding="utf-8"
+    )
+    found = task_runner.discover_child_runs_for_root(
+        "ROOT", repo_root=tmp_path, exclude_ids={"SELF"}
+    )
+    assert [p.name for p in found] == ["SIB-PKT", "SIB-READY"]
+
+    t_root = task_runner.load_g4_tracker(runs / "ROOT" / "g4-tracker.json", task_id="ROOT")
+    t_root["completed_attempts"]["att-1"] = {
+        "candidate_sha": "1" * 40,
+        "status": "CHANGES_REQUESTED",
+        "packet_epoch": e1,
+    }
+    t_root["packet_rounds"][e1] = 2
+    t_sib = task_runner.load_g4_tracker(runs / "SIB-PKT" / "g4-tracker.json", task_id="SIB-PKT")
+    t_sib["completed_attempts"]["att-2"] = {
+        "candidate_sha": "2" * 40,
+        "status": "PASSED",
+        "packet_epoch": e1,
+    }
+    t_sib["in_flight"]["res-3"] = {"candidate_sha": "3" * 40, "packet_epoch": e1}
+    merged = task_runner.merge_g4_trackers(t_root, t_sib)
+    assert merged is not None
+    assert merged["packet_rounds"][e1] == 3
+    assert task_runner.count_tracker_packet_rounds(merged, e1) == 4
+
+
+
 

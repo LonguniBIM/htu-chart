@@ -446,6 +446,7 @@ def test_auto_backend_prioritizes_codex_and_falls_back_to_agy_on_quota_exhaustio
         codex_quota_script,
         (
             "import json, sys\n"
+            "if sys.argv[1:2] == ['app-server']: sys.exit(1)\n"
             "_ = sys.stdin.read()\n"
             "print(json.dumps({'type': 'error', "
             "'message': 'usage_limit_reached - Codex CLI quota exhausted'}), flush=True)\n"
@@ -458,6 +459,7 @@ def test_auto_backend_prioritizes_codex_and_falls_back_to_agy_on_quota_exhaustio
         codex_crash_script,
         (
             "import sys\n"
+            "if sys.argv[1:2] == ['app-server']: sys.exit(1)\n"
             "_ = sys.stdin.read()\n"
             "sys.stderr.write('Error: unexpected internal parser failure\\n')\n"
             "sys.exit(1)\n"
@@ -1332,6 +1334,7 @@ def test_nc11_tool_output_with_usage_limit_does_not_trigger_quota_fallback(
         codex_script,
         (
             "import json, sys\n"
+            "if sys.argv[1:2] == ['app-server']: sys.exit(1)\n"
             "_ = sys.stdin.read()\n"
             "print(json.dumps({'type': 'item.completed', 'item': {'id': 'i1', "
             "'type': 'mcp_tool_call', 'output': 'test: usage_limit_reached 429'}}), flush=True)\n"
@@ -1451,6 +1454,7 @@ def test_auto_backend_blocks_infra_when_qualified_routes_empty_without_cli_overr
         codex_script,
         (
             "import json, sys\n"
+            "if sys.argv[1:2] == ['app-server']: sys.exit(1)\n"
             "_ = sys.stdin.read()\n"
             "print(json.dumps({'type': 'turn.failed', "
             "'error': {'message': 'You\\u2019ve hit your usage limit'}}), flush=True)\n"
@@ -2125,6 +2129,7 @@ def _install_counting_codex_stub(
         script_path,
         (
             "import json, pathlib, sys\n"
+            "if sys.argv[1:2] == ['app-server']: sys.exit(1)\n"
             "args = sys.argv[1:]\n"
             "out_path = pathlib.Path(args[args.index('-o') + 1])\n"
             "prompt = sys.stdin.read()\n"
@@ -4211,19 +4216,19 @@ def test_codex_5h_window_exhausted_preflight_triggers_agy_fallback_and_strips_pi
         ),
     )
 
-    agy_calls = tmp_path / "agy_5h_calls.txt"
+    agy_calls = tmp_path / "agy_5h_calls"
+    agy_calls.mkdir()
     fake_agy = tmp_path / "fake_agy_5h.py"
     agy_prefix = _write_fake_codex_script(
         fake_agy,
         (
             "import json, pathlib, sys\n"
-            f"af = pathlib.Path({str(agy_calls)!r})\n"
-            "prev = af.read_text(encoding='utf-8') if af.is_file() else ''\n"
-            "af.write_text(prev + 'agy\\n', encoding='utf-8')\n"
+            f"ad = pathlib.Path({str(agy_calls)!r})\n"
             "args = sys.argv[1:]\n"
             "prompt = args[args.index('-p') + 1]\n"
             "lens = 'security_and_invariants' if 'security_and_invariants' in prompt "
             "else 'correctness_and_tests'\n"
+            "(ad / f'{lens}.log').write_text('agy\\n', encoding='utf-8')\n"
             f"payload = {{'revision_sha': {sha1!r}, 'lens': lens, 'verdict': 'APPROVE', "
             "'summary': 'agy ok', 'findings': [], 'test_quality_issues': [], "
             "'unverified_areas': []}\n"
@@ -4237,8 +4242,8 @@ def test_codex_5h_window_exhausted_preflight_triggers_agy_fallback_and_strips_pi
     monkeypatch.setattr(codex_room_review, "resolve_codex_command", lambda: codex_prefix)
     monkeypatch.setattr(codex_room_review, "resolve_agy_command", lambda: agy_prefix)
 
-    # Case 1: primary.usedPercent == 100 under --backend auto -> 0 codex exec calls, agy fallback.
-    pct_file.write_text("100.0", encoding="utf-8")
+    # Case 1: primary.usedPercent == 90.0 under --backend auto -> 0 codex exec calls, agy fallback.
+    pct_file.write_text("90.0", encoding="utf-8")
     out_auto = tmp_path / "out_5h_auto"
     rc_auto = codex_room_review.main(
         [
@@ -4256,7 +4261,7 @@ def test_codex_5h_window_exhausted_preflight_triggers_agy_fallback_and_strips_pi
     )
     assert rc_auto == 0
     assert _count_calls(exec_calls) == 0
-    assert len(agy_calls.read_text(encoding="utf-8").splitlines()) == 2
+    assert _count_calls(agy_calls) == 2
     rep_auto = json.loads((out_auto / "consolidated-review.json").read_text(encoding="utf-8"))
     assert rep_auto["review_backend"] == "agy"
     assert rep_auto["fallback_used"] is True
@@ -4266,8 +4271,9 @@ def test_codex_5h_window_exhausted_preflight_triggers_agy_fallback_and_strips_pi
     assert "accountId" not in rl_snap_text
     assert "acct-secret-pii-999" not in rl_snap_text
 
-    # Case 2: primary.usedPercent == 100 under --backend codex -> 0 calls -> BLOCKED_INFRA.
-    agy_calls.unlink()
+    # Case 2: primary.usedPercent == 90.0 under --backend codex -> 0 calls -> BLOCKED_INFRA.
+    for old_f in agy_calls.iterdir():
+        old_f.unlink()
     out_codex_only = tmp_path / "out_5h_codex_only"
     rc_only = codex_room_review.main(
         [
@@ -4285,14 +4291,14 @@ def test_codex_5h_window_exhausted_preflight_triggers_agy_fallback_and_strips_pi
     )
     assert rc_only == 2
     assert _count_calls(exec_calls) == 0
-    assert not agy_calls.exists()
+    assert _count_calls(agy_calls) == 0
     rep_only = json.loads(
         (out_codex_only / "consolidated-review.json").read_text(encoding="utf-8")
     )
     assert rep_only["review_gate_status"] == "BLOCKED_INFRA"
 
-    # Case 3: primary.usedPercent == 47 (< 100) under --backend auto -> codex exec runs (2 calls).
-    pct_file.write_text("47.0", encoding="utf-8")
+    # Case 3: primary.usedPercent == 89.0 (< 90) under --backend auto -> codex exec runs (2 calls).
+    pct_file.write_text("89.0", encoding="utf-8")
     out_ok = tmp_path / "out_5h_ok"
     rc_ok = codex_room_review.main(
         [
@@ -4310,7 +4316,7 @@ def test_codex_5h_window_exhausted_preflight_triggers_agy_fallback_and_strips_pi
     )
     assert rc_ok == 0
     assert _count_calls(exec_calls) == 2
-    assert not agy_calls.exists()
+    assert _count_calls(agy_calls) == 0
     rep_ok = json.loads((out_ok / "consolidated-review.json").read_text(encoding="utf-8"))
     assert rep_ok["review_backend"] == "codex"
     assert rep_ok["fallback_used"] is False
@@ -4322,6 +4328,366 @@ def test_codex_5h_window_exhausted_preflight_triggers_agy_fallback_and_strips_pi
     assert disallowed is True
     assert d_reason is not None and "codex_usage_disallowed" in d_reason
     assert isinstance(d_snap, dict) and d_snap.get("ordinaryUsageAllowed") is False
+
+
+def test_codex_window_guard_secondary_snake_case_invalid_config_and_probe_timeout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """5h guard handles secondary 100%, snake_case fields, invalid config, and probe timeout."""
+    sec_hit, sec_reason, _ = codex_room_review.evaluate_codex_window_exhaustion(
+        {"rateLimits": {"primary": {"usedPercent": 10.0}, "secondary": {"usedPercent": 100.0}}}
+    )
+    assert sec_hit is True
+    assert sec_reason is not None and "secondary_window_exhausted" in sec_reason
+
+    snake_hit, snake_reason, _ = codex_room_review.evaluate_codex_window_exhaustion(
+        {"rate_limits": {"primary": {"used_percent": 90.0}}}
+    )
+    assert snake_hit is True
+    assert snake_reason is not None and "codex_5h_window_exhausted" in snake_reason
+
+    repo_dir, sha1 = _init_policy_repo(
+        tmp_path / "repo_bad_cfg", qualified_routes=["gemini-4-carbon-high"]
+    )
+    pol_path = repo_dir / "harness" / "model-policy.json"
+    pol = json.loads(pol_path.read_text(encoding="utf-8"))
+    pol["roles"]["independent_reviewer_primary"]["primary_window_exhausted_percent"] = "ninety"
+    pol_path.write_text(json.dumps(pol, indent=2), encoding="utf-8")
+    calls = _install_counting_codex_stub(tmp_path, monkeypatch, sha1)
+    rt_root = tmp_path / "rt_bad_cfg"
+    (rt_root / "topstep-review-pass1").mkdir(parents=True)
+    out_dir = tmp_path / "out_bad_cfg"
+    rc = codex_room_review.main(
+        [
+            "--commit",
+            sha1,
+            "--runtime-root",
+            str(rt_root),
+            "--repo-root",
+            str(repo_dir),
+            "--out-dir",
+            str(out_dir),
+            "--backend",
+            "auto",
+        ]
+    )
+    assert rc == 2
+    assert _count_calls(calls) == 0
+
+    hanging_script = tmp_path / "fake_codex_hang_probe.py"
+    hang_prefix = _write_fake_codex_script(
+        hanging_script,
+        "import time\ntime.sleep(30)\n",
+    )
+    res = codex_room_review.probe_codex_rate_limits(
+        hang_prefix,
+        rt_root / "topstep-review-pass1",
+        init_timeout_sec=0.15,
+        read_timeout_sec=0.15,
+    )
+    assert res is None
+
+
+def test_g4_canary_prefix_with_attempts_or_packet_enforces_caps(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """canary-* task_id cannot bypass G4 caps when attempts/ or Root Task ID is present."""
+    repo_dir, sha1 = _init_policy_repo(tmp_path / "repo_canary_cap", qualified_routes=[])
+    root_attempts = repo_dir / "harness" / "runs" / "ROOT" / "attempts"
+    for idx in range(6):
+        p_sha = f"{idx + 1}" * 40
+        att = root_attempts / f"att-{idx}-{p_sha[:12]}"
+        att.mkdir(parents=True, exist_ok=True)
+        (att / "consolidated-review.json").write_text(
+            json.dumps(
+                {
+                    "revision_sha": p_sha,
+                    "passes_completed": 2,
+                    "independent_contexts": True,
+                    "review_gate_status": "CHANGES_REQUESTED",
+                    "blocking_open_count": 1,
+                    "consolidated_findings": [],
+                }
+            ),
+            encoding="utf-8",
+        )
+    pkt = tmp_path / "canary_packet.md"
+    pkt.write_text("# Task Packet\n\n- **Root Task ID**: `ROOT`\n", encoding="utf-8")
+    calls = _install_counting_codex_stub(tmp_path, monkeypatch, sha1)
+    out_dir = repo_dir / "harness" / "runs" / "canary-bypass" / "attempts" / f"r1-{sha1[:12]}"
+    rc = codex_room_review.main(
+        [
+            "--commit",
+            sha1,
+            "--task-id",
+            "canary-bypass",
+            "--task-packet",
+            str(pkt),
+            "--repo-root",
+            str(repo_dir),
+            "--out-dir",
+            str(out_dir),
+            "--backend",
+            "codex",
+        ]
+    )
+    assert rc == 2
+    assert _count_calls(calls) == 0
+    assert not out_dir.exists()
+
+
+def test_g4_sibling_child_runs_union_persists_tracker_and_fails_closed_on_corrupt_tracker(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Sibling child attempts count toward root cap, persist, and corrupt tracker blocks."""
+    repo_dir, sha1 = _init_policy_repo(tmp_path / "repo_sib_union", qualified_routes=[])
+    root_attempts = repo_dir / "harness" / "runs" / "ROOT" / "attempts"
+    for idx in range(5):
+        p_sha = f"{idx + 1}" * 40
+        att = root_attempts / f"att-{idx}-{p_sha[:12]}"
+        att.mkdir(parents=True, exist_ok=True)
+        (att / "consolidated-review.json").write_text(
+            json.dumps(
+                {
+                    "revision_sha": p_sha,
+                    "passes_completed": 2,
+                    "independent_contexts": True,
+                    "review_gate_status": "CHANGES_REQUESTED",
+                    "blocking_open_count": 1,
+                    "consolidated_findings": [],
+                }
+            ),
+            encoding="utf-8",
+        )
+
+    c1_dir = repo_dir / "harness" / "runs" / "CHILD-V1"
+    c1_dir.mkdir(parents=True, exist_ok=True)
+    (c1_dir / "packet.md").write_text(
+        "# Packet\n\n- **Root Task ID**: `ROOT`\n- **Packet Version**: `1`\n",
+        encoding="utf-8",
+    )
+    c1_sha = "6" * 40
+    c1_att = c1_dir / "attempts" / f"att-6-{c1_sha[:12]}"
+    c1_att.mkdir(parents=True, exist_ok=True)
+    (c1_att / "consolidated-review.json").write_text(
+        json.dumps(
+            {
+                "revision_sha": c1_sha,
+                "passes_completed": 2,
+                "independent_contexts": True,
+                "review_gate_status": "CHANGES_REQUESTED",
+                "blocking_open_count": 1,
+                "consolidated_findings": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    c2_pkt = tmp_path / "child_v2_packet.md"
+    c2_pkt.write_text(
+        "# Packet\n\n- **Root Task ID**: `ROOT`\n- **Packet Version**: `2`\n",
+        encoding="utf-8",
+    )
+
+    calls = _install_counting_codex_stub(tmp_path, monkeypatch, sha1)
+    rt_root = tmp_path / "rt_sib"
+    (rt_root / "topstep-review-pass1").mkdir(parents=True)
+    out_c2 = repo_dir / "harness" / "runs" / "CHILD-V2" / "attempts" / f"r7-{sha1[:12]}"
+    rc_c2 = codex_room_review.main(
+        [
+            "--commit",
+            sha1,
+            "--task-id",
+            "CHILD-V2",
+            "--task-packet",
+            str(c2_pkt),
+            "--runtime-root",
+            str(rt_root),
+            "--repo-root",
+            str(repo_dir),
+            "--out-dir",
+            str(out_c2),
+            "--backend",
+            "codex",
+        ]
+    )
+    assert rc_c2 == 2
+    assert _count_calls(calls) == 0
+    assert not out_c2.exists()
+    root_tracker = json.loads(
+        (repo_dir / "harness" / "runs" / "ROOT" / "g4-tracker.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert len(root_tracker["completed_attempts"]) == 6
+
+    # Corrupt root g4-tracker.json fails closed (rc=2, no CLI calls).
+    (repo_dir / "harness" / "runs" / "ROOT" / "g4-tracker.json").write_text(
+        "{corrupt-json", encoding="utf-8"
+    )
+    out_bad = tmp_path / "out_corrupt_trk"
+    rc_bad = codex_room_review.main(
+        [
+            "--commit",
+            sha1,
+            "--task-id",
+            "CHILD-V2",
+            "--task-packet",
+            str(c2_pkt),
+            "--runtime-root",
+            str(rt_root),
+            "--repo-root",
+            str(repo_dir),
+            "--out-dir",
+            str(out_bad),
+            "--backend",
+            "codex",
+        ]
+    )
+    assert rc_bad == 2
+    assert _count_calls(calls) == 0
+    assert not out_bad.exists()
+
+
+def test_g4_ledgerless_packet_epoch_cap_blocks_fourth_round_same_packet(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Ledgerless G4 stops on 4th round for same packet.md and resets after packet bump."""
+    repo_dir, sha1 = _init_policy_repo(tmp_path / "repo_pkt_epoch", qualified_routes=[])
+    pkt_path = repo_dir / "harness" / "runs" / "T-PKT-EP" / "packet.md"
+    pkt_path.parent.mkdir(parents=True, exist_ok=True)
+    pkt_path.write_text(
+        "# Packet\n\n- **Root Task ID**: `T-PKT-EP`\n- **Packet Version**: `1`\n",
+        encoding="utf-8",
+    )
+    rt_root = tmp_path / "rt_pkt_ep"
+    (rt_root / "topstep-review-pass1").mkdir(parents=True)
+    (rt_root / "topstep-review-pass2").mkdir(parents=True)
+
+    shas = [sha1]
+    for idx in range(2, 6):
+        (repo_dir / "app.py").write_text(f"x = {idx}\n", encoding="utf-8")
+        shas.append(_commit_repo_change(repo_dir, f"c{idx}"))
+
+    for idx in range(3):
+        calls = _install_counting_codex_stub(tmp_path, monkeypatch, shas[idx])
+        out_r = pkt_path.parent / "attempts" / f"r{idx + 1}-{shas[idx][:12]}"
+        rc = codex_room_review.main(
+            [
+                "--commit",
+                shas[idx],
+                "--task-id",
+                "T-PKT-EP",
+                "--task-packet",
+                str(pkt_path),
+                "--runtime-root",
+                str(rt_root),
+                "--repo-root",
+                str(repo_dir),
+                "--out-dir",
+                str(out_r),
+                "--backend",
+                "codex",
+            ]
+        )
+        assert rc == 0
+        assert _count_calls(calls) == 2
+
+    calls4 = _install_counting_codex_stub(tmp_path, monkeypatch, shas[3])
+    out_4 = pkt_path.parent / "attempts" / f"r4-{shas[3][:12]}"
+    rc4 = codex_room_review.main(
+        [
+            "--commit",
+            shas[3],
+            "--task-id",
+            "T-PKT-EP",
+            "--task-packet",
+            str(pkt_path),
+            "--runtime-root",
+            str(rt_root),
+            "--repo-root",
+            str(repo_dir),
+            "--out-dir",
+            str(out_4),
+            "--backend",
+            "codex",
+        ]
+    )
+    assert rc4 == 2
+    assert _count_calls(calls4) == 0
+    assert not out_4.exists()
+
+    # Bump Packet Version -> new epoch allows round 4/6.
+    pkt_path.write_text(
+        "# Packet\n\n- **Root Task ID**: `T-PKT-EP`\n- **Packet Version**: `2`\n",
+        encoding="utf-8",
+    )
+    calls5 = _install_counting_codex_stub(tmp_path, monkeypatch, shas[3])
+    rc5 = codex_room_review.main(
+        [
+            "--commit",
+            shas[3],
+            "--task-id",
+            "T-PKT-EP",
+            "--task-packet",
+            str(pkt_path),
+            "--runtime-root",
+            str(rt_root),
+            "--repo-root",
+            str(repo_dir),
+            "--out-dir",
+            str(out_4),
+            "--backend",
+            "codex",
+        ]
+    )
+    assert rc5 == 0
+    assert _count_calls(calls5) == 2
+
+
+def test_g4_preflight_blocks_when_spent_plus_reserved_exceeds_budget(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """G4 preflight blocks PAUSED_BUDGET when spent + active_reservations exceeds limit."""
+    from harness.scripts import task_runner
+
+    repo_dir, sha1 = _init_policy_repo(tmp_path / "repo_preflight_res", qualified_routes=[])
+    ledger_path = _setup_ledger_for_g4_test(
+        repo_dir,
+        "T-PRE-BUD",
+        state="REVIEW_FROZEN_G4",
+        candidate_sha=sha1,
+    )
+    ledger = task_runner.load_ledger(ledger_path, repo_root=repo_dir)
+    ledger["budget_limit_usd"] = 1.0
+    ledger["spent_api_equiv_usd"] = 0.7
+    ledger["active_reservations"] = {"peer-1": 0.4}
+    task_runner.save_ledger(ledger_path, ledger)
+
+    calls = _install_counting_codex_stub(tmp_path, monkeypatch, sha1)
+    out_dir = repo_dir / "harness" / "runs" / "T-PRE-BUD" / "attempts" / f"r1-{sha1[:12]}"
+    rc = codex_room_review.main(
+        [
+            "--commit",
+            sha1,
+            "--task-id",
+            "T-PRE-BUD",
+            "--ledger",
+            str(ledger_path),
+            "--repo-root",
+            str(repo_dir),
+            "--out-dir",
+            str(out_dir),
+            "--backend",
+            "codex",
+        ]
+    )
+    assert rc == 2
+    assert _count_calls(calls) == 0
+    assert not out_dir.exists()
+    led_after = json.loads(ledger_path.read_text(encoding="utf-8"))
+    assert led_after["state"] == "PAUSED_BUDGET"
+    assert any(ev.get("kind") == "BUDGET_EXCEEDED_G4_PREFLIGHT" for ev in led_after["events"])
+
 
 
 

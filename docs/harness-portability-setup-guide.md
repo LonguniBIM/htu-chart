@@ -880,7 +880,7 @@ SUMMARY: <1-3 sentence technical summary and test evidence>
       "selected_effort": "high",
       "qualification_status": "production_qualified",
       "fallback_on_5h_window_exhausted": true,
-      "primary_window_exhausted_percent": 100.0
+      "primary_window_exhausted_percent": 90.0
     },
     "independent_reviewer_fallbacks": {
       "qualified_routes": [

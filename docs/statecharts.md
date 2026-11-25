@@ -101,9 +101,9 @@ stateDiagram-v2
 ```
 
 **Invariants (`G4 ↔ ledger.json ↔ G5` Hard Round Caps)**:
-- `codex_room_review.py` enforces `max_g4_rounds_per_root_task = 6`, `max_g4_rounds_per_packet_version = 3`, and `max_g4_invocations_per_candidate_sha = 2` via OS-locked canonical `g4-tracker.json` (bound to `Root Task ID`) + `attempts/` + `ledger.json` with atomic in-flight slot reservations and epoch validation before creating `out_dir`/`.review-attempt.lock`/`frozen/` or spawning any reviewer CLI, runs a `codex app-server` `account/rateLimits/read` 5-hour window guard (`fallback_on_5h_window_exhausted`) before `codex exec`, bills all non-reused `pass{1,2}*.raw.jsonl` logs, and exits `2` if `PAUSED_BUDGET` or a stale reservation is detected.
+- `codex_room_review.py` enforces `max_g4_rounds_per_root_task = 6`, `max_g4_rounds_per_packet_version = 3`, and `max_g4_invocations_per_candidate_sha = 2` via OS-locked canonical `g4-tracker.json` (bound to `Root Task ID`, unioned across child/sibling runs, failing closed on corrupt trackers) + `attempts/` + `ledger.json` (`spent + reserved` preflight budget guard, `in_flight`/`active_g4_reservations`, and `packet_version`/packet-epoch checks) before creating `out_dir`/`.review-attempt.lock`/`frozen/` or spawning any reviewer CLI, runs a `codex app-server` `account/rateLimits/read` 5-hour window guard (`fallback_on_5h_window_exhausted`, default `primary_window_exhausted_percent = 90.0`, `3.0s`/`6.0s` probe timeouts) before `codex exec`, bills all non-reused `pass{1,2}*.raw.jsonl` logs, and exits `2` if `PAUSED_BUDGET` or a stale reservation is detected.
 - `record_replan` resets `g4_rounds_in_packet = 0` while keeping `g4_rounds_total` monotonic across replans.
-- `receipt.py` (`G5`) evaluates `g4-tracker.json`, `attempts/`, and `ledger.json` atomically under `_ledger_lock` and refuses `VERIFIED` (`BLOCKED`, `exit 2`) if halted, skipped, or over-cap.
+- `receipt.py` (`G5`) evaluates canonical/child/sibling `g4-tracker.json` (failing closed on corrupt trackers), `attempts/`, and `ledger.json` atomically under `_ledger_lock` and refuses `VERIFIED` (`BLOCKED`, `exit 2`) if halted, skipped, or over root/per-packet/per-SHA caps.
 
 ---
 

@@ -448,6 +448,52 @@ def extract_root_task_id(
     return None
 
 
+def extract_packet_epoch(task_packet: Path | None = None) -> str | None:
+    """Return stable packet epoch token (``v<N>:<sha16>`` or ``sha:<sha16>``)."""
+    if task_packet is None or not task_packet.is_file():
+        return None
+    try:
+        raw = task_packet.read_bytes()
+    except OSError:
+        return None
+    sha16 = hashlib.sha256(raw).hexdigest()[:16]
+    text = raw.decode("utf-8", errors="replace")
+    m = re.search(
+        r"^\s*[-*]\s+\*\*Packet Version\*\*:\s*`?(\d+)`?\b",
+        text,
+        flags=re.MULTILINE,
+    )
+    if m:
+        return f"v{m.group(1)}:{sha16}"
+    return f"sha:{sha16}"
+
+
+def discover_child_runs_for_root(
+    root_task_id: str,
+    *,
+    repo_root: Path,
+    exclude_ids: set[str] | None = None,
+) -> list[Path]:
+    """Discover child run directories under ``harness/runs/`` bound to ``root_task_id``."""
+    runs_dir = repo_root.resolve() / "harness" / "runs"
+    if not runs_dir.is_dir() or not root_task_id:
+        return []
+    excluded = set(exclude_ids or set()) | {root_task_id}
+    matched_dirs: list[Path] = []
+    for run_dir in sorted(runs_dir.iterdir()):
+        if not run_dir.is_dir() or run_dir.name in excluded:
+            continue
+        readiness = run_dir / "readiness.json"
+        if extract_root_task_id(task_manifest=readiness) == root_task_id:
+            matched_dirs.append(run_dir)
+            continue
+        for pkt in sorted(run_dir.glob("packet*.md")):
+            if extract_root_task_id(task_packet=pkt) == root_task_id:
+                matched_dirs.append(run_dir)
+                break
+    return matched_dirs
+
+
 def find_ledger_path_for_task(
     task_id: str,
     *,
@@ -571,6 +617,8 @@ def load_g4_tracker(tracker_path: Path, *, task_id: str = "") -> dict[str, Any]:
         data["completed_attempts"] = {}
     if not isinstance(data.get("attempts"), dict):
         data["attempts"] = {}
+    if not isinstance(data.get("packet_rounds"), dict):
+        data["packet_rounds"] = {}
     return data
 
 
@@ -592,6 +640,63 @@ def _native_tracker_round_dirs(tracker: dict[str, Any]) -> set[str]:
             raw_out = ent.get("out_dir")
             native.add(_norm_attempt_dir(raw_out) if raw_out else f"attempt:{res_id}")
     return native
+
+
+def _native_tracker_packet_round_dirs(
+    tracker: dict[str, Any], packet_epoch: str
+) -> set[str]:
+    round_statuses = {"PASSED", "CHANGES_REQUESTED", "BLOCKED", "IN_PROGRESS"}
+    native: set[str] = set()
+    for raw_out, ent in (tracker.get("completed_attempts") or {}).items():
+        if (
+            isinstance(ent, dict)
+            and str(ent.get("status") or "") in round_statuses
+            and ent.get("packet_epoch") == packet_epoch
+            and not ent.get("seeded_from_fs")
+        ):
+            native.add(_norm_attempt_dir(raw_out))
+    for res_id, ent in (tracker.get("attempts") or {}).items():
+        if (
+            isinstance(ent, dict)
+            and str(ent.get("status") or "") in round_statuses
+            and ent.get("packet_epoch") == packet_epoch
+        ):
+            raw_out = ent.get("out_dir")
+            native.add(_norm_attempt_dir(raw_out) if raw_out else f"attempt:{res_id}")
+    return native
+
+
+def count_tracker_packet_rounds(
+    tracker: dict[str, Any] | None, packet_epoch: str | None
+) -> int:
+    """Count distinct G4 rounds recorded in ``tracker`` for ``packet_epoch``."""
+    if not isinstance(tracker, dict) or not packet_epoch:
+        return 0
+    round_statuses = {"PASSED", "CHANGES_REQUESTED", "BLOCKED", "IN_PROGRESS"}
+    round_dirs: set[str] = set()
+    for raw_out, ent in (tracker.get("completed_attempts") or {}).items():
+        if (
+            isinstance(ent, dict)
+            and str(ent.get("status") or "") in round_statuses
+            and ent.get("packet_epoch") == packet_epoch
+        ):
+            round_dirs.add(_norm_attempt_dir(raw_out))
+    for res_id, ent in (tracker.get("attempts") or {}).items():
+        if (
+            isinstance(ent, dict)
+            and str(ent.get("status") or "") in round_statuses
+            and ent.get("packet_epoch") == packet_epoch
+        ):
+            raw_out = ent.get("out_dir")
+            round_dirs.add(_norm_attempt_dir(raw_out) if raw_out else f"attempt:{res_id}")
+    for res_id, ent in (tracker.get("in_flight") or {}).items():
+        if isinstance(ent, dict) and ent.get("packet_epoch") == packet_epoch:
+            raw_out = ent.get("out_dir")
+            round_dirs.add(_norm_attempt_dir(raw_out) if raw_out else f"inflight:{res_id}")
+    native_count = len(_native_tracker_packet_round_dirs(tracker, packet_epoch))
+    pkt_map = tracker.get("packet_rounds") or {}
+    legacy_raw = int(pkt_map.get(packet_epoch, 0)) if isinstance(pkt_map, dict) else 0
+    return len(round_dirs) + max(0, legacy_raw - native_count)
 
 
 def merge_g4_trackers(
@@ -628,6 +733,33 @@ def merge_g4_trackers(
     merged["completed_rounds"] = (
         len(_native_tracker_round_dirs(merged)) + base_legacy + extra_legacy
     )
+    all_epochs: set[str] = set()
+    for trk in (base_tracker, extra_tracker, merged):
+        pkt_map = trk.get("packet_rounds")
+        if isinstance(pkt_map, dict):
+            all_epochs.update(str(k) for k in pkt_map)
+        for sec in ("completed_attempts", "attempts"):
+            sec_map = trk.get(sec)
+            if isinstance(sec_map, dict):
+                for ent in sec_map.values():
+                    if isinstance(ent, dict) and isinstance(ent.get("packet_epoch"), str):
+                        all_epochs.add(ent["packet_epoch"])
+    merged_pkt: dict[str, int] = {}
+    base_pkt = base_tracker.get("packet_rounds") or {}
+    extra_pkt = extra_tracker.get("packet_rounds") or {}
+    for ep in sorted(all_epochs):
+        b_leg = max(
+            0,
+            (int(base_pkt.get(ep, 0)) if isinstance(base_pkt, dict) else 0)
+            - len(_native_tracker_packet_round_dirs(base_tracker, ep)),
+        )
+        e_leg = max(
+            0,
+            (int(extra_pkt.get(ep, 0)) if isinstance(extra_pkt, dict) else 0)
+            - len(_native_tracker_packet_round_dirs(extra_tracker, ep)),
+        )
+        merged_pkt[ep] = len(_native_tracker_packet_round_dirs(merged, ep)) + b_leg + e_leg
+    merged["packet_rounds"] = merged_pkt
     return merged
 
 

@@ -656,19 +656,19 @@ def extract_codex_window_guard_config(
 ) -> tuple[bool, float, str | None]:
     """Validate 5h window preflight fallback settings under independent_reviewer_primary."""
     if not isinstance(policy, dict):
-        return True, 100.0, None
+        return True, 90.0, None
     roles = policy.get("roles")
     if roles is None:
-        return True, 100.0, None
+        return True, 90.0, None
     if not isinstance(roles, dict):
-        return False, 100.0, "model-policy.json roles must be an object."
+        return False, 90.0, "model-policy.json roles must be an object."
     primary = roles.get("independent_reviewer_primary")
     if primary is None:
-        return True, 100.0, None
+        return True, 90.0, None
     if not isinstance(primary, dict):
         return (
             False,
-            100.0,
+            90.0,
             "model-policy.json roles.independent_reviewer_primary must be an object.",
         )
 
@@ -678,12 +678,12 @@ def extract_codex_window_guard_config(
         if not isinstance(raw_enabled, bool):
             return (
                 False,
-                100.0,
+                90.0,
                 "fallback_on_5h_window_exhausted must be a strict boolean.",
             )
         enabled = raw_enabled
 
-    threshold = 100.0
+    threshold = 90.0
     if "primary_window_exhausted_percent" in primary:
         raw_pct = primary["primary_window_exhausted_percent"]
         if (
@@ -695,7 +695,7 @@ def extract_codex_window_guard_config(
         ):
             return (
                 False,
-                100.0,
+                90.0,
                 "primary_window_exhausted_percent must be finite in (0, 100].",
             )
         threshold = float(raw_pct)
@@ -720,8 +720,8 @@ def probe_codex_rate_limits(
     codex_prefix: list[str],
     runtime_dir: Path,
     *,
-    init_timeout_sec: float = 0.5,
-    read_timeout_sec: float = 4.0,
+    init_timeout_sec: float = 3.0,
+    read_timeout_sec: float = 6.0,
 ) -> dict[str, Any] | None:
     """Query ``codex app-server`` ``account/rateLimits/read`` via JSON-RPC over stdio."""
     env = dict(os.environ)
@@ -865,7 +865,7 @@ def _parse_rl_pct(val: Any) -> float | None:
 def evaluate_codex_window_exhaustion(
     rate_limits_result: dict[str, Any] | None,
     *,
-    threshold_pct: float = 100.0,
+    threshold_pct: float = 90.0,
 ) -> tuple[bool, str | None, dict[str, Any] | None]:
     """Evaluate Codex 5h/secondary window limits and strip PII from preflight snapshot."""
     if not isinstance(rate_limits_result, dict):
@@ -1914,15 +1914,14 @@ def _should_enforce_g4_caps(
 ) -> bool:
     if args.dry_run or args.consolidate_only is not None:
         return False
-    if str(args.task_id).startswith("canary-"):
-        return False
     packet_candidate = args.task_packet or (
         git_top / "harness" / "runs" / args.task_id / "packet.md"
     )
+    is_exempt_id = args.task_id == "adhoc" or str(args.task_id).startswith("canary-")
     if (
         args.ledger is None
         and not args.require_ledger
-        and args.task_id == "adhoc"
+        and is_exempt_id
         and out_dir.parent.name != "attempts"
         and task_runner.extract_root_task_id(task_packet=packet_candidate) is None
         and task_runner.find_ledger_path_for_task(
@@ -2025,7 +2024,9 @@ def _preflight_g4_caps(
 
     policy_cb = task_runner.load_circuit_breakers(repo_root=git_top)
     max_g4_root = int(policy_cb["max_g4_rounds_per_root_task"])
+    max_g4_pkt = int(policy_cb["max_g4_rounds_per_packet_version"])
     max_g4_sha = int(policy_cb["max_g4_invocations_per_candidate_sha"])
+    packet_epoch = task_runner.extract_packet_epoch(packet_candidate)
 
     attempt_roots = [git_top / "harness" / "runs" / args.task_id / "attempts"]
     if tracker_id != args.task_id:
@@ -2046,27 +2047,76 @@ def _preflight_g4_caps(
     now_iso = datetime.now(timezone.utc).isoformat()
 
     def _check_and_reserve_locked() -> tuple[int | None, Path | None, str | None]:
-        tracker = task_runner.load_g4_tracker(tracker_path, task_id=tracker_id)
-        child_tracker: dict[str, Any] | None = None
+        try:
+            tracker = task_runner.load_g4_tracker(tracker_path, task_id=tracker_id)
+        except (OSError, UnicodeDecodeError, ValueError, json.JSONDecodeError) as exc:
+            print(
+                f"[codex_room_review] BLOCKED: Invalid root g4-tracker.json "
+                f"at {tracker_path}: {exc}",
+                file=sys.stderr,
+            )
+            return 2, None, None
+
+        extra_trackers: list[dict[str, Any]] = []
         if tracker_id != args.task_id:
-            try:
-                child_t_path = task_runner.default_g4_tracker_path(
-                    args.task_id, repo_root=git_top
-                )
-                if child_t_path.is_file():
-                    child_tracker = task_runner.load_g4_tracker(
-                        child_t_path, task_id=args.task_id
+            child_t_path = task_runner.default_g4_tracker_path(
+                args.task_id, repo_root=git_top
+            )
+            if child_t_path.is_file():
+                try:
+                    extra_trackers.append(
+                        task_runner.load_g4_tracker(child_t_path, task_id=args.task_id)
                     )
-            except (OSError, UnicodeDecodeError, ValueError, json.JSONDecodeError):
-                child_tracker = None
-        union_tracker = task_runner.merge_g4_trackers(tracker, child_tracker)
+                except (OSError, UnicodeDecodeError, ValueError, json.JSONDecodeError) as exc:
+                    print(
+                        f"[codex_room_review] BLOCKED: Invalid child g4-tracker.json "
+                        f"at {child_t_path}: {exc}",
+                        file=sys.stderr,
+                    )
+                    return 2, None, None
+
+        run_attempt_roots = list(attempt_roots)
+        for sib_dir in task_runner.discover_child_runs_for_root(
+            tracker_id, repo_root=git_top, exclude_ids={tracker_id, args.task_id}
+        ):
+            sib_attempts = sib_dir / "attempts"
+            if sib_attempts not in run_attempt_roots:
+                run_attempt_roots.append(sib_attempts)
+            sib_t_path = sib_dir / "g4-tracker.json"
+            if sib_t_path.is_file():
+                try:
+                    extra_trackers.append(
+                        task_runner.load_g4_tracker(sib_t_path, task_id=sib_dir.name)
+                    )
+                except (OSError, UnicodeDecodeError, ValueError, json.JSONDecodeError) as exc:
+                    print(
+                        f"[codex_room_review] BLOCKED: Invalid sibling g4-tracker.json "
+                        f"at {sib_t_path}: {exc}",
+                        file=sys.stderr,
+                    )
+                    return 2, None, None
+
+        merged = tracker
+        for extra_t in extra_trackers:
+            merged_next = task_runner.merge_g4_trackers(merged, extra_t)
+            if merged_next is not None:
+                merged = merged_next
+        merged["task_id"] = tracker_id
+        tracker = merged
+
         union = task_runner.collect_g4_attempt_union(
-            attempt_roots, union_tracker, candidate_sha=candidate_sha
+            run_attempt_roots, tracker, candidate_sha=candidate_sha
         )
-        if _seed_tracker_from_union(tracker, union, now_iso):
+        seeded = _seed_tracker_from_union(tracker, union, now_iso)
+        if (
+            tracker_path.is_file()
+            or bool(extra_trackers)
+            or seeded
+            or bool(union.get("discovered_entries"))
+        ):
             task_runner.save_g4_tracker(tracker_path, tracker)
         effective_rounds = int(union["total_rounds"])
-        t_sha = int((union_tracker or tracker).get("sha_invocations", {}).get(candidate_sha, 0))
+        t_sha = int(tracker.get("sha_invocations", {}).get(candidate_sha, 0))
         effective_sha = max(int(union["sha_count"]), t_sha)
         prior_sha_statuses = {st for st in union["sha_statuses"].values() if st}
         non_infra_statuses = {st for st in prior_sha_statuses if st != "BLOCKED_INFRA"}
@@ -2101,6 +2151,14 @@ def _preflight_g4_caps(
                     file=sys.stderr,
                 )
                 return 2, None, None
+            pkt_rounds = task_runner.count_tracker_packet_rounds(tracker, packet_epoch)
+            if packet_epoch is not None and pkt_rounds >= max_g4_pkt:
+                print(
+                    f"[codex_room_review] NEEDS_REPLAN: G4 packet cap reached "
+                    f"(packet_rounds={pkt_rounds} >= {max_g4_pkt}).",
+                    file=sys.stderr,
+                )
+                return 2, None, None
             if effective_sha >= max_g4_sha or (effective_sha >= 1 and args.resume_from is None):
                 print(
                     f"[codex_room_review] BLOCKED: Duplicate G4 invocation for candidate_sha "
@@ -2117,17 +2175,27 @@ def _preflight_g4_caps(
                     file=sys.stderr,
                 )
                 return 2, None, None
-            tracker["in_flight"][reservation_id] = {
+            slot_meta: dict[str, Any] = {
                 "candidate_sha": candidate_sha,
                 "out_dir": norm_out,
                 "pid": os.getpid(),
                 "reserved_at_utc": now_iso,
             }
+            if packet_epoch is not None:
+                slot_meta["packet_epoch"] = packet_epoch
+            tracker["in_flight"][reservation_id] = slot_meta
             tracker["sha_invocations"][candidate_sha] = effective_sha + 1
             task_runner.save_g4_tracker(tracker_path, tracker)
             return None, tracker_path, reservation_id
 
-        ledger = task_runner.load_ledger(ledger_path, repo_root=git_top)
+        try:
+            ledger = task_runner.load_ledger(ledger_path, repo_root=git_top)
+        except (OSError, UnicodeDecodeError, ValueError, json.JSONDecodeError) as exc:
+            print(
+                f"[codex_room_review] BLOCKED: Invalid ledger.json at {ledger_path}: {exc}",
+                file=sys.stderr,
+            )
+            return 2, None, None
         locked_bind_err = task_runner.validate_ledger_task_binding(
             ledger, task_id=args.task_id, expected_root_task_id=expected_root
         )
@@ -2139,7 +2207,7 @@ def _preflight_g4_caps(
         l_max_pkt = int(
             cb.get(
                 "max_g4_rounds_per_packet_version",
-                policy_cb["max_g4_rounds_per_packet_version"],
+                max_g4_pkt,
             )
         )
         l_max_sha = int(cb.get("max_g4_invocations_per_candidate_sha", max_g4_sha))
@@ -2147,7 +2215,7 @@ def _preflight_g4_caps(
         ledger_active = ledger.get("active_g4_reservations", {})
         if (
             tracker.get("in_flight")
-            or (isinstance(child_tracker, dict) and child_tracker.get("in_flight"))
+            or any(isinstance(et, dict) and et.get("in_flight") for et in extra_trackers)
             or ledger_active
             or "IN_PROGRESS" in prior_sha_statuses
         ):
@@ -2247,28 +2315,39 @@ def _preflight_g4_caps(
             return 2, None, None
 
         spent = float(ledger.get("spent_api_equiv_usd", 0.0))
+        reserved = task_runner._active_reserved_usd(ledger)
+        committed = round(spent + reserved, 8)
         limit = float(ledger.get("budget_limit_usd", 0.0))
-        if limit > 0 and round(spent, 8) > round(limit, 8):
+        if limit > 0 and committed > round(limit, 8):
             ledger["state"] = "PAUSED_BUDGET"
             task_runner._append_event(
                 ledger,
                 "BUDGET_EXCEEDED_G4_PREFLIGHT",
-                {"spent_usd": spent, "limit_usd": limit},
+                {
+                    "spent_usd": spent,
+                    "reserved_usd": reserved,
+                    "committed_usd": committed,
+                    "limit_usd": limit,
+                },
             )
             task_runner.save_ledger(ledger_path, ledger)
             print(
                 f"[codex_room_review] PAUSED_BUDGET: Budget exceeded "
-                f"(${spent:.4f} > ${limit:.4f}).",
+                f"(${committed:.4f} committed = ${spent:.4f} spent + "
+                f"${reserved:.4f} reserved > ${limit:.4f}).",
                 file=sys.stderr,
             )
             return 2, None, None
 
-        tracker["in_flight"][reservation_id] = {
+        slot_meta = {
             "candidate_sha": candidate_sha,
             "out_dir": norm_out,
             "pid": os.getpid(),
             "reserved_at_utc": now_iso,
         }
+        if packet_epoch is not None:
+            slot_meta["packet_epoch"] = packet_epoch
+        tracker["in_flight"][reservation_id] = slot_meta
         tracker["sha_invocations"][candidate_sha] = sha_count + 1
         task_runner.save_g4_tracker(tracker_path, tracker)
 
@@ -2556,21 +2635,35 @@ def _record_g4_outcome(
             }
             norm_out = task_runner._norm_attempt_dir(out_dir)
             completed_at = datetime.now(timezone.utc).isoformat()
+            pkt_epoch: str | None = None
             if reservation_id:
-                tracker["in_flight"].pop(reservation_id, None)
-                tracker["attempts"][reservation_id] = {
+                inflight_ent = tracker["in_flight"].pop(reservation_id, None)
+                if isinstance(inflight_ent, dict) and isinstance(
+                    inflight_ent.get("packet_epoch"), str
+                ):
+                    pkt_epoch = inflight_ent["packet_epoch"]
+                att_entry: dict[str, Any] = {
                     "candidate_sha": candidate_sha,
                     "status": gate_status,
                     "out_dir": norm_out,
                     "completed_at_utc": completed_at,
                 }
-            tracker.setdefault("completed_attempts", {})[norm_out] = {
+                if pkt_epoch is not None:
+                    att_entry["packet_epoch"] = pkt_epoch
+                tracker["attempts"][reservation_id] = att_entry
+            comp_entry: dict[str, Any] = {
                 "candidate_sha": candidate_sha,
                 "status": gate_status,
                 "completed_at_utc": completed_at,
             }
+            if pkt_epoch is not None:
+                comp_entry["packet_epoch"] = pkt_epoch
+            tracker.setdefault("completed_attempts", {})[norm_out] = comp_entry
             if count_round:
                 tracker["completed_rounds"] = int(tracker.get("completed_rounds", 0)) + 1
+                if pkt_epoch is not None:
+                    pkt_map = tracker.setdefault("packet_rounds", {})
+                    pkt_map[pkt_epoch] = int(pkt_map.get(pkt_epoch, 0)) + 1
             task_runner.save_g4_tracker(tracker_path, tracker)
 
         if ledger_path is None or not ledger_path.is_file():
@@ -2952,7 +3045,7 @@ def _execute_after_preflight(
     qualified_routes: list[str],
     max_transient_retries: int,
     window_guard_enabled: bool = True,
-    window_exhausted_pct: float = 100.0,
+    window_exhausted_pct: float = 90.0,
     policy_sha256: str,
     schema: dict[str, Any],
     schema_sha256: str,

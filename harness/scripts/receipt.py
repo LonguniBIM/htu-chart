@@ -488,12 +488,15 @@ def _evaluate_ledger_and_attempts(
     tracker_data: dict[str, Any] | None,
     require_ledger: bool,
     expected_root_task_id: str | None = None,
+    packet_candidate: Path | None = None,
 ) -> list[str]:
     """Enforce G4/candidate ceilings and ledger state/SHA invariants for G5."""
     blockers: list[str] = []
     breakers = task_runner.load_circuit_breakers(repo_root=active_root)
     max_g4_root = int(breakers.get("max_g4_rounds_per_root_task", 6))
+    max_g4_pkt = int(breakers.get("max_g4_rounds_per_packet_version", 3))
     max_g4_sha = int(breakers.get("max_g4_invocations_per_candidate_sha", 2))
+    max_cand_pkt = int(breakers.get("max_candidates_per_packet_version", 3))
     max_total_cand = int(breakers.get("max_total_candidates_per_root_task", 6))
 
     tracker_id = expected_root_task_id or task_id
@@ -510,7 +513,9 @@ def _evaluate_ledger_and_attempts(
         cb = ledger_data.get("circuit_breakers")
         if isinstance(cb, dict):
             max_g4_root = int(cb.get("max_g4_rounds_per_root_task", max_g4_root))
+            max_g4_pkt = int(cb.get("max_g4_rounds_per_packet_version", max_g4_pkt))
             max_g4_sha = int(cb.get("max_g4_invocations_per_candidate_sha", max_g4_sha))
+            max_cand_pkt = int(cb.get("max_candidates_per_packet_version", max_cand_pkt))
             max_total_cand = int(cb.get("max_total_candidates_per_root_task", max_total_cand))
 
     try:
@@ -524,22 +529,39 @@ def _evaluate_ledger_and_attempts(
         attempt_roots.append(active_root / "harness" / "runs" / tracker_id / "attempts")
     effective_tracker = tracker_data
     if effective_tracker is None:
-        try:
-            t_path = task_runner.default_g4_tracker_path(tracker_id, repo_root=active_root)
-            if t_path.is_file():
+        t_path = task_runner.default_g4_tracker_path(tracker_id, repo_root=active_root)
+        if t_path.is_file():
+            try:
                 effective_tracker = task_runner.load_g4_tracker(t_path, task_id=tracker_id)
-        except (OSError, UnicodeDecodeError, ValueError, json.JSONDecodeError):
-            effective_tracker = None
+            except (OSError, UnicodeDecodeError, ValueError, json.JSONDecodeError) as exc:
+                blockers.append(f"Invalid root g4-tracker.json at {t_path}: {exc}")
     if tracker_id != task_id:
-        try:
-            child_t_path = task_runner.default_g4_tracker_path(task_id, repo_root=active_root)
-            if child_t_path.is_file():
+        child_t_path = task_runner.default_g4_tracker_path(task_id, repo_root=active_root)
+        if child_t_path.is_file():
+            try:
                 child_tracker = task_runner.load_g4_tracker(child_t_path, task_id=task_id)
                 effective_tracker = task_runner.merge_g4_trackers(
                     effective_tracker, child_tracker
                 )
-        except (OSError, UnicodeDecodeError, ValueError, json.JSONDecodeError):
-            pass
+            except (OSError, UnicodeDecodeError, ValueError, json.JSONDecodeError) as exc:
+                blockers.append(f"Invalid child g4-tracker.json at {child_t_path}: {exc}")
+
+    for sib_dir in task_runner.discover_child_runs_for_root(
+        tracker_id, repo_root=active_root, exclude_ids={tracker_id, task_id}
+    ):
+        sib_attempts = sib_dir / "attempts"
+        if sib_attempts not in attempt_roots:
+            attempt_roots.append(sib_attempts)
+        sib_t_path = sib_dir / "g4-tracker.json"
+        if sib_t_path.is_file():
+            try:
+                sib_tracker = task_runner.load_g4_tracker(sib_t_path, task_id=sib_dir.name)
+                effective_tracker = task_runner.merge_g4_trackers(
+                    effective_tracker, sib_tracker
+                )
+            except (OSError, UnicodeDecodeError, ValueError, json.JSONDecodeError) as exc:
+                blockers.append(f"Invalid sibling g4-tracker.json at {sib_t_path}: {exc}")
+
     attempt_union = task_runner.collect_g4_attempt_union(
         attempt_roots, effective_tracker, candidate_sha=candidate_sha
     )
@@ -570,6 +592,16 @@ def _evaluate_ledger_and_attempts(
         return blockers
 
     if ledger_data is None:
+        eff_packet = packet_candidate or (
+            active_root / "harness" / "runs" / task_id / "packet.md"
+        )
+        packet_epoch = task_runner.extract_packet_epoch(eff_packet)
+        pkt_rounds = task_runner.count_tracker_packet_rounds(effective_tracker, packet_epoch)
+        if packet_epoch is not None and pkt_rounds > max_g4_pkt:
+            blockers.append(
+                f"Packet G4 rounds ({pkt_rounds}) exceed "
+                f"max_g4_rounds_per_packet_version ({max_g4_pkt})."
+            )
         return blockers
 
     state = ledger_data.get("state")
@@ -595,6 +627,15 @@ def _evaluate_ledger_and_attempts(
         blockers.append(
             f"Task ledger exceeds ceiling (g4_rounds_total={g4_total}/{max_g4_root}, "
             f"total_candidates={total_cand}/{max_total_cand})."
+        )
+
+    g4_pkt = int(ledger_data.get("g4_rounds_in_packet", 0))
+    cand_pkt = int(ledger_data.get("candidates_in_packet", 0))
+    if g4_pkt > max_g4_pkt or cand_pkt > max_cand_pkt:
+        blockers.append(
+            f"Task ledger exceeds per-packet ceiling "
+            f"(g4_rounds_in_packet={g4_pkt}/{max_g4_pkt}, "
+            f"candidates_in_packet={cand_pkt}/{max_cand_pkt})."
         )
 
     budget_limit = float(ledger_data.get("budget_limit_usd", 0.0) or 0.0)
@@ -647,6 +688,7 @@ def evaluate_receipt(
     tracker_data: dict[str, Any] | None = None,
     require_ledger: bool = False,
     expected_root_task_id: str | None = None,
+    packet_candidate: Path | None = None,
 ) -> dict[str, Any]:
     """Evaluate all gates and build the immutable receipt payload."""
     active_root = repo_root or REPO_ROOT
@@ -709,6 +751,7 @@ def evaluate_receipt(
         tracker_data=tracker_data,
         require_ledger=require_ledger,
         expected_root_task_id=expected_root_task_id,
+        packet_candidate=packet_candidate,
     )
     blockers.extend(ledger_blockers)
 
@@ -981,11 +1024,11 @@ def main(argv: list[str] | None = None) -> int:
             tracker_data=tracker_data,
             require_ledger=bool(args.require_ledger or explicit_missing),
             expected_root_task_id=expected_root_id,
+            packet_candidate=packet_candidate,
         )
         if ledger_load_err and ledger_load_err not in receipt["blockers"]:
             receipt["blockers"].append(ledger_load_err)
-            if not receipt["failures"]:
-                receipt["conclusion"] = "BLOCKED"
+            receipt["conclusion"] = "BLOCKED"
 
         try:
             with receipt_json_path.open("x", encoding="utf-8") as fh:
