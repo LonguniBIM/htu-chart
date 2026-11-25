@@ -1403,6 +1403,31 @@ def test_merge_g4_trackers_idempotent_gcounter_and_rejects_corrupt_types(
     assert "corrupt g4-tracker.json" in msg_rep
 
 
+def test_ensure_ledger_defaults_rejects_wrong_typed_maps_and_counters(tmp_path: Path) -> None:
+    """load_ledger rejects malformed map/counter field types instead of resetting them."""
+    led_path = tmp_path / "ledger.json"
+    task_runner.init_or_load_ledger(
+        led_path, root_task_id="T-BAD-LED", base_sha="0" * 40, budget_usd=6.0
+    )
+    base_data = json.loads(led_path.read_text(encoding="utf-8"))
+    for bad_patch in (
+        {"active_g4_reservations": ["live"]},
+        {"g4_invocations_by_sha": []},
+        {"circuit_breakers": []},
+        {"g4_rounds_total": "1"},
+        {"g4_rounds_in_packet": True},
+        {"g4_invocations_by_sha": {"abc": -1}},
+        {"active_g4_reservations": {"r1": "bad"}},
+    ):
+        corrupted = dict(base_data)
+        corrupted.update(bad_patch)
+        bad_file = tmp_path / "bad_ledger.json"
+        bad_file.write_text(json.dumps(corrupted), encoding="utf-8")
+        with pytest.raises(ValueError):
+            task_runner.load_ledger(bad_file)
+
+
+
 
 
 

@@ -2363,6 +2363,123 @@ def test_g5_receipt_blocks_hybrid_tracker_packet_cap_and_wrong_type_tracker(
     )
 
 
+def test_g5_receipt_blocks_combined_legacy_plus_fs_sha_and_wrong_typed_ledger_maps(
+    tmp_path: Path,
+) -> None:
+    """G5 enforces counter-only + FS SHA sum and rejects wrong-typed ledger.json maps."""
+    from harness.scripts import receipt as receipt_mod
+    from harness.scripts import task_runner
+
+    cand_sha = "f" * 40
+    base_sha = "0" * 40
+    repo = tmp_path / "repo_g5_sha_mix"
+    repo.mkdir()
+    trk_path = task_runner.default_g4_tracker_path("T-G5-SHAMIX", repo_root=repo)
+    trk = task_runner.load_g4_tracker(trk_path, task_id="T-G5-SHAMIX")
+    trk["completed_rounds"] = 1
+    trk["sha_invocations"][cand_sha] = 1
+    task_runner.save_g4_tracker(trk_path, trk)
+
+    for idx in (1, 2):
+        att = repo / "harness" / "runs" / "T-G5-SHAMIX" / "attempts" / f"r{idx}-{cand_sha[:12]}"
+        att.mkdir(parents=True, exist_ok=True)
+        (att / "consolidated-review.json").write_text(
+            json.dumps(
+                {
+                    "revision_sha": cand_sha,
+                    "passes_completed": 2,
+                    "independent_contexts": True,
+                    "review_gate_status": "PASSED" if idx == 2 else "BLOCKED_INFRA",
+                    "blocking_open_count": 0,
+                    "consolidated_findings": [],
+                }
+            ),
+            encoding="utf-8",
+        )
+
+    v_path = tmp_path / "v_mix.json"
+    r_path = tmp_path / "r_mix.json"
+    v_path.write_text(json.dumps(_verifier(cand_sha)), encoding="utf-8")
+    r_path.write_text(json.dumps(_review(cand_sha)), encoding="utf-8")
+    out_mix = tmp_path / "out_g5_mix"
+    rc_mix = receipt_mod.main(
+        [
+            "--task-id",
+            "T-G5-SHAMIX",
+            "--phase",
+            "1",
+            "--base-sha",
+            base_sha,
+            "--candidate-sha",
+            cand_sha,
+            "--verifier-json",
+            str(v_path),
+            "--review-json",
+            str(r_path),
+            "--repo-root",
+            str(repo),
+            "--out-dir",
+            str(out_mix),
+        ]
+    )
+    assert rc_mix == 2
+    rec_mix = json.loads((out_mix / "receipt.json").read_text(encoding="utf-8"))
+    assert rec_mix["conclusion"] == "BLOCKED"
+    assert any(
+        "union=3" in b and "max_g4_invocations_per_candidate_sha" in b
+        for b in rec_mix["blockers"]
+    )
+
+    # Wrong-typed ledger map fails closed in receipt CLI too.
+    for idx, bad_field in enumerate(
+        (
+            {"active_g4_reservations": ["live"]},
+            {"g4_invocations_by_sha": []},
+        ),
+        start=1,
+    ):
+        task_id = f"T-G5-BADMAP-{idx}"
+        led_path = repo / "harness" / "runs" / task_id / "ledger.json"
+        led = task_runner.init_or_load_ledger(
+            led_path, root_task_id=task_id, base_sha=base_sha, budget_usd=6.0
+        )
+        led["state"] = "READY_FOR_ACCEPTANCE"
+        led["candidate_sha"] = cand_sha
+        task_runner.save_ledger(led_path, led)
+        raw = json.loads(led_path.read_text(encoding="utf-8"))
+        raw.update(bad_field)
+        led_path.write_text(json.dumps(raw), encoding="utf-8")
+
+        out_bad = tmp_path / f"out_badmap_{idx}"
+        rc_bad = receipt_mod.main(
+            [
+                "--task-id",
+                task_id,
+                "--phase",
+                "1",
+                "--base-sha",
+                base_sha,
+                "--candidate-sha",
+                cand_sha,
+                "--verifier-json",
+                str(v_path),
+                "--review-json",
+                str(r_path),
+                "--ledger",
+                str(led_path),
+                "--repo-root",
+                str(repo),
+                "--out-dir",
+                str(out_bad),
+            ]
+        )
+        assert rc_bad == 2
+        rec_bad = json.loads((out_bad / "receipt.json").read_text(encoding="utf-8"))
+        assert rec_bad["conclusion"] == "BLOCKED"
+        assert any("Invalid ledger.json" in b for b in rec_bad["blockers"])
+
+
+
 
 
 

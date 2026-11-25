@@ -5116,6 +5116,197 @@ def test_g4_child_in_flight_does_not_persist_zombie_lock_in_root_tracker(
     assert json.loads(root_trk_path.read_text(encoding="utf-8")).get("in_flight") == {}
 
 
+def test_g4_counter_only_sha_plus_fs_attempt_stays_blocked_across_two_preflights(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Counter-only SHA residual + 1 FS attempt stays sha_count=2 across repeated preflights."""
+    from harness.scripts import task_runner
+
+    repo_dir, sha1 = _init_policy_repo(tmp_path / "repo_mix_sha", qualified_routes=[])
+    trk_path = task_runner.default_g4_tracker_path("T-MIX-SHA", repo_root=repo_dir)
+    trk = task_runner.load_g4_tracker(trk_path, task_id="T-MIX-SHA")
+    trk["completed_rounds"] = 1
+    trk["sha_invocations"][sha1] = 1
+    task_runner.save_g4_tracker(trk_path, trk)
+
+    r1_dir = repo_dir / "harness" / "runs" / "T-MIX-SHA" / "attempts" / f"r1-{sha1[:12]}"
+    r1_dir.mkdir(parents=True, exist_ok=True)
+    (r1_dir / "consolidated-review.json").write_text(
+        json.dumps({"revision_sha": sha1, "review_gate_status": "BLOCKED_INFRA"}),
+        encoding="utf-8",
+    )
+
+    calls = _install_counting_codex_stub(tmp_path, monkeypatch, sha1)
+    for idx in (2, 3):
+        out_dir = (
+            repo_dir / "harness" / "runs" / "T-MIX-SHA" / "attempts" / f"r{idx}-{sha1[:12]}"
+        )
+        rc = codex_room_review.main(
+            [
+                "--commit",
+                sha1,
+                "--task-id",
+                "T-MIX-SHA",
+                "--resume-from",
+                str(r1_dir),
+                "--repo-root",
+                str(repo_dir),
+                "--out-dir",
+                str(out_dir),
+                "--backend",
+                "codex",
+            ]
+        )
+        assert rc == 2
+        assert _count_calls(calls) == 0
+        assert not out_dir.exists()
+
+    persisted = json.loads(trk_path.read_text(encoding="utf-8"))
+    assert persisted["sha_invocations"][sha1] == 2
+    assert persisted["imported_legacy_sha"]["T-MIX-SHA"][sha1] == 1
+
+
+def test_g4_malformed_ledger_map_types_fail_closed_without_cli(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Wrong-typed ledger.json map fields fail closed in G4 preflight before spawning CLI."""
+    repo_dir, sha1 = _init_policy_repo(tmp_path / "repo_bad_led_map", qualified_routes=[])
+    calls = _install_counting_codex_stub(tmp_path, monkeypatch, sha1)
+    for idx, bad_field in enumerate(
+        (
+            {"active_g4_reservations": ["live"]},
+            {"g4_invocations_by_sha": []},
+        ),
+        start=1,
+    ):
+        task_id = f"T-BAD-LED-{idx}"
+        ledger_path = _setup_ledger_for_g4_test(
+            repo_dir, task_id, state="REVIEW_FROZEN_G4", candidate_sha=sha1
+        )
+        raw = json.loads(ledger_path.read_text(encoding="utf-8"))
+        raw.update(bad_field)
+        ledger_path.write_text(json.dumps(raw), encoding="utf-8")
+
+        out_dir = repo_dir / "harness" / "runs" / task_id / "attempts" / f"r1-{sha1[:12]}"
+        rc = codex_room_review.main(
+            [
+                "--commit",
+                sha1,
+                "--task-id",
+                task_id,
+                "--ledger",
+                str(ledger_path),
+                "--repo-root",
+                str(repo_dir),
+                "--out-dir",
+                str(out_dir),
+                "--backend",
+                "codex",
+            ]
+        )
+        assert rc == 2
+        assert _count_calls(calls) == 0
+        assert not out_dir.exists()
+
+
+def test_g4_mid_run_tracker_corruption_bills_tokens_and_blocks(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Mid-run corrupt g4-tracker.json still bills token usage and persists BLOCKED."""
+    repo_dir, sha1 = _init_policy_repo(tmp_path / "repo_mid_corr", qualified_routes=[])
+    ledger_path = _setup_ledger_for_g4_test(
+        repo_dir, "T-MID-CORR", state="REVIEW_FROZEN_G4", candidate_sha=sha1
+    )
+    trk_path = repo_dir / "harness" / "runs" / "T-MID-CORR" / "g4-tracker.json"
+    fake_codex = tmp_path / "fake_codex_corrupt_trk.py"
+    prefix = _write_fake_codex_script(
+        fake_codex,
+        (
+            "import json, pathlib, sys\n"
+            "if sys.argv[1:2] == ['app-server']: sys.exit(1)\n"
+            "args = sys.argv[1:]\n"
+            "out_path = pathlib.Path(args[args.index('-o') + 1])\n"
+            "prompt = sys.stdin.read()\n"
+            "is_p2 = 'security_and_invariants' in prompt\n"
+            "lens = 'security_and_invariants' if is_p2 else 'correctness_and_tests'\n"
+            f"payload = {{'revision_sha': {sha1!r}, 'lens': lens, 'verdict': 'APPROVE', "
+            "'summary': 'ok', 'findings': [], 'test_quality_issues': [], "
+            "'unverified_areas': []}\n"
+            "out_path.write_text(json.dumps(payload), encoding='utf-8')\n"
+            "print(json.dumps({'type': 'turn.completed', 'usage': "
+            "{'input_tokens': 10000, 'cached_input_tokens': 2000, 'output_tokens': 1500}}), "
+            "flush=True)\n"
+            "if is_p2:\n"
+            f"    pathlib.Path({str(trk_path)!r}).write_text('{{corrupt', encoding='utf-8')\n"
+        ),
+    )
+    monkeypatch.setattr(
+        codex_room_review, "verify_role", lambda role, root: {"ok": True, "errors": []}
+    )
+    monkeypatch.setattr(codex_room_review, "resolve_codex_command", lambda: prefix)
+
+    out_dir = repo_dir / "harness" / "runs" / "T-MID-CORR" / "attempts" / f"r1-{sha1[:12]}"
+    rc = codex_room_review.main(
+        [
+            "--commit",
+            sha1,
+            "--task-id",
+            "T-MID-CORR",
+            "--ledger",
+            str(ledger_path),
+            "--repo-root",
+            str(repo_dir),
+            "--out-dir",
+            str(out_dir),
+            "--backend",
+            "codex",
+        ]
+    )
+    assert rc == 2
+    rep = json.loads((out_dir / "consolidated-review.json").read_text(encoding="utf-8"))
+    assert rep["review_gate_status"] == "BLOCKED"
+    assert any("Corrupt g4-tracker.json" in err for err in rep["errors"])
+    led_after = json.loads(ledger_path.read_text(encoding="utf-8"))
+    assert led_after["state"] == "BLOCKED"
+    assert led_after["spent_api_equiv_usd"] > 0.0
+    assert any(ev.get("kind") == "G4_TRACKER_CORRUPT_BLOCKED" for ev in led_after["events"])
+
+
+def test_codex_window_allowlist_coerces_wrong_typed_allowlisted_fields() -> None:
+    """Wrong-typed values inside allowlisted fields coerce cleanly to defaults/None."""
+    exhausted, reason, snap = codex_room_review.evaluate_codex_window_exhaustion(
+        {
+            "rateLimits": {
+                "limitId": 123,
+                "planType": ["pro"],
+                "ordinaryUsageAllowed": "yes",
+                "spendControlReached": {"flag": True},
+                "rateLimitReachedType": 42,
+                "primary": {
+                    "usedPercent": True,
+                    "windowDurationMins": True,
+                    "resetsAt": "soon",
+                },
+                "secondary": ["bad"],
+                "credits": {"hasCredits": "true", "unlimited": 1},
+            }
+        }
+    )
+    assert exhausted is False
+    assert reason is None
+    assert snap == {
+        "limitId": "codex",
+        "planType": None,
+        "ordinaryUsageAllowed": None,
+        "spendControlReached": None,
+        "rateLimitReachedType": None,
+        "primary": {"usedPercent": None, "windowDurationMins": None, "resetsAt": None},
+        "secondary": None,
+        "credits": {"hasCredits": None, "unlimited": None},
+    }
+
+
+
 
 
 

@@ -268,16 +268,46 @@ def _ensure_ledger_defaults(
     policy_breakers: dict[str, int] | None = None,
 ) -> dict[str, Any]:
     defaults = policy_breakers or DEFAULT_CIRCUIT_BREAKERS
-    breakers = data.setdefault("circuit_breakers", {})
-    if isinstance(breakers, dict):
-        for key, val in defaults.items():
-            breakers.setdefault(key, val)
-    data.setdefault("g4_rounds_total", 0)
-    data.setdefault("g4_rounds_in_packet", 0)
-    if not isinstance(data.get("g4_invocations_by_sha"), dict):
-        data["g4_invocations_by_sha"] = {}
-    if not isinstance(data.get("active_g4_reservations"), dict):
-        data["active_g4_reservations"] = {}
+    if "circuit_breakers" not in data:
+        data["circuit_breakers"] = {}
+    elif not isinstance(data["circuit_breakers"], dict):
+        raise ValueError("Invalid 'circuit_breakers' in ledger.json: expected dict.")
+    breakers = data["circuit_breakers"]
+    for key, val in defaults.items():
+        breakers.setdefault(key, val)
+
+    for cnt_key in (
+        "g4_rounds_total",
+        "g4_rounds_in_packet",
+        "total_candidates",
+        "candidates_in_packet",
+        "consecutive_failed_candidates",
+    ):
+        if cnt_key not in data:
+            data[cnt_key] = 0
+        elif not is_strict_int(data[cnt_key]) or data[cnt_key] < 0:
+            raise ValueError(
+                f"Invalid {cnt_key!r} in ledger.json: expected non-negative int."
+            )
+
+    for map_key in (
+        "g4_invocations_by_sha",
+        "active_g4_reservations",
+        "active_reservations",
+        "usage_by_conversation",
+    ):
+        if map_key not in data:
+            data[map_key] = {}
+        elif not isinstance(data[map_key], dict):
+            raise ValueError(f"Invalid {map_key!r} in ledger.json: expected dict.")
+
+    for sha_k, cnt in data["g4_invocations_by_sha"].items():
+        if not isinstance(sha_k, str) or not sha_k or not is_strict_int(cnt) or cnt < 0:
+            raise ValueError("Invalid entry in ledger.json 'g4_invocations_by_sha'.")
+    for res_id, ent in data["active_g4_reservations"].items():
+        if not isinstance(res_id, str) or not res_id or not isinstance(ent, dict):
+            raise ValueError("Invalid entry in ledger.json 'active_g4_reservations'.")
+
     data.setdefault("last_g4_candidate_sha", None)
     data.setdefault("last_g4_status", None)
     return data

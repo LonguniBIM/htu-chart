@@ -574,7 +574,7 @@ def _evaluate_ledger_and_attempts(
             f"max_g4_rounds_per_root_task ({max_g4_root})."
         )
 
-    sha_union_count = len(attempt_union["sha_dirs"])
+    sha_union_count = int(attempt_union["sha_count"])
     tracker_sha_count = (
         int(effective_tracker.get("sha_invocations", {}).get(candidate_sha, 0))
         if isinstance(effective_tracker, dict)

@@ -1964,8 +1964,22 @@ def _resolve_g4_ledger_path(args: argparse.Namespace, git_top: Path) -> Path | N
 def _seed_tracker_from_union(
     tracker: dict[str, Any], union: dict[str, Any], now_iso: str
 ) -> bool:
-    """Persist discovered attempt directories and per-SHA counts into tracker."""
+    """Snapshot legacy residuals, seed discovered attempt dirs, and recompute counts."""
     changed = False
+    imp_rounds = task_runner._extract_legacy_rounds_by_source(tracker)
+    imp_sha = task_runner._extract_legacy_nested_by_source(
+        tracker,
+        imported_key="imported_legacy_sha",
+        counts_key="sha_invocations",
+        keyed_fn=task_runner._keyed_tracker_sha_dirs,
+    )
+    if imp_rounds and tracker.get("imported_legacy_rounds") != imp_rounds:
+        tracker["imported_legacy_rounds"] = imp_rounds
+        changed = True
+    if imp_sha and tracker.get("imported_legacy_sha") != imp_sha:
+        tracker["imported_legacy_sha"] = imp_sha
+        changed = True
+
     completed_map = tracker.setdefault("completed_attempts", {})
     for norm_dir, meta in union.get("discovered_entries", {}).items():
         existing = completed_map.get(norm_dir)
@@ -1980,16 +1994,31 @@ def _seed_tracker_from_union(
                 "seeded_from_fs": True,
             }
             changed = True
-    sha_counts: dict[str, int] = {}
-    for entry in completed_map.values():
-        if isinstance(entry, dict) and isinstance(entry.get("candidate_sha"), str):
-            sha_key = entry["candidate_sha"]
-            sha_counts[sha_key] = sha_counts.get(sha_key, 0) + 1
+
     inv_map = tracker.setdefault("sha_invocations", {})
-    for sha_key, cnt in sha_counts.items():
-        if int(inv_map.get(sha_key, 0)) < cnt:
-            inv_map[sha_key] = cnt
+    all_shas: set[str] = {str(k) for k in inv_map}
+    for sec in ("completed_attempts", "attempts", "in_flight"):
+        sec_map = tracker.get(sec)
+        if isinstance(sec_map, dict):
+            for ent in sec_map.values():
+                if isinstance(ent, dict) and isinstance(ent.get("candidate_sha"), str):
+                    all_shas.add(ent["candidate_sha"])
+    for sub in imp_sha.values():
+        all_shas.update(sub.keys())
+    for sha_key in sorted(all_shas):
+        target_cnt = len(task_runner._keyed_tracker_sha_dirs(tracker, sha_key)) + sum(
+            sub.get(sha_key, 0) for sub in imp_sha.values()
+        )
+        if int(inv_map.get(sha_key, 0)) < target_cnt:
+            inv_map[sha_key] = target_cnt
             changed = True
+
+    target_rounds = len(task_runner._native_tracker_round_dirs(tracker)) + sum(
+        imp_rounds.values()
+    )
+    if int(tracker.get("completed_rounds", 0)) < target_rounds:
+        tracker["completed_rounds"] = target_rounds
+        changed = True
     return changed
 
 
@@ -2021,7 +2050,13 @@ def _preflight_g4_caps(
     tracker_id = expected_root or args.task_id
     if ledger_path is not None and ledger_path.is_file():
         raw_ledger = task_runner._read_optional_json_dict(ledger_path)
-        if isinstance(raw_ledger, dict) and raw_ledger.get("root_task_id"):
+        if raw_ledger is None:
+            print(
+                f"[codex_room_review] BLOCKED: Invalid JSON in ledger.json at {ledger_path}.",
+                file=sys.stderr,
+            )
+            return 2, None, None
+        if raw_ledger.get("root_task_id"):
             bind_err = task_runner.validate_ledger_task_binding(
                 raw_ledger,
                 task_id=args.task_id,
@@ -2675,21 +2710,40 @@ def _record_g4_outcome(
             except (OSError, UnicodeDecodeError, ValueError, json.JSONDecodeError) as exc:
                 err_msg = f"Corrupt g4-tracker.json at {tracker_path}: {exc}"
                 report["review_gate_status"] = "BLOCKED"
-                report.setdefault("errors", []).append(err_msg)
+                if err_msg not in report.setdefault("errors", []):
+                    report["errors"].append(err_msg)
                 if ledger_path is not None and ledger_path.is_file():
+                    _bill_pass_raw_logs(
+                        ledger_path,
+                        out_dir=out_dir,
+                        states=states,
+                        reused_passes=reused_passes,
+                        active_backend=active_backend,
+                        active_model=active_model,
+                        primary_model=primary_model,
+                        route_models_by_tag=route_models_by_tag,
+                    )
                     ledger = task_runner.load_ledger(ledger_path, repo_root=git_top)
                     if reservation_id is not None:
                         ledger.setdefault("active_g4_reservations", {}).pop(
                             reservation_id, None
                         )
-                    ledger["state"] = "BLOCKED"
+                    spent = float(ledger.get("spent_api_equiv_usd", 0.0))
+                    limit = float(ledger.get("budget_limit_usd", 0.0))
+                    reserved = task_runner._active_reserved_usd(ledger)
+                    committed = round(spent + reserved, 8)
+                    ledger["state"] = (
+                        "PAUSED_BUDGET"
+                        if (limit > 0 and committed > round(limit, 8))
+                        else "BLOCKED"
+                    )
                     ledger["last_g4_candidate_sha"] = candidate_sha
                     ledger["last_g4_status"] = "BLOCKED"
                     task_runner._append_event(
                         ledger, "G4_TRACKER_CORRUPT_BLOCKED", {"error": err_msg}
                     )
                     task_runner.save_ledger(ledger_path, ledger)
-                    return "BLOCKED"
+                    return str(ledger["state"])
                 return None
             prior_union = task_runner.collect_g4_attempt_union(
                 attempt_roots, tracker, candidate_sha=candidate_sha
@@ -3426,6 +3480,14 @@ def _execute_after_preflight(
         report["pass2_model"] = states["pass2"].model
         report["reused_passes"] = list(reused_passes)
         report["exhausted_quota_pools"] = list(exhausted_quota_pools)
+        if active_tracker_path is not None and active_tracker_path.is_file():
+            try:
+                task_runner.load_g4_tracker(active_tracker_path)
+            except (OSError, UnicodeDecodeError, ValueError, json.JSONDecodeError) as exc:
+                err_msg = f"Corrupt g4-tracker.json at {active_tracker_path}: {exc}"
+                report["review_gate_status"] = "BLOCKED"
+                if err_msg not in report["errors"]:
+                    report["errors"].append(err_msg)
         if not _write_once_outputs(out_dir, report):
             return 2
 
