@@ -886,17 +886,12 @@ def probe_codex_rate_limits(
         return None
     finally:
         if proc is not None:
-            if proc.stdin is not None:
-                try:
-                    proc.stdin.close()
-                except OSError:
-                    pass
             try:
                 terminate_process_tree(proc, job_handle=job_handle)
                 job_handle = None
             except OSError:
                 pass
-            for stream in (proc.stdout, proc.stderr):
+            for stream in (proc.stdin, proc.stdout, proc.stderr):
                 if stream is not None:
                     try:
                         stream.close()

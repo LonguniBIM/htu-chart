@@ -191,6 +191,13 @@ def test_consolidate_passes_only_when_both_passes_clear_blocking_findings() -> N
 
 
 def _write_fake_codex_script(script_path: Path, body: str) -> list[str]:
+    if "app-server" not in body and "time.sleep(60)" not in body:
+        body = (
+            "import sys as _sys\n"
+            "if _sys.argv[1:2] == ['app-server']:\n"
+            "    _sys.exit(0)\n"
+            + body
+        )
     script_path.write_text(body, encoding="utf-8")
     return [sys.executable, "-u", str(script_path)]
 
@@ -5902,6 +5909,30 @@ def test_g4_ledgerless_edited_packet_same_version_stays_blocked_until_version_bu
     )
     assert rc5 == 0
     assert _count_calls(calls5) == 2
+
+
+def test_probe_codex_rate_limits_terminates_process_before_stdin_eof(tmp_path: Path) -> None:
+    """probe_codex_rate_limits kills child tree before closing stdin so EOF cannot wake it."""
+    raced_flag = tmp_path / "raced_eof.flag"
+    script = tmp_path / "raw_stdin_blocking_probe.py"
+    script.write_text(
+        (
+            "import pathlib, sys\n"
+            "_ = sys.stdin.read()\n"
+            f"pathlib.Path({str(raced_flag)!r}).write_text('raced', encoding='utf-8')\n"
+        ),
+        encoding="utf-8",
+    )
+    rt_dir = tmp_path / "rt_eof_probe"
+    rt_dir.mkdir(parents=True)
+    res = codex_room_review.probe_codex_rate_limits(
+        [sys.executable, "-u", str(script)],
+        rt_dir,
+        init_timeout_sec=0.2,
+        read_timeout_sec=0.2,
+    )
+    assert res is None
+    assert not raced_flag.exists()
 
 
 
