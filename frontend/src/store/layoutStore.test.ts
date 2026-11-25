@@ -634,4 +634,23 @@ describe("useLayoutStore (Phase 3 Part 2)", () => {
       expect.any(AbortSignal),
     );
   });
+
+  it("keeps dirty === false and draftRevision unchanged when setTemplate is called with already active template (P1-002)", () => {
+    /**
+     * Contract: Calling setTemplate(activeLayout.template_id) when activeLayout already uses
+     * that template with matching pane count is a no-op that preserves dirty === false and
+     * draftRevision.
+     * Defect caught: Re-selecting the active template marking a clean layout dirty or bumping draftRevision.
+     */
+    const base = makeFourPaneLayout();
+    useLayoutStore.getState().hydrateLayouts([base]);
+    const initialRevision = useLayoutStore.getState().draftRevision;
+    expect(useLayoutStore.getState().dirty).toBe(false);
+
+    useLayoutStore.getState().setTemplate(base.template_id);
+    expect(useLayoutStore.getState().dirty).toBe(false);
+    expect(useLayoutStore.getState().draftRevision).toBe(initialRevision);
+    expect(useLayoutStore.getState().activeLayout?.template_id).toBe(base.template_id);
+    expect(useLayoutStore.getState().activeLayout?.panes).toHaveLength(4);
+  });
 });

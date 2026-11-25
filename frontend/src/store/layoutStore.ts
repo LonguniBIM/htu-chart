@@ -254,6 +254,12 @@ export const useLayoutStore = create<LayoutStoreState>((set, get) => ({
       return;
     }
     const targetCount = LAYOUT_TEMPLATE_PANE_COUNTS[templateId];
+    if (
+      activeLayout.template_id === templateId &&
+      activeLayout.panes.length === targetCount
+    ) {
+      return;
+    }
     const nextArchive: Record<string, PaneConfig> = { ...paneArchive };
     const nextArchiveBySlot: Record<number, PaneConfig> = { ...paneArchiveBySlot };
     activeLayout.panes.forEach((pane, idx) => {

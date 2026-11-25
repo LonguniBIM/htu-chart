@@ -2537,6 +2537,131 @@ describe("App bootstrap and R03 503 recovery (P1-R3-03, P1-R3-04, P2-005)", () =
     expect(screen.getByText("CON.F.US.MES.LIVE")).toBeTruthy();
     expect(screen.getByText("CON.F.US.MNQ.SIM")).toBeTruthy();
   });
+
+  it("clears per-controller in-flight tracking when layout switch aborts so subsequent Live activation re-fetches and resolves contractId (P1-001, P2-001)", async () => {
+    /**
+     * Contract: Switching from Sim -> Live -> Sim aborts the pending Live fetchContracts controller
+     * and immediately clears its per-controller in-flight mode entry; subsequently deleting the Sim
+     * layout (activating Live) invokes fetchContracts(..., true) again and resolves the Live pane's
+     * contractId instead of leaking live=true in an in-flight Set forever.
+     * Defect caught: Aborted controller leaking modes in inFlightContractModesRef and stranding Unresolved panes.
+     */
+    const liveLayout: LayoutRecord = {
+      ...SAMPLE_LAYOUT,
+      id: "layout-live",
+      name: "Live MNQ",
+      is_default: false,
+      panes: [
+        {
+          pane_id: "pane-live",
+          root_symbol: "MNQ",
+          timeframe: "5m",
+          live_mode: true,
+          playback_mode: "live",
+        },
+      ],
+    };
+
+    fetchSessionMock.mockResolvedValue({
+      authenticated: true,
+      csrf_token: "csrf-token-abort-race",
+    });
+    fetchStatusMock.mockResolvedValue({
+      connected: true,
+      live: true,
+      feed_state: "LIVE",
+    });
+    listLayoutsMock
+      .mockResolvedValueOnce([SAMPLE_LAYOUT, liveLayout])
+      .mockResolvedValueOnce([{ ...liveLayout, is_default: true }]);
+    deleteLayoutMock.mockResolvedValueOnce({ deleted: true, id: "layout-1" });
+
+    let abortedLiveSignal: AbortSignal | undefined;
+    fetchContractsMock
+      .mockResolvedValueOnce({
+        live: false,
+        contracts: {
+          MES: { selected: { id: "CON.F.US.MES.SIM" }, error_type: null, error: null },
+        },
+      })
+      .mockImplementationOnce((_symbols, live, signal) => {
+        expect(live).toBe(true);
+        abortedLiveSignal = signal;
+        return new Promise<ContractsResponse>((_resolve, reject) => {
+          signal?.addEventListener("abort", () => {
+            reject(new DOMException("The operation was aborted.", "AbortError"));
+          });
+        });
+      })
+      .mockResolvedValueOnce({
+        live: true,
+        contracts: {
+          MNQ: { selected: { id: "CON.F.US.MNQ.LIVE" }, error_type: null, error: null },
+        },
+      });
+    fetchBarsMock.mockResolvedValue({
+      provider: "topstepx",
+      live: false,
+      contract_id: "CON.F.US.MES.SIM",
+      root_symbol: "MES",
+      timeframe: "5m",
+      start_time: 1000,
+      end_time: 1000,
+      count: 0,
+      include_partial: true,
+      quality: {
+        is_complete: true,
+        truncated: false,
+        provider_gap: false,
+        quarantined_count: 0,
+      },
+      bars: [],
+    });
+
+    render(<App />);
+    await act(async () => {
+      await flushMicrotasks();
+    });
+    expect(screen.getByText("CON.F.US.MES.SIM")).toBeTruthy();
+    expect(fetchContractsMock).toHaveBeenCalledTimes(1);
+
+    // Switch to Live layout -> starts pending fetchContracts(..., true)
+    await act(async () => {
+      fireEvent.change(screen.getByLabelText("Active layout"), {
+        target: { value: "layout-live" },
+      });
+      await flushMicrotasks();
+    });
+    expect(fetchContractsMock).toHaveBeenCalledTimes(2);
+    expect(abortedLiveSignal?.aborted).toBe(false);
+
+    // Switch back to Sim before Live settles -> aborts Live fetch
+    await act(async () => {
+      fireEvent.change(screen.getByLabelText("Active layout"), {
+        target: { value: "layout-1" },
+      });
+      await flushMicrotasks();
+    });
+    expect(abortedLiveSignal?.aborted).toBe(true);
+    expect(fetchContractsMock).toHaveBeenCalledTimes(2);
+    expect(screen.getByText("CON.F.US.MES.SIM")).toBeTruthy();
+
+    // Delete Sim layout -> activates Live layout; Live contract fetch must run again and resolve
+    fireEvent.click(screen.getByRole("button", { name: "Layout picker" }));
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Delete Default Sim" }));
+      await flushMicrotasks();
+    });
+
+    expect(fetchContractsMock).toHaveBeenCalledTimes(3);
+    expect(fetchContractsMock).toHaveBeenNthCalledWith(
+      3,
+      ["MES", "MNQ", "MYM", "MGC"],
+      true,
+      expect.any(AbortSignal),
+    );
+    expect(screen.getByText("CON.F.US.MNQ.LIVE")).toBeTruthy();
+  });
 });
 
 function setupPreOpenWsIntegrationMocks(secondSessionError: ApiError) {

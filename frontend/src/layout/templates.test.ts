@@ -8,6 +8,23 @@ import {
 
 const GRID_SPAN_RE = /^(\d+)\s*\/\s*(\d+)$/;
 
+function parseGridSpan(span: string): [number, number] {
+  const match = GRID_SPAN_RE.exec(span);
+  expect(match).not.toBeNull();
+  const start = Number(match![1]);
+  const end = Number(match![2]);
+  expect(start).toBeGreaterThanOrEqual(1);
+  expect(end).toBeGreaterThan(start);
+  return [start, end];
+}
+
+function rectsOverlap(
+  a: { x1: number; x2: number; y1: number; y2: number },
+  b: { x1: number; x2: number; y1: number; y2: number },
+): boolean {
+  return a.x1 < b.x2 && b.x1 < a.x2 && a.y1 < b.y2 && b.y1 < a.y2;
+}
+
 describe("Layout templates (Phase 3 Part 2)", () => {
   it("defines all 21 canonical LAYOUT_TEMPLATE_PANE_COUNTS templates with matching paneAreas and previewRects", () => {
     /**
@@ -74,5 +91,47 @@ describe("Layout templates (Phase 3 Part 2)", () => {
     }
     expect(total).toBe(21);
     expect(TEMPLATES_BY_PANE_COUNT[4]!.some((t) => t.id === "4-grid-2x2")).toBe(true);
+  });
+
+  it("ensures pairwise non-overlapping paneAreas and previewRects within all 21 templates", () => {
+    /**
+     * Contract: Within each of the 21 layout templates, no two paneAreas overlap in grid space
+     * and no two previewRects overlap in the 0..24 SVG viewBox.
+     * Defect caught: Overlapping grid track spans or colliding SVG preview rectangles.
+     */
+    expect(LAYOUT_TEMPLATES).toHaveLength(21);
+
+    for (const tpl of LAYOUT_TEMPLATES) {
+      const parsedAreas = tpl.paneAreas.map((area) => {
+        const [x1, x2] = parseGridSpan(area.gridColumn);
+        const [y1, y2] = parseGridSpan(area.gridRow);
+        return { x1, x2, y1, y2 };
+      });
+
+      for (let i = 0; i < parsedAreas.length; i += 1) {
+        for (let j = i + 1; j < parsedAreas.length; j += 1) {
+          expect(
+            rectsOverlap(parsedAreas[i]!, parsedAreas[j]!),
+            `paneAreas overlap in ${tpl.id} between pane ${i} and ${j}`,
+          ).toBe(false);
+        }
+      }
+
+      const parsedPreview = tpl.previewRects.map((rect) => ({
+        x1: rect.x,
+        x2: rect.x + rect.width,
+        y1: rect.y,
+        y2: rect.y + rect.height,
+      }));
+
+      for (let i = 0; i < parsedPreview.length; i += 1) {
+        for (let j = i + 1; j < parsedPreview.length; j += 1) {
+          expect(
+            rectsOverlap(parsedPreview[i]!, parsedPreview[j]!),
+            `previewRects overlap in ${tpl.id} between rect ${i} and ${j}`,
+          ).toBe(false);
+        }
+      }
+    }
   });
 });
