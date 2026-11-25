@@ -742,7 +742,7 @@ def probe_codex_rate_limits(
             errors="replace",
             bufsize=1,
         )
-    except OSError:
+    except (OSError, RuntimeError):
         return None
 
     def _pump_stdout() -> None:
@@ -818,7 +818,7 @@ def probe_codex_rate_limits(
         if not read_msg or not isinstance(read_msg.get("result"), dict):
             return None
         return read_msg["result"]
-    except OSError:
+    except (OSError, RuntimeError):
         return None
     finally:
         if proc is not None:
@@ -828,7 +828,8 @@ def probe_codex_rate_limits(
                 except OSError:
                     pass
             try:
-                terminate_process_tree(proc, job_handle)
+                terminate_process_tree(proc, job_handle=job_handle)
+                job_handle = None
             except OSError:
                 pass
             for stream in (proc.stdout, proc.stderr):
@@ -888,8 +889,22 @@ def evaluate_codex_window_exhaustion(
     secondary_used = _parse_rl_pct(_rl_field(secondary, "usedPercent", "used_percent"))
     secondary_resets = _rl_field(secondary, "resetsAt", "resets_at")
     rate_limit_type = _rl_field(bucket, "rateLimitReachedType", "rate_limit_reached_type")
+    if rate_limit_type is None:
+        rate_limit_type = _rl_field(
+            rate_limits_result, "rateLimitReachedType", "rate_limit_reached_type"
+        )
     spend_reached = _rl_field(bucket, "spendControlReached", "spend_control_reached")
+    if spend_reached is None:
+        spend_reached = _rl_field(
+            rate_limits_result, "spendControlReached", "spend_control_reached"
+        )
     ordinary_allowed = _rl_field(bucket, "ordinaryUsageAllowed", "ordinary_usage_allowed")
+    if ordinary_allowed is None:
+        ordinary_allowed = _rl_field(
+            rate_limits_result, "ordinaryUsageAllowed", "ordinary_usage_allowed"
+        )
+    if ordinary_allowed is not None:
+        sanitized["ordinaryUsageAllowed"] = ordinary_allowed
 
     if primary_used is not None and primary_used >= threshold_pct:
         reason = (
@@ -3579,7 +3594,11 @@ def _execute_after_preflight(
     if codex_prefix is not None and window_guard_enabled and any(
         not s.is_complete for s in states.values()
     ):
-        rl_result = probe_codex_rate_limits(codex_prefix, args.runtime_root)
+        probe_role = "pass1" if not states["pass1"].is_complete else "pass2"
+        probe_rt = args.runtime_root / f"topstep-review-{probe_role}"
+        if not probe_rt.is_dir():
+            probe_rt = args.runtime_root
+        rl_result = probe_codex_rate_limits(codex_prefix, probe_rt)
         rl_exhausted, rl_reason, rl_snapshot = evaluate_codex_window_exhaustion(
             rl_result, threshold_pct=window_exhausted_pct
         )

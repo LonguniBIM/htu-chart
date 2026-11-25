@@ -4163,16 +4163,20 @@ def test_codex_5h_window_exhausted_preflight_triggers_agy_fallback_and_strips_pi
     repo_dir, sha1 = _init_policy_repo(
         tmp_path / "repo_5h_guard", qualified_routes=["gemini-4-carbon-high"]
     )
-    exec_calls = tmp_path / "codex_exec_5h_calls.txt"
+    rt_root = tmp_path / "codex_rt_5h"
+    (rt_root / "topstep-review-pass1").mkdir(parents=True)
+    exec_calls = tmp_path / "codex_exec_5h_calls"
+    exec_calls.mkdir()
     pct_file = tmp_path / "codex_window_pct.txt"
     fake_codex = tmp_path / "fake_codex_app_server.py"
     codex_prefix = _write_fake_codex_script(
         fake_codex,
         (
-            "import json, pathlib, sys\n"
+            "import json, os, pathlib, sys\n"
             f"pct_p = pathlib.Path({str(pct_file)!r})\n"
-            f"exec_p = pathlib.Path({str(exec_calls)!r})\n"
+            f"exec_d = pathlib.Path({str(exec_calls)!r})\n"
             "if len(sys.argv) > 1 and sys.argv[1] == 'app-server':\n"
+            "    assert pathlib.Path(os.environ['CODEX_HOME']).name == 'topstep-review-pass1'\n"
             "    pct = float(pct_p.read_text(encoding='utf-8').strip())\n"
             "    for raw in sys.stdin:\n"
             "        raw = raw.strip()\n"
@@ -4195,10 +4199,9 @@ def test_codex_5h_window_exhausted_preflight_triggers_agy_fallback_and_strips_pi
             "            print(json.dumps({'jsonrpc': '2.0', 'id': mid, 'result': res}), "
             "flush=True)\n"
             "    sys.exit(0)\n"
-            "prev = exec_p.read_text(encoding='utf-8') if exec_p.is_file() else ''\n"
-            "exec_p.write_text(prev + 'exec\\n', encoding='utf-8')\n"
             "args = sys.argv[1:]\n"
             "out_path = pathlib.Path(args[args.index('-o') + 1])\n"
+            "(exec_d / f'{out_path.stem}.log').write_text('exec\\n', encoding='utf-8')\n"
             "lens = 'security_and_invariants' if out_path.name == 'pass2.json' "
             "else 'correctness_and_tests'\n"
             f"payload = {{'revision_sha': {sha1!r}, 'lens': lens, 'verdict': 'APPROVE', "
@@ -4241,6 +4244,8 @@ def test_codex_5h_window_exhausted_preflight_triggers_agy_fallback_and_strips_pi
         [
             "--commit",
             sha1,
+            "--runtime-root",
+            str(rt_root),
             "--repo-root",
             str(repo_dir),
             "--out-dir",
@@ -4250,7 +4255,7 @@ def test_codex_5h_window_exhausted_preflight_triggers_agy_fallback_and_strips_pi
         ]
     )
     assert rc_auto == 0
-    assert not exec_calls.exists()
+    assert _count_calls(exec_calls) == 0
     assert len(agy_calls.read_text(encoding="utf-8").splitlines()) == 2
     rep_auto = json.loads((out_auto / "consolidated-review.json").read_text(encoding="utf-8"))
     assert rep_auto["review_backend"] == "agy"
@@ -4268,6 +4273,8 @@ def test_codex_5h_window_exhausted_preflight_triggers_agy_fallback_and_strips_pi
         [
             "--commit",
             sha1,
+            "--runtime-root",
+            str(rt_root),
             "--repo-root",
             str(repo_dir),
             "--out-dir",
@@ -4277,7 +4284,7 @@ def test_codex_5h_window_exhausted_preflight_triggers_agy_fallback_and_strips_pi
         ]
     )
     assert rc_only == 2
-    assert not exec_calls.exists()
+    assert _count_calls(exec_calls) == 0
     assert not agy_calls.exists()
     rep_only = json.loads(
         (out_codex_only / "consolidated-review.json").read_text(encoding="utf-8")
@@ -4291,6 +4298,8 @@ def test_codex_5h_window_exhausted_preflight_triggers_agy_fallback_and_strips_pi
         [
             "--commit",
             sha1,
+            "--runtime-root",
+            str(rt_root),
             "--repo-root",
             str(repo_dir),
             "--out-dir",
@@ -4300,11 +4309,19 @@ def test_codex_5h_window_exhausted_preflight_triggers_agy_fallback_and_strips_pi
         ]
     )
     assert rc_ok == 0
-    assert len(exec_calls.read_text(encoding="utf-8").splitlines()) == 2
+    assert _count_calls(exec_calls) == 2
     assert not agy_calls.exists()
     rep_ok = json.loads((out_ok / "consolidated-review.json").read_text(encoding="utf-8"))
     assert rep_ok["review_backend"] == "codex"
     assert rep_ok["fallback_used"] is False
+
+    # Case 4: Top-level ordinaryUsageAllowed=False triggers codex_usage_disallowed cleanly.
+    disallowed, d_reason, d_snap = codex_room_review.evaluate_codex_window_exhaustion(
+        {"ordinaryUsageAllowed": False, "rateLimits": {"primary": {"usedPercent": 20}}}
+    )
+    assert disallowed is True
+    assert d_reason is not None and "codex_usage_disallowed" in d_reason
+    assert isinstance(d_snap, dict) and d_snap.get("ordinaryUsageAllowed") is False
 
 
 
