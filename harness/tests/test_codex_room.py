@@ -5306,6 +5306,269 @@ def test_codex_window_allowlist_coerces_wrong_typed_allowlisted_fields() -> None
     }
 
 
+def test_agy_auto_fallback_serializes_passes_while_codex_stays_parallel(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """agy fallback serializes passes by default while codex runs in parallel by default."""
+    repo_dir, sha1 = _init_policy_repo(
+        tmp_path / "repo_agy_seq", qualified_routes=["gemini-4-carbon-high"]
+    )
+    rt_root = tmp_path / "rt_agy_seq"
+    (rt_root / "topstep-review-pass1").mkdir(parents=True)
+    active_dir = tmp_path / "active_agy"
+    active_dir.mkdir()
+    pct_file = tmp_path / "pct_seq.txt"
+    pct_file.write_text("94.0", encoding="utf-8")
+
+    fake_codex = tmp_path / "fake_codex_seq.py"
+    codex_prefix = _write_fake_codex_script(
+        fake_codex,
+        (
+            "import json, pathlib, sys\n"
+            f"pct_p = pathlib.Path({str(pct_file)!r})\n"
+            "if sys.argv[1:2] == ['app-server']:\n"
+            "    pct = float(pct_p.read_text(encoding='utf-8').strip())\n"
+            "    for raw in sys.stdin:\n"
+            "        raw = raw.strip()\n"
+            "        if not raw: continue\n"
+            "        msg = json.loads(raw)\n"
+            "        mid, method = msg.get('id'), msg.get('method')\n"
+            "        if method == 'initialize':\n"
+            "            print(json.dumps({'jsonrpc': '2.0', 'id': mid, 'result': {}}), "
+            "flush=True)\n"
+            "        elif method == 'account/rateLimits/read':\n"
+            "            res = {'rateLimits': {'primary': {'usedPercent': pct}}}\n"
+            "            print(json.dumps({'jsonrpc': '2.0', 'id': mid, 'result': res}), "
+            "flush=True)\n"
+            "    sys.exit(0)\n"
+            "args = sys.argv[1:]\n"
+            "out_path = pathlib.Path(args[args.index('-o') + 1])\n"
+            "lens = 'security_and_invariants' if out_path.name == 'pass2.json' "
+            "else 'correctness_and_tests'\n"
+            f"payload = {{'revision_sha': {sha1!r}, 'lens': lens, 'verdict': 'APPROVE', "
+            "'summary': 'codex ok', 'findings': [], 'test_quality_issues': [], "
+            "'unverified_areas': []}\n"
+            "out_path.write_text(json.dumps(payload), encoding='utf-8')\n"
+        ),
+    )
+
+    max_file = tmp_path / "max_active.txt"
+    fake_agy = tmp_path / "fake_agy_seq.py"
+    agy_prefix = _write_fake_codex_script(
+        fake_agy,
+        (
+            "import json, pathlib, sys, time\n"
+            f"ad = pathlib.Path({str(active_dir)!r})\n"
+            f"mf = pathlib.Path({str(max_file)!r})\n"
+            "args = sys.argv[1:]\n"
+            "prompt = args[args.index('-p') + 1]\n"
+            "lens = 'security_and_invariants' if 'security_and_invariants' in prompt "
+            "else 'correctness_and_tests'\n"
+            "lock = ad / f'{lens}.active'\n"
+            "lock.write_text('1', encoding='utf-8')\n"
+            "try:\n"
+            "    cur = len(list(ad.glob('*.active')))\n"
+            "    prev = int(mf.read_text(encoding='utf-8')) if mf.is_file() else 0\n"
+            "    mf.write_text(str(max(prev, cur)), encoding='utf-8')\n"
+            "    time.sleep(0.08)\n"
+            "finally:\n"
+            "    lock.unlink(missing_ok=True)\n"
+            f"payload = {{'revision_sha': {sha1!r}, 'lens': lens, 'verdict': 'APPROVE', "
+            "'summary': 'agy ok', 'findings': [], 'test_quality_issues': [], "
+            "'unverified_areas': []}\n"
+            "print(json.dumps({'event': 'result', "
+            "'result': {'status': 'SUCCESS', 'structured_output': payload}}), flush=True)\n"
+        ),
+    )
+
+    seq_calls: list[bool] = []
+    orig_exec = codex_room_review._execute_two_passes
+
+    def _spy_exec(fn, k1, k2, *, sequential=False):
+        seq_calls.append(bool(sequential))
+        return orig_exec(fn, k1, k2, sequential=sequential)
+
+    monkeypatch.setattr(
+        codex_room_review, "verify_role", lambda role, root: {"ok": True, "errors": []}
+    )
+    monkeypatch.setattr(codex_room_review, "resolve_codex_command", lambda: codex_prefix)
+    monkeypatch.setattr(codex_room_review, "resolve_agy_command", lambda: agy_prefix)
+    monkeypatch.setattr(codex_room_review, "_execute_two_passes", _spy_exec)
+
+    rc_auto = codex_room_review.main(
+        [
+            "--commit",
+            sha1,
+            "--runtime-root",
+            str(rt_root),
+            "--repo-root",
+            str(repo_dir),
+            "--out-dir",
+            str(tmp_path / "out_auto_seq"),
+            "--backend",
+            "auto",
+        ]
+    )
+    assert rc_auto == 0
+    assert int(max_file.read_text(encoding="utf-8")) == 1
+    assert seq_calls[-1] is True
+
+    pct_file.write_text("10.0", encoding="utf-8")
+    rc_codex = codex_room_review.main(
+        [
+            "--commit",
+            sha1,
+            "--runtime-root",
+            str(rt_root),
+            "--repo-root",
+            str(repo_dir),
+            "--out-dir",
+            str(tmp_path / "out_codex_par"),
+            "--backend",
+            "codex",
+        ]
+    )
+    assert rc_codex == 0
+    assert seq_calls[-1] is False
+
+
+def test_agy_plain_text_stderr_zero_token_startup_race_retries_archives_and_degrades(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Plain-text 0-token agy stderr race retries once, archives stderr, or BLOCKED_INFRA."""
+    repo_dir, sha1 = _init_policy_repo(
+        tmp_path / "repo_agy_stderr_race", qualified_routes=["gemini-4-carbon-high"]
+    )
+    fail_forever = tmp_path / "fail_forever.flag"
+    calls_dir = tmp_path / "agy_stderr_calls"
+    calls_dir.mkdir()
+    fake_agy = tmp_path / "fake_agy_stderr_race.py"
+    agy_prefix = _write_fake_codex_script(
+        fake_agy,
+        (
+            "import json, pathlib, sys\n"
+            f"cd = pathlib.Path({str(calls_dir)!r})\n"
+            f"ff = pathlib.Path({str(fail_forever)!r})\n"
+            "args = sys.argv[1:]\n"
+            "prompt = args[args.index('-p') + 1]\n"
+            "lens = 'security_and_invariants' if 'security_and_invariants' in prompt "
+            "else 'correctness_and_tests'\n"
+            "lf = cd / f'{lens}.log'\n"
+            "prev = lf.read_text(encoding='utf-8') if lf.is_file() else ''\n"
+            "seen = len(prev.splitlines())\n"
+            "lf.write_text(prev + 'call\\n', encoding='utf-8')\n"
+            "if ff.is_file() or (lens == 'correctness_and_tests' and seen == 0):\n"
+            "    sys.stderr.write("
+            "'error: failed to start conversation: backend returned an empty conversation id\\n')\n"
+            "    sys.exit(1)\n"
+            f"payload = {{'revision_sha': {sha1!r}, 'lens': lens, 'verdict': 'APPROVE', "
+            "'summary': 'agy ok', 'findings': [], 'test_quality_issues': [], "
+            "'unverified_areas': []}\n"
+            "print(json.dumps({'event': 'result', "
+            "'result': {'status': 'SUCCESS', 'structured_output': payload}}), flush=True)\n"
+        ),
+    )
+    monkeypatch.setattr(codex_room_review, "resolve_agy_command", lambda: agy_prefix)
+
+    out_ok = tmp_path / "out_stderr_recover"
+    rc_ok = codex_room_review.main(
+        [
+            "--commit",
+            sha1,
+            "--repo-root",
+            str(repo_dir),
+            "--out-dir",
+            str(out_ok),
+            "--backend",
+            "agy",
+        ]
+    )
+    assert rc_ok == 0
+    retry_logs = list(out_ok.glob("pass1.*retry0*.stderr.log"))
+    assert len(retry_logs) == 1
+    assert "empty conversation id" in retry_logs[0].read_text(encoding="utf-8")
+
+    fail_forever.write_text("1", encoding="utf-8")
+    out_inf = tmp_path / "out_stderr_blocked_infra"
+    rc_inf = codex_room_review.main(
+        [
+            "--commit",
+            sha1,
+            "--repo-root",
+            str(repo_dir),
+            "--out-dir",
+            str(out_inf),
+            "--backend",
+            "agy",
+        ]
+    )
+    assert rc_inf == 2
+    rep_inf = json.loads((out_inf / "consolidated-review.json").read_text(encoding="utf-8"))
+    assert rep_inf["review_gate_status"] == "BLOCKED_INFRA"
+    assert len(list(out_inf.glob("pass1.*retry0*.stderr.log"))) == 1
+
+
+def test_classify_agy_failure_rejects_nonzero_or_bool_tokens_with_startup_stderr(
+    tmp_path: Path,
+) -> None:
+    """Non-zero or bool token counts with startup stderr classify as SCHEMA_OR_POLICY."""
+    stderr_msg = (
+        "error: failed to start conversation: backend returned an empty conversation id\n"
+    )
+    for idx, raw_content in enumerate(
+        (
+            json.dumps({"usage": {"input_tokens": 12}}) + "\n",
+            json.dumps(
+                {
+                    "event": "result",
+                    "result": {
+                        "status": "ERROR",
+                        "error": "failed to start conversation",
+                        "usage": {"total_tokens": 42},
+                    },
+                }
+            )
+            + "\n",
+            json.dumps(
+                {
+                    "event": "result",
+                    "result": {
+                        "status": "ERROR",
+                        "error": "failed to start conversation",
+                        "usage": {"total_tokens": False},
+                    },
+                }
+            )
+            + "\n",
+        ),
+        start=1,
+    ):
+        d = tmp_path / f"neg_tok_{idx}"
+        d.mkdir()
+        (d / "pass1.raw.jsonl").write_text(raw_content, encoding="utf-8")
+        (d / "pass1.stderr.log").write_text(stderr_msg, encoding="utf-8")
+        failure = codex_room_review.classify_agy_failure(d, "pass1", returncode=1)
+        assert failure.category == codex_room_review.OUTCOME_SCHEMA_OR_POLICY
+
+    # Structured JSON error on stderr with 0 tokens still triggers OUTCOME_TRANSIENT.
+    d_json_err = tmp_path / "json_stderr_startup"
+    d_json_err.mkdir()
+    (d_json_err / "pass1.raw.jsonl").write_text("", encoding="utf-8")
+    (d_json_err / "pass1.stderr.log").write_text(
+        json.dumps(
+            {
+                "error_code": 500,
+                "short_error": "failed to start conversation: empty conversation id",
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    f_json = codex_room_review.classify_agy_failure(d_json_err, "pass1", returncode=1)
+    assert f_json.category == codex_room_review.OUTCOME_TRANSIENT
+
+
+
 
 
 

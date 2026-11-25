@@ -428,6 +428,41 @@ def _extract_agy_result_errors(raw_jsonl_text: str) -> list[dict[str, Any]]:
     return results
 
 
+def _agy_raw_has_nonzero_or_bad_usage(raw_text: str) -> bool:
+    """Return True if raw AGY JSONL records any >0 token count or malformed token value."""
+    usage_keys = (
+        "input_tokens",
+        "cache_read_tokens",
+        "cached_input_tokens",
+        "output_tokens",
+        "total_tokens",
+    )
+    for line in raw_text.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        try:
+            ev = json.loads(stripped)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(ev, dict):
+            continue
+        res = ev.get("result") if isinstance(ev.get("result"), dict) else None
+        usage = (
+            res.get("usage")
+            if (res and isinstance(res.get("usage"), dict))
+            else ev.get("usage")
+        )
+        if not isinstance(usage, dict):
+            continue
+        for key in usage_keys:
+            if key in usage:
+                val = usage[key]
+                if not is_strict_int(val) or val != 0:
+                    return True
+    return False
+
+
 def classify_agy_failure(
     out_dir: Path,
     pass_name: str,
@@ -505,6 +540,12 @@ def classify_agy_failure(
     if has_watchdog:
         return PassFailure(OUTCOME_SCHEMA_OR_POLICY, f"{pass_name}: watchdog timeout")
 
+    _, _, r_in, r_cache, r_out = _extract_agy_cumulative_usage(raw_path)
+    zero_raw_tokens = (
+        (r_in + r_cache + r_out) == 0 and not _agy_raw_has_nonzero_or_bad_usage(raw_text)
+    )
+    stderr_norm = _norm_provider_text(stderr_provider)
+
     for res in result_errors:
         usage = res.get("usage") if isinstance(res.get("usage"), dict) else {}
         total_tokens = usage.get("total_tokens")
@@ -514,8 +555,14 @@ def classify_agy_failure(
         retry_sec = _parse_retry_after_value(
             res.get("retry_after_sec") or res.get("retry_after")
         ) or _extract_retry_after_from_text(err_blob)
-        if total_tokens == 0 and (
-            "failed to start conversation" in err_blob or "empty conversation id" in err_blob
+        if (
+            is_strict_int(total_tokens)
+            and total_tokens == 0
+            and zero_raw_tokens
+            and (
+                "failed to start conversation" in err_blob
+                or "empty conversation id" in err_blob
+            )
         ):
             return PassFailure(
                 OUTCOME_TRANSIENT,
@@ -539,6 +586,19 @@ def classify_agy_failure(
             obj.get("retry_after_sec") or obj.get("retry_after") or obj.get("retryAfterSec")
         ) or _extract_retry_after_from_text(short_err)
         if (
+            not result_errors
+            and zero_raw_tokens
+            and (
+                "failed to start conversation" in short_err
+                or "empty conversation id" in short_err
+            )
+        ):
+            return PassFailure(
+                OUTCOME_TRANSIENT,
+                f"agy_transient_startup ({pass_name}.stderr.log: 0-token startup race)",
+                retry_after_sec=retry_sec,
+            )
+        if (
             code in {429, 502, 503, 504}
             or status in {"UNAVAILABLE", "DEADLINE_EXCEEDED"}
             or AGY_TRANSIENT_RE.search(short_err)
@@ -548,6 +608,20 @@ def classify_agy_failure(
                 f"agy_transient_error ({pass_name}.stderr.log: status={status} code={code})",
                 retry_after_sec=retry_sec,
             )
+
+    if (
+        not result_errors
+        and zero_raw_tokens
+        and (
+            "failed to start conversation" in stderr_norm
+            or "empty conversation id" in stderr_norm
+        )
+    ):
+        return PassFailure(
+            OUTCOME_TRANSIENT,
+            f"agy_transient_startup ({pass_name}.stderr.log: 0-token startup race)",
+            retry_after_sec=_extract_retry_after_from_text(stderr_provider),
+        )
 
     if AGY_TRANSIENT_RE.search(stderr_provider):
         return PassFailure(
@@ -3604,7 +3678,7 @@ def _execute_after_preflight(
                 runner,
                 kwargs_by_pass[target_passes[0]],
                 kwargs_by_pass[target_passes[1]],
-                sequential=args.sequential,
+                sequential=(args.sequential or backend_name == "agy"),
             )
             results[target_passes[0]] = r1
             results[target_passes[1]] = r2
