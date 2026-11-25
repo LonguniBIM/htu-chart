@@ -333,8 +333,8 @@ def test_run_codex_pass_enforces_hard_total_timeout_cap(tmp_path: Path) -> None:
 
 def test_codex_room_review_parser_defaults_enable_parallel_and_idle_watchdog() -> None:
     args = _build_parser().parse_args([])
-    assert args.timeout == 1200.0
-    assert args.idle_timeout == 180.0
+    assert args.timeout == 1800.0
+    assert args.idle_timeout == 270.0
     assert args.sequential is False
     assert args.backend == "auto"
     assert args.fallback_model is None
@@ -6520,6 +6520,116 @@ def test_g4_lock_loser_does_not_bill_foreign_raw_logs_on_abort(
     assert ledger_b["active_g4_reservations"] == {}
     assert tracker_b["in_flight"] == {}
     assert task_runner._norm_attempt_dir(shared_out_dir) not in tracker_b["completed_attempts"]
+
+
+def test_codex_room_review_raises_timeouts_50pct_and_caps_agy_idle(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Default CLI uses +50% timeouts (1800/270 Codex, 1800/630 AGY) & caps AGY idle."""
+    repo_dir, sha1 = _init_policy_repo(
+        tmp_path / "repo_50pct_timeouts", qualified_routes=["gemini-4-carbon-high"]
+    )
+    codex_seen: list[tuple[float, float]] = []
+    agy_seen: list[tuple[float, float]] = []
+
+    def _spy_codex(**kwargs: Any) -> dict[str, Any]:
+        codex_seen.append((float(kwargs["timeout_sec"]), float(kwargs["idle_timeout_sec"])))
+        pass_name = str(kwargs["pass_name"])
+        lens = "security_and_invariants" if pass_name == "pass2" else "correctness_and_tests"
+        return _sample_pass(sha1, lens)
+
+    def _spy_agy(**kwargs: Any) -> dict[str, Any]:
+        agy_seen.append((float(kwargs["timeout_sec"]), float(kwargs["idle_timeout_sec"])))
+        pass_name = str(kwargs["pass_name"])
+        lens = "security_and_invariants" if pass_name == "pass2" else "correctness_and_tests"
+        return _sample_pass(sha1, lens)
+
+    monkeypatch.setattr(
+        codex_room_review, "verify_role", lambda role, root, **_kw: {"ok": True, "errors": []}
+    )
+    monkeypatch.setattr(codex_room_review, "resolve_codex_command", lambda: ["codex"])
+    monkeypatch.setattr(codex_room_review, "resolve_agy_command", lambda: ["agy"])
+    monkeypatch.setattr(
+        codex_room_review, "probe_codex_rate_limits", lambda *a, **kw: None
+    )
+    monkeypatch.setattr(codex_room_review, "_run_codex_pass", _spy_codex)
+    monkeypatch.setattr(codex_room_review, "_run_agy_pass", _spy_agy)
+
+    assert (
+        codex_room_review.main(
+            [
+                "--commit",
+                sha1,
+                "--repo-root",
+                str(repo_dir),
+                "--out-dir",
+                str(tmp_path / "out_codex_def"),
+                "--backend",
+                "codex",
+            ]
+        )
+        == 0
+    )
+    assert (
+        codex_room_review.main(
+            [
+                "--commit",
+                sha1,
+                "--repo-root",
+                str(repo_dir),
+                "--out-dir",
+                str(tmp_path / "out_agy_def"),
+                "--backend",
+                "agy",
+            ]
+        )
+        == 0
+    )
+    assert (
+        codex_room_review.main(
+            [
+                "--commit",
+                sha1,
+                "--repo-root",
+                str(repo_dir),
+                "--out-dir",
+                str(tmp_path / "out_agy_cap"),
+                "--backend",
+                "agy",
+                "--timeout",
+                "400",
+                "--idle-timeout",
+                "270",
+            ]
+        )
+        == 0
+    )
+    assert (
+        codex_room_review.main(
+            [
+                "--commit",
+                sha1,
+                "--repo-root",
+                str(repo_dir),
+                "--out-dir",
+                str(tmp_path / "out_agy_fast"),
+                "--backend",
+                "agy",
+                "--idle-timeout",
+                "5",
+            ]
+        )
+        == 0
+    )
+
+    codex_kw = codex_seen[0]
+    agy_kw = agy_seen[0]
+    agy_capped_kw = agy_seen[2]
+    agy_fast_kw = agy_seen[4]
+    assert codex_kw == (1800.0, 270.0)
+    assert agy_kw == (1800.0, 630.0)
+    assert agy_capped_kw == (400.0, 400.0)
+    assert agy_fast_kw == (1800.0, 5.0)
 
 
 

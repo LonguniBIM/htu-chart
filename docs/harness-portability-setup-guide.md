@@ -918,9 +918,10 @@ SUMMARY: <1-3 sentence technical summary and test evidence>
       "peer_round": 600,
       "verifier_step": 180,
       "verifier_total": 420,
-      "reviewer_pass_total": 600,
-      "reviewer_pass_idle": 180,
-      "root_task_wall_clock": 3600
+      "reviewer_pass_total": 900,
+      "reviewer_pass_idle": 270,
+      "reviewer_agy_pass_idle": 630,
+      "root_task_wall_clock": 5400
     }
   }
 }

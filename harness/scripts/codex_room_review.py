@@ -85,6 +85,9 @@ PROMPTS_DIR = CODEX_ROOM_DIR / "prompts"
 
 DEFAULT_AGY_FALLBACK_MODEL = "claude-opus-5-5-medium"
 AGY_INLINE_PROMPT_CHAR_LIMIT = 16000
+DEFAULT_PASS_TIMEOUT_SEC = 1800.0
+DEFAULT_CODEX_IDLE_TIMEOUT_SEC = 270.0
+DEFAULT_AGY_IDLE_TIMEOUT_SEC = 630.0
 
 OUTCOME_AUTH_ERROR = "AUTH_ERROR"
 OUTCOME_CONFIRMED_QUOTA = "CONFIRMED_QUOTA_EXHAUSTED"
@@ -1711,7 +1714,7 @@ def _run_codex_pass(
     pass_name: str,
     model: str | None,
     timeout_sec: float,
-    idle_timeout_sec: float = 180.0,
+    idle_timeout_sec: float = DEFAULT_CODEX_IDLE_TIMEOUT_SEC,
 ) -> dict[str, Any] | None:
     pass_json = out_dir / f"{pass_name}.json"
     raw_jsonl = out_dir / f"{pass_name}.raw.jsonl"
@@ -1790,7 +1793,7 @@ def _run_agy_pass(
     pass_name: str,
     model: str,
     timeout_sec: float,
-    idle_timeout_sec: float = 180.0,
+    idle_timeout_sec: float = DEFAULT_AGY_IDLE_TIMEOUT_SEC,
 ) -> dict[str, Any] | None:
     """Run one isolated read-only review pass via Antigravity CLI (`agy`)."""
     pass_json = out_dir / f"{pass_name}.json"
@@ -1908,16 +1911,16 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--timeout",
         type=float,
-        default=1200.0,
-        help="Hard wall-clock safety ceiling per pass in seconds (0 disables). Default: 1200.",
+        default=DEFAULT_PASS_TIMEOUT_SEC,
+        help="Hard wall-clock safety ceiling per pass in seconds (0 disables). Default: 1800.",
     )
     parser.add_argument(
         "--idle-timeout",
         type=float,
-        default=180.0,
+        default=DEFAULT_CODEX_IDLE_TIMEOUT_SEC,
         help=(
             "Inactivity watchdog timeout per pass in seconds; resets on stdout/stderr "
-            "activity (0 disables). Default: 180."
+            "activity (0 disables). Default: 270 (630 for agy)."
         ),
     )
     parser.add_argument(
@@ -3971,6 +3974,16 @@ def _execute_after_preflight(
                 before_status = _git_output(git_top, ["status", "--porcelain"]).stdout
             except TimeoutError as exc:
                 return {p: None for p in target_passes}, f"Read-only check failed: {exc}"
+            if args.idle_timeout <= 0:
+                eff_agy_idle = 0.0
+            elif args.idle_timeout >= 180.0:
+                eff_agy_idle = max(float(args.idle_timeout), DEFAULT_AGY_IDLE_TIMEOUT_SEC)
+                if args.timeout > 0:
+                    eff_agy_idle = min(eff_agy_idle, float(args.timeout))
+            else:
+                eff_agy_idle = float(args.idle_timeout)
+        else:
+            eff_agy_idle = float(args.idle_timeout)
 
         kwargs_by_pass: dict[str, dict[str, Any]] = {}
         for pass_name in target_passes:
@@ -4002,7 +4015,7 @@ def _execute_after_preflight(
                     "pass_name": pass_name,
                     "model": model_name,
                     "timeout_sec": args.timeout,
-                    "idle_timeout_sec": args.idle_timeout,
+                    "idle_timeout_sec": eff_agy_idle,
                 }
 
         runner = _run_codex_pass if backend_name == "codex" else _run_agy_pass

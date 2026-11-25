@@ -488,7 +488,7 @@ def test_wall_clock_deadline_and_managed_subprocess_timeout(tmp_path: Path) -> N
         base_sha=base_sha,
         budget_usd=6.0,
     )
-    ledger["created_at_utc"] = (datetime.now(UTC) - timedelta(seconds=4000)).isoformat()
+    ledger["created_at_utc"] = (datetime.now(UTC) - timedelta(seconds=6000)).isoformat()
     task_runner.save_ledger(ledger_path, ledger)
 
     ok, l_exp, rc_exp, _ = task_runner.check_dispatch(
@@ -834,7 +834,7 @@ def test_p1_001_003_004_005_006_007_hardening(
     assert "--strict-clean" in ver_cmd and "--commit" in ver_cmd
     assert "--repo-root" in rev_cmd and "--base" in rev_cmd
     assert "--timeout" in rev_cmd and "--idle-timeout" in rev_cmd
-    assert rev_timeout >= 1260.0
+    assert rev_timeout >= 5520.0
     assert "--task-manifest" in rec_cmd and "--candidate-sha" in rec_cmd
 
 
@@ -1843,7 +1843,7 @@ def test_g4_retry_count_matches_ledger_override_across_wrapper_and_reviewer(
     rep_wrap = json.loads((out_wrap / "consolidated-review.json").read_text(encoding="utf-8"))
     led_wrap_after = task_runner.load_ledger(wrap_ledger_path)
     assert proc.returncode == 2
-    assert seen_wrap_timeouts == [pytest.approx(1920.0)]
+    assert seen_wrap_timeouts == [pytest.approx(2820.0)]
     assert "--max-transient-retries" in seen_wrap_cmds[0]
     idx_flag = seen_wrap_cmds[0].index("--max-transient-retries")
     assert seen_wrap_cmds[0][idx_flag + 1] == "0"

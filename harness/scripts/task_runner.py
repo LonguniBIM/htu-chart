@@ -58,9 +58,9 @@ DEFAULT_DEADLINES_SEC: dict[str, int] = {
     "peer_round": 600,
     "verifier_step": 180,
     "verifier_total": 420,
-    "reviewer_pass_total": 600,
-    "reviewer_pass_idle": 180,
-    "root_task_wall_clock": 3600,
+    "reviewer_pass_total": 900,
+    "reviewer_pass_idle": 270,
+    "root_task_wall_clock": 5400,
 }
 
 DEFAULT_CIRCUIT_BREAKERS: dict[str, int] = {
@@ -1270,8 +1270,8 @@ def run_review_gate_step(
             disk_ledger = None
     cfg_ledger = ledger if isinstance(ledger, dict) else disk_ledger
     deadlines = (cfg_ledger or {}).get("deadlines_sec", DEFAULT_DEADLINES_SEC)
-    pass_total = int(deadlines.get("reviewer_pass_total", 600))
-    pass_idle = int(deadlines.get("reviewer_pass_idle", 180))
+    pass_total = int(deadlines.get("reviewer_pass_total", 900))
+    pass_idle = int(deadlines.get("reviewer_pass_idle", 270))
     effective_base = base_sha or (str(cfg_ledger.get("base_sha", "")) if cfg_ledger else "")
     cb_cfg = cfg_ledger.get("circuit_breakers") if isinstance(cfg_ledger, dict) else None
     raw_retries = (
@@ -1719,7 +1719,7 @@ def _check_dispatch_locked(
     current_time = now_utc or _now_utc()
     created_at = datetime.fromisoformat(str(ledger["created_at_utc"]))
     elapsed_sec = (current_time - created_at).total_seconds()
-    wall_limit = float(ledger["deadlines_sec"].get("root_task_wall_clock", 3600))
+    wall_limit = float(ledger["deadlines_sec"].get("root_task_wall_clock", 5400))
     if elapsed_sec > wall_limit:
         ledger["state"] = "PAUSED_BUDGET"
         msg = f"Root task wall-clock deadline exceeded ({elapsed_sec:.1f}s > {wall_limit:.1f}s)."
