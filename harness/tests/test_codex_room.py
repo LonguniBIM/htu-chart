@@ -9,6 +9,7 @@ import subprocess
 import sys
 import tomllib
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -3569,6 +3570,69 @@ def test_g4_rejects_resume_from_missing_consolidated_review(
     assert rc_nolog == 2
     assert _count_calls(calls) == 0
 
+    # Zero prior SHA invocations: empty tracker (effective_sha == 0) must still fail closed.
+    out_zero_nolog = tmp_path / "out_res_zero_nolog"
+    rc_zero_nolog = codex_room_review.main(
+        [
+            "--commit",
+            sha1,
+            "--task-id",
+            "T-RES-EMPTY-ZERO-NOLOG",
+            "--resume-from",
+            str(empty_dir),
+            "--out-dir",
+            str(out_zero_nolog),
+            "--repo-root",
+            str(repo_dir),
+            "--backend",
+            "codex",
+        ]
+    )
+    assert rc_zero_nolog == 2
+    assert _count_calls(calls) == 0
+    assert not (out_zero_nolog / "frozen").exists()
+    assert not (out_zero_nolog / ".review-attempt.lock").exists()
+    t_zero_path = task_runner.default_g4_tracker_path(
+        "T-RES-EMPTY-ZERO-NOLOG", repo_root=repo_dir
+    )
+    if t_zero_path.is_file():
+        assert task_runner.load_g4_tracker(t_zero_path)["in_flight"] == {}
+
+    # Zero prior SHA invocations: fresh REVIEW_FROZEN_G4 ledger (sha_count == 0) fails closed.
+    led_zero_path = _setup_ledger_for_g4_test(
+        repo_dir,
+        "T-RES-EMPTY-ZERO-LED",
+        state="REVIEW_FROZEN_G4",
+        candidate_sha=sha1,
+    )
+    out_zero_led = tmp_path / "out_res_zero_led"
+    rc_zero_led = codex_room_review.main(
+        [
+            "--commit",
+            sha1,
+            "--task-id",
+            "T-RES-EMPTY-ZERO-LED",
+            "--resume-from",
+            str(empty_dir),
+            "--out-dir",
+            str(out_zero_led),
+            "--repo-root",
+            str(repo_dir),
+            "--backend",
+            "codex",
+        ]
+    )
+    assert rc_zero_led == 2
+    assert _count_calls(calls) == 0
+    assert not (out_zero_led / "frozen").exists()
+    assert not (out_zero_led / ".review-attempt.lock").exists()
+    assert task_runner.load_ledger(led_zero_path)["active_g4_reservations"] == {}
+    t_zero_led_path = task_runner.default_g4_tracker_path(
+        "T-RES-EMPTY-ZERO-LED", repo_root=repo_dir
+    )
+    if t_zero_led_path.is_file():
+        assert task_runner.load_g4_tracker(t_zero_led_path)["in_flight"] == {}
+
 
 def test_g4_persists_lock_only_attempts_across_out_dir_switch(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -5911,7 +5975,9 @@ def test_g4_ledgerless_edited_packet_same_version_stays_blocked_until_version_bu
     assert _count_calls(calls5) == 2
 
 
-def test_probe_codex_rate_limits_terminates_process_before_stdin_eof(tmp_path: Path) -> None:
+def test_probe_codex_rate_limits_terminates_process_before_stdin_eof(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """probe_codex_rate_limits kills child tree before closing stdin so EOF cannot wake it."""
     raced_flag = tmp_path / "raced_eof.flag"
     script = tmp_path / "raw_stdin_blocking_probe.py"
@@ -5925,6 +5991,41 @@ def test_probe_codex_rate_limits_terminates_process_before_stdin_eof(tmp_path: P
     )
     rt_dir = tmp_path / "rt_eof_probe"
     rt_dir.mkdir(parents=True)
+
+    events: list[str] = []
+    orig_spawn = codex_room_review.spawn_managed_process
+    orig_term = codex_room_review.terminate_process_tree
+
+    class _StdinCloseSpy:
+        def __init__(self, wrapped: Any) -> None:
+            self._wrapped = wrapped
+
+        def write(self, data: str) -> int:
+            return int(self._wrapped.write(data))
+
+        def flush(self) -> None:
+            self._wrapped.flush()
+
+        def close(self) -> None:
+            events.append("stdin_close")
+            self._wrapped.close()
+
+        def __getattr__(self, name: str) -> Any:
+            return getattr(self._wrapped, name)
+
+    def _spy_spawn(*args: Any, **kwargs: Any) -> tuple[Any, Any]:
+        proc, job_handle = orig_spawn(*args, **kwargs)
+        if proc.stdin is not None:
+            proc.stdin = _StdinCloseSpy(proc.stdin)
+        return proc, job_handle
+
+    def _spy_term(proc: Any, *, job_handle: int | None = None) -> None:
+        events.append("terminate")
+        orig_term(proc, job_handle=job_handle)
+
+    monkeypatch.setattr(codex_room_review, "spawn_managed_process", _spy_spawn)
+    monkeypatch.setattr(codex_room_review, "terminate_process_tree", _spy_term)
+
     res = codex_room_review.probe_codex_rate_limits(
         [sys.executable, "-u", str(script)],
         rt_dir,
@@ -5933,6 +6034,161 @@ def test_probe_codex_rate_limits_terminates_process_before_stdin_eof(tmp_path: P
     )
     assert res is None
     assert not raced_flag.exists()
+    assert events.index("terminate") < events.index("stdin_close")
+
+
+def _install_1m_token_codex_stub(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    sha: str,
+    *,
+    tag: str,
+) -> None:
+    script_path = tmp_path / f"fake_codex_1m_{tag}.py"
+    prefix = _write_fake_codex_script(
+        script_path,
+        (
+            "import json, pathlib, sys\n"
+            "args = sys.argv[1:]\n"
+            "out_path = pathlib.Path(args[args.index('-o') + 1])\n"
+            "prompt = sys.stdin.read()\n"
+            "is_p2 = 'security_and_invariants' in prompt\n"
+            "lens = 'security_and_invariants' if is_p2 else 'correctness_and_tests'\n"
+            f"payload = {{'revision_sha': {sha!r}, 'lens': lens, 'verdict': 'APPROVE', "
+            "'summary': 'ok', 'findings': [], 'test_quality_issues': [], "
+            "'unverified_areas': []}\n"
+            "out_path.write_text(json.dumps(payload), encoding='utf-8')\n"
+            "print(json.dumps({'type': 'turn.completed', 'usage': "
+            "{'input_tokens': 1000000, 'cached_input_tokens': 0, "
+            "'output_tokens': 0}}), flush=True)\n"
+        ),
+    )
+    monkeypatch.setattr(
+        codex_room_review, "verify_role", lambda role, root: {"ok": True, "errors": []}
+    )
+    monkeypatch.setattr(codex_room_review, "resolve_codex_command", lambda: prefix)
+
+
+def test_g4_atomic_billing_saves_ledger_before_tracker_and_reconciles_on_abort(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """First save_ledger failure in _record_g4_outcome reconciles $5.00 & marks tracker ABORTED."""
+    from harness.scripts import task_runner
+
+    repo_dir, sha1 = _init_policy_repo(tmp_path / "repo_atomic_bill", qualified_routes=[])
+    _install_1m_token_codex_stub(tmp_path, monkeypatch, sha1, tag="atomic")
+    ledger_path = _setup_ledger_for_g4_test(
+        repo_dir, "T-G4-ATOMIC-BILL", state="REVIEW_FROZEN_G4", candidate_sha=sha1
+    )
+    out_dir = tmp_path / "out_atomic_bill"
+    norm_out = task_runner._norm_attempt_dir(out_dir)
+
+    orig_save_ledger = task_runner.save_ledger
+    orig_save_tracker = task_runner.save_g4_tracker
+    outcome_save_failed = False
+    tracker_statuses_written: list[str] = []
+
+    def _faulty_save_ledger(path: Path, data: dict[str, Any]) -> None:
+        nonlocal outcome_save_failed
+        if (
+            not outcome_save_failed
+            and path.resolve() == ledger_path.resolve()
+            and float(data.get("spent_api_equiv_usd", 0.0)) > 0.0
+        ):
+            outcome_save_failed = True
+            raise PermissionError("injected first save_ledger failure in _record_g4_outcome")
+        orig_save_ledger(path, data)
+
+    def _spy_save_tracker(path: Path, data: dict[str, Any]) -> None:
+        comp = data.get("completed_attempts", {}).get(norm_out)
+        if isinstance(comp, dict) and isinstance(comp.get("status"), str):
+            tracker_statuses_written.append(comp["status"])
+        orig_save_tracker(path, data)
+
+    monkeypatch.setattr(task_runner, "save_ledger", _faulty_save_ledger)
+    monkeypatch.setattr(task_runner, "save_g4_tracker", _spy_save_tracker)
+
+    with pytest.raises(PermissionError):
+        codex_room_review.main(
+            [
+                "--commit",
+                sha1,
+                "--task-id",
+                "T-G4-ATOMIC-BILL",
+                "--out-dir",
+                str(out_dir),
+                "--repo-root",
+                str(repo_dir),
+                "--backend",
+                "codex",
+            ]
+        )
+
+    assert outcome_save_failed is True
+    assert "PASSED" not in tracker_statuses_written
+    ledger = task_runner.load_ledger(ledger_path)
+    tracker = task_runner.load_g4_tracker(
+        task_runner.default_g4_tracker_path("T-G4-ATOMIC-BILL", repo_root=repo_dir)
+    )
+    assert ledger["spent_api_equiv_usd"] == pytest.approx(5.0)
+    assert ledger["active_g4_reservations"] == {}
+    assert ledger["state"] == "BLOCKED"
+    assert tracker["in_flight"] == {}
+    assert tracker["completed_attempts"][norm_out]["status"] != "PASSED"
+    assert tracker["completed_attempts"][norm_out]["status"] == "ABORTED"
+
+
+def test_g4_output_write_failure_cleans_partial_json_and_bills_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """PermissionError on consolidated-review.md cleans .json, returns 2, and bills once."""
+    from harness.scripts import task_runner
+
+    repo_dir, sha1 = _init_policy_repo(tmp_path / "repo_out_err", qualified_routes=[])
+    _install_1m_token_codex_stub(tmp_path, monkeypatch, sha1, tag="outerr")
+    ledger_path = _setup_ledger_for_g4_test(
+        repo_dir, "T-G4-OUT-ERR", state="REVIEW_FROZEN_G4", candidate_sha=sha1
+    )
+    out_dir = tmp_path / "out_write_err"
+    norm_out = task_runner._norm_attempt_dir(out_dir)
+    orig_path_open = Path.open
+
+    def _deny_md_open(self: Path, mode: str = "r", *args: Any, **kwargs: Any) -> Any:
+        if self.name == "consolidated-review.md" and "x" in mode:
+            raise PermissionError("simulated markdown output PermissionError")
+        return orig_path_open(self, mode, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", _deny_md_open)
+    rc = codex_room_review.main(
+        [
+            "--commit",
+            sha1,
+            "--task-id",
+            "T-G4-OUT-ERR",
+            "--out-dir",
+            str(out_dir),
+            "--repo-root",
+            str(repo_dir),
+            "--backend",
+            "codex",
+        ]
+    )
+
+    expected_usd = 2.0 * task_runner.compute_usage_cost_usd(
+        "gpt-6.1-sol", input_tokens=1_000_000
+    )
+    ledger = task_runner.load_ledger(ledger_path)
+    tracker = task_runner.load_g4_tracker(
+        task_runner.default_g4_tracker_path("T-G4-OUT-ERR", repo_root=repo_dir)
+    )
+    assert rc == 2
+    assert not (out_dir / "consolidated-review.json").exists()
+    assert not (out_dir / "consolidated-review.md").exists()
+    assert ledger["spent_api_equiv_usd"] == pytest.approx(expected_usd)
+    assert ledger["active_g4_reservations"] == {}
+    assert ledger["state"] == "BLOCKED"
+    assert tracker["in_flight"] == {}
+    assert tracker["completed_attempts"][norm_out]["status"] == "BLOCKED"
 
 
 

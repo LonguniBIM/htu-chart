@@ -1222,6 +1222,23 @@ def run_verifier_gate_step(
     return run_managed_stage_cmd("verifier_total", cmd, ledger=ledger, cwd=root)
 
 
+def _count_qualified_reviewer_routes(repo_root: Path) -> int:
+    """Count configured AGY reviewer fallback routes in model-policy.json (min 1)."""
+    data = _read_optional_json_dict(repo_root / "harness" / "model-policy.json")
+    if not isinstance(data, dict):
+        return 1
+    roles = data.get("roles")
+    if not isinstance(roles, dict):
+        return 1
+    fallbacks = roles.get("independent_reviewer_fallbacks")
+    if not isinstance(fallbacks, dict):
+        return 1
+    routes = fallbacks.get("qualified_routes")
+    if not isinstance(routes, list):
+        return 1
+    return max(1, len(routes))
+
+
 def run_review_gate_step(
     *,
     commit_sha: str,
@@ -1272,7 +1289,9 @@ def run_review_gate_step(
         )
     if effective_ledger is not None:
         cmd.extend(["--ledger", str(effective_ledger)])
-    outer_timeout = float(max(pass_total * 2 + 60, pass_total + 60))
+    n_routes = _count_qualified_reviewer_routes(root)
+    margin = min(120.0, max(0.5, float(pass_total) * 0.2))
+    outer_timeout = float(pass_total * (2 + 3 * n_routes) + margin)
     return run_managed_stage_cmd(
         "reviewer_pass_total",
         cmd,
@@ -2455,6 +2474,128 @@ def compute_usage_cost_usd(
     return in_cost + out_cost + cache_cost
 
 
+def _validate_usage_inputs(
+    *,
+    input_tokens: int,
+    output_tokens: int,
+    thinking_tokens: int,
+    cache_read_tokens: int,
+    counter_mode: str,
+) -> None:
+    for name, val in (
+        ("input_tokens", input_tokens),
+        ("output_tokens", output_tokens),
+        ("thinking_tokens", thinking_tokens),
+        ("cache_read_tokens", cache_read_tokens),
+    ):
+        if not is_strict_int(val) or val < 0:
+            raise ValueError(f"{name} must be a non-negative integer, got {val!r}.")
+    if counter_mode not in {"cumulative", "delta"}:
+        raise ValueError(f"counter_mode must be 'cumulative' or 'delta', got {counter_mode!r}.")
+
+
+def apply_usage_to_ledger_dict(
+    ledger: dict[str, Any],
+    *,
+    model: str,
+    input_tokens: int = 0,
+    output_tokens: int = 0,
+    thinking_tokens: int = 0,
+    cache_read_tokens: int = 0,
+    conversation_id: str | None = None,
+    counter_mode: str = "cumulative",
+    pricing: dict[str, dict[str, float]] | None = None,
+) -> tuple[float, int]:
+    """Apply token usage in memory with high-water deduplication for cumulative sessions."""
+    _validate_usage_inputs(
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+        thinking_tokens=thinking_tokens,
+        cache_read_tokens=cache_read_tokens,
+        counter_mode=counter_mode,
+    )
+    usage_map = ledger.setdefault("usage_by_conversation", {})
+    conv_key = (conversation_id or "").strip()
+
+    if counter_mode == "cumulative" and conv_key:
+        prev = usage_map.get(
+            conv_key,
+            {
+                "model": model,
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "thinking_tokens": 0,
+                "cache_read_tokens": 0,
+                "billed_usd": 0.0,
+            },
+        )
+        d_in = max(0, input_tokens - int(prev["input_tokens"]))
+        d_out = max(0, output_tokens - int(prev["output_tokens"]))
+        d_think = max(0, thinking_tokens - int(prev["thinking_tokens"]))
+        d_cache = max(0, cache_read_tokens - int(prev["cache_read_tokens"]))
+
+        delta_usd = compute_usage_cost_usd(
+            model,
+            input_tokens=d_in,
+            output_tokens=d_out,
+            thinking_tokens=d_think,
+            cache_read_tokens=d_cache,
+            pricing=pricing,
+        )
+        usage_map[conv_key] = {
+            "model": model,
+            "input_tokens": max(int(prev["input_tokens"]), input_tokens),
+            "output_tokens": max(int(prev["output_tokens"]), output_tokens),
+            "thinking_tokens": max(int(prev["thinking_tokens"]), thinking_tokens),
+            "cache_read_tokens": max(int(prev["cache_read_tokens"]), cache_read_tokens),
+            "billed_usd": round(float(prev["billed_usd"]) + delta_usd, 8),
+        }
+    else:
+        delta_usd = compute_usage_cost_usd(
+            model,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            thinking_tokens=thinking_tokens,
+            cache_read_tokens=cache_read_tokens,
+            pricing=pricing,
+        )
+        if conv_key:
+            prev = usage_map.get(
+                conv_key,
+                {
+                    "model": model,
+                    "input_tokens": 0,
+                    "output_tokens": 0,
+                    "thinking_tokens": 0,
+                    "cache_read_tokens": 0,
+                    "billed_usd": 0.0,
+                },
+            )
+            usage_map[conv_key] = {
+                "model": model,
+                "input_tokens": int(prev["input_tokens"]) + input_tokens,
+                "output_tokens": int(prev["output_tokens"]) + output_tokens,
+                "thinking_tokens": int(prev["thinking_tokens"]) + thinking_tokens,
+                "cache_read_tokens": int(prev["cache_read_tokens"]) + cache_read_tokens,
+                "billed_usd": round(float(prev["billed_usd"]) + delta_usd, 8),
+            }
+
+    ledger["spent_api_equiv_usd"] = round(float(ledger["spent_api_equiv_usd"]) + delta_usd, 8)
+    committed = _refresh_budget_warning(ledger)
+    limit = float(ledger["budget_limit_usd"])
+    rc = 0
+    if round(committed, 8) > round(limit, 8):
+        if ledger["state"] != "VERIFIED":
+            ledger["state"] = "PAUSED_BUDGET"
+            rc = 2
+        _append_event(
+            ledger,
+            "BUDGET_EXCEEDED_USAGE",
+            {"committed_usd": committed, "limit_usd": limit},
+        )
+    return delta_usd, rc
+
+
 def record_usage(
     ledger_path: Path,
     *,
@@ -2468,98 +2609,27 @@ def record_usage(
     pricing: dict[str, dict[str, float]] | None = None,
 ) -> tuple[dict[str, Any], float, int]:
     """Record token usage with high-water deduplication for cumulative sessions."""
-    for name, val in (
-        ("input_tokens", input_tokens),
-        ("output_tokens", output_tokens),
-        ("thinking_tokens", thinking_tokens),
-        ("cache_read_tokens", cache_read_tokens),
-    ):
-        if not is_strict_int(val) or val < 0:
-            raise ValueError(f"{name} must be a non-negative integer, got {val!r}.")
-    if counter_mode not in {"cumulative", "delta"}:
-        raise ValueError(f"counter_mode must be 'cumulative' or 'delta', got {counter_mode!r}.")
+    _validate_usage_inputs(
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+        thinking_tokens=thinking_tokens,
+        cache_read_tokens=cache_read_tokens,
+        counter_mode=counter_mode,
+    )
 
     with _ledger_lock(ledger_path):
         ledger = load_ledger(ledger_path)
-        usage_map = ledger.setdefault("usage_by_conversation", {})
-        conv_key = (conversation_id or "").strip()
-
-        if counter_mode == "cumulative" and conv_key:
-            prev = usage_map.get(
-                conv_key,
-                {
-                    "model": model,
-                    "input_tokens": 0,
-                    "output_tokens": 0,
-                    "thinking_tokens": 0,
-                    "cache_read_tokens": 0,
-                    "billed_usd": 0.0,
-                },
-            )
-            d_in = max(0, input_tokens - int(prev["input_tokens"]))
-            d_out = max(0, output_tokens - int(prev["output_tokens"]))
-            d_think = max(0, thinking_tokens - int(prev["thinking_tokens"]))
-            d_cache = max(0, cache_read_tokens - int(prev["cache_read_tokens"]))
-
-            delta_usd = compute_usage_cost_usd(
-                model,
-                input_tokens=d_in,
-                output_tokens=d_out,
-                thinking_tokens=d_think,
-                cache_read_tokens=d_cache,
-                pricing=pricing,
-            )
-            usage_map[conv_key] = {
-                "model": model,
-                "input_tokens": max(int(prev["input_tokens"]), input_tokens),
-                "output_tokens": max(int(prev["output_tokens"]), output_tokens),
-                "thinking_tokens": max(int(prev["thinking_tokens"]), thinking_tokens),
-                "cache_read_tokens": max(int(prev["cache_read_tokens"]), cache_read_tokens),
-                "billed_usd": round(float(prev["billed_usd"]) + delta_usd, 8),
-            }
-        else:
-            delta_usd = compute_usage_cost_usd(
-                model,
-                input_tokens=input_tokens,
-                output_tokens=output_tokens,
-                thinking_tokens=thinking_tokens,
-                cache_read_tokens=cache_read_tokens,
-                pricing=pricing,
-            )
-            if conv_key:
-                prev = usage_map.get(
-                    conv_key,
-                    {
-                        "model": model,
-                        "input_tokens": 0,
-                        "output_tokens": 0,
-                        "thinking_tokens": 0,
-                        "cache_read_tokens": 0,
-                        "billed_usd": 0.0,
-                    },
-                )
-                usage_map[conv_key] = {
-                    "model": model,
-                    "input_tokens": int(prev["input_tokens"]) + input_tokens,
-                    "output_tokens": int(prev["output_tokens"]) + output_tokens,
-                    "thinking_tokens": int(prev["thinking_tokens"]) + thinking_tokens,
-                    "cache_read_tokens": int(prev["cache_read_tokens"]) + cache_read_tokens,
-                    "billed_usd": round(float(prev["billed_usd"]) + delta_usd, 8),
-                }
-
-        ledger["spent_api_equiv_usd"] = round(float(ledger["spent_api_equiv_usd"]) + delta_usd, 8)
-        committed = _refresh_budget_warning(ledger)
-        limit = float(ledger["budget_limit_usd"])
-        rc = 0
-        if round(committed, 8) > round(limit, 8):
-            if ledger["state"] != "VERIFIED":
-                ledger["state"] = "PAUSED_BUDGET"
-                rc = 2
-            _append_event(
-                ledger,
-                "BUDGET_EXCEEDED_USAGE",
-                {"committed_usd": committed, "limit_usd": limit},
-            )
+        delta_usd, rc = apply_usage_to_ledger_dict(
+            ledger,
+            model=model,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            thinking_tokens=thinking_tokens,
+            cache_read_tokens=cache_read_tokens,
+            conversation_id=conversation_id,
+            counter_mode=counter_mode,
+            pricing=pricing,
+        )
         save_ledger(ledger_path, ledger)
         return ledger, delta_usd, rc
 

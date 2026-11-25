@@ -1457,6 +1457,183 @@ def test_ensure_ledger_defaults_rejects_wrong_typed_maps_and_counters(tmp_path: 
     assert cb["max_transient_retries_per_provider_pass"] == 0
 
 
+def test_run_review_gate_step_outer_timeout_handles_late_quota_and_sequential_agy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """run_review_gate_step scales outer_timeout for late Codex quota + sequential 2-pass AGY."""
+    import os
+    from harness.scripts import codex_room_sync
+
+    # 1. Verify outer_timeout formula scales with qualified_routes and default pass_total=600.
+    repo_scale = tmp_path / "repo_scale"
+    (repo_scale / "harness").mkdir(parents=True)
+    (repo_scale / "harness" / "model-policy.json").write_text(
+        json.dumps(
+            {
+                "roles": {
+                    "independent_reviewer_fallbacks": {
+                        "qualified_routes": ["gemini-4-carbon-high", "gemini-4-neon-high"]
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    pkt_scale = tmp_path / "pkt_scale.md"
+    pkt_scale.write_text("# Task Packet\n", encoding="utf-8")
+    seen_timeouts: list[float] = []
+
+    def _spy_run(cmd: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        seen_timeouts.append(float(kwargs.get("timeout_sec", 0.0)))
+        return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="", stderr="")
+
+    with monkeypatch.context() as mp:
+        mp.setattr(task_runner, "run_managed_cmd", _spy_run)
+        task_runner.run_review_gate_step(
+            commit_sha="a" * 40,
+            task_id="T-SCALE",
+            packet_path=pkt_scale,
+            out_dir=tmp_path / "scale_out",
+            repo_root=repo_scale,
+            ledger={"deadlines_sec": {"reviewer_pass_total": 600, "reviewer_pass_idle": 180}},
+        )
+    assert seen_timeouts == [pytest.approx(4920.0)]
+
+    # 2. Live integration: reviewer_pass_total=1 (margin=0.5s; old 2*1+0.5=2.5s would fail),
+    # Codex hits quota after 0.85s, followed by two sequential 0.85s AGY passes (~2.7s+).
+    repo_dir = tmp_path / "repo_live_timeout"
+    repo_dir.mkdir(parents=True)
+    _git(repo_dir, "init")
+    _git(repo_dir, "config", "user.email", "peer@example.com")
+    _git(repo_dir, "config", "user.name", "Peer")
+    (repo_dir / "harness").mkdir(parents=True)
+    (repo_dir / "harness" / "model-policy.json").write_text(
+        json.dumps(
+            {
+                "excluded_model_prefixes": list(task_runner.DEFAULT_EXCLUDED_MODEL_PREFIXES),
+                "roles": {
+                    "independent_reviewer": {"primary": "gpt-6.1-sol"},
+                    "independent_reviewer_fallbacks": {
+                        "qualified_routes": ["gemini-4-carbon-high"]
+                    },
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    (repo_dir / "app.py").write_text("print('ok')\n", encoding="utf-8")
+    _git(repo_dir, "add", ".")
+    _git(repo_dir, "commit", "-m", "init")
+    sha = _git(repo_dir, "rev-parse", "HEAD")
+
+    pkt = tmp_path / "pkt_live.md"
+    pkt.write_text("# Task Packet\n", encoding="utf-8")
+
+    fake_home = tmp_path / "fake_home"
+    rt_root = fake_home / ".codex-runtime"
+    for role in ("pass1", "pass2"):
+        r_dir = rt_root / f"topstep-review-{role}"
+        r_dir.mkdir(parents=True, exist_ok=True)
+        (r_dir / "config.toml").write_text(
+            (
+                f'model = "{codex_room_sync.EXPECTED_REVIEW_MODEL}"\n'
+                f'model_reasoning_effort = "{codex_room_sync.EXPECTED_REASONING_EFFORT}"\n'
+                'sandbox_mode = "read-only"\n'
+                'approval_policy = "never"\n'
+                "[features]\n"
+                "multi_agent = false\n"
+                "multi_agent_v2 = false\n"
+                "agent_message_board = false\n"
+            ),
+            encoding="utf-8",
+        )
+
+    codex_py = tmp_path / "codex_stub.py"
+    codex_py.write_text(
+        (
+            "import sys, time\n"
+            "if sys.argv[1:2] == ['app-server']:\n"
+            "    sys.exit(0)\n"
+            "_ = sys.stdin.read()\n"
+            "time.sleep(0.85)\n"
+            "sys.stderr.write('error: usage_limit_reached 429\\n')\n"
+            "sys.exit(1)\n"
+        ),
+        encoding="utf-8",
+    )
+    agy_py = tmp_path / "agy_stub.py"
+    agy_py.write_text(
+        (
+            "import json, sys, time\n"
+            "args = sys.argv[1:]\n"
+            "prompt = args[args.index('-p') + 1]\n"
+            "lens = 'security_and_invariants' if 'security_and_invariants' in prompt "
+            "else 'correctness_and_tests'\n"
+            "time.sleep(0.85)\n"
+            f"payload = {{'revision_sha': {sha!r}, 'lens': lens, 'verdict': 'APPROVE', "
+            "'summary': 'agy ok', 'findings': [], 'test_quality_issues': [], "
+            "'unverified_areas': []}\n"
+            "print(json.dumps({'event': 'result', "
+            "'result': {'status': 'SUCCESS', 'structured_output': payload}}), flush=True)\n"
+        ),
+        encoding="utf-8",
+    )
+
+    worktree_root = str(Path(task_runner.__file__).resolve().parents[2])
+    launcher_py = tmp_path / "review_launcher.py"
+    launcher_py.write_text(
+        (
+            "import sys\n"
+            f"sys.path.insert(0, {worktree_root!r})\n"
+            "from harness.scripts import codex_room_review\n"
+            "codex_room_review.verify_role = "
+            "lambda role, root, **_kw: {'ok': True, 'errors': []}\n"
+            f"codex_room_review.resolve_codex_command = "
+            f"lambda: [sys.executable, '-u', {str(codex_py)!r}]\n"
+            f"codex_room_review.resolve_agy_command = "
+            f"lambda: [sys.executable, '-u', {str(agy_py)!r}]\n"
+            "sys.exit(codex_room_review.main(sys.argv[1:]))\n"
+        ),
+        encoding="utf-8",
+    )
+
+    orig_run_managed = task_runner.run_managed_cmd
+    seen_live_timeouts: list[float] = []
+
+    def _run_with_launcher(cmd: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        seen_live_timeouts.append(float(kwargs.get("timeout_sec", 0.0)))
+        wrapped_cmd = [cmd[0], str(launcher_py), *cmd[2:]]
+        return orig_run_managed(wrapped_cmd, **kwargs)
+
+    monkeypatch.setattr(task_runner, "run_managed_cmd", _run_with_launcher)
+    monkeypatch.setenv("HOME", str(fake_home))
+    if os.name == "nt":
+        monkeypatch.setenv("USERPROFILE", str(fake_home))
+
+    ledger_path = task_runner.default_ledger_path("T-OUTER-TIMEOUT", repo_root=repo_dir)
+    ledger = task_runner.init_or_load_ledger(
+        ledger_path, root_task_id="T-OUTER-TIMEOUT", base_sha=sha, budget_usd=6.0
+    )
+    ledger["state"] = "REVIEW_FROZEN_G4"
+    ledger["candidate_sha"] = sha
+    ledger["deadlines_sec"]["reviewer_pass_total"] = 1
+    ledger["deadlines_sec"]["reviewer_pass_idle"] = 2
+    task_runner.save_ledger(ledger_path, ledger)
+
+    proc = task_runner.run_review_gate_step(
+        commit_sha=sha,
+        task_id="T-OUTER-TIMEOUT",
+        packet_path=pkt,
+        out_dir=tmp_path / "live_timeout_out",
+        base_sha=sha,
+        repo_root=repo_dir,
+        ledger=ledger,
+        ledger_path=ledger_path,
+    )
+    assert seen_live_timeouts == [pytest.approx(5.5)]
+    assert proc.returncode == 0, f"stderr={proc.stderr}\nstdout={proc.stdout}"
+
+
 
 
 
