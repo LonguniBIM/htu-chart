@@ -6633,13 +6633,16 @@ def test_codex_room_review_raises_timeouts_50pct_and_caps_agy_idle(
         ["git", "-C", str(repo_dir), "rev-parse", "HEAD"], text=True
     ).strip()
 
-    def _spy_agy_sha2(**kwargs: Any) -> dict[str, Any]:
-        agy_seen.append((float(kwargs["timeout_sec"]), float(kwargs["idle_timeout_sec"])))
-        pass_name = str(kwargs["pass_name"])
-        lens = "security_and_invariants" if pass_name == "pass2" else "correctness_and_tests"
-        return _sample_pass(sha2, lens)
+    def _spy_agy_for_sha(target_sha: str) -> Any:
+        def _spy(**kwargs: Any) -> dict[str, Any]:
+            agy_seen.append((float(kwargs["timeout_sec"]), float(kwargs["idle_timeout_sec"])))
+            pass_name = str(kwargs["pass_name"])
+            lens = "security_and_invariants" if pass_name == "pass2" else "correctness_and_tests"
+            return _sample_pass(target_sha, lens)
 
-    monkeypatch.setattr(codex_room_review, "_run_agy_pass", _spy_agy_sha2)
+        return _spy
+
+    monkeypatch.setattr(codex_room_review, "_run_agy_pass", _spy_agy_for_sha(sha2))
     probe_state["result"] = None
     agy_seen.clear()
     assert (
@@ -6690,9 +6693,123 @@ def test_codex_room_review_raises_timeouts_50pct_and_caps_agy_idle(
 
     assert agy_policy == (1800.0, 500.0)
     assert agy_ledger == (1800.0, 480.0)
+
+    # Legacy ledger backfill preserves finite float (1000.5) and 0 idle deadlines from policy.
+    pol_obj["circuit_breakers"]["deadlines_sec"] = {"reviewer_agy_pass_idle": 1000.5}
+    pol_path.write_text(json.dumps(pol_obj, indent=2), encoding="utf-8")
+    _commit_repo_change(repo_dir, "set policy reviewer_agy_pass_idle=1000.5")
+    sha3 = subprocess.check_output(
+        ["git", "-C", str(repo_dir), "rev-parse", "HEAD"], text=True
+    ).strip()
+    monkeypatch.setattr(codex_room_review, "_run_agy_pass", _spy_agy_for_sha(sha3))
+    agy_seen.clear()
     assert (
         codex_room_review.main(
-            ["--commit", sha2, "--repo-root", str(repo_dir), "--agy-idle-timeout", "-1"]
+            [
+                "--commit",
+                sha3,
+                "--repo-root",
+                str(repo_dir),
+                "--out-dir",
+                str(tmp_path / "out_agy_ledgerless_float"),
+                "--backend",
+                "agy",
+            ]
+        )
+        == 0
+    )
+    ledgerless_float = agy_seen[0]
+
+    led_leg_float = _setup_ledger_for_g4_test(
+        repo_dir, "T-AGY-LEG-FLOAT", state="REVIEW_FROZEN_G4", candidate_sha=sha3
+    )
+    raw_leg_float = json.loads(led_leg_float.read_text(encoding="utf-8"))
+    raw_leg_float["deadlines_sec"].pop("reviewer_agy_pass_idle", None)
+    led_leg_float.write_text(json.dumps(raw_leg_float), encoding="utf-8")
+    agy_seen.clear()
+    assert (
+        codex_room_review.main(
+            [
+                "--commit",
+                sha3,
+                "--task-id",
+                "T-AGY-LEG-FLOAT",
+                "--ledger",
+                str(led_leg_float),
+                "--repo-root",
+                str(repo_dir),
+                "--out-dir",
+                str(tmp_path / "out_agy_legacy_float"),
+                "--backend",
+                "agy",
+            ]
+        )
+        == 0
+    )
+    legacy_float = agy_seen[0]
+    backfilled_float = task_runner.load_ledger(led_leg_float, repo_root=repo_dir)
+    assert backfilled_float["deadlines_sec"]["reviewer_agy_pass_idle"] == 1000.5
+
+    pol_obj["circuit_breakers"]["deadlines_sec"] = {"reviewer_agy_pass_idle": 0}
+    pol_path.write_text(json.dumps(pol_obj, indent=2), encoding="utf-8")
+    _commit_repo_change(repo_dir, "set policy reviewer_agy_pass_idle=0")
+    sha4 = subprocess.check_output(
+        ["git", "-C", str(repo_dir), "rev-parse", "HEAD"], text=True
+    ).strip()
+    monkeypatch.setattr(codex_room_review, "_run_agy_pass", _spy_agy_for_sha(sha4))
+    agy_seen.clear()
+    assert (
+        codex_room_review.main(
+            [
+                "--commit",
+                sha4,
+                "--repo-root",
+                str(repo_dir),
+                "--out-dir",
+                str(tmp_path / "out_agy_ledgerless_zero"),
+                "--backend",
+                "agy",
+            ]
+        )
+        == 0
+    )
+    ledgerless_zero = agy_seen[0]
+
+    led_leg_zero = _setup_ledger_for_g4_test(
+        repo_dir, "T-AGY-LEG-ZERO", state="REVIEW_FROZEN_G4", candidate_sha=sha4
+    )
+    raw_leg_zero = json.loads(led_leg_zero.read_text(encoding="utf-8"))
+    raw_leg_zero.pop("deadlines_sec", None)
+    led_leg_zero.write_text(json.dumps(raw_leg_zero), encoding="utf-8")
+    agy_seen.clear()
+    assert (
+        codex_room_review.main(
+            [
+                "--commit",
+                sha4,
+                "--task-id",
+                "T-AGY-LEG-ZERO",
+                "--ledger",
+                str(led_leg_zero),
+                "--repo-root",
+                str(repo_dir),
+                "--out-dir",
+                str(tmp_path / "out_agy_legacy_zero"),
+                "--backend",
+                "agy",
+            ]
+        )
+        == 0
+    )
+    legacy_zero = agy_seen[0]
+    backfilled_zero = task_runner.load_ledger(led_leg_zero, repo_root=repo_dir)
+    assert backfilled_zero["deadlines_sec"]["reviewer_agy_pass_idle"] == 0
+
+    assert legacy_float == ledgerless_float == (1800.0, 1000.5)
+    assert legacy_zero == ledgerless_zero == (1800.0, 0.0)
+    assert (
+        codex_room_review.main(
+            ["--commit", sha4, "--repo-root", str(repo_dir), "--agy-idle-timeout", "-1"]
         )
         == 2
     )

@@ -1475,6 +1475,72 @@ def test_ensure_ledger_defaults_rejects_wrong_typed_maps_and_counters(tmp_path: 
     assert cb["max_g4_rounds_per_root_task"] == 6
     assert cb["max_transient_retries_per_provider_pass"] == 0
 
+    pol_dl_valid = tmp_path / "pol_dl_valid.json"
+    pol_dl_valid.write_text(
+        json.dumps(
+            {
+                "circuit_breakers": {
+                    "deadlines_sec": {
+                        "reviewer_agy_pass_idle": 1000.5,
+                        "reviewer_pass_idle": 0,
+                        "reviewer_pass_total": 950.5,
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    dl_valid = task_runner.load_deadlines_sec(policy_path=pol_dl_valid)
+    assert dl_valid["reviewer_agy_pass_idle"] == 1000.5
+    assert dl_valid["reviewer_pass_idle"] == 0
+    assert dl_valid["reviewer_pass_total"] == 950.5
+
+    pol_dl_invalid = tmp_path / "pol_dl_invalid.json"
+    pol_dl_invalid.write_text(
+        json.dumps(
+            {
+                "circuit_breakers": {
+                    "deadlines_sec": {
+                        "reviewer_pass_total": 0,
+                        "reviewer_agy_pass_idle": -1,
+                        "reviewer_pass_idle": True,
+                        "verifier_step": "bad",
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    dl_invalid = task_runner.load_deadlines_sec(policy_path=pol_dl_invalid)
+    assert dl_invalid == task_runner.DEFAULT_DEADLINES_SEC
+
+    backfilled_float = task_runner.load_ledger(leg_file, policy_path=pol_dl_valid)
+    assert backfilled_float["deadlines_sec"]["reviewer_agy_pass_idle"] == 1000.5
+
+    pol_dl_zero = tmp_path / "pol_dl_zero.json"
+    pol_dl_zero.write_text(
+        json.dumps({"circuit_breakers": {"deadlines_sec": {"reviewer_agy_pass_idle": 0}}}),
+        encoding="utf-8",
+    )
+    leg_no_dl = dict(base_data)
+    leg_no_dl.pop("deadlines_sec", None)
+    leg_no_dl_file = tmp_path / "legacy_no_deadlines.json"
+    leg_no_dl_file.write_text(json.dumps(leg_no_dl), encoding="utf-8")
+    backfilled_zero = task_runner.load_ledger(leg_no_dl_file, policy_path=pol_dl_zero)
+    assert backfilled_zero["deadlines_sec"]["reviewer_agy_pass_idle"] == 0
+
+    for bad_dl in ({"reviewer_pass_total": 0}, {"reviewer_agy_pass_idle": -1}):
+        bad_init_path = tmp_path / f"bad_init_{len(bad_dl)}_{next(iter(bad_dl))}.json"
+        with pytest.raises(ValueError):
+            task_runner.init_or_load_ledger(
+                bad_init_path,
+                root_task_id="T-BAD-INIT-DL",
+                base_sha="0" * 40,
+                budget_usd=6.0,
+                deadlines_sec=bad_dl,
+            )
+        assert not bad_init_path.exists()
+
 
 def test_run_review_gate_step_outer_timeout_handles_late_quota_and_sequential_agy(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -1501,9 +1567,11 @@ def test_run_review_gate_step_outer_timeout_handles_late_quota_and_sequential_ag
     pkt_scale = tmp_path / "pkt_scale.md"
     pkt_scale.write_text("# Task Packet\n", encoding="utf-8")
     seen_timeouts: list[float] = []
+    seen_cmds: list[list[str]] = []
 
     def _spy_run(cmd: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
         seen_timeouts.append(float(kwargs.get("timeout_sec", 0.0)))
+        seen_cmds.append(list(cmd))
         return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="", stderr="")
 
     with monkeypatch.context() as mp:
@@ -1516,7 +1584,25 @@ def test_run_review_gate_step_outer_timeout_handles_late_quota_and_sequential_ag
             repo_root=repo_scale,
             ledger={"deadlines_sec": {"reviewer_pass_total": 600, "reviewer_pass_idle": 180}},
         )
-    assert seen_timeouts == [pytest.approx(6120.0)]
+        task_runner.run_review_gate_step(
+            commit_sha="a" * 40,
+            task_id="T-FLOAT-DL",
+            packet_path=pkt_scale,
+            out_dir=tmp_path / "float_out",
+            repo_root=repo_scale,
+            ledger={
+                "deadlines_sec": {
+                    "reviewer_pass_total": 950.5,
+                    "reviewer_pass_idle": 0,
+                    "reviewer_agy_pass_idle": 1000.5,
+                }
+            },
+        )
+    assert seen_timeouts[0] == pytest.approx(6120.0)
+    float_cmd = seen_cmds[1]
+    assert float_cmd[float_cmd.index("--timeout") + 1] == "950.5"
+    assert float_cmd[float_cmd.index("--idle-timeout") + 1] == "0"
+    assert float_cmd[float_cmd.index("--agy-idle-timeout") + 1] == "1000.5"
 
     # 2. Live integration: reviewer_pass_total=4 (new 24.8s ceiling vs 20.8s old ceiling):
     # Codex hits transient -> quota (2 * 3.55s), and both sequential AGY passes hit

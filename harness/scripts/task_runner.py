@@ -53,7 +53,7 @@ except ImportError:
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
-DEFAULT_DEADLINES_SEC: dict[str, int] = {
+DEFAULT_DEADLINES_SEC: dict[str, int | float] = {
     "brief_generation": 300,
     "peer_round": 600,
     "verifier_step": 180,
@@ -63,6 +63,13 @@ DEFAULT_DEADLINES_SEC: dict[str, int] = {
     "reviewer_agy_pass_idle": 630,
     "root_task_wall_clock": 5400,
 }
+
+ZERO_OK_DEADLINES_SEC: frozenset[str] = frozenset(
+    {
+        "reviewer_pass_idle",
+        "reviewer_agy_pass_idle",
+    }
+)
 
 DEFAULT_CIRCUIT_BREAKERS: dict[str, int] = {
     "reassess_after_failed_candidates": 2,
@@ -83,6 +90,27 @@ ZERO_OK_CIRCUIT_BREAKERS: frozenset[str] = frozenset(
 )
 
 
+def _read_policy_section_dict(
+    section_getter: Any,
+    *,
+    repo_root: Path | None = None,
+    policy_path: Path | None = None,
+) -> dict[str, Any] | None:
+    policy_file = (
+        policy_path.resolve()
+        if policy_path is not None
+        else ((repo_root or REPO_ROOT).resolve() / "harness" / "model-policy.json")
+    )
+    if not policy_file.is_file():
+        return None
+    try:
+        data = json.loads(policy_file.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    raw_sec = section_getter(data) if isinstance(data, dict) else None
+    return raw_sec if isinstance(raw_sec, dict) else None
+
+
 def _load_policy_int_map(
     defaults: dict[str, int],
     *,
@@ -92,19 +120,12 @@ def _load_policy_int_map(
     policy_path: Path | None = None,
 ) -> dict[str, int]:
     merged = dict(defaults)
-    policy_file = (
-        policy_path.resolve()
-        if policy_path is not None
-        else ((repo_root or REPO_ROOT).resolve() / "harness" / "model-policy.json")
+    raw_sec = _read_policy_section_dict(
+        section_getter,
+        repo_root=repo_root,
+        policy_path=policy_path,
     )
-    if not policy_file.is_file():
-        return merged
-    try:
-        data = json.loads(policy_file.read_text(encoding="utf-8"))
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
-        return merged
-    raw_sec = section_getter(data) if isinstance(data, dict) else None
-    if not isinstance(raw_sec, dict):
+    if raw_sec is None:
         return merged
     for key in defaults:
         val = raw_sec.get(key)
@@ -131,11 +152,11 @@ def load_circuit_breakers(
 def load_deadlines_sec(
     repo_root: Path | None = None,
     policy_path: Path | None = None,
-) -> dict[str, int]:
-    """Load integer deadline settings from model-policy.json with safe defaults."""
-    return _load_policy_int_map(
-        DEFAULT_DEADLINES_SEC,
-        section_getter=lambda d: (
+) -> dict[str, int | float]:
+    """Load finite deadline settings from model-policy.json with safe defaults."""
+    merged: dict[str, int | float] = dict(DEFAULT_DEADLINES_SEC)
+    raw_sec = _read_policy_section_dict(
+        lambda d: (
             d["circuit_breakers"].get("deadlines_sec")
             if isinstance(d.get("circuit_breakers"), dict)
             else None
@@ -143,6 +164,18 @@ def load_deadlines_sec(
         repo_root=repo_root,
         policy_path=policy_path,
     )
+    if raw_sec is None:
+        return merged
+    for key in DEFAULT_DEADLINES_SEC:
+        val = raw_sec.get(key)
+        if isinstance(val, bool) or not isinstance(val, (int, float)):
+            continue
+        fval = float(val)
+        if not math.isfinite(fval):
+            continue
+        if (fval >= 0.0) if key in ZERO_OK_DEADLINES_SEC else (fval > 0.0):
+            merged[key] = int(val) if is_strict_int(val) else fval
+    return merged
 
 
 def _read_optional_json_dict(path: Path) -> dict[str, Any] | None:
@@ -309,9 +342,9 @@ def _ensure_ledger_defaults(
     data: dict[str, Any],
     *,
     policy_breakers: dict[str, int] | None = None,
-    policy_deadlines: dict[str, int] | None = None,
+    policy_deadlines: dict[str, int | float] | None = None,
 ) -> dict[str, Any]:
-    defaults = policy_breakers or DEFAULT_CIRCUIT_BREAKERS
+    defaults = policy_breakers if policy_breakers is not None else DEFAULT_CIRCUIT_BREAKERS
     if "circuit_breakers" not in data:
         data["circuit_breakers"] = {}
     elif not isinstance(data["circuit_breakers"], dict):
@@ -327,7 +360,7 @@ def _ensure_ledger_defaults(
                 f"(expected int >= {min_val})."
             )
 
-    dl_defaults = policy_deadlines or DEFAULT_DEADLINES_SEC
+    dl_defaults = policy_deadlines if policy_deadlines is not None else DEFAULT_DEADLINES_SEC
     if "deadlines_sec" not in data:
         data["deadlines_sec"] = {}
     elif not isinstance(data["deadlines_sec"], dict):
@@ -341,7 +374,7 @@ def _ensure_ledger_defaults(
         _require_finite_number(
             dl_v,
             f"deadlines_sec[{dl_k!r}]",
-            allow_zero=(dl_k in {"reviewer_pass_idle", "reviewer_agy_pass_idle"}),
+            allow_zero=(dl_k in ZERO_OK_DEADLINES_SEC),
         )
 
     if "packet_version" in data and (
@@ -1117,7 +1150,7 @@ def init_or_load_ledger(
     packet_version: int = 1,
     base_sha: str = "",
     budget_usd: float = 6.0,
-    deadlines_sec: dict[str, int] | None = None,
+    deadlines_sec: dict[str, int | float] | None = None,
     circuit_breakers: dict[str, int] | None = None,
     repo_root: Path | None = None,
     policy_path: Path | None = None,
@@ -1142,10 +1175,14 @@ def init_or_load_ledger(
 
         now_iso = _now_utc().isoformat()
         merged_deadlines = load_deadlines_sec(repo_root=repo_root, policy_path=policy_path)
-        if deadlines_sec:
+        if deadlines_sec is not None:
+            if not isinstance(deadlines_sec, dict):
+                raise ValueError("deadlines_sec must be a dict.")
             merged_deadlines.update(deadlines_sec)
         merged_breakers = load_circuit_breakers(repo_root=repo_root, policy_path=policy_path)
-        if circuit_breakers:
+        if circuit_breakers is not None:
+            if not isinstance(circuit_breakers, dict):
+                raise ValueError("circuit_breakers must be a dict.")
             merged_breakers.update(circuit_breakers)
 
         ledger: dict[str, Any] = {
@@ -1178,6 +1215,11 @@ def init_or_load_ledger(
             "usage_by_conversation": {},
             "events": [],
         }
+        _ensure_ledger_defaults(
+            ledger,
+            policy_breakers=merged_breakers,
+            policy_deadlines=merged_deadlines,
+        )
         save_ledger(resolved, ledger)
         return ledger
 
@@ -1197,6 +1239,26 @@ def _append_event(
     ledger.setdefault("events", []).append(event)
 
 
+def _resolve_effective_deadlines(
+    ledger: dict[str, Any] | None,
+    *,
+    repo_root: Path | None = None,
+) -> dict[str, int | float]:
+    """Merge policy defaults with validated non-negative/positive ledger deadlines."""
+    effective = load_deadlines_sec(repo_root=repo_root)
+    if isinstance(ledger, dict) and isinstance(ledger.get("deadlines_sec"), dict):
+        for k, v in ledger["deadlines_sec"].items():
+            if not isinstance(k, str) or not k:
+                raise ValueError(f"Invalid deadlines_sec key {k!r} in ledger.json.")
+            fval = _require_finite_number(
+                v,
+                f"deadlines_sec[{k!r}]",
+                allow_zero=(k in ZERO_OK_DEADLINES_SEC),
+            )
+            effective[k] = int(v) if is_strict_int(v) else fval
+    return effective
+
+
 def run_managed_stage_cmd(
     stage: str,
     cmd: list[str],
@@ -1206,12 +1268,16 @@ def run_managed_stage_cmd(
     timeout_override: float | None = None,
 ) -> subprocess.CompletedProcess[str]:
     """Run a harness/git command under process-tree containment with stage timeout."""
-    deadlines = ledger.get("deadlines_sec", {}) if ledger else DEFAULT_DEADLINES_SEC
-    timeout_sec = float(
-        timeout_override
-        if timeout_override is not None
-        else deadlines.get(stage, DEFAULT_DEADLINES_SEC.get(stage, 180))
-    )
+    if timeout_override is not None:
+        timeout_sec = float(timeout_override)
+    else:
+        policy_root = (
+            cwd
+            if cwd is not None and (cwd / "harness" / "model-policy.json").is_file()
+            else None
+        )
+        deadlines = _resolve_effective_deadlines(ledger, repo_root=policy_root)
+        timeout_sec = float(deadlines.get(stage, DEFAULT_DEADLINES_SEC.get(stage, 180)))
     return run_managed_cmd(cmd, cwd=cwd, timeout_sec=timeout_sec, text=True)
 
 
@@ -1253,12 +1319,9 @@ def run_verifier_gate_step(
     """Execute ``build_verifier.py`` via managed subprocess with ``verifier_total`` deadline."""
     root = (repo_root or REPO_ROOT).resolve()
     script = Path(__file__).resolve().parent / "build_verifier.py"
-    step_timeout = int(
-        (ledger or {}).get("deadlines_sec", DEFAULT_DEADLINES_SEC).get("verifier_step", 180)
-    )
-    total_timeout = int(
-        (ledger or {}).get("deadlines_sec", DEFAULT_DEADLINES_SEC).get("verifier_total", 420)
-    )
+    deadlines = _resolve_effective_deadlines(ledger, repo_root=root)
+    step_timeout = deadlines.get("verifier_step", 180)
+    total_timeout = deadlines.get("verifier_total", 420)
     cmd = [
         sys.executable,
         str(script),
@@ -1327,14 +1390,10 @@ def run_review_gate_step(
         except (OSError, UnicodeDecodeError, ValueError, json.JSONDecodeError):
             disk_ledger = None
     cfg_ledger = ledger if isinstance(ledger, dict) else disk_ledger
-    deadlines = (
-        cfg_ledger.get("deadlines_sec", DEFAULT_DEADLINES_SEC)
-        if isinstance(cfg_ledger, dict)
-        else load_deadlines_sec(repo_root=root)
-    )
-    pass_total = int(deadlines.get("reviewer_pass_total", 900))
-    pass_idle = int(deadlines.get("reviewer_pass_idle", 270))
-    pass_agy_idle = int(deadlines.get("reviewer_agy_pass_idle", 630))
+    deadlines = _resolve_effective_deadlines(cfg_ledger, repo_root=root)
+    pass_total = deadlines.get("reviewer_pass_total", 900)
+    pass_idle = deadlines.get("reviewer_pass_idle", 270)
+    pass_agy_idle = deadlines.get("reviewer_agy_pass_idle", 630)
     effective_base = base_sha or (str(cfg_ledger.get("base_sha", "")) if cfg_ledger else "")
     cb_cfg = cfg_ledger.get("circuit_breakers") if isinstance(cfg_ledger, dict) else None
     raw_retries = (
@@ -1383,7 +1442,7 @@ def run_review_gate_step(
     attempts_per_pass = 1 + max_retries
     n_routes = _count_qualified_reviewer_routes(root)
     margin = min(120.0, max(0.5, float(pass_total) * 0.2))
-    outer_timeout = float(pass_total * attempts_per_pass * (1 + 2 * n_routes) + margin)
+    outer_timeout = float(float(pass_total) * attempts_per_pass * (1 + 2 * n_routes) + margin)
     return run_managed_stage_cmd(
         "reviewer_pass_total",
         cmd,
