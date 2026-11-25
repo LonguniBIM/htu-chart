@@ -1499,9 +1499,9 @@ def test_run_review_gate_step_outer_timeout_handles_late_quota_and_sequential_ag
         )
     assert seen_timeouts == [pytest.approx(6120.0)]
 
-    # 2. Live integration: reviewer_pass_total=1 (new 6.5s ceiling vs 5.5s old ceiling):
-    # Codex hits transient -> quota (2 * 0.85s), and both sequential AGY passes hit
-    # transient -> success (4 * 0.85s), exceeding 5.5s wall clock while finishing < 6.5s.
+    # 2. Live integration: reviewer_pass_total=4 (new 24.8s ceiling vs 20.8s old ceiling):
+    # Codex hits transient -> quota (2 * 3.55s), and both sequential AGY passes hit
+    # transient -> success (4 * 3.55s = 21.30s active sleep > 20.8s old ceiling, < 24.8s).
     repo_dir = tmp_path / "repo_live_timeout"
     repo_dir.mkdir(parents=True)
     _git(repo_dir, "init")
@@ -1563,7 +1563,7 @@ def test_run_review_gate_step_outer_timeout_handles_late_quota_and_sequential_ag
             f"sf = pathlib.Path({str(codex_state_dir)!r}) / (out_name + '.cnt')\n"
             "n = int(sf.read_text()) + 1 if sf.is_file() else 1\n"
             "sf.write_text(str(n))\n"
-            "time.sleep(0.75)\n"
+            "time.sleep(3.55)\n"
             "if n == 1:\n"
             "    sys.stderr.write('error: temporary network connection reset\\n')\n"
             "else:\n"
@@ -1585,7 +1585,7 @@ def test_run_review_gate_step_outer_timeout_handles_late_quota_and_sequential_ag
             f"sf = pathlib.Path({str(agy_state_dir)!r}) / (lens + '.cnt')\n"
             "n = int(sf.read_text()) + 1 if sf.is_file() else 1\n"
             "sf.write_text(str(n))\n"
-            "time.sleep(0.75)\n"
+            "time.sleep(3.55)\n"
             "if n == 1:\n"
             "    sys.stderr.write('error: temporary network connection reset\\n')\n"
             "    sys.exit(1)\n"
@@ -1637,8 +1637,8 @@ def test_run_review_gate_step_outer_timeout_handles_late_quota_and_sequential_ag
     )
     ledger["state"] = "REVIEW_FROZEN_G4"
     ledger["candidate_sha"] = sha
-    ledger["deadlines_sec"]["reviewer_pass_total"] = 1
-    ledger["deadlines_sec"]["reviewer_pass_idle"] = 2
+    ledger["deadlines_sec"]["reviewer_pass_total"] = 4
+    ledger["deadlines_sec"]["reviewer_pass_idle"] = 6
     task_runner.save_ledger(ledger_path, ledger)
 
     proc = task_runner.run_review_gate_step(
@@ -1651,11 +1651,206 @@ def test_run_review_gate_step_outer_timeout_handles_late_quota_and_sequential_ag
         ledger=ledger,
         ledger_path=ledger_path,
     )
-    assert seen_live_timeouts == [pytest.approx(6.5)]
+    assert seen_live_timeouts == [pytest.approx(24.8)]
     assert proc.returncode == 0, f"stderr={proc.stderr}\nstdout={proc.stdout}"
     led_after = task_runner.load_ledger(ledger_path)
     assert led_after["active_g4_reservations"] == {}
     assert led_after["spent_api_equiv_usd"] == pytest.approx(0.044)
+
+
+def test_g4_retry_count_matches_ledger_override_across_wrapper_and_reviewer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Ledger retry=0 overrides policy retry=1 in both run_review_gate_step and reviewer."""
+    import os
+    from harness.scripts import codex_room_review, codex_room_sync
+
+    repo_dir = tmp_path / "repo_retry_parity"
+    repo_dir.mkdir(parents=True)
+    _git(repo_dir, "init")
+    _git(repo_dir, "config", "user.email", "peer@example.com")
+    _git(repo_dir, "config", "user.name", "Peer")
+    (repo_dir / "harness").mkdir(parents=True)
+    (repo_dir / "harness" / "model-policy.json").write_text(
+        json.dumps(
+            {
+                "excluded_model_prefixes": list(task_runner.DEFAULT_EXCLUDED_MODEL_PREFIXES),
+                "roles": {
+                    "independent_reviewer": {"primary": "gpt-6.1-sol"},
+                    "independent_reviewer_fallbacks": {
+                        "qualified_routes": ["gemini-4-carbon-high"]
+                    },
+                },
+                "circuit_breakers": {
+                    "max_transient_retries_per_provider_pass": 1,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    (repo_dir / "app.py").write_text("print('ok')\n", encoding="utf-8")
+    _git(repo_dir, "add", ".")
+    _git(repo_dir, "commit", "-m", "init")
+    sha = _git(repo_dir, "rev-parse", "HEAD")
+
+    pkt = tmp_path / "pkt_parity.md"
+    pkt.write_text("# Task Packet\n", encoding="utf-8")
+
+    fake_home = tmp_path / "fake_home"
+    rt_root = fake_home / ".codex-runtime"
+    for role in ("pass1", "pass2"):
+        r_dir = rt_root / f"topstep-review-{role}"
+        r_dir.mkdir(parents=True, exist_ok=True)
+        (r_dir / "config.toml").write_text(
+            (
+                f'model = "{codex_room_sync.EXPECTED_REVIEW_MODEL}"\n'
+                f'model_reasoning_effort = "{codex_room_sync.EXPECTED_REASONING_EFFORT}"\n'
+                'sandbox_mode = "read-only"\n'
+                'approval_policy = "never"\n'
+                "[features]\n"
+                "multi_agent = false\n"
+                "multi_agent_v2 = false\n"
+                "agent_message_board = false\n"
+            ),
+            encoding="utf-8",
+        )
+
+    calls_dir = tmp_path / "parity_calls"
+    calls_dir.mkdir(parents=True)
+    codex_py = tmp_path / "codex_transient_stub.py"
+    codex_py.write_text(
+        (
+            "import json, pathlib, sys\n"
+            "if sys.argv[1:2] == ['app-server']:\n"
+            "    sys.exit(1)\n"
+            "args = sys.argv[1:]\n"
+            "out_stem = pathlib.Path(args[args.index('-o') + 1]).stem\n"
+            "_ = sys.stdin.read()\n"
+            f"cf = pathlib.Path({str(calls_dir)!r}) / (out_stem + '.cnt')\n"
+            "cnt = int(cf.read_text()) + 1 if cf.is_file() else 1\n"
+            "cf.write_text(str(cnt))\n"
+            "print(json.dumps({'type': 'turn.completed', 'usage': "
+            "{'input_tokens': 1000000, 'cached_input_tokens': 0, "
+            "'output_tokens': 0}}), flush=True)\n"
+            "sys.stderr.write('error: temporary network connection reset\\n')\n"
+            "sys.exit(1)\n"
+        ),
+        encoding="utf-8",
+    )
+
+    # 1. Direct codex_room_review.main --ledger (no --max-transient-retries flag) uses ledger=0.
+    direct_ledger_path = task_runner.default_ledger_path("T-PARITY-DIRECT", repo_root=repo_dir)
+    direct_ledger = task_runner.init_or_load_ledger(
+        direct_ledger_path, root_task_id="T-PARITY-DIRECT", base_sha=sha, budget_usd=6.0
+    )
+    direct_ledger["state"] = "REVIEW_FROZEN_G4"
+    direct_ledger["candidate_sha"] = sha
+    direct_ledger["circuit_breakers"]["max_transient_retries_per_provider_pass"] = 0
+    task_runner.save_ledger(direct_ledger_path, direct_ledger)
+
+    out_direct = tmp_path / "out_parity_direct"
+    with monkeypatch.context() as mp:
+        mp.setattr(
+            codex_room_review, "verify_role", lambda role, root: {"ok": True, "errors": []}
+        )
+        mp.setattr(
+            codex_room_review,
+            "resolve_codex_command",
+            lambda: [sys.executable, "-u", str(codex_py)],
+        )
+        rc_direct = codex_room_review.main(
+            [
+                "--commit",
+                sha,
+                "--task-id",
+                "T-PARITY-DIRECT",
+                "--ledger",
+                str(direct_ledger_path),
+                "--out-dir",
+                str(out_direct),
+                "--repo-root",
+                str(repo_dir),
+                "--backend",
+                "codex",
+            ]
+        )
+
+    pass1_direct = int((calls_dir / "pass1.cnt").read_text())
+    pass2_direct = int((calls_dir / "pass2.cnt").read_text())
+    rep_direct = json.loads((out_direct / "consolidated-review.json").read_text(encoding="utf-8"))
+    led_direct_after = task_runner.load_ledger(direct_ledger_path)
+    assert rc_direct == 2
+    assert pass1_direct == 1 and pass2_direct == 1
+    assert rep_direct["review_gate_status"] == "BLOCKED_INFRA"
+    assert led_direct_after["active_g4_reservations"] == {}
+    assert led_direct_after["spent_api_equiv_usd"] == pytest.approx(5.0)
+
+    # 2. Wrapper run_review_gate_step (ledger=None, loads disk ledger) passes retry=0 & deadline.
+    for f in calls_dir.glob("*.cnt"):
+        f.unlink()
+    wrap_ledger_path = task_runner.default_ledger_path("T-PARITY-WRAP", repo_root=repo_dir)
+    wrap_ledger = task_runner.init_or_load_ledger(
+        wrap_ledger_path, root_task_id="T-PARITY-WRAP", base_sha=sha, budget_usd=6.0
+    )
+    wrap_ledger["state"] = "REVIEW_FROZEN_G4"
+    wrap_ledger["candidate_sha"] = sha
+    wrap_ledger["circuit_breakers"]["max_transient_retries_per_provider_pass"] = 0
+    task_runner.save_ledger(wrap_ledger_path, wrap_ledger)
+
+    worktree_root = str(Path(task_runner.__file__).resolve().parents[2])
+    launcher_py = tmp_path / "parity_launcher.py"
+    launcher_py.write_text(
+        (
+            "import sys\n"
+            f"sys.path.insert(0, {worktree_root!r})\n"
+            "from harness.scripts import codex_room_review\n"
+            "codex_room_review.verify_role = "
+            "lambda role, root, **_kw: {'ok': True, 'errors': []}\n"
+            f"codex_room_review.resolve_codex_command = "
+            f"lambda: [sys.executable, '-u', {str(codex_py)!r}]\n"
+            "sys.exit(codex_room_review.main(sys.argv[1:]))\n"
+        ),
+        encoding="utf-8",
+    )
+    orig_run_managed = task_runner.run_managed_cmd
+    seen_wrap_timeouts: list[float] = []
+    seen_wrap_cmds: list[list[str]] = []
+
+    def _wrap_launcher(cmd: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        seen_wrap_timeouts.append(float(kwargs.get("timeout_sec", 0.0)))
+        seen_wrap_cmds.append(list(cmd))
+        return orig_run_managed([cmd[0], str(launcher_py), *cmd[2:]], **kwargs)
+
+    monkeypatch.setattr(task_runner, "run_managed_cmd", _wrap_launcher)
+    monkeypatch.setenv("HOME", str(fake_home))
+    if os.name == "nt":
+        monkeypatch.setenv("USERPROFILE", str(fake_home))
+
+    out_wrap = tmp_path / "out_parity_wrap"
+    proc = task_runner.run_review_gate_step(
+        commit_sha=sha,
+        task_id="T-PARITY-WRAP",
+        packet_path=pkt,
+        out_dir=out_wrap,
+        base_sha=sha,
+        repo_root=repo_dir,
+        ledger=None,
+        ledger_path=wrap_ledger_path,
+    )
+
+    pass1_wrap = int((calls_dir / "pass1.cnt").read_text())
+    pass2_wrap = int((calls_dir / "pass2.cnt").read_text())
+    rep_wrap = json.loads((out_wrap / "consolidated-review.json").read_text(encoding="utf-8"))
+    led_wrap_after = task_runner.load_ledger(wrap_ledger_path)
+    assert proc.returncode == 2
+    assert seen_wrap_timeouts == [pytest.approx(1920.0)]
+    assert "--max-transient-retries" in seen_wrap_cmds[0]
+    idx_flag = seen_wrap_cmds[0].index("--max-transient-retries")
+    assert seen_wrap_cmds[0][idx_flag + 1] == "0"
+    assert pass1_wrap == 1 and pass2_wrap == 1
+    assert rep_wrap["review_gate_status"] == "BLOCKED_INFRA"
+    assert led_wrap_after["active_g4_reservations"] == {}
+    assert led_wrap_after["spent_api_equiv_usd"] == pytest.approx(5.0)
 
 
 

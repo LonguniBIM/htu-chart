@@ -3982,7 +3982,9 @@ def test_g4_root_discovery_foreign_ledger_monotonic_counter_and_reused_billing(
         primary_model="gpt-6.1-sol",
         route_models_by_tag={},
     )
-    assert json.loads(led_reused.read_text(encoding="utf-8"))["spent_api_equiv_usd"] > 0.0
+    assert json.loads(led_reused.read_text(encoding="utf-8"))["spent_api_equiv_usd"] == (
+        pytest.approx(0.037, abs=1e-6)
+    )
 
 
 def test_g4_ledgerless_root_packet_blocks_child_task_id(
@@ -5339,7 +5341,7 @@ def test_g4_mid_run_tracker_corruption_bills_tokens_and_blocks(
     assert any("Corrupt g4-tracker.json" in err for err in rep["errors"])
     led_after = json.loads(ledger_path.read_text(encoding="utf-8"))
     assert led_after["state"] == "BLOCKED"
-    assert led_after["spent_api_equiv_usd"] > 0.0
+    assert led_after["spent_api_equiv_usd"] == pytest.approx(0.077, abs=1e-6)
     assert any(ev.get("kind") == "G4_TRACKER_CORRUPT_BLOCKED" for ev in led_after["events"])
 
 

@@ -1921,6 +1921,12 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--max-transient-retries",
+        type=int,
+        default=None,
+        help="Optional override for max transient retries per provider pass (>= 0).",
+    )
+    parser.add_argument(
         "--sequential",
         action="store_true",
         help="Run pass1 and pass2 sequentially instead of in parallel.",
@@ -3307,6 +3313,13 @@ def _release_g4_reservation_on_abort(
 
 def main(argv: list[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
+    if args.max_transient_retries is not None and args.max_transient_retries < 0:
+        print(
+            f"[codex_room_review] BLOCKED: --max-transient-retries must be >= 0, "
+            f"got {args.max_transient_retries}.",
+            file=sys.stderr,
+        )
+        return 2
     repo_root = args.repo_root.resolve()
     policy_data, excluded_prefixes, policy_err = load_model_policy(
         repo_root, require_exists=False
@@ -3474,6 +3487,27 @@ def main(argv: list[str] | None = None) -> int:
         )
 
     try:
+        ledger_for_cfg = active_ledger_path or _resolve_g4_ledger_path(args, git_top)
+        if args.max_transient_retries is not None:
+            max_transient_retries = int(args.max_transient_retries)
+        elif ledger_for_cfg is not None and ledger_for_cfg.is_file():
+            try:
+                loaded_cfg_ledger = task_runner.load_ledger(ledger_for_cfg, repo_root=git_top)
+            except (OSError, UnicodeDecodeError, ValueError, json.JSONDecodeError) as exc:
+                print(
+                    f"[codex_room_review] BLOCKED: Invalid ledger.json at "
+                    f"{ledger_for_cfg}: {exc}",
+                    file=sys.stderr,
+                )
+                return 2
+            cb_cfg = loaded_cfg_ledger.get("circuit_breakers")
+            raw_r = (
+                cb_cfg.get("max_transient_retries_per_provider_pass")
+                if isinstance(cb_cfg, dict)
+                else None
+            )
+            if is_strict_int(raw_r):
+                max_transient_retries = max(0, int(raw_r))
         return _run_after_preflight()
     finally:
         _release_g4_reservation_on_abort(

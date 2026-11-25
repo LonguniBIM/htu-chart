@@ -1253,10 +1253,43 @@ def run_review_gate_step(
     """Execute ``codex_room_review.py`` via managed subprocess with reviewer deadlines."""
     root = (repo_root or REPO_ROOT).resolve()
     script = Path(__file__).resolve().parent / "codex_room_review.py"
-    deadlines = (ledger or {}).get("deadlines_sec", DEFAULT_DEADLINES_SEC)
+    effective_ledger = ledger_path
+    if effective_ledger is None and isinstance(ledger, dict) and ledger.get("root_task_id"):
+        cand = default_ledger_path(str(ledger["root_task_id"]), repo_root=root)
+        if cand.is_file():
+            effective_ledger = cand
+    if effective_ledger is None:
+        effective_ledger = find_ledger_path_for_task(
+            task_id, repo_root=root, task_packet=packet_path
+        )
+    disk_ledger: dict[str, Any] | None = None
+    if ledger is None and effective_ledger is not None and effective_ledger.is_file():
+        try:
+            disk_ledger = load_ledger(effective_ledger, repo_root=root)
+        except (OSError, UnicodeDecodeError, ValueError, json.JSONDecodeError):
+            disk_ledger = None
+    cfg_ledger = ledger if isinstance(ledger, dict) else disk_ledger
+    deadlines = (cfg_ledger or {}).get("deadlines_sec", DEFAULT_DEADLINES_SEC)
     pass_total = int(deadlines.get("reviewer_pass_total", 600))
     pass_idle = int(deadlines.get("reviewer_pass_idle", 180))
-    effective_base = base_sha or (str(ledger.get("base_sha", "")) if ledger else "")
+    effective_base = base_sha or (str(cfg_ledger.get("base_sha", "")) if cfg_ledger else "")
+    cb_cfg = cfg_ledger.get("circuit_breakers") if isinstance(cfg_ledger, dict) else None
+    raw_retries = (
+        cb_cfg.get("max_transient_retries_per_provider_pass")
+        if isinstance(cb_cfg, dict)
+        else None
+    )
+    if is_strict_int(raw_retries):
+        max_retries = max(0, int(raw_retries))
+    else:
+        max_retries = max(
+            0,
+            int(
+                load_circuit_breakers(repo_root=root).get(
+                    "max_transient_retries_per_provider_pass", 1
+                )
+            ),
+        )
     cmd = [
         sys.executable,
         str(script),
@@ -1274,38 +1307,14 @@ def run_review_gate_step(
         str(pass_total),
         "--idle-timeout",
         str(pass_idle),
+        "--max-transient-retries",
+        str(max_retries),
         "--fail-on-blocking",
     ]
     if effective_base:
         cmd.extend(["--base", effective_base])
-    effective_ledger = ledger_path
-    if effective_ledger is None and isinstance(ledger, dict) and ledger.get("root_task_id"):
-        cand = default_ledger_path(str(ledger["root_task_id"]), repo_root=root)
-        if cand.is_file():
-            effective_ledger = cand
-    if effective_ledger is None:
-        effective_ledger = find_ledger_path_for_task(
-            task_id, repo_root=root, task_packet=packet_path
-        )
     if effective_ledger is not None:
         cmd.extend(["--ledger", str(effective_ledger)])
-    cb_cfg = ledger.get("circuit_breakers") if isinstance(ledger, dict) else None
-    raw_retries = (
-        cb_cfg.get("max_transient_retries_per_provider_pass")
-        if isinstance(cb_cfg, dict)
-        else None
-    )
-    if is_strict_int(raw_retries):
-        max_retries = max(0, int(raw_retries))
-    else:
-        max_retries = max(
-            0,
-            int(
-                load_circuit_breakers(repo_root=root).get(
-                    "max_transient_retries_per_provider_pass", 1
-                )
-            ),
-        )
     attempts_per_pass = 1 + max_retries
     n_routes = _count_qualified_reviewer_routes(root)
     margin = min(120.0, max(0.5, float(pass_total) * 0.2))
@@ -1313,7 +1322,7 @@ def run_review_gate_step(
     return run_managed_stage_cmd(
         "reviewer_pass_total",
         cmd,
-        ledger=ledger,
+        ledger=cfg_ledger,
         cwd=root,
         timeout_override=outer_timeout,
     )
