@@ -5489,6 +5489,7 @@ def test_agy_plain_text_stderr_zero_token_startup_race_retries_archives_and_degr
     assert "empty conversation id" in retry_logs[0].read_text(encoding="utf-8")
 
     fail_forever.write_text("1", encoding="utf-8")
+    (calls_dir / "correctness_and_tests.log").unlink()
     out_inf = tmp_path / "out_stderr_blocked_infra"
     rc_inf = codex_room_review.main(
         [
@@ -5506,6 +5507,8 @@ def test_agy_plain_text_stderr_zero_token_startup_race_retries_archives_and_degr
     rep_inf = json.loads((out_inf / "consolidated-review.json").read_text(encoding="utf-8"))
     assert rep_inf["review_gate_status"] == "BLOCKED_INFRA"
     assert len(list(out_inf.glob("pass1.*retry0*.stderr.log"))) == 1
+    p1_lines = (calls_dir / "correctness_and_tests.log").read_text(encoding="utf-8").splitlines()
+    assert len(p1_lines) == 2
 
 
 def test_classify_agy_failure_rejects_nonzero_or_bool_tokens_with_startup_stderr(
@@ -5540,6 +5543,8 @@ def test_classify_agy_failure_rejects_nonzero_or_bool_tokens_with_startup_stderr
                 }
             )
             + "\n",
+            json.dumps({"usage": {"input_tokens": "invalid"}}) + "\n",
+            json.dumps({"usage": {"cache_read_tokens": {}, "output_tokens": []}}) + "\n",
         ),
         start=1,
     ):
@@ -5566,6 +5571,293 @@ def test_classify_agy_failure_rejects_nonzero_or_bool_tokens_with_startup_stderr
     )
     f_json = codex_room_review.classify_agy_failure(d_json_err, "pass1", returncode=1)
     assert f_json.category == codex_room_review.OUTCOME_TRANSIENT
+
+
+def test_g4_rejects_malformed_circuit_breakers_and_missing_spent_without_cli(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Malformed ledger circuit_breakers or missing spent_api_equiv_usd fails closed preflight."""
+    repo_dir, sha1 = _init_policy_repo(tmp_path / "repo_bad_cb", qualified_routes=[])
+    calls = _install_counting_codex_stub(tmp_path, monkeypatch, sha1)
+    bad_cases = (
+        {"circuit_breakers": {"max_g4_rounds_per_root_task": "100"}},
+        {"circuit_breakers": {"max_g4_rounds_per_root_task": True}},
+        {"circuit_breakers": {"max_g4_rounds_per_root_task": None}},
+        {"circuit_breakers": {"max_g4_rounds_per_root_task": 0}},
+        {"__drop_spent__": True},
+    )
+    for idx, case in enumerate(bad_cases, start=1):
+        task_id = f"T-BAD-CB-{idx}"
+        ledger_path = _setup_ledger_for_g4_test(
+            repo_dir, task_id, state="REVIEW_FROZEN_G4", candidate_sha=sha1
+        )
+        raw = json.loads(ledger_path.read_text(encoding="utf-8"))
+        if case.get("__drop_spent__"):
+            raw.pop("spent_api_equiv_usd", None)
+        else:
+            raw.update(case)
+        ledger_path.write_text(json.dumps(raw), encoding="utf-8")
+
+        out_dir = repo_dir / "harness" / "runs" / task_id / "attempts" / f"r1-{sha1[:12]}"
+        rc = codex_room_review.main(
+            [
+                "--commit",
+                sha1,
+                "--task-id",
+                task_id,
+                "--ledger",
+                str(ledger_path),
+                "--repo-root",
+                str(repo_dir),
+                "--out-dir",
+                str(out_dir),
+                "--backend",
+                "codex",
+            ]
+        )
+        assert rc == 2
+        assert _count_calls(calls) == 0
+        assert not (out_dir / "frozen").exists()
+        assert not out_dir.exists()
+
+
+def test_g4_agy_malformed_pass1_usage_classifies_blocked_and_bills_pass2(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Malformed usage in pass1 yields BLOCKED report without crashing and still bills pass2."""
+    repo_dir, sha1 = _init_policy_repo(
+        tmp_path / "repo_malformed_usage", qualified_routes=["gemini-4-carbon-high"]
+    )
+    ledger_path = _setup_ledger_for_g4_test(
+        repo_dir, "T-MAL-USAGE", state="REVIEW_FROZEN_G4", candidate_sha=sha1
+    )
+    fake_agy = tmp_path / "fake_agy_mal_usage.py"
+    agy_prefix = _write_fake_codex_script(
+        fake_agy,
+        (
+            "import json, sys\n"
+            "args = sys.argv[1:]\n"
+            "prompt = args[args.index('-p') + 1]\n"
+            "is_p2 = 'security_and_invariants' in prompt\n"
+            "if not is_p2:\n"
+            "    print(json.dumps({'usage': {'input_tokens': 'invalid', 'output_tokens': {}}}), "
+            "flush=True)\n"
+            "    sys.stderr.write('error: failed to start conversation\\n')\n"
+            "    sys.exit(1)\n"
+            f"payload = {{'revision_sha': {sha1!r}, 'lens': 'security_and_invariants', "
+            "'verdict': 'APPROVE', 'summary': 'p2 ok', 'findings': [], "
+            "'test_quality_issues': [], 'unverified_areas': []}\n"
+            "print(json.dumps({'event': 'result', 'result': {'status': 'SUCCESS', "
+            "'model': 'gemini-4-carbon-high', "
+            "'usage': {'input_tokens': 5000, 'output_tokens': 1000}, "
+            "'structured_output': payload}}), flush=True)\n"
+        ),
+    )
+    monkeypatch.setattr(codex_room_review, "resolve_agy_command", lambda: agy_prefix)
+    out_dir = repo_dir / "harness" / "runs" / "T-MAL-USAGE" / "attempts" / f"r1-{sha1[:12]}"
+    rc = codex_room_review.main(
+        [
+            "--commit",
+            sha1,
+            "--task-id",
+            "T-MAL-USAGE",
+            "--ledger",
+            str(ledger_path),
+            "--repo-root",
+            str(repo_dir),
+            "--out-dir",
+            str(out_dir),
+            "--backend",
+            "agy",
+        ]
+    )
+    assert rc == 2
+    rep = json.loads((out_dir / "consolidated-review.json").read_text(encoding="utf-8"))
+    assert rep["review_gate_status"] == "BLOCKED"
+    led = json.loads(ledger_path.read_text(encoding="utf-8"))
+    assert led["state"] == "BLOCKED"
+    assert led["spent_api_equiv_usd"] > 0.0
+
+
+def test_g4_agy_alias_model_bills_via_route_and_unpriceable_model_blocks(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Unknown AGY event model alias falls back to route pricing; unpriceable usage blocks."""
+    repo_dir, sha1 = _init_policy_repo(
+        tmp_path / "repo_agy_alias_bill", qualified_routes=["gemini-4-carbon-high"]
+    )
+    fake_agy = tmp_path / "fake_agy_alias.py"
+    agy_prefix = _write_fake_codex_script(
+        fake_agy,
+        (
+            "import json, sys\n"
+            "args = sys.argv[1:]\n"
+            "prompt = args[args.index('-p') + 1]\n"
+            "lens = 'security_and_invariants' if 'security_and_invariants' in prompt "
+            "else 'correctness_and_tests'\n"
+            f"payload = {{'revision_sha': {sha1!r}, 'lens': lens, 'verdict': 'APPROVE', "
+            "'summary': 'ok', 'findings': [], 'test_quality_issues': [], "
+            "'unverified_areas': []}\n"
+            "print(json.dumps({'event': 'result', 'result': {'status': 'SUCCESS', "
+            "'model': 'agy-custom-alias', "
+            "'usage': {'input_tokens': 4000, 'output_tokens': 800}, "
+            "'structured_output': payload}}), flush=True)\n"
+        ),
+    )
+    monkeypatch.setattr(codex_room_review, "resolve_agy_command", lambda: agy_prefix)
+
+    led_ok = _setup_ledger_for_g4_test(
+        repo_dir, "T-AGY-ALIAS-OK", state="REVIEW_FROZEN_G4", candidate_sha=sha1
+    )
+    out_ok = repo_dir / "harness" / "runs" / "T-AGY-ALIAS-OK" / "attempts" / f"r1-{sha1[:12]}"
+    rc_ok = codex_room_review.main(
+        [
+            "--commit",
+            sha1,
+            "--task-id",
+            "T-AGY-ALIAS-OK",
+            "--ledger",
+            str(led_ok),
+            "--repo-root",
+            str(repo_dir),
+            "--out-dir",
+            str(out_ok),
+            "--backend",
+            "agy",
+        ]
+    )
+    assert rc_ok == 0
+    assert json.loads(led_ok.read_text(encoding="utf-8"))["spent_api_equiv_usd"] > 0.0
+
+    # Unpriceable event + route model fails closed (rc=2, BLOCKED).
+    led_bad = _setup_ledger_for_g4_test(
+        repo_dir, "T-AGY-UNPRICED", state="REVIEW_FROZEN_G4", candidate_sha=sha1
+    )
+    out_bad = repo_dir / "harness" / "runs" / "T-AGY-UNPRICED" / "attempts" / f"r1-{sha1[:12]}"
+    rc_bad = codex_room_review.main(
+        [
+            "--commit",
+            sha1,
+            "--task-id",
+            "T-AGY-UNPRICED",
+            "--ledger",
+            str(led_bad),
+            "--repo-root",
+            str(repo_dir),
+            "--out-dir",
+            str(out_bad),
+            "--backend",
+            "agy",
+            "--fallback-model",
+            "unpriced-route-model",
+        ]
+    )
+    assert rc_bad == 2
+    rep_bad = json.loads((out_bad / "consolidated-review.json").read_text(encoding="utf-8"))
+    assert rep_bad["review_gate_status"] == "BLOCKED"
+    assert json.loads(led_bad.read_text(encoding="utf-8"))["state"] == "BLOCKED"
+
+
+def test_g4_ledgerless_edited_packet_same_version_stays_blocked_until_version_bumps(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Editing packet.md body/whitespace without bumping Packet Version still blocks round 4."""
+    repo_dir, sha1 = _init_policy_repo(tmp_path / "repo_pkt_bucket", qualified_routes=[])
+    pkt_path = repo_dir / "harness" / "runs" / "T-PKT-BUCKET" / "packet.md"
+    pkt_path.parent.mkdir(parents=True, exist_ok=True)
+    pkt_path.write_text(
+        "# Packet\n\n- **Root Task ID**: `T-PKT-BUCKET`\n- **Packet Version**: `1`\nBody A\n",
+        encoding="utf-8",
+    )
+    rt_root = tmp_path / "rt_pkt_bkt"
+    (rt_root / "topstep-review-pass1").mkdir(parents=True)
+    (rt_root / "topstep-review-pass2").mkdir(parents=True)
+
+    shas = [sha1]
+    for idx in range(2, 6):
+        (repo_dir / "app.py").write_text(f"x = {idx}\n", encoding="utf-8")
+        shas.append(_commit_repo_change(repo_dir, f"c{idx}"))
+
+    for idx in range(3):
+        calls = _install_counting_codex_stub(tmp_path, monkeypatch, shas[idx])
+        out_r = pkt_path.parent / "attempts" / f"r{idx + 1}-{shas[idx][:12]}"
+        rc = codex_room_review.main(
+            [
+                "--commit",
+                shas[idx],
+                "--task-id",
+                "T-PKT-BUCKET",
+                "--task-packet",
+                str(pkt_path),
+                "--runtime-root",
+                str(rt_root),
+                "--repo-root",
+                str(repo_dir),
+                "--out-dir",
+                str(out_r),
+                "--backend",
+                "codex",
+            ]
+        )
+        assert rc == 0
+        assert _count_calls(calls) == 2
+
+    # Edit packet body while keeping Packet Version: 1 -> must STILL block 4th round!
+    pkt_path.write_text(
+        "# Packet\n\n- **Root Task ID**: `T-PKT-BUCKET`\n- **Packet Version**: `1`\nBody B\n\n",
+        encoding="utf-8",
+    )
+    calls4 = _install_counting_codex_stub(tmp_path, monkeypatch, shas[3])
+    out_4 = pkt_path.parent / "attempts" / f"r4-{shas[3][:12]}"
+    rc4 = codex_room_review.main(
+        [
+            "--commit",
+            shas[3],
+            "--task-id",
+            "T-PKT-BUCKET",
+            "--task-packet",
+            str(pkt_path),
+            "--runtime-root",
+            str(rt_root),
+            "--repo-root",
+            str(repo_dir),
+            "--out-dir",
+            str(out_4),
+            "--backend",
+            "codex",
+        ]
+    )
+    assert rc4 == 2
+    assert _count_calls(calls4) == 0
+    assert not out_4.exists()
+
+    # Bump Packet Version: 2 -> opens new bucket and allows round 4.
+    pkt_path.write_text(
+        "# Packet\n\n- **Root Task ID**: `T-PKT-BUCKET`\n- **Packet Version**: `2`\nBody B\n",
+        encoding="utf-8",
+    )
+    calls5 = _install_counting_codex_stub(tmp_path, monkeypatch, shas[3])
+    rc5 = codex_room_review.main(
+        [
+            "--commit",
+            shas[3],
+            "--task-id",
+            "T-PKT-BUCKET",
+            "--task-packet",
+            str(pkt_path),
+            "--runtime-root",
+            str(rt_root),
+            "--repo-root",
+            str(repo_dir),
+            "--out-dir",
+            str(out_4),
+            "--backend",
+            "codex",
+        ]
+    )
+    assert rc5 == 0
+    assert _count_calls(calls5) == 2
+
 
 
 

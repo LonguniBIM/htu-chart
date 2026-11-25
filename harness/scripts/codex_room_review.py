@@ -540,10 +540,9 @@ def classify_agy_failure(
     if has_watchdog:
         return PassFailure(OUTCOME_SCHEMA_OR_POLICY, f"{pass_name}: watchdog timeout")
 
+    bad_or_nonzero = _agy_raw_has_nonzero_or_bad_usage(raw_text)
     _, _, r_in, r_cache, r_out = _extract_agy_cumulative_usage(raw_path)
-    zero_raw_tokens = (
-        (r_in + r_cache + r_out) == 0 and not _agy_raw_has_nonzero_or_bad_usage(raw_text)
-    )
+    zero_raw_tokens = (r_in + r_cache + r_out) == 0 and not bad_or_nonzero
     stderr_norm = _norm_provider_text(stderr_provider)
 
     for res in result_errors:
@@ -2530,6 +2529,10 @@ def _preflight_g4_caps(
         return _check_and_reserve_locked()
 
 
+def _safe_nonneg_int(val: Any) -> int:
+    return int(val) if is_strict_int(val) and val > 0 else 0
+
+
 def _extract_codex_usage_deltas(raw_path: Path) -> list[tuple[int, int, int]]:
     """Extract per-turn (uncached_in, cache_read, output_tokens) deltas from Codex JSONL."""
     if not raw_path.is_file():
@@ -2548,13 +2551,13 @@ def _extract_codex_usage_deltas(raw_path: Path) -> list[tuple[int, int, int]]:
         usage = ev.get("usage")
         if not isinstance(usage, dict):
             continue
-        raw_in = max(0, int(usage.get("input_tokens") or 0))
+        raw_in = _safe_nonneg_int(usage.get("input_tokens"))
         cache_in = max(
-            0,
-            int(usage.get("cached_input_tokens") or usage.get("cache_read_tokens") or 0),
+            _safe_nonneg_int(usage.get("cached_input_tokens")),
+            _safe_nonneg_int(usage.get("cache_read_tokens")),
         )
         uncached_in = max(0, raw_in - cache_in)
-        out_tok = max(0, int(usage.get("output_tokens") or 0))
+        out_tok = _safe_nonneg_int(usage.get("output_tokens"))
         if uncached_in or cache_in or out_tok:
             deltas.append((uncached_in, cache_in, out_tok))
     return deltas
@@ -2598,12 +2601,13 @@ def _extract_agy_cumulative_usage(
         )
         if not isinstance(usage, dict):
             continue
-        max_in = max(max_in, max(0, int(usage.get("input_tokens") or 0)))
+        max_in = max(max_in, _safe_nonneg_int(usage.get("input_tokens")))
         max_cache = max(
             max_cache,
-            max(0, int(usage.get("cache_read_tokens") or usage.get("cached_input_tokens") or 0)),
+            _safe_nonneg_int(usage.get("cache_read_tokens")),
+            _safe_nonneg_int(usage.get("cached_input_tokens")),
         )
-        max_out = max(max_out, max(0, int(usage.get("output_tokens") or 0)))
+        max_out = max(max_out, _safe_nonneg_int(usage.get("output_tokens")))
     return conv_id, model_name, max_in, max_cache, max_out
 
 
@@ -2642,8 +2646,21 @@ def _resolve_raw_log_model(
     return active_model if active_backend == "agy" else None
 
 
-def _bill_pass_raw_logs(
-    ledger_path: Path,
+def _first_priceable_model(candidates: list[str | None]) -> str | None:
+    seen: set[str] = set()
+    for cand in candidates:
+        if not isinstance(cand, str) or not cand or cand in seen:
+            continue
+        seen.add(cand)
+        try:
+            task_runner._resolve_pricing(cand)
+            return cand
+        except ValueError:
+            continue
+    return None
+
+
+def _plan_raw_log_billing(
     *,
     out_dir: Path,
     states: dict[str, PassState],
@@ -2652,7 +2669,9 @@ def _bill_pass_raw_logs(
     active_model: str | None,
     primary_model: str | None,
     route_models_by_tag: dict[str, str],
-) -> None:
+) -> tuple[list[dict[str, Any]], list[str]]:
+    bill_entries: list[dict[str, Any]] = []
+    unbillable_errors: list[str] = []
     for pass_name in ("pass1", "pass2"):
         if pass_name in reused_passes:
             continue
@@ -2670,28 +2689,20 @@ def _bill_pass_raw_logs(
                     primary_model=primary_model,
                     route_models_by_tag=route_models_by_tag,
                 )
-                if not c_model:
-                    continue
-                try:
-                    task_runner._resolve_pricing(c_model)
-                except ValueError:
-                    continue
-                for u_in, u_cache, u_out in codex_deltas:
-                    task_runner.record_usage(
-                        ledger_path,
-                        model=c_model,
-                        input_tokens=u_in,
-                        output_tokens=u_out,
-                        thinking_tokens=0,
-                        cache_read_tokens=u_cache,
-                        counter_mode="delta",
+                priced = _first_priceable_model([c_model])
+                if priced is None:
+                    unbillable_errors.append(
+                        f"Unbillable Codex token usage in {raw_path.name}: "
+                        f"no pricing for model {c_model!r}."
                     )
+                    continue
+                bill_entries.append({"kind": "codex", "model": priced, "deltas": codex_deltas})
                 continue
 
             conv_id, ev_model, a_in, a_cache, a_out = _extract_agy_cumulative_usage(raw_path)
             if not (a_in or a_cache or a_out):
                 continue
-            a_model = ev_model or _resolve_raw_log_model(
+            route_model = _resolve_raw_log_model(
                 raw_path,
                 pass_name=pass_name,
                 is_codex=False,
@@ -2701,22 +2712,70 @@ def _bill_pass_raw_logs(
                 primary_model=primary_model,
                 route_models_by_tag=route_models_by_tag,
             )
-            if not a_model:
+            priced_agy = _first_priceable_model([ev_model, route_model])
+            if priced_agy is None:
+                unbillable_errors.append(
+                    f"Unbillable AGY token usage in {raw_path.name}: "
+                    f"no pricing for event={ev_model!r} or route={route_model!r}."
+                )
                 continue
-            try:
-                task_runner._resolve_pricing(a_model)
-            except ValueError:
-                continue
+            bill_entries.append(
+                {
+                    "kind": "agy",
+                    "model": priced_agy,
+                    "a_in": a_in,
+                    "a_cache": a_cache,
+                    "a_out": a_out,
+                    "conv_id": conv_id,
+                }
+            )
+    return bill_entries, unbillable_errors
+
+
+def _bill_pass_raw_logs(
+    ledger_path: Path,
+    *,
+    out_dir: Path,
+    states: dict[str, PassState],
+    reused_passes: list[str],
+    active_backend: str,
+    active_model: str | None,
+    primary_model: str | None,
+    route_models_by_tag: dict[str, str],
+) -> list[str]:
+    bill_entries, unbillable_errors = _plan_raw_log_billing(
+        out_dir=out_dir,
+        states=states,
+        reused_passes=reused_passes,
+        active_backend=active_backend,
+        active_model=active_model,
+        primary_model=primary_model,
+        route_models_by_tag=route_models_by_tag,
+    )
+    for item in bill_entries:
+        if item["kind"] == "codex":
+            for u_in, u_cache, u_out in item["deltas"]:
+                task_runner.record_usage(
+                    ledger_path,
+                    model=item["model"],
+                    input_tokens=u_in,
+                    output_tokens=u_out,
+                    thinking_tokens=0,
+                    cache_read_tokens=u_cache,
+                    counter_mode="delta",
+                )
+        else:
             task_runner.record_usage(
                 ledger_path,
-                model=a_model,
-                input_tokens=a_in,
-                output_tokens=a_out,
+                model=item["model"],
+                input_tokens=item["a_in"],
+                output_tokens=item["a_out"],
                 thinking_tokens=0,
-                cache_read_tokens=a_cache,
-                conversation_id=conv_id,
+                cache_read_tokens=item["a_cache"],
+                conversation_id=item["conv_id"],
                 counter_mode="cumulative",
             )
+    return unbillable_errors
 
 
 def _has_prior_blocking_review(
@@ -2861,7 +2920,7 @@ def _record_g4_outcome(
         if ledger_path is None or not ledger_path.is_file():
             return None
 
-        _bill_pass_raw_logs(
+        bill_errors = _bill_pass_raw_logs(
             ledger_path,
             out_dir=out_dir,
             states=states,
@@ -2871,13 +2930,20 @@ def _record_g4_outcome(
             primary_model=primary_model,
             route_models_by_tag=route_models_by_tag,
         )
+        effective_gate_status = gate_status
+        if bill_errors:
+            effective_gate_status = "BLOCKED"
+            report["review_gate_status"] = "BLOCKED"
+            for b_err in bill_errors:
+                if b_err not in report.setdefault("errors", []):
+                    report["errors"].append(b_err)
         ledger = task_runner.load_ledger(ledger_path, repo_root=git_top)
         res_meta: Any = None
         if reservation_id is not None:
             res_meta = ledger.setdefault("active_g4_reservations", {}).pop(
                 reservation_id, None
             )
-        if gate_status in {"PASSED", "CHANGES_REQUESTED"}:
+        if effective_gate_status in {"PASSED", "CHANGES_REQUESTED"}:
             ledger["g4_rounds_total"] = int(ledger.get("g4_rounds_total", 0)) + 1
 
         spent = float(ledger.get("spent_api_equiv_usd", 0.0))
@@ -2924,10 +2990,10 @@ def _record_g4_outcome(
                 and ledger.get("last_g4_status") == "CHANGES_REQUESTED"
             )
         )
-        if gate_status in {"PASSED", "CHANGES_REQUESTED"}:
+        if effective_gate_status in {"PASSED", "CHANGES_REQUESTED"}:
             ledger["g4_rounds_in_packet"] = int(ledger.get("g4_rounds_in_packet", 0)) + 1
         ledger["last_g4_candidate_sha"] = candidate_sha
-        ledger["last_g4_status"] = gate_status
+        ledger["last_g4_status"] = effective_gate_status
         ledger["transient_retries_in_stage"] = 0
 
         if budget_exceeded:
@@ -2943,7 +3009,7 @@ def _record_g4_outcome(
                     "limit_usd": limit,
                 },
             )
-        elif gate_status == "PASSED":
+        elif effective_gate_status == "PASSED":
             if prior_changes_requested:
                 ledger["candidate_sha"] = None
                 ledger["state"] = "BLOCKED"
@@ -2957,7 +3023,7 @@ def _record_g4_outcome(
                 ledger["candidate_sha"] = candidate_sha
                 ledger["state"] = "READY_FOR_ACCEPTANCE"
                 task_runner._append_event(ledger, "G4_PASSED", {"candidate_sha": candidate_sha})
-        elif gate_status == "CHANGES_REQUESTED":
+        elif effective_gate_status == "CHANGES_REQUESTED":
             ledger["candidate_sha"] = None
             ledger["consecutive_failed_candidates"] = (
                 int(ledger.get("consecutive_failed_candidates", 0)) + 1
@@ -2969,10 +3035,10 @@ def _record_g4_outcome(
                 {"candidate_sha": candidate_sha},
             )
         else:
-            ledger["state"] = gate_status
+            ledger["state"] = effective_gate_status
             task_runner._append_event(
                 ledger,
-                f"G4_{gate_status}",
+                f"G4_{effective_gate_status}",
                 {"candidate_sha": candidate_sha, "errors": report.get("errors", [])},
             )
         task_runner.save_ledger(ledger_path, ledger)
@@ -3562,6 +3628,21 @@ def _execute_after_preflight(
                 report["review_gate_status"] = "BLOCKED"
                 if err_msg not in report["errors"]:
                     report["errors"].append(err_msg)
+        if active_ledger_path is not None and active_ledger_path.is_file():
+            _, unbillable_errs = _plan_raw_log_billing(
+                out_dir=out_dir,
+                states=states,
+                reused_passes=reused_passes,
+                active_backend=active_backend,
+                active_model=active_model,
+                primary_model=primary_model,
+                route_models_by_tag=route_models_by_tag,
+            )
+            if unbillable_errs:
+                report["review_gate_status"] = "BLOCKED"
+                for u_err in unbillable_errs:
+                    if u_err not in report["errors"]:
+                        report["errors"].append(u_err)
         if not _write_once_outputs(out_dir, report):
             return 2
 

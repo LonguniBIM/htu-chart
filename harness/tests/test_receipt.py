@@ -2479,6 +2479,142 @@ def test_g5_receipt_blocks_combined_legacy_plus_fs_sha_and_wrong_typed_ledger_ma
         assert any("Invalid ledger.json" in b for b in rec_bad["blockers"])
 
 
+def test_g5_receipt_blocks_malformed_breaker_caps_and_missing_spent(tmp_path: Path) -> None:
+    """G5 rejects malformed circuit_breakers cap values or missing spent_api_equiv_usd."""
+    from harness.scripts import receipt as receipt_mod
+    from harness.scripts import task_runner
+
+    cand_sha = "e" * 40
+    base_sha = "a" * 40
+    repo = tmp_path / "repo_g5_bad_cb"
+    repo.mkdir()
+    v_path = tmp_path / "v_cb.json"
+    r_path = tmp_path / "r_cb.json"
+    v_path.write_text(json.dumps(_verifier(cand_sha)), encoding="utf-8")
+    r_path.write_text(json.dumps(_review(cand_sha)), encoding="utf-8")
+
+    for idx, mutate_kind in enumerate(("str_cap", "bool_cap", "zero_cap", "drop_spent"), start=1):
+        tid = f"T-G5-BADCB-{idx}"
+        led_path = repo / "harness" / "runs" / tid / "ledger.json"
+        led = task_runner.init_or_load_ledger(
+            led_path, root_task_id=tid, base_sha=base_sha, budget_usd=6.0
+        )
+        led["state"] = "READY_FOR_ACCEPTANCE"
+        led["candidate_sha"] = cand_sha
+        task_runner.save_ledger(led_path, led)
+        raw = json.loads(led_path.read_text(encoding="utf-8"))
+        if mutate_kind == "str_cap":
+            raw["circuit_breakers"]["max_g4_rounds_per_root_task"] = "100"
+        elif mutate_kind == "bool_cap":
+            raw["circuit_breakers"]["max_g4_rounds_per_root_task"] = True
+        elif mutate_kind == "zero_cap":
+            raw["circuit_breakers"]["max_g4_rounds_per_root_task"] = 0
+        else:
+            raw.pop("spent_api_equiv_usd", None)
+        led_path.write_text(json.dumps(raw), encoding="utf-8")
+
+        out_dir = tmp_path / f"out_cb_{idx}"
+        rc = receipt_mod.main(
+            [
+                "--task-id",
+                tid,
+                "--phase",
+                "1",
+                "--base-sha",
+                base_sha,
+                "--candidate-sha",
+                cand_sha,
+                "--verifier-json",
+                str(v_path),
+                "--review-json",
+                str(r_path),
+                "--ledger",
+                str(led_path),
+                "--repo-root",
+                str(repo),
+                "--out-dir",
+                str(out_dir),
+            ]
+        )
+        assert rc == 2
+        rec = json.loads((out_dir / "receipt.json").read_text(encoding="utf-8"))
+        assert rec["conclusion"] == "BLOCKED"
+        assert any("Invalid ledger.json" in b for b in rec["blockers"])
+
+
+def test_g5_receipt_refuses_publish_when_ledger_save_raises_and_retries_cleanly(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """PermissionError on G5 ledger persistence leaves no receipt.json so retry succeeds."""
+    from harness.scripts import receipt as receipt_mod
+    from harness.scripts import task_runner
+
+    cand_sha = "1" * 40
+    base_sha = "0" * 40
+    repo = tmp_path / "repo_g5_atomic"
+    repo.mkdir()
+    led_path = repo / "harness" / "runs" / "T-G5-ATOMIC" / "ledger.json"
+    led = task_runner.init_or_load_ledger(
+        led_path, root_task_id="T-G5-ATOMIC", base_sha=base_sha, budget_usd=6.0
+    )
+    led["state"] = "READY_FOR_ACCEPTANCE"
+    led["candidate_sha"] = cand_sha
+    led["g4_rounds_total"] = 1
+    led["g4_rounds_in_packet"] = 1
+    led["g4_invocations_by_sha"][cand_sha] = 1
+    task_runner.save_ledger(led_path, led)
+
+    v_path = tmp_path / "v_atom.json"
+    r_path = tmp_path / "r_atom.json"
+    v_path.write_text(json.dumps(_verifier(cand_sha)), encoding="utf-8")
+    r_path.write_text(json.dumps(_review(cand_sha)), encoding="utf-8")
+    out_dir = tmp_path / "out_g5_atomic"
+
+    orig_save = task_runner.save_ledger
+    fail_once = {"armed": True}
+
+    def _flaky_save(path: Path, payload: dict) -> None:
+        if fail_once["armed"] and path.resolve() == led_path.resolve():
+            fail_once["armed"] = False
+            raise PermissionError("simulated locked ledger.json")
+        orig_save(path, payload)
+
+    monkeypatch.setattr(task_runner, "save_ledger", _flaky_save)
+
+    argv = [
+        "--task-id",
+        "T-G5-ATOMIC",
+        "--phase",
+        "1",
+        "--base-sha",
+        base_sha,
+        "--candidate-sha",
+        cand_sha,
+        "--verifier-json",
+        str(v_path),
+        "--review-json",
+        str(r_path),
+        "--ledger",
+        str(led_path),
+        "--repo-root",
+        str(repo),
+        "--out-dir",
+        str(out_dir),
+    ]
+    rc_err = receipt_mod.main(argv)
+    assert rc_err == 2
+    assert not (out_dir / "receipt.json").exists()
+    assert not (out_dir / "receipt.md").exists()
+    assert json.loads(led_path.read_text(encoding="utf-8"))["state"] == "READY_FOR_ACCEPTANCE"
+
+    rc_retry = receipt_mod.main(argv)
+    assert rc_retry == 0
+    rec_ok = json.loads((out_dir / "receipt.json").read_text(encoding="utf-8"))
+    assert rec_ok["conclusion"] == "VERIFIED"
+    assert json.loads(led_path.read_text(encoding="utf-8"))["state"] == "VERIFIED"
+
+
+
 
 
 

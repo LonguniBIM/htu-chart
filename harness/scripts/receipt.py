@@ -1031,49 +1031,80 @@ def main(argv: list[str] | None = None) -> int:
             receipt["blockers"].append(ledger_load_err)
             receipt["conclusion"] = "BLOCKED"
 
-        try:
-            with receipt_json_path.open("x", encoding="utf-8") as fh:
-                fh.write(json.dumps(receipt, indent=2) + "\n")
-        except FileExistsError:
+        if receipt_json_path.exists() or receipt_md_path.exists():
             print(
-                f"[receipt] Write-once refusal: {receipt_json_path} already exists.",
+                f"[receipt] Write-once refusal: {receipt_json_path} or "
+                f"{receipt_md_path} already exists.",
                 file=sys.stderr,
             )
             return None, 2
-        with receipt_md_path.open("x", encoding="utf-8") as fh:
-            fh.write(render_receipt_markdown(receipt))
 
+        orig_ledger_bytes: bytes | None = None
+        ledger_mutated = False
         if (
             receipt["conclusion"] == "VERIFIED"
             and ledger_path is not None
             and ledger_path.is_file()
         ):
-            cur_ledger = task_runner.load_ledger(ledger_path, repo_root=active_root)
-            if cur_ledger["state"] == "READY_FOR_ACCEPTANCE":
-                _, g5_rc = task_runner.record_gate_outcome(
-                    ledger_path,
-                    gate="G5",
-                    outcome="VERIFIED",
-                    candidate_sha=args.candidate_sha,
+            try:
+                orig_ledger_bytes = ledger_path.read_bytes()
+                cur_ledger = task_runner.load_ledger(ledger_path, repo_root=active_root)
+                if cur_ledger["state"] == "READY_FOR_ACCEPTANCE":
+                    _, g5_rc = task_runner.record_gate_outcome(
+                        ledger_path,
+                        gate="G5",
+                        outcome="VERIFIED",
+                        candidate_sha=args.candidate_sha,
+                    )
+                    if g5_rc != 0:
+                        return None, 2
+                    ledger_mutated = True
+                elif (
+                    isinstance(dispositions_obj, dict)
+                    and dispositions_obj.get("dispositions")
+                    and cur_ledger["state"] in {"ACTIVE_PEER_G1", "NEEDS_REPLAN"}
+                    and cur_ledger.get("last_g4_candidate_sha") == args.candidate_sha
+                ):
+                    cur_ledger["state"] = "VERIFIED"
+                    cur_ledger["candidate_sha"] = args.candidate_sha
+                    cur_ledger["consecutive_failed_candidates"] = 0
+                    cur_ledger["transient_retries_in_stage"] = 0
+                    task_runner._append_event(
+                        cur_ledger,
+                        "G5_VERIFIED",
+                        {"candidate_sha": args.candidate_sha, "via_dispositions": True},
+                    )
+                    task_runner.save_ledger(ledger_path, cur_ledger)
+                    ledger_mutated = True
+            except (OSError, ValueError) as exc:
+                print(
+                    f"[receipt] Failed to persist G5_VERIFIED transition to "
+                    f"{ledger_path}: {exc}",
+                    file=sys.stderr,
                 )
-                if g5_rc != 0:
-                    return None, 2
-            elif (
-                isinstance(dispositions_obj, dict)
-                and dispositions_obj.get("dispositions")
-                and cur_ledger["state"] in {"ACTIVE_PEER_G1", "NEEDS_REPLAN"}
-                and cur_ledger.get("last_g4_candidate_sha") == args.candidate_sha
-            ):
-                cur_ledger["state"] = "VERIFIED"
-                cur_ledger["candidate_sha"] = args.candidate_sha
-                cur_ledger["consecutive_failed_candidates"] = 0
-                cur_ledger["transient_retries_in_stage"] = 0
-                task_runner._append_event(
-                    cur_ledger,
-                    "G5_VERIFIED",
-                    {"candidate_sha": args.candidate_sha, "via_dispositions": True},
-                )
-                task_runner.save_ledger(ledger_path, cur_ledger)
+                return None, 2
+
+        created_receipts: list[Path] = []
+        try:
+            with receipt_json_path.open("x", encoding="utf-8") as fh:
+                fh.write(json.dumps(receipt, indent=2) + "\n")
+            created_receipts.append(receipt_json_path)
+            with receipt_md_path.open("x", encoding="utf-8") as fh:
+                fh.write(render_receipt_markdown(receipt))
+            created_receipts.append(receipt_md_path)
+        except OSError as exc:
+            for created_p in created_receipts:
+                try:
+                    created_p.unlink(missing_ok=True)
+                except OSError:
+                    pass
+            if ledger_mutated and orig_ledger_bytes is not None and ledger_path is not None:
+                task_runner._atomic_write_bytes(ledger_path, orig_ledger_bytes)
+            print(
+                f"[receipt] Failed to publish receipt artifacts at {out_dir}: {exc}",
+                file=sys.stderr,
+            )
+            return None, 2
         return receipt, None
 
     if tracker_path is not None:

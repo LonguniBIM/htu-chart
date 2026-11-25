@@ -1418,6 +1418,13 @@ def test_ensure_ledger_defaults_rejects_wrong_typed_maps_and_counters(tmp_path: 
         {"g4_rounds_in_packet": True},
         {"g4_invocations_by_sha": {"abc": -1}},
         {"active_g4_reservations": {"r1": "bad"}},
+        {"active_reservations": {"r1": True}},
+        {"packet_version": True},
+        {"auto_replans_used": -1},
+        {"circuit_breakers": {"max_g4_rounds_per_root_task": "100"}},
+        {"circuit_breakers": {"max_g4_rounds_per_root_task": True}},
+        {"circuit_breakers": {"max_g4_rounds_per_root_task": None}},
+        {"circuit_breakers": {"max_g4_rounds_per_root_task": 0}},
     ):
         corrupted = dict(base_data)
         corrupted.update(bad_patch)
@@ -1425,6 +1432,14 @@ def test_ensure_ledger_defaults_rejects_wrong_typed_maps_and_counters(tmp_path: 
         bad_file.write_text(json.dumps(corrupted), encoding="utf-8")
         with pytest.raises(ValueError):
             task_runner.load_ledger(bad_file)
+
+    missing_spent = dict(base_data)
+    missing_spent.pop("spent_api_equiv_usd", None)
+    ms_file = tmp_path / "missing_spent.json"
+    ms_file.write_text(json.dumps(missing_spent), encoding="utf-8")
+    with pytest.raises(ValueError):
+        task_runner.load_ledger(ms_file)
+
 
 
 

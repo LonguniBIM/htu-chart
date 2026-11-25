@@ -275,6 +275,29 @@ def _ensure_ledger_defaults(
     breakers = data["circuit_breakers"]
     for key, val in defaults.items():
         breakers.setdefault(key, val)
+    zero_ok_breakers = {
+        "max_transient_retries_per_provider_pass",
+        "max_auto_replans_per_root_task",
+    }
+    for br_k, br_v in breakers.items():
+        min_val = 0 if br_k in zero_ok_breakers else 1
+        if not isinstance(br_k, str) or not br_k or not is_strict_int(br_v) or br_v < min_val:
+            raise ValueError(
+                f"Invalid circuit_breakers[{br_k!r}]={br_v!r} in ledger.json "
+                f"(expected int >= {min_val})."
+            )
+
+    if "packet_version" in data and (
+        not is_strict_int(data["packet_version"]) or data["packet_version"] < 1
+    ):
+        raise ValueError("Invalid 'packet_version' in ledger.json: expected int >= 1.")
+    for opt_cnt_key in ("auto_replans_used", "transient_retries_in_stage"):
+        if opt_cnt_key in data and (
+            not is_strict_int(data[opt_cnt_key]) or data[opt_cnt_key] < 0
+        ):
+            raise ValueError(
+                f"Invalid {opt_cnt_key!r} in ledger.json: expected non-negative int."
+            )
 
     for cnt_key in (
         "g4_rounds_total",
@@ -307,6 +330,10 @@ def _ensure_ledger_defaults(
     for res_id, ent in data["active_g4_reservations"].items():
         if not isinstance(res_id, str) or not res_id or not isinstance(ent, dict):
             raise ValueError("Invalid entry in ledger.json 'active_g4_reservations'.")
+    for res_id, res_amt in data["active_reservations"].items():
+        if not isinstance(res_id, str) or not res_id:
+            raise ValueError("Invalid key in ledger.json 'active_reservations'.")
+        _require_finite_number(res_amt, f"active_reservations[{res_id!r}]")
 
     data.setdefault("last_g4_candidate_sha", None)
     data.setdefault("last_g4_status", None)
@@ -600,16 +627,15 @@ def default_g4_tracker_path(task_id: str, repo_root: Path | None = None) -> Path
     return root / "harness" / "runs" / safe_id / "g4-tracker.json"
 
 
-def _atomic_write_json(target_path: Path, data: dict[str, Any]) -> None:
+def _atomic_write_bytes(target_path: Path, raw_bytes: bytes) -> None:
     resolved = target_path.resolve()
-    payload = json.dumps(data, indent=2, allow_nan=False) + "\n"
     with _ledger_lock(resolved):
         resolved.parent.mkdir(parents=True, exist_ok=True)
         tmp_name = f".{resolved.name}.{os.getpid()}.{threading.get_ident()}.tmp"
         tmp_path = resolved.parent / tmp_name
         try:
-            with tmp_path.open("w", encoding="utf-8") as fh:
-                fh.write(payload)
+            with tmp_path.open("wb") as fh:
+                fh.write(raw_bytes)
                 fh.flush()
                 os.fsync(fh.fileno())
             for attempt in range(10):
@@ -627,6 +653,11 @@ def _atomic_write_json(target_path: Path, data: dict[str, Any]) -> None:
                 except OSError:
                     pass
             raise
+
+
+def _atomic_write_json(target_path: Path, data: dict[str, Any]) -> None:
+    payload = (json.dumps(data, indent=2, allow_nan=False) + "\n").encode("utf-8")
+    _atomic_write_bytes(target_path, payload)
 
 
 def load_g4_tracker(tracker_path: Path, *, task_id: str = "") -> dict[str, Any]:
@@ -736,11 +767,25 @@ def _native_tracker_packet_round_dirs(
     return native
 
 
+def _packet_version_bucket(epoch: str | None) -> str | None:
+    """Normalize a packet epoch (``v<N>:<sha>`` or ``sha:<sha>``) to its version bucket."""
+    if not isinstance(epoch, str) or not epoch:
+        return None
+    if epoch.startswith("v"):
+        head = epoch.split(":", 1)[0]
+        if len(head) > 1 and head[1:].isdigit():
+            return head
+    if epoch.startswith("sha:"):
+        return "unversioned"
+    return epoch
+
+
 def count_tracker_packet_rounds(
     tracker: dict[str, Any] | None, packet_epoch: str | None
 ) -> int:
-    """Count distinct G4 rounds recorded in ``tracker`` for ``packet_epoch``."""
-    if not isinstance(tracker, dict) or not packet_epoch:
+    """Count distinct G4 rounds recorded in ``tracker`` for ``packet_epoch``'s version bucket."""
+    target_bucket = _packet_version_bucket(packet_epoch)
+    if not isinstance(tracker, dict) or not target_bucket:
         return 0
     round_statuses = {"PASSED", "CHANGES_REQUESTED", "BLOCKED", "IN_PROGRESS"}
     round_dirs: set[str] = set()
@@ -748,25 +793,32 @@ def count_tracker_packet_rounds(
         if (
             isinstance(ent, dict)
             and str(ent.get("status") or "") in round_statuses
-            and ent.get("packet_epoch") == packet_epoch
+            and _packet_version_bucket(ent.get("packet_epoch")) == target_bucket
         ):
             round_dirs.add(_norm_attempt_dir(raw_out))
     for res_id, ent in (tracker.get("attempts") or {}).items():
         if (
             isinstance(ent, dict)
             and str(ent.get("status") or "") in round_statuses
-            and ent.get("packet_epoch") == packet_epoch
+            and _packet_version_bucket(ent.get("packet_epoch")) == target_bucket
         ):
             raw_out = ent.get("out_dir")
             round_dirs.add(_norm_attempt_dir(raw_out) if raw_out else f"attempt:{res_id}")
     for res_id, ent in (tracker.get("in_flight") or {}).items():
-        if isinstance(ent, dict) and ent.get("packet_epoch") == packet_epoch:
+        if (
+            isinstance(ent, dict)
+            and _packet_version_bucket(ent.get("packet_epoch")) == target_bucket
+        ):
             raw_out = ent.get("out_dir")
             round_dirs.add(_norm_attempt_dir(raw_out) if raw_out else f"inflight:{res_id}")
-    native_count = len(_native_tracker_packet_round_dirs(tracker, packet_epoch))
     pkt_map = tracker.get("packet_rounds") or {}
-    legacy_raw = int(pkt_map.get(packet_epoch, 0)) if isinstance(pkt_map, dict) else 0
-    return len(round_dirs) + max(0, legacy_raw - native_count)
+    legacy_residual = 0
+    if isinstance(pkt_map, dict):
+        for ep_key, cnt in pkt_map.items():
+            if _packet_version_bucket(ep_key) == target_bucket:
+                native_for_key = len(_native_tracker_packet_round_dirs(tracker, ep_key))
+                legacy_residual += max(0, int(cnt) - native_for_key)
+    return len(round_dirs) + legacy_residual
 
 
 def _tracker_source_id(tracker: dict[str, Any]) -> str:
@@ -983,6 +1035,9 @@ def load_ledger(
     if not isinstance(data, dict) or not data.get("root_task_id"):
         raise ValueError(f"Invalid ledger payload at {resolved}")
     _require_finite_number(data.get("budget_limit_usd"), "budget_limit_usd", positive=True)
+    if "spent_api_equiv_usd" not in data:
+        raise ValueError(f"Missing required 'spent_api_equiv_usd' in ledger at {resolved}.")
+    _require_finite_number(data["spent_api_equiv_usd"], "spent_api_equiv_usd")
     if expected_root_task_id is not None and data["root_task_id"] != expected_root_task_id:
         raise ValueError(
             f"Root task mismatch: ledger belongs to {data['root_task_id']!r}, "
