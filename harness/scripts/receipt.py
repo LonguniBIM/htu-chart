@@ -1087,11 +1087,11 @@ def main(argv: list[str] | None = None) -> int:
         created_receipts: list[Path] = []
         try:
             with receipt_json_path.open("x", encoding="utf-8") as fh:
+                created_receipts.append(receipt_json_path)
                 fh.write(json.dumps(receipt, indent=2) + "\n")
-            created_receipts.append(receipt_json_path)
             with receipt_md_path.open("x", encoding="utf-8") as fh:
+                created_receipts.append(receipt_md_path)
                 fh.write(render_receipt_markdown(receipt))
-            created_receipts.append(receipt_md_path)
         except OSError as exc:
             for created_p in created_receipts:
                 try:
@@ -1099,7 +1099,10 @@ def main(argv: list[str] | None = None) -> int:
                 except OSError:
                     pass
             if ledger_mutated and orig_ledger_bytes is not None and ledger_path is not None:
-                task_runner._atomic_write_bytes(ledger_path, orig_ledger_bytes)
+                try:
+                    task_runner._atomic_write_bytes(ledger_path, orig_ledger_bytes)
+                except OSError:
+                    pass
             print(
                 f"[receipt] Failed to publish receipt artifacts at {out_dir}: {exc}",
                 file=sys.stderr,

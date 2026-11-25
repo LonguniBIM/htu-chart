@@ -428,8 +428,8 @@ def _extract_agy_result_errors(raw_jsonl_text: str) -> list[dict[str, Any]]:
     return results
 
 
-def _agy_raw_has_nonzero_or_bad_usage(raw_text: str) -> bool:
-    """Return True if raw AGY JSONL records any >0 token count or malformed token value."""
+def _scan_raw_usage_anomalies(raw_text: str, *, reject_positive: bool) -> bool:
+    """Detect malformed token values (and optionally >0 counts) across JSONL usage dicts."""
     usage_keys = (
         "input_tokens",
         "cache_read_tokens",
@@ -456,11 +456,30 @@ def _agy_raw_has_nonzero_or_bad_usage(raw_text: str) -> bool:
         if not isinstance(usage, dict):
             continue
         for key in usage_keys:
-            if key in usage:
-                val = usage[key]
+            if key not in usage:
+                continue
+            val = usage[key]
+            if reject_positive:
                 if not is_strict_int(val) or val != 0:
                     return True
+            elif val is not None and (not is_strict_int(val) or val < 0):
+                return True
     return False
+
+
+def _agy_raw_has_nonzero_or_bad_usage(raw_text: str) -> bool:
+    """Return True if raw AGY JSONL records any >0 token count or malformed token value."""
+    return _scan_raw_usage_anomalies(raw_text, reject_positive=True)
+
+
+def _raw_log_has_malformed_usage(raw_path: Path) -> bool:
+    """Return True if raw JSONL contains non-None non-int or negative token values."""
+    if not raw_path.is_file():
+        return False
+    return _scan_raw_usage_anomalies(
+        raw_path.read_text(encoding="utf-8", errors="replace"),
+        reject_positive=False,
+    )
 
 
 def classify_agy_failure(
@@ -2677,6 +2696,10 @@ def _plan_raw_log_billing(
             continue
         p_state = states[pass_name]
         for raw_path in sorted(out_dir.glob(f"{pass_name}*.raw.jsonl")):
+            if p_state.is_complete and _raw_log_has_malformed_usage(raw_path):
+                unbillable_errors.append(
+                    f"Unbillable malformed token usage in {raw_path.name}."
+                )
             codex_deltas = _extract_codex_usage_deltas(raw_path)
             if codex_deltas:
                 c_model = _resolve_raw_log_model(

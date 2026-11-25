@@ -5757,6 +5757,51 @@ def test_g4_agy_alias_model_bills_via_route_and_unpriceable_model_blocks(
     assert rep_bad["review_gate_status"] == "BLOCKED"
     assert json.loads(led_bad.read_text(encoding="utf-8"))["state"] == "BLOCKED"
 
+    # Completed APPROVE pass with malformed string token value fails closed (rc=2, BLOCKED).
+    fake_str_tok = tmp_path / "fake_agy_str_tok.py"
+    str_tok_prefix = _write_fake_codex_script(
+        fake_str_tok,
+        (
+            "import json, sys\n"
+            "args = sys.argv[1:]\n"
+            "prompt = args[args.index('-p') + 1]\n"
+            "lens = 'security_and_invariants' if 'security_and_invariants' in prompt "
+            "else 'correctness_and_tests'\n"
+            f"payload = {{'revision_sha': {sha1!r}, 'lens': lens, 'verdict': 'APPROVE', "
+            "'summary': 'ok', 'findings': [], 'test_quality_issues': [], "
+            "'unverified_areas': []}\n"
+            "print(json.dumps({'event': 'result', 'result': {'status': 'SUCCESS', "
+            "'model': 'gemini-4-carbon-high', "
+            "'usage': {'input_tokens': '10000', 'output_tokens': 500}, "
+            "'structured_output': payload}}), flush=True)\n"
+        ),
+    )
+    monkeypatch.setattr(codex_room_review, "resolve_agy_command", lambda: str_tok_prefix)
+    led_str = _setup_ledger_for_g4_test(
+        repo_dir, "T-AGY-STR-TOK", state="REVIEW_FROZEN_G4", candidate_sha=sha1
+    )
+    out_str = repo_dir / "harness" / "runs" / "T-AGY-STR-TOK" / "attempts" / f"r1-{sha1[:12]}"
+    rc_str = codex_room_review.main(
+        [
+            "--commit",
+            sha1,
+            "--task-id",
+            "T-AGY-STR-TOK",
+            "--ledger",
+            str(led_str),
+            "--repo-root",
+            str(repo_dir),
+            "--out-dir",
+            str(out_str),
+            "--backend",
+            "agy",
+        ]
+    )
+    assert rc_str == 2
+    rep_str = json.loads((out_str / "consolidated-review.json").read_text(encoding="utf-8"))
+    assert rep_str["review_gate_status"] == "BLOCKED"
+    assert json.loads(led_str.read_text(encoding="utf-8"))["state"] == "BLOCKED"
+
 
 def test_g4_ledgerless_edited_packet_same_version_stays_blocked_until_version_bumps(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch

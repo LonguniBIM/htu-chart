@@ -74,6 +74,13 @@ DEFAULT_CIRCUIT_BREAKERS: dict[str, int] = {
     "max_transient_retries_per_provider_pass": 1,
 }
 
+ZERO_OK_CIRCUIT_BREAKERS: frozenset[str] = frozenset(
+    {
+        "max_transient_retries_per_provider_pass",
+        "max_auto_replans_per_root_task",
+    }
+)
+
 
 def load_circuit_breakers(
     repo_root: Path | None = None,
@@ -97,7 +104,8 @@ def load_circuit_breakers(
         return breakers
     for key in DEFAULT_CIRCUIT_BREAKERS:
         val = raw_cb.get(key)
-        if is_strict_int(val) and val >= 0:
+        min_val = 0 if key in ZERO_OK_CIRCUIT_BREAKERS else 1
+        if is_strict_int(val) and val >= min_val:
             breakers[key] = int(val)
     return breakers
 
@@ -275,12 +283,8 @@ def _ensure_ledger_defaults(
     breakers = data["circuit_breakers"]
     for key, val in defaults.items():
         breakers.setdefault(key, val)
-    zero_ok_breakers = {
-        "max_transient_retries_per_provider_pass",
-        "max_auto_replans_per_root_task",
-    }
     for br_k, br_v in breakers.items():
-        min_val = 0 if br_k in zero_ok_breakers else 1
+        min_val = 0 if br_k in ZERO_OK_CIRCUIT_BREAKERS else 1
         if not isinstance(br_k, str) or not br_k or not is_strict_int(br_v) or br_v < min_val:
             raise ValueError(
                 f"Invalid circuit_breakers[{br_k!r}]={br_v!r} in ledger.json "

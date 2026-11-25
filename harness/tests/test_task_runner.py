@@ -1440,6 +1440,22 @@ def test_ensure_ledger_defaults_rejects_wrong_typed_maps_and_counters(tmp_path: 
     with pytest.raises(ValueError):
         task_runner.load_ledger(ms_file)
 
+    pol_path = tmp_path / "pol_zero_cap.json"
+    pol_path.write_text(
+        json.dumps(
+            {
+                "circuit_breakers": {
+                    "max_g4_rounds_per_root_task": 0,
+                    "max_transient_retries_per_provider_pass": 0,
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    cb = task_runner.load_circuit_breakers(policy_path=pol_path)
+    assert cb["max_g4_rounds_per_root_task"] == 6
+    assert cb["max_transient_retries_per_provider_pass"] == 0
+
 
 
 

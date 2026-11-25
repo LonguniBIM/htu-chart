@@ -2607,6 +2607,19 @@ def test_g5_receipt_refuses_publish_when_ledger_save_raises_and_retries_cleanly(
     assert not (out_dir / "receipt.md").exists()
     assert json.loads(led_path.read_text(encoding="utf-8"))["state"] == "READY_FOR_ACCEPTANCE"
 
+    # Also verify receipt.md write failure rolls back BOTH receipt.json and ledger.json.
+    monkeypatch.setattr(
+        receipt_mod,
+        "render_receipt_markdown",
+        lambda _rec: (_ for _ in ()).throw(OSError("simulated disk full on receipt.md")),
+    )
+    rc_md_err = receipt_mod.main(argv)
+    assert rc_md_err == 2
+    assert not (out_dir / "receipt.json").exists()
+    assert not (out_dir / "receipt.md").exists()
+    assert json.loads(led_path.read_text(encoding="utf-8"))["state"] == "READY_FOR_ACCEPTANCE"
+    monkeypatch.undo()
+
     rc_retry = receipt_mod.main(argv)
     assert rc_retry == 0
     rec_ok = json.loads((out_dir / "receipt.json").read_text(encoding="utf-8"))
