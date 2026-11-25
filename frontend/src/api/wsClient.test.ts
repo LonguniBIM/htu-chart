@@ -434,4 +434,133 @@ describe("MarketWsClient (P1-04, P1-05, P2-003)", () => {
     ws4?.emitClose(1008, "after unsubscribe");
     expect(expiredReasons).toHaveLength(2);
   });
+
+  it("verifies session on pre-open close 1006 and expires session when verifySession returns false (P1-R13-001, P2-R13-001)", async () => {
+    /**
+     * Contract: Mid-stream closes after socket open reconnect without calling verifySession, whereas
+     * a pre-open close (1006 before open) invokes verifySession(signal). When verifySession resolves
+     * false, MarketWsClient fires onSessionExpired("Session expired") and schedules zero reconnects.
+     * Defect caught: Browser close 1006 from pre-accept HTTP 403 looping reconnects forever.
+     */
+    const verifySession = vi.fn<(signal: AbortSignal) => Promise<boolean>>();
+    const client = new MarketWsClient(() => "ws://127.0.0.1:8000/ws/market", verifySession);
+    const expiredReasons: string[] = [];
+    client.onSessionExpired((reason) => {
+      expiredReasons.push(reason);
+    });
+
+    client.connect();
+    const ws1 = FakeWebSocket.instances[0];
+    expect(ws1).toBeDefined();
+    ws1?.emitOpen();
+
+    // Mid-stream drop after open does NOT call verifySession and schedules reconnect
+    ws1?.emitClose(1006, "network_drop");
+    expect(verifySession).not.toHaveBeenCalled();
+
+    vi.advanceTimersByTime(1_000);
+    expect(FakeWebSocket.instances).toHaveLength(2);
+    const ws2 = FakeWebSocket.instances[1];
+    expect(ws2).toBeDefined();
+
+    // Pre-open close 1006 on reconnect triggers verifySession -> false => session expired
+    let capturedSignal: AbortSignal | undefined;
+    verifySession.mockImplementationOnce(async (signal) => {
+      capturedSignal = signal;
+      return false;
+    });
+    ws2?.emitClose(1006, "");
+    expect(verifySession).toHaveBeenCalledTimes(1);
+    expect(capturedSignal?.aborted).toBe(false);
+
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(expiredReasons).toEqual(["Session expired"]);
+    expect(client.getConnectionState()).toBe("disconnected");
+
+    vi.advanceTimersByTime(60_000);
+    expect(FakeWebSocket.instances).toHaveLength(2);
+  });
+
+  it("reconnects after backoff when pre-open close verifySession resolves true or rejects transiently (P1-R13-001)", async () => {
+    /**
+     * Contract: On a pre-open close 1006, if verifySession resolves true or rejects with a
+     * transient error (network/5xx), onSessionExpired does NOT fire and reconnect is scheduled.
+     * Defect caught: Transient session probe failures falsely logging the user out or halting reconnects.
+     */
+    const verifySession = vi
+      .fn<(signal: AbortSignal) => Promise<boolean>>()
+      .mockResolvedValueOnce(true)
+      .mockRejectedValueOnce(new Error("503 Service Unavailable"));
+    const client = new MarketWsClient(() => "ws://127.0.0.1:8000/ws/market", verifySession);
+    const expiredListener = vi.fn();
+    client.onSessionExpired(expiredListener);
+
+    client.connect();
+    const ws1 = FakeWebSocket.instances[0];
+    expect(ws1).toBeDefined();
+    ws1?.emitClose(1006, "");
+    expect(verifySession).toHaveBeenCalledTimes(1);
+
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(expiredListener).not.toHaveBeenCalled();
+    expect(FakeWebSocket.instances).toHaveLength(1);
+
+    vi.advanceTimersByTime(1_000);
+    expect(FakeWebSocket.instances).toHaveLength(2);
+
+    const ws2 = FakeWebSocket.instances[1];
+    expect(ws2).toBeDefined();
+    ws2?.emitClose(1006, "");
+    expect(verifySession).toHaveBeenCalledTimes(2);
+
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(expiredListener).not.toHaveBeenCalled();
+    expect(FakeWebSocket.instances).toHaveLength(2);
+
+    vi.advanceTimersByTime(2_000);
+    expect(FakeWebSocket.instances).toHaveLength(3);
+  });
+
+  it("aborts pending verifySession on disconnect() and ignores late settlement across epochs (P1-R13-001)", async () => {
+    /**
+     * Contract: Calling disconnect() while verifySession is pending aborts its AbortSignal and
+     * advances connectionEpoch so late settlement triggers neither onSessionExpired nor reconnect.
+     * Defect caught: Stale verifySession settlement logging out or reconnecting a disconnected/new epoch.
+     */
+    let capturedSignal: AbortSignal | undefined;
+    let resolvePending!: (value: boolean) => void;
+    const verifySession = vi.fn<(signal: AbortSignal) => Promise<boolean>>((signal) => {
+      capturedSignal = signal;
+      return new Promise<boolean>((resolve) => {
+        resolvePending = resolve;
+      });
+    });
+
+    const client = new MarketWsClient(() => "ws://127.0.0.1:8000/ws/market", verifySession);
+    const expiredListener = vi.fn();
+    client.onSessionExpired(expiredListener);
+
+    client.connect();
+    const ws1 = FakeWebSocket.instances[0];
+    expect(ws1).toBeDefined();
+    ws1?.emitClose(1006, "");
+
+    expect(verifySession).toHaveBeenCalledTimes(1);
+    expect(capturedSignal?.aborted).toBe(false);
+
+    client.disconnect();
+    expect(capturedSignal?.aborted).toBe(true);
+
+    resolvePending(false);
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(expiredListener).not.toHaveBeenCalled();
+    vi.advanceTimersByTime(60_000);
+    expect(FakeWebSocket.instances).toHaveLength(1);
+  });
 });

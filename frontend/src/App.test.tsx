@@ -31,12 +31,31 @@ let resyncListeners = new Set<(msg: WsResyncRequiredMessage) => void>();
 let errorListeners = new Set<(msg: WsErrorMessage) => void>();
 let subscribedListeners = new Set<(msg: WsSubscribedMessage) => void>();
 let sessionExpiredListeners = new Set<(reason: string) => void>();
+let useRealWsClient = false;
 
-vi.mock("./api/wsClient", () => ({
-  MarketWsClient: class MockMarketWsClient {
-    connect = mockWsConnect;
-    disconnect = mockWsDisconnect;
-    subscribe = mockWsSubscribe;
+vi.mock("./api/wsClient", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("./api/wsClient")>();
+  return {
+    ...actual,
+    MarketWsClient: class MockMarketWsClient {
+      connect = mockWsConnect;
+      disconnect = mockWsDisconnect;
+      subscribe = mockWsSubscribe;
+
+      constructor(
+        urlFactory?: () => string,
+        verifySession?: (signal: AbortSignal) => Promise<boolean>,
+      ) {
+        if (useRealWsClient) {
+          const real = new actual.MarketWsClient(urlFactory, verifySession);
+          const origDisconnect = real.disconnect.bind(real);
+          vi.spyOn(real, "disconnect").mockImplementation(() => {
+            mockWsDisconnect();
+            origDisconnect();
+          });
+          return real as unknown as MockMarketWsClient;
+        }
+      }
 
     onConnectionState(listener: (state: WsConnectionState) => void) {
       connectionStateListeners.add(listener);
@@ -80,14 +99,15 @@ vi.mock("./api/wsClient", () => ({
       };
     }
 
-    onSessionExpired(listener: (reason: string) => void) {
-      sessionExpiredListeners.add(listener);
-      return () => {
-        sessionExpiredListeners.delete(listener);
-      };
-    }
-  },
-}));
+      onSessionExpired(listener: (reason: string) => void) {
+        sessionExpiredListeners.add(listener);
+        return () => {
+          sessionExpiredListeners.delete(listener);
+        };
+      }
+    },
+  };
+});
 
 vi.mock("lightweight-charts", () => {
   const CandlestickSeries = Symbol("CandlestickSeries");
@@ -207,6 +227,7 @@ describe("App bootstrap and R03 503 recovery (P1-R3-03, P1-R3-04, P2-005)", () =
     errorListeners = new Set();
     subscribedListeners = new Set();
     sessionExpiredListeners = new Set();
+    useRealWsClient = false;
     vi.stubGlobal("ResizeObserver", MockResizeObserver);
   });
 
@@ -1984,5 +2005,152 @@ describe("App bootstrap and R03 503 recovery (P1-R3-03, P1-R3-04, P2-005)", () =
       await flushMicrotasks();
     });
     expect(fetchBarsMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("transitions to login gate on pre-open WS reconnect close 1006 when fetchSession returns 401 (P1-R13-001, P2-R13-001)", async () => {
+    /**
+     * Contract: When an authenticated session loses WS and the reconnect socket closes with 1006
+     * before open (pre-accept HTTP 403), App's MarketWsClient verifySession calls fetchSession(signal);
+     * on ApiError(401), App transitions to the login gate, clears workspace state, disconnects WS,
+     * and schedules zero further WS reconnects.
+     * Defect caught: Pre-open WS close 1006 looping reconnects forever without checking HTTP session.
+     */
+    class FakeWebSocket {
+      static readonly CONNECTING = 0;
+      static readonly OPEN = 1;
+      static readonly CLOSING = 2;
+      static readonly CLOSED = 3;
+      static instances: FakeWebSocket[] = [];
+
+      readonly url: string;
+      readyState = FakeWebSocket.CONNECTING;
+      private readonly listeners = new Map<string, Set<(event: unknown) => void>>();
+
+      constructor(url: string) {
+        this.url = url;
+        FakeWebSocket.instances.push(this);
+      }
+
+      addEventListener(type: string, listener: (event: unknown) => void): void {
+        let bucket = this.listeners.get(type);
+        if (bucket === undefined) {
+          bucket = new Set();
+          this.listeners.set(type, bucket);
+        }
+        bucket.add(listener);
+      }
+
+      send(): void {}
+
+      close(): void {
+        this.readyState = FakeWebSocket.CLOSED;
+      }
+
+      emitOpen(): void {
+        this.readyState = FakeWebSocket.OPEN;
+        this.dispatch("open", {});
+      }
+
+      emitClose(code: number, reason = ""): void {
+        this.readyState = FakeWebSocket.CLOSED;
+        this.dispatch("close", { code, reason });
+      }
+
+      private dispatch(type: string, event: unknown): void {
+        const bucket = this.listeners.get(type);
+        if (bucket === undefined) {
+          return;
+        }
+        for (const listener of bucket) {
+          listener(event);
+        }
+      }
+    }
+
+    vi.useFakeTimers();
+    vi.stubGlobal("WebSocket", FakeWebSocket);
+    useRealWsClient = true;
+
+    fetchSessionMock
+      .mockResolvedValueOnce({
+        authenticated: true,
+        csrf_token: "csrf-token-1234567890",
+      })
+      .mockRejectedValueOnce(new ApiError(401, "Session expired"));
+    fetchStatusMock.mockResolvedValue({
+      connected: true,
+      live: false,
+      feed_state: "LIVE",
+    });
+    listLayoutsMock.mockResolvedValue([SAMPLE_LAYOUT]);
+    fetchContractsMock.mockResolvedValue({
+      live: false,
+      contracts: {
+        MES: {
+          selected: { id: "CON.F.US.MES.H26" },
+          error_type: null,
+          error: null,
+        },
+      },
+    });
+    fetchBarsMock.mockResolvedValue({
+      provider: "topstepx",
+      live: false,
+      contract_id: "CON.F.US.MES.H26",
+      root_symbol: "MES",
+      timeframe: "5m",
+      start_time: 1000,
+      end_time: 1000,
+      count: 0,
+      include_partial: true,
+      quality: {
+        is_complete: true,
+        truncated: false,
+        provider_gap: false,
+        quarantined_count: 0,
+      },
+      bars: [],
+    });
+
+    render(<App />);
+    await act(async () => {
+      await flushMicrotasks();
+    });
+
+    expect(screen.getByText("CON.F.US.MES.H26")).toBeTruthy();
+    expect(FakeWebSocket.instances).toHaveLength(1);
+    const ws1 = FakeWebSocket.instances[0]!;
+
+    // Open initial socket, then simulate unexpected drop after open
+    act(() => {
+      ws1.emitOpen();
+    });
+    act(() => {
+      ws1.emitClose(1006, "network_drop");
+    });
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1_000);
+      await flushMicrotasks();
+    });
+    expect(FakeWebSocket.instances).toHaveLength(2);
+    const ws2 = FakeWebSocket.instances[1]!;
+
+    // Reconnect socket closes before open (browser close 1006 on HTTP 403 upgrade rejection)
+    await act(async () => {
+      ws2.emitClose(1006, "");
+      await flushMicrotasks();
+    });
+
+    expect(fetchSessionMock).toHaveBeenCalledTimes(2);
+    expect(screen.getByPlaceholderText("Enter terminal password")).toBeTruthy();
+    expect(screen.queryByText("CON.F.US.MES.H26")).toBeNull();
+    expect(mockWsDisconnect).toHaveBeenCalledTimes(1);
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(60_000);
+      await flushMicrotasks();
+    });
+    expect(FakeWebSocket.instances).toHaveLength(2);
   });
 });

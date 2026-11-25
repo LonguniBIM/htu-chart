@@ -57,9 +57,16 @@ export class MarketWsClient {
   private readonly connectionListeners = new Set<ConnectionStateListener>();
   private readonly sessionExpiredListeners = new Set<SessionExpiredListener>();
   private readonly urlFactory: () => string;
+  private readonly verifySession: ((signal: AbortSignal) => Promise<boolean>) | undefined;
+  private sessionCheckController: AbortController | null = null;
+  private connectionEpoch = 0;
 
-  constructor(urlFactory: () => string = buildMarketWsUrl) {
+  constructor(
+    urlFactory: () => string = buildMarketWsUrl,
+    verifySession?: (signal: AbortSignal) => Promise<boolean>,
+  ) {
     this.urlFactory = urlFactory;
+    this.verifySession = verifySession;
   }
 
   getState(): WsConnectionState {
@@ -79,6 +86,8 @@ export class MarketWsClient {
     ) {
       return;
     }
+    this.connectionEpoch += 1;
+    this.abortSessionCheck();
     this.clearReconnectTimer();
     this.openSocket();
   }
@@ -87,6 +96,8 @@ export class MarketWsClient {
     this.shouldRun = false;
     this.hasConnectedOnce = false;
     this.reconnectAttempt = 0;
+    this.connectionEpoch += 1;
+    this.abortSessionCheck();
     this.clearTimers();
     if (this.socket !== null) {
       const sock = this.socket;
@@ -200,11 +211,13 @@ export class MarketWsClient {
     this.setConnectionState("connecting");
     const ws = new WebSocket(this.urlFactory());
     this.socket = ws;
+    let socketOpened = false;
 
     ws.addEventListener("open", () => {
       if (this.socket !== ws) {
         return;
       }
+      socketOpened = true;
       const wasReconnect = this.hasConnectedOnce;
       this.hasConnectedOnce = true;
       this.reconnectAttempt = 0;
@@ -300,6 +313,49 @@ export class MarketWsClient {
         this.shouldRun = false;
         return;
       }
+      if (!socketOpened && this.verifySession !== undefined) {
+        const epoch = this.connectionEpoch;
+        this.abortSessionCheck();
+        const controller = new AbortController();
+        this.sessionCheckController = controller;
+        const settleSessionCheck = (isSessionValid: boolean): void => {
+          if (
+            controller.signal.aborted ||
+            !this.shouldRun ||
+            epoch !== this.connectionEpoch
+          ) {
+            return;
+          }
+          if (this.sessionCheckController === controller) {
+            this.sessionCheckController = null;
+          }
+          if (!isSessionValid) {
+            this.shouldRun = false;
+            for (const listener of this.sessionExpiredListeners) {
+              listener("Session expired");
+            }
+            return;
+          }
+          this.scheduleReconnect();
+        };
+
+        let checkPromise: Promise<boolean>;
+        try {
+          checkPromise = this.verifySession(controller.signal);
+        } catch {
+          settleSessionCheck(true);
+          return;
+        }
+        void checkPromise.then(
+          (isValid) => {
+            settleSessionCheck(isValid);
+          },
+          () => {
+            settleSessionCheck(true);
+          },
+        );
+        return;
+      }
       this.scheduleReconnect();
     });
 
@@ -332,6 +388,13 @@ export class MarketWsClient {
         this.openSocket();
       }
     }, delayMs);
+  }
+
+  private abortSessionCheck(): void {
+    if (this.sessionCheckController !== null) {
+      this.sessionCheckController.abort();
+      this.sessionCheckController = null;
+    }
   }
 
   private clearReconnectTimer(): void {

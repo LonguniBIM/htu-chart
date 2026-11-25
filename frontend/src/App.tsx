@@ -74,7 +74,21 @@ export function App() {
   const [wsState, setWsState] = useState<WsConnectionState>("disconnected");
   const [loadError, setLoadError] = useState<string | null>(null);
 
-  const wsClient = useMemo(() => new MarketWsClient(), []);
+  const wsClient = useMemo(
+    () =>
+      new MarketWsClient(undefined, async (signal) => {
+        try {
+          await fetchSession(signal);
+          return true;
+        } catch (err: unknown) {
+          if (err instanceof ApiError && (err.status === 401 || err.status === 403)) {
+            return false;
+          }
+          throw err;
+        }
+      }),
+    [],
+  );
   const coordinator = useMemo(() => new PaneFetchCoordinator(), []);
   const resolvedModesRef = useRef<Set<boolean>>(new Set());
   const [contractsPendingRetry, setContractsPendingRetry] = useState<boolean>(false);
