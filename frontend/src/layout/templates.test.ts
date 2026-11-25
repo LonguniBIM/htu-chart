@@ -7,6 +7,7 @@ import {
 } from "./templates";
 
 const GRID_SPAN_RE = /^(\d+)\s*\/\s*(\d+)$/;
+const REPEAT_TRACK_RE = /^repeat\(\s*(\d+)\s*,/;
 
 function parseGridSpan(span: string): [number, number] {
   const match = GRID_SPAN_RE.exec(span);
@@ -16,6 +17,15 @@ function parseGridSpan(span: string): [number, number] {
   expect(start).toBeGreaterThanOrEqual(1);
   expect(end).toBeGreaterThan(start);
   return [start, end];
+}
+
+function parseTrackCount(trackList: string): number {
+  const trimmed = trackList.trim();
+  const repeatMatch = REPEAT_TRACK_RE.exec(trimmed);
+  if (repeatMatch !== null) {
+    return Number(repeatMatch[1]);
+  }
+  return trimmed.split(/\s+/).length;
 }
 
 function rectsOverlap(
@@ -107,6 +117,19 @@ describe("Layout templates (Phase 3 Part 2)", () => {
         const [y1, y2] = parseGridSpan(area.gridRow);
         return { x1, x2, y1, y2 };
       });
+
+      const declaredCols = parseTrackCount(tpl.gridTemplateColumns);
+      const declaredRows = parseTrackCount(tpl.gridTemplateRows);
+      const maxColEnd = Math.max(...parsedAreas.map((area) => area.x2));
+      const maxRowEnd = Math.max(...parsedAreas.map((area) => area.y2));
+      expect(
+        maxColEnd - 1,
+        `max paneAreas column end index in ${tpl.id} must match gridTemplateColumns track count`,
+      ).toBe(declaredCols);
+      expect(
+        maxRowEnd - 1,
+        `max paneAreas row end index in ${tpl.id} must match gridTemplateRows track count`,
+      ).toBe(declaredRows);
 
       for (let i = 0; i < parsedAreas.length; i += 1) {
         for (let j = i + 1; j < parsedAreas.length; j += 1) {

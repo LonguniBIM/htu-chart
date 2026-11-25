@@ -2662,6 +2662,452 @@ describe("App bootstrap and R03 503 recovery (P1-R3-03, P1-R3-04, P2-005)", () =
     );
     expect(screen.getByText("CON.F.US.MNQ.LIVE")).toBeTruthy();
   });
+
+  it("isolates retryGenerationRef from store-driven resolveMissingContractModes so both Live and Sim resolve (P1-001a)", async () => {
+    /**
+     * Contract: When retryUnresolvedContracts is in flight for Live (true) and LayoutPicker
+     * expands the layout to add a Sim pane (false), resolveMissingContractModes([false]) increments
+     * layoutResolveGenerationRef without invalidating retryGenerationRef, so both responses commit.
+     * Defect caught: Shared contractResolveGenerationRef dropping retryUnresolvedContracts HTTP 200 results.
+     */
+    const liveOnlyLayout: LayoutRecord = {
+      ...SAMPLE_LAYOUT,
+      id: "layout-live-only",
+      name: "Live Single",
+      panes: [
+        {
+          pane_id: "pane-1",
+          root_symbol: "MES",
+          timeframe: "5m",
+          live_mode: true,
+          playback_mode: "live",
+        },
+      ],
+    };
+
+    fetchSessionMock.mockResolvedValue({
+      authenticated: true,
+      csrf_token: "csrf-token-p1-001a",
+    });
+    fetchStatusMock.mockResolvedValue({
+      connected: true,
+      live: true,
+      feed_state: "LIVE",
+    });
+    listLayoutsMock.mockResolvedValue([liveOnlyLayout]);
+    fetchBarsMock.mockResolvedValue({
+      provider: "topstepx",
+      live: true,
+      contract_id: "CON.F.US.MES.LIVE",
+      root_symbol: "MES",
+      timeframe: "5m",
+      start_time: 1000,
+      end_time: 1000,
+      count: 0,
+      include_partial: true,
+      quality: {
+        is_complete: true,
+        truncated: false,
+        provider_gap: false,
+        quarantined_count: 0,
+      },
+      bars: [],
+    });
+
+    let resolveRetryLive!: (value: ContractsResponse) => void;
+    let resolveExpandSim!: (value: ContractsResponse) => void;
+    fetchContractsMock
+      .mockRejectedValueOnce(new ApiError(503, "TopstepX is not connected"))
+      .mockImplementationOnce((_symbols, live) => {
+        expect(live).toBe(true);
+        return new Promise<ContractsResponse>((resolve) => {
+          resolveRetryLive = resolve;
+        });
+      })
+      .mockImplementationOnce((_symbols, live) => {
+        expect(live).toBe(false);
+        return new Promise<ContractsResponse>((resolve) => {
+          resolveExpandSim = resolve;
+        });
+      });
+
+    render(<App />);
+    await act(async () => {
+      await flushMicrotasks();
+    });
+    expect(screen.getByRole("button", { name: "Retry Contracts" })).toBeTruthy();
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Retry Contracts" }));
+      await flushMicrotasks();
+    });
+    expect(fetchContractsMock).toHaveBeenCalledTimes(2);
+
+    fireEvent.click(screen.getByRole("button", { name: "Layout picker" }));
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "2 Columns" }));
+      await flushMicrotasks();
+    });
+    expect(fetchContractsMock).toHaveBeenCalledTimes(3);
+
+    await act(async () => {
+      resolveRetryLive({
+        live: true,
+        contracts: {
+          MES: { selected: { id: "CON.F.US.MES.LIVE" }, error_type: null, error: null },
+          MNQ: { selected: { id: "CON.F.US.MNQ.LIVE" }, error_type: null, error: null },
+        },
+      });
+      resolveExpandSim({
+        live: false,
+        contracts: {
+          MES: { selected: { id: "CON.F.US.MES.SIM" }, error_type: null, error: null },
+          MNQ: { selected: { id: "CON.F.US.MNQ.SIM" }, error_type: null, error: null },
+        },
+      });
+      await flushMicrotasks();
+    });
+
+    expect(screen.getByText("CON.F.US.MES.LIVE")).toBeTruthy();
+    expect(screen.getByText("CON.F.US.MNQ.SIM")).toBeTruthy();
+    expect(screen.queryByRole("button", { name: /retry contracts/i })).toBeNull();
+  });
+
+  it("still invalidates session on 401 in retryUnresolvedContracts when store-driven resolveMissingContractModes runs concurrently (P1-001b)", async () => {
+    /**
+     * Contract: When retryUnresolvedContracts is pending and store-driven resolveMissingContractModes([false])
+     * resolves, a subsequent ApiError(401) from retryUnresolvedContracts still triggers invalidateSessionLocally()
+     * and renders the login gate.
+     * Defect caught: Shared generation counter suppressing 401/403 fail-closed logout in retryUnresolvedContracts.
+     */
+    const liveOnlyLayout: LayoutRecord = {
+      ...SAMPLE_LAYOUT,
+      id: "layout-live-only",
+      name: "Live Single",
+      panes: [
+        {
+          pane_id: "pane-1",
+          root_symbol: "MES",
+          timeframe: "5m",
+          live_mode: true,
+          playback_mode: "live",
+        },
+      ],
+    };
+
+    fetchSessionMock.mockResolvedValue({
+      authenticated: true,
+      csrf_token: "csrf-token-p1-001b",
+    });
+    fetchStatusMock
+      .mockResolvedValueOnce({
+        connected: false,
+        live: true,
+        feed_state: "DISCONNECTED",
+      })
+      .mockResolvedValueOnce({
+        connected: true,
+        live: true,
+        feed_state: "LIVE",
+      });
+    listLayoutsMock.mockResolvedValue([liveOnlyLayout]);
+    fetchBarsMock.mockResolvedValue({
+      provider: "topstepx",
+      live: false,
+      contract_id: "CON.F.US.MNQ.SIM",
+      root_symbol: "MNQ",
+      timeframe: "5m",
+      start_time: 1000,
+      end_time: 1000,
+      count: 0,
+      include_partial: true,
+      quality: {
+        is_complete: true,
+        truncated: false,
+        provider_gap: false,
+        quarantined_count: 0,
+      },
+      bars: [],
+    });
+
+    let rejectRetryLive!: (reason?: unknown) => void;
+    let resolveExpandSim!: (value: ContractsResponse) => void;
+    fetchContractsMock
+      .mockRejectedValueOnce(new ApiError(503, "TopstepX is not connected"))
+      .mockImplementationOnce((_symbols, live) => {
+        expect(live).toBe(true);
+        return new Promise<ContractsResponse>((_resolve, reject) => {
+          rejectRetryLive = reject;
+        });
+      })
+      .mockImplementationOnce((_symbols, live) => {
+        expect(live).toBe(false);
+        return new Promise<ContractsResponse>((resolve) => {
+          resolveExpandSim = resolve;
+        });
+      });
+
+    render(<App />);
+    await act(async () => {
+      await flushMicrotasks();
+    });
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Retry Contracts" }));
+      await flushMicrotasks();
+    });
+    expect(fetchContractsMock).toHaveBeenCalledTimes(2);
+
+    fireEvent.click(screen.getByRole("button", { name: "Layout picker" }));
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "2 Columns" }));
+      await flushMicrotasks();
+    });
+    expect(fetchContractsMock).toHaveBeenCalledTimes(3);
+
+    await act(async () => {
+      resolveExpandSim({
+        live: false,
+        contracts: {
+          MES: { selected: { id: "CON.F.US.MES.SIM" }, error_type: null, error: null },
+          MNQ: { selected: { id: "CON.F.US.MNQ.SIM" }, error_type: null, error: null },
+        },
+      });
+      rejectRetryLive(new ApiError(401, "Session expired"));
+      await flushMicrotasks();
+    });
+
+    expect(clearCsrfTokenMock).toHaveBeenCalledTimes(1);
+    expect(screen.getByPlaceholderText("Enter terminal password")).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Unlock Terminal" })).toBeTruthy();
+  });
+
+  it("aborts superseded layoutResolveControllerRef when deleting active Live layout returns to Sim (P1-002a)", async () => {
+    /**
+     * Contract: Switching Sim -> Live starts a pending fetchContracts(true) on layoutResolveControllerRef;
+     * deleting the Live layout via LayoutPicker promotes Sim, aborts the pending Live AbortSignal, and
+     * ignores any late 503 rejection without showing Retry Contracts.
+     * Defect caught: Deleting active layout leaving superseded layoutResolveControllerRef un-aborted.
+     */
+    const liveLayout: LayoutRecord = {
+      ...SAMPLE_LAYOUT,
+      id: "layout-live",
+      name: "Live MNQ",
+      is_default: false,
+      panes: [
+        {
+          pane_id: "pane-live",
+          root_symbol: "MNQ",
+          timeframe: "5m",
+          live_mode: true,
+          playback_mode: "live",
+        },
+      ],
+    };
+
+    fetchSessionMock.mockResolvedValue({
+      authenticated: true,
+      csrf_token: "csrf-token-p1-002a",
+    });
+    fetchStatusMock.mockResolvedValue({
+      connected: true,
+      live: true,
+      feed_state: "LIVE",
+    });
+    listLayoutsMock.mockResolvedValue([SAMPLE_LAYOUT, liveLayout]);
+    deleteLayoutMock.mockResolvedValueOnce({ deleted: true, id: "layout-live" });
+    fetchBarsMock.mockResolvedValue({
+      provider: "topstepx",
+      live: false,
+      contract_id: "CON.F.US.MES.SIM",
+      root_symbol: "MES",
+      timeframe: "5m",
+      start_time: 1000,
+      end_time: 1000,
+      count: 0,
+      include_partial: true,
+      quality: {
+        is_complete: true,
+        truncated: false,
+        provider_gap: false,
+        quarantined_count: 0,
+      },
+      bars: [],
+    });
+
+    let liveSignal: AbortSignal | undefined;
+    let rejectPendingLive!: (reason?: unknown) => void;
+    fetchContractsMock
+      .mockResolvedValueOnce({
+        live: false,
+        contracts: {
+          MES: { selected: { id: "CON.F.US.MES.SIM" }, error_type: null, error: null },
+        },
+      })
+      .mockImplementationOnce((_symbols, live, signal) => {
+        expect(live).toBe(true);
+        liveSignal = signal;
+        return new Promise<ContractsResponse>((_resolve, reject) => {
+          rejectPendingLive = reject;
+        });
+      });
+
+    render(<App />);
+    await act(async () => {
+      await flushMicrotasks();
+    });
+    expect(screen.getByText("CON.F.US.MES.SIM")).toBeTruthy();
+
+    await act(async () => {
+      fireEvent.change(screen.getByLabelText("Active layout"), {
+        target: { value: "layout-live" },
+      });
+      await flushMicrotasks();
+    });
+    expect(fetchContractsMock).toHaveBeenCalledTimes(2);
+    expect(liveSignal?.aborted).toBe(false);
+
+    fireEvent.click(screen.getByRole("button", { name: "Layout picker" }));
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Delete Live MNQ" }));
+      await flushMicrotasks();
+    });
+
+    expect(liveSignal?.aborted).toBe(true);
+
+    await act(async () => {
+      rejectPendingLive(new ApiError(503, "Late 503 after abort"));
+      await flushMicrotasks();
+    });
+
+    expect(screen.getByText("CON.F.US.MES.SIM")).toBeTruthy();
+    expect(screen.queryByRole("button", { name: /retry contracts/i })).toBeNull();
+  });
+
+  it("recovers unresolved Live mode when deleting Sim promotes Live even after auto-retry cap (P1-002b)", async () => {
+    /**
+     * Contract: When live=true is in unresolvedModesRef after auto-retry exhaustion while viewing Sim,
+     * deleting Sim via LayoutPicker switches activeLayout.id to Live and triggers a fresh fetchContracts(true).
+     * Defect caught: Active layout effect skipping unresolvedModesRef on layout ID change after retry exhaustion.
+     */
+    vi.useFakeTimers();
+    const liveLayout: LayoutRecord = {
+      ...SAMPLE_LAYOUT,
+      id: "layout-live",
+      name: "Live MNQ",
+      is_default: false,
+      panes: [
+        {
+          pane_id: "pane-live",
+          root_symbol: "MNQ",
+          timeframe: "5m",
+          live_mode: true,
+          playback_mode: "live",
+        },
+      ],
+    };
+
+    fetchSessionMock.mockResolvedValue({
+      authenticated: true,
+      csrf_token: "csrf-token-p1-002b",
+    });
+    fetchStatusMock.mockResolvedValue({
+      connected: true,
+      live: true,
+      feed_state: "LIVE",
+    });
+    listLayoutsMock
+      .mockResolvedValueOnce([SAMPLE_LAYOUT, liveLayout])
+      .mockResolvedValueOnce([{ ...liveLayout, is_default: true }]);
+    deleteLayoutMock.mockResolvedValueOnce({ deleted: true, id: "layout-1" });
+    fetchBarsMock.mockResolvedValue({
+      provider: "topstepx",
+      live: false,
+      contract_id: "CON.F.US.MES.SIM",
+      root_symbol: "MES",
+      timeframe: "5m",
+      start_time: 1000,
+      end_time: 1000,
+      count: 0,
+      include_partial: true,
+      quality: {
+        is_complete: true,
+        truncated: false,
+        provider_gap: false,
+        quarantined_count: 0,
+      },
+      bars: [],
+    });
+
+    fetchContractsMock.mockImplementation(async (_symbols, live) => {
+      if (live === false) {
+        return {
+          live: false,
+          contracts: {
+            MES: { selected: { id: "CON.F.US.MES.SIM" }, error_type: null, error: null },
+          },
+        };
+      }
+      throw new ApiError(503, "TopstepX Live unavailable");
+    });
+
+    render(<App />);
+    await act(async () => {
+      await flushMicrotasks();
+    });
+    expect(screen.getByText("CON.F.US.MES.SIM")).toBeTruthy();
+
+    // Switch to Live -> 503 puts live=true in unresolvedModesRef
+    await act(async () => {
+      fireEvent.change(screen.getByLabelText("Active layout"), {
+        target: { value: "layout-live" },
+      });
+      await flushMicrotasks();
+    });
+    expect(screen.getByRole("button", { name: "Retry Contracts" })).toBeTruthy();
+
+    // Switch back to Sim and exhaust the 12 automatic retry attempts
+    await act(async () => {
+      fireEvent.change(screen.getByLabelText("Active layout"), {
+        target: { value: "layout-1" },
+      });
+      await flushMicrotasks();
+    });
+
+    const expectedDelays = [
+      2000, 4000, 8000, 15000, 15000, 15000, 15000, 15000, 15000, 15000, 15000, 15000,
+    ];
+    for (const delay of expectedDelays) {
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(delay);
+        await flushMicrotasks();
+      });
+    }
+    const callsBeforeDelete = fetchContractsMock.mock.calls.length;
+
+    // Now Live succeeds when Sim is deleted and Live is promoted
+    fetchContractsMock.mockResolvedValueOnce({
+      live: true,
+      contracts: {
+        MNQ: { selected: { id: "CON.F.US.MNQ.LIVE" }, error_type: null, error: null },
+      },
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: "Layout picker" }));
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Delete Default Sim" }));
+      await flushMicrotasks();
+    });
+
+    expect(fetchContractsMock.mock.calls.length).toBe(callsBeforeDelete + 1);
+    expect(fetchContractsMock).toHaveBeenLastCalledWith(
+      ["MES", "MNQ", "MYM", "MGC"],
+      true,
+      expect.any(AbortSignal),
+    );
+    expect(screen.getByText("CON.F.US.MNQ.LIVE")).toBeTruthy();
+    expect(screen.queryByRole("button", { name: /retry contracts/i })).toBeNull();
+  });
 });
 
 function setupPreOpenWsIntegrationMocks(secondSessionError: ApiError) {

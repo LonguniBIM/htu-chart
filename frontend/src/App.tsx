@@ -102,7 +102,9 @@ export function App() {
   const retryAbortControllerRef = useRef<AbortController | null>(null);
   const layoutResolveControllerRef = useRef<AbortController | null>(null);
   const sessionEpochRef = useRef<number>(0);
-  const contractResolveGenerationRef = useRef<number>(0);
+  const retryGenerationRef = useRef<number>(0);
+  const layoutResolveGenerationRef = useRef<number>(0);
+  const prevActiveLayoutIdRef = useRef<string | null>(null);
   const activeLayoutRef = useRef<LayoutRecord | null>(null);
   activeLayoutRef.current = activeLayout;
 
@@ -137,7 +139,9 @@ export function App() {
     const inFlightControllers = inFlightContractControllersRef.current;
     return () => {
       sessionEpochRef.current += 1;
-      contractResolveGenerationRef.current += 1;
+      retryGenerationRef.current += 1;
+      layoutResolveGenerationRef.current += 1;
+      prevActiveLayoutIdRef.current = null;
       activeAuthControllerRef.current?.abort();
       activeAuthControllerRef.current = null;
       abortAndClearController(retryAbortControllerRef);
@@ -156,7 +160,8 @@ export function App() {
         clearCsrfToken();
       }
       sessionEpochRef.current += 1;
-      contractResolveGenerationRef.current += 1;
+      retryGenerationRef.current += 1;
+      layoutResolveGenerationRef.current += 1;
       activeAuthControllerRef.current?.abort();
       activeAuthControllerRef.current = null;
       abortAndClearController(retryAbortControllerRef);
@@ -174,6 +179,7 @@ export function App() {
       coordinator.dispose();
       useLayoutStore.getState().reset();
       activeLayoutRef.current = null;
+      prevActiveLayoutIdRef.current = null;
       setContracts({});
       setStatusData(null);
       setAuthStage("unauthenticated");
@@ -310,7 +316,8 @@ export function App() {
       const controller = new AbortController();
       retryAbortControllerRef.current = controller;
       const requestEpoch = sessionEpochRef.current;
-      const generation = ++contractResolveGenerationRef.current;
+      const generation = ++retryGenerationRef.current;
+      layoutResolveGenerationRef.current += 1;
       setIsRetryingContracts(true);
       if (options?.resetAttempt) {
         setRetrySchedule((prev) => ({ attempt: 0, nonce: prev.nonce + 1 }));
@@ -336,7 +343,7 @@ export function App() {
           (err.status === 401 || err.status === 403) &&
           !controller.signal.aborted &&
           requestEpoch === sessionEpochRef.current &&
-          generation === contractResolveGenerationRef.current
+          generation === retryGenerationRef.current
         ) {
           invalidateSessionLocally(err.status === 403 ? err.message : null);
         }
@@ -352,7 +359,7 @@ export function App() {
         if (
           controller.signal.aborted ||
           requestEpoch !== sessionEpochRef.current ||
-          generation !== contractResolveGenerationRef.current
+          generation !== retryGenerationRef.current
         ) {
           return;
         }
@@ -399,7 +406,7 @@ export function App() {
           if (
             !controller.signal.aborted &&
             requestEpoch === sessionEpochRef.current &&
-            generation === contractResolveGenerationRef.current &&
+            generation === retryGenerationRef.current &&
             options?.countAsAutoAttempt &&
             contractsRetryNeededRef.current
           ) {
@@ -493,7 +500,9 @@ export function App() {
     async (signal?: AbortSignal) => {
       sessionEpochRef.current += 1;
       const requestEpoch = sessionEpochRef.current;
-      const generation = ++contractResolveGenerationRef.current;
+      const retryGeneration = ++retryGenerationRef.current;
+      const layoutGeneration = ++layoutResolveGenerationRef.current;
+      prevActiveLayoutIdRef.current = null;
       setLoadError(null);
       abortAndClearController(retryAbortControllerRef);
       abortAndClearController(layoutResolveControllerRef);
@@ -507,7 +516,8 @@ export function App() {
       const isStale = () =>
         Boolean(signal?.aborted) ||
         requestEpoch !== sessionEpochRef.current ||
-        generation !== contractResolveGenerationRef.current;
+        retryGeneration !== retryGenerationRef.current ||
+        layoutGeneration !== layoutResolveGenerationRef.current;
 
       const statusOpts = signal !== undefined ? signal : undefined;
       await fetchSession(statusOpts);
@@ -528,6 +538,7 @@ export function App() {
       useLayoutStore.getState().hydrateLayouts(loadedLayouts);
       const defaultLayout = useLayoutStore.getState().activeLayout;
       activeLayoutRef.current = defaultLayout;
+      prevActiveLayoutIdRef.current = defaultLayout?.id ?? null;
 
       resolvedModesRef.current.clear();
       const distinctModes = distinctPaneLiveModes(defaultLayout?.panes ?? []);
@@ -644,7 +655,8 @@ export function App() {
     event.preventDefault();
     setAuthError(null);
     sessionEpochRef.current += 1;
-    contractResolveGenerationRef.current += 1;
+    retryGenerationRef.current += 1;
+    layoutResolveGenerationRef.current += 1;
     abortAndClearController(retryAbortControllerRef);
     abortAndClearController(layoutResolveControllerRef);
     inFlightContractControllersRef.current.clear();
@@ -738,14 +750,15 @@ export function App() {
         return;
       }
       abortAndClearController(layoutResolveControllerRef);
+      const requestEpoch = sessionEpochRef.current;
+      const generation = ++layoutResolveGenerationRef.current;
       if (options?.cancelRetry) {
+        retryGenerationRef.current += 1;
         abortAndClearController(retryAbortControllerRef);
         setIsRetryingContracts(false);
       }
       const controller = new AbortController();
       layoutResolveControllerRef.current = controller;
-      const requestEpoch = sessionEpochRef.current;
-      const generation = ++contractResolveGenerationRef.current;
       inFlightContractControllersRef.current.set(controller, missingModes);
 
       void fetchContractsForModes(missingModes, controller.signal)
@@ -753,7 +766,7 @@ export function App() {
           if (
             controller.signal.aborted ||
             requestEpoch !== sessionEpochRef.current ||
-            generation !== contractResolveGenerationRef.current
+            generation !== layoutResolveGenerationRef.current
           ) {
             return;
           }
@@ -763,7 +776,7 @@ export function App() {
           if (
             controller.signal.aborted ||
             requestEpoch !== sessionEpochRef.current ||
-            generation !== contractResolveGenerationRef.current ||
+            generation !== layoutResolveGenerationRef.current ||
             (err instanceof DOMException && err.name === "AbortError")
           ) {
             return;
@@ -790,31 +803,48 @@ export function App() {
       return;
     }
     const distinctModes = distinctPaneLiveModes(activeLayout.panes);
-    const newlyMissing = distinctModes.filter(
-      (mode) =>
-        !resolvedModesRef.current.has(mode) &&
-        !unresolvedModesRef.current.has(mode) &&
-        !isContractModeInFlight(mode),
-    );
-    if (newlyMissing.length === 0) {
-      return;
+    if (layoutResolveControllerRef.current !== null) {
+      const inFlightModes =
+        inFlightContractControllersRef.current.get(layoutResolveControllerRef.current) ?? [];
+      if (inFlightModes.some((mode) => !distinctModes.includes(mode))) {
+        abortAndClearController(layoutResolveControllerRef);
+        layoutResolveGenerationRef.current += 1;
+      }
     }
-    const modesToResolve =
-      layoutResolveControllerRef.current !== null
-        ? distinctModes.filter(
-            (mode) =>
-              !resolvedModesRef.current.has(mode) && !unresolvedModesRef.current.has(mode),
-          )
-        : newlyMissing;
-    resolveMissingContractModes(modesToResolve);
-  }, [activeLayout, authStage, isContractModeInFlight, resolveMissingContractModes]);
+
+    const didSwitchLayoutId = prevActiveLayoutIdRef.current !== activeLayout.id;
+    prevActiveLayoutIdRef.current = activeLayout.id;
+
+    const modesToFetch = didSwitchLayoutId
+      ? distinctModes.filter(
+          (mode) => !resolvedModesRef.current.has(mode) && !isContractModeInFlight(mode),
+        )
+      : distinctModes.filter(
+          (mode) =>
+            !resolvedModesRef.current.has(mode) &&
+            !unresolvedModesRef.current.has(mode) &&
+            !isContractModeInFlight(mode),
+        );
+
+    if (modesToFetch.length > 0) {
+      resolveMissingContractModes(modesToFetch);
+    }
+  }, [
+    abortAndClearController,
+    activeLayout,
+    authStage,
+    isContractModeInFlight,
+    resolveMissingContractModes,
+  ]);
 
   const handleLayoutChange = useCallback(
     (nextLayoutId: string) => {
       useLayoutStore.getState().selectLayout(nextLayoutId);
       const picked = useLayoutStore.getState().activeLayout;
       activeLayoutRef.current = picked;
+      prevActiveLayoutIdRef.current = picked?.id ?? null;
       abortAndClearController(layoutResolveControllerRef);
+      layoutResolveGenerationRef.current += 1;
       if (picked === null) {
         return;
       }
