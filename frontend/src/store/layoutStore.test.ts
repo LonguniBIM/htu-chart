@@ -853,4 +853,85 @@ describe("useLayoutStore (Phase 3 Part 2)", () => {
       useLayoutStore.getState().layouts.find((l) => l.id === "layout-zeta")?.is_default,
     ).toBe(false);
   });
+
+  it("switches to created layout on saveLayoutAs after clean re-select, but preserves newer draft edit on dirty re-select (P1-001)", async () => {
+    /**
+     * Contract:
+     * (a) Editing A, starting saveLayoutAs("Layout B"), calling selectLayout(A.id) cleanly
+     *     (dirty === false), and resolving createLayout with B switches activeLayout to B with
+     *     dirty === false.
+     * (b) Editing A, starting saveLayoutAs("Layout B"), calling selectLayout(A.id) and making a
+     *     new edit on A (dirty === true), and resolving createLayout with B keeps activeLayout on
+     *     A with dirty === true and the new draft edit preserved while appending B to layouts.
+     * Defect caught: saveLayoutAs requiring draftRevision === targetDraftRevision even when
+     * activeLayout was cleanly re-selected (dirty === false).
+     */
+    const layoutA = makeFourPaneLayout({ id: "layout-a", name: "Layout A", is_default: true });
+    const recordB: LayoutRecord = {
+      ...layoutA,
+      id: "layout-b",
+      name: "Layout B",
+      is_default: false,
+      panes: layoutA.panes.map((p) => (p.pane_id === "pane-1" ? { ...p, root_symbol: "MNQ" } : p)),
+    };
+
+    // (a) Clean re-select of A while saveLayoutAs("Layout B") is pending -> activates B
+    useLayoutStore.getState().hydrateLayouts([layoutA]);
+    useLayoutStore.getState().setPaneSymbol("pane-1", "MNQ");
+    expect(useLayoutStore.getState().dirty).toBe(true);
+
+    let resolveCreateA!: (val: LayoutRecord) => void;
+    createLayoutMock.mockImplementationOnce(
+      () =>
+        new Promise<LayoutRecord>((resolve) => {
+          resolveCreateA = resolve;
+        }),
+    );
+    const saveAsPromiseA = useLayoutStore.getState().saveLayoutAs("Layout B");
+    useLayoutStore.getState().selectLayout("layout-a");
+    expect(useLayoutStore.getState().dirty).toBe(false);
+
+    resolveCreateA(recordB);
+    const createdA = await saveAsPromiseA;
+    expect(createdA?.id).toBe("layout-b");
+    expect(useLayoutStore.getState().activeLayout?.id).toBe("layout-b");
+    expect(useLayoutStore.getState().dirty).toBe(false);
+    expect(useLayoutStore.getState().layouts.some((l) => l.id === "layout-b")).toBe(true);
+
+    // (b) Re-select A and edit A while saveLayoutAs("Layout B 2") is pending -> preserves draft A
+    useLayoutStore.getState().hydrateLayouts([layoutA]);
+    useLayoutStore.getState().setPaneSymbol("pane-1", "MYM");
+    expect(useLayoutStore.getState().dirty).toBe(true);
+
+    let resolveCreateB!: (val: LayoutRecord) => void;
+    createLayoutMock.mockImplementationOnce(
+      () =>
+        new Promise<LayoutRecord>((resolve) => {
+          resolveCreateB = resolve;
+        }),
+    );
+    const saveAsPromiseB = useLayoutStore.getState().saveLayoutAs("Layout B 2");
+    useLayoutStore.getState().selectLayout("layout-a");
+    useLayoutStore.getState().setPaneSymbol("pane-1", "MGC");
+    useLayoutStore.getState().setPaneTimeframe("pane-1", "15m");
+    expect(useLayoutStore.getState().dirty).toBe(true);
+
+    const recordB2: LayoutRecord = {
+      ...layoutA,
+      id: "layout-b-2",
+      name: "Layout B 2",
+      is_default: false,
+      panes: layoutA.panes.map((p) => (p.pane_id === "pane-1" ? { ...p, root_symbol: "MYM" } : p)),
+    };
+    resolveCreateB(recordB2);
+    const createdB = await saveAsPromiseB;
+    expect(createdB?.id).toBe("layout-b-2");
+
+    const state = useLayoutStore.getState();
+    expect(state.activeLayout?.id).toBe("layout-a");
+    expect(state.dirty).toBe(true);
+    expect(state.activeLayout?.panes[0]?.root_symbol).toBe("MGC");
+    expect(state.activeLayout?.panes[0]?.timeframe).toBe("15m");
+    expect(state.layouts.some((l) => l.id === "layout-b-2")).toBe(true);
+  });
 });

@@ -530,7 +530,7 @@ export const useLayoutStore = create<LayoutStoreState>((set, get) => ({
         const nextLayouts = [...baseLayouts, cloneLayout(cloned)];
         const canReplaceActive =
           state.activeLayout?.id === targetLayoutId &&
-          state.draftRevision === targetDraftRevision;
+          (!state.dirty || state.draftRevision === targetDraftRevision);
         if (!canReplaceActive) {
           return {
             layouts: nextLayouts,
