@@ -841,11 +841,14 @@ def _parse_rl_int(val: Any) -> int | None:
 def _build_rl_window_snapshot(win: Any) -> dict[str, Any] | None:
     if not isinstance(win, dict):
         return None
+    raw_mins = (
+        win["windowDurationMins"]
+        if "windowDurationMins" in win
+        else win.get("window_minutes", win.get("window_duration_mins"))
+    )
     return {
         "usedPercent": _parse_rl_pct(_rl_field(win, "usedPercent", "used_percent")),
-        "windowDurationMins": _parse_rl_int(
-            _rl_field(win, "windowDurationMins", "window_duration_mins")
-        ),
+        "windowDurationMins": _parse_rl_int(raw_mins),
         "resetsAt": _parse_rl_int(_rl_field(win, "resetsAt", "resets_at")),
     }
 
@@ -2110,9 +2113,14 @@ def _preflight_g4_caps(
                     )
                     return 2, None, None
 
+        any_extra_in_flight = any(
+            isinstance(et, dict) and bool(et.get("in_flight")) for et in extra_trackers
+        )
         merged = tracker
         for extra_t in extra_trackers:
-            merged_next = task_runner.merge_g4_trackers(merged, extra_t)
+            merged_next = task_runner.merge_g4_trackers(
+                merged, extra_t, include_in_flight=False
+            )
             if merged_next is not None:
                 merged = merged_next
         merged["task_id"] = tracker_id
@@ -2121,6 +2129,19 @@ def _preflight_g4_caps(
         union = task_runner.collect_g4_attempt_union(
             run_attempt_roots, tracker, candidate_sha=candidate_sha
         )
+        prior_sha_statuses = {st for st in union["sha_statuses"].values() if st}
+        if (
+            tracker.get("in_flight")
+            or any_extra_in_flight
+            or "IN_PROGRESS" in prior_sha_statuses
+        ):
+            print(
+                "[codex_room_review] BLOCKED: Active G4 review already in flight "
+                f"for task {args.task_id!r}.",
+                file=sys.stderr,
+            )
+            return 2, None, None
+
         seeded = _seed_tracker_from_union(tracker, union, now_iso)
         if (
             tracker_path.is_file()
@@ -2132,7 +2153,6 @@ def _preflight_g4_caps(
         effective_rounds = int(union["total_rounds"])
         t_sha = int(tracker.get("sha_invocations", {}).get(candidate_sha, 0))
         effective_sha = max(int(union["sha_count"]), t_sha)
-        prior_sha_statuses = {st for st in union["sha_statuses"].values() if st}
         non_infra_statuses = {st for st in prior_sha_statuses if st != "BLOCKED_INFRA"}
         norm_out = task_runner._norm_attempt_dir(out_dir)
 
@@ -2229,7 +2249,7 @@ def _preflight_g4_caps(
         ledger_active = ledger.get("active_g4_reservations", {})
         if (
             tracker.get("in_flight")
-            or any(isinstance(et, dict) and et.get("in_flight") for et in extra_trackers)
+            or any_extra_in_flight
             or ledger_active
             or "IN_PROGRESS" in prior_sha_statuses
         ):

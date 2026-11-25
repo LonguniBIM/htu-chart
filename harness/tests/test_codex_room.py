@@ -4760,7 +4760,7 @@ def test_codex_5h_allowlist_strips_nested_oauth_cookies_and_unknown_keys(
             "                    'refresh_token': 'secret-rt',\n"
             "                    'oauthToken': 'secret-oauth',\n"
             "                    'primary': {'usedPercent': 92.5, 'resetsAt': 1795651200, "
-            "'refreshToken': 'secret-nested-rt'},\n"
+            "'window_minutes': 300, 'refreshToken': 'secret-nested-rt'},\n"
             "                    'secondary': {'usedPercent': 10.0, 'resetsAt': 1796000000},\n"
             "                    'credits': {'hasCredits': True, 'unlimited': False, "
             "'balance': '99', 'sessionKey': 'secret-cred'},\n"
@@ -4836,7 +4836,17 @@ def test_codex_5h_allowlist_strips_nested_oauth_cookies_and_unknown_keys(
         "credits",
     }
     assert set(snap["primary"].keys()) == {"usedPercent", "windowDurationMins", "resetsAt"}
+    assert snap["primary"]["windowDurationMins"] == 300
     assert set(snap["credits"].keys()) == {"hasCredits", "unlimited"}
+    _, _, snake_snap = codex_room_review.evaluate_codex_window_exhaustion(
+        {
+            "rate_limits": {
+                "primary": {"used_percent": 50.0, "window_minutes": 300, "resets_at": 1795530291}
+            }
+        }
+    )
+    assert isinstance(snake_snap, dict)
+    assert snake_snap["primary"]["windowDurationMins"] == 300
 
 
 def test_g4_hybrid_packet_cap_blocks_when_ledger_packet_lower_than_tracker(
@@ -5025,6 +5035,86 @@ def test_g4_valid_json_wrong_field_type_tracker_fails_closed_no_artifacts(
     assert rc2 == 2
     assert _count_calls(calls) == 0
     assert not out2.exists()
+
+
+def test_g4_child_in_flight_does_not_persist_zombie_lock_in_root_tracker(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Rejecting a sibling while CHILD-V1 is in_flight must not leave a zombie lock in ROOT."""
+    from harness.scripts import task_runner
+
+    repo_dir, sha1 = _init_policy_repo(tmp_path / "repo_zombie_lock", qualified_routes=[])
+    rt_root = tmp_path / "rt_zombie"
+    (rt_root / "topstep-review-pass1").mkdir(parents=True)
+    (rt_root / "topstep-review-pass2").mkdir(parents=True)
+
+    c1_dir = repo_dir / "harness" / "runs" / "CHILD-V1"
+    c1_dir.mkdir(parents=True, exist_ok=True)
+    (c1_dir / "packet.md").write_text(
+        "# P\n\n- **Root Task ID**: `ROOT-ZF`\n", encoding="utf-8"
+    )
+    c1_trk_path = c1_dir / "g4-tracker.json"
+    c1_trk = task_runner.load_g4_tracker(c1_trk_path, task_id="CHILD-V1")
+    c1_trk["in_flight"]["live-c1"] = {"candidate_sha": sha1, "out_dir": "custom_c1_out"}
+    task_runner.save_g4_tracker(c1_trk_path, c1_trk)
+
+    c2_pkt = tmp_path / "c2_zf.md"
+    c2_pkt.write_text("# P\n\n- **Root Task ID**: `ROOT-ZF`\n", encoding="utf-8")
+    (repo_dir / "app.py").write_text("x = 2\n", encoding="utf-8")
+    sha2 = _commit_repo_change(repo_dir, "cand2")
+
+    calls = _install_counting_codex_stub(tmp_path, monkeypatch, sha2)
+    out_c2 = repo_dir / "harness" / "runs" / "CHILD-V2" / "attempts" / f"r1-{sha2[:12]}"
+    rc_blocked = codex_room_review.main(
+        [
+            "--commit",
+            sha2,
+            "--task-id",
+            "CHILD-V2",
+            "--task-packet",
+            str(c2_pkt),
+            "--runtime-root",
+            str(rt_root),
+            "--repo-root",
+            str(repo_dir),
+            "--out-dir",
+            str(out_c2),
+            "--backend",
+            "codex",
+        ]
+    )
+    assert rc_blocked == 2
+    assert _count_calls(calls) == 0
+    assert not out_c2.exists()
+    root_trk_path = task_runner.default_g4_tracker_path("ROOT-ZF", repo_root=repo_dir)
+    if root_trk_path.is_file():
+        assert json.loads(root_trk_path.read_text(encoding="utf-8")).get("in_flight") == {}
+
+    # Simulate CHILD-V1 finishing and clearing its own in_flight slot; CHILD-V2 must succeed.
+    c1_trk["in_flight"] = {}
+    task_runner.save_g4_tracker(c1_trk_path, c1_trk)
+    rc_ok = codex_room_review.main(
+        [
+            "--commit",
+            sha2,
+            "--task-id",
+            "CHILD-V2",
+            "--task-packet",
+            str(c2_pkt),
+            "--runtime-root",
+            str(rt_root),
+            "--repo-root",
+            str(repo_dir),
+            "--out-dir",
+            str(out_c2),
+            "--backend",
+            "codex",
+        ]
+    )
+    assert rc_ok == 0
+    assert _count_calls(calls) == 2
+    assert json.loads(root_trk_path.read_text(encoding="utf-8")).get("in_flight") == {}
+
 
 
 

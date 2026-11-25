@@ -814,14 +814,25 @@ def _extract_legacy_nested_by_source(
 def merge_g4_trackers(
     base_tracker: dict[str, Any] | None,
     extra_tracker: dict[str, Any] | None,
+    *,
+    include_in_flight: bool = True,
 ) -> dict[str, Any] | None:
     """Merge ``extra_tracker`` into ``base_tracker`` idempotently (CRDT GCounter + set union)."""
     if extra_tracker is None:
         return base_tracker
     if base_tracker is None:
-        return extra_tracker
+        if include_in_flight:
+            return extra_tracker
+        cloned = json.loads(json.dumps(extra_tracker))
+        cloned["in_flight"] = {}
+        return cloned
     merged = json.loads(json.dumps(base_tracker))
-    for key in ("completed_attempts", "attempts", "in_flight"):
+    copy_keys = (
+        ("completed_attempts", "attempts", "in_flight")
+        if include_in_flight
+        else ("completed_attempts", "attempts")
+    )
+    for key in copy_keys:
         dst = merged.setdefault(key, {})
         src = extra_tracker.get(key, {})
         if isinstance(dst, dict) and isinstance(src, dict):
