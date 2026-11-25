@@ -563,4 +563,124 @@ describe("MarketWsClient (P1-04, P1-05, P2-003)", () => {
     vi.advanceTimersByTime(60_000);
     expect(FakeWebSocket.instances).toHaveLength(1);
   });
+
+  it("aborts hung verifySession probe after 5000ms deadline and schedules reconnect (P2-R15-001)", async () => {
+    /**
+     * Contract: When pre-open close 1006 triggers verifySession(signal) and the probe never
+     * settles within SESSION_CHECK_TIMEOUT_MS (5000ms), MarketWsClient aborts the probe
+     * AbortSignal, does NOT fire onSessionExpired, and schedules reconnect after backoff.
+     * Defect caught: Hung /api/auth/session probe permanently stranding MarketWsClient offline (P2-R15-001).
+     */
+    let capturedSignal: AbortSignal | undefined;
+    const verifySession = vi.fn<(signal: AbortSignal) => Promise<boolean>>((signal) => {
+      capturedSignal = signal;
+      return new Promise<boolean>(() => {});
+    });
+
+    const client = new MarketWsClient(() => "ws://127.0.0.1:8000/ws/market", verifySession);
+    const expiredListener = vi.fn();
+    client.onSessionExpired(expiredListener);
+
+    client.connect();
+    const ws1 = FakeWebSocket.instances[0];
+    expect(ws1).toBeDefined();
+    ws1?.emitClose(1006, "");
+
+    expect(verifySession).toHaveBeenCalledTimes(1);
+    expect(capturedSignal?.aborted).toBe(false);
+
+    vi.advanceTimersByTime(4_999);
+    expect(capturedSignal?.aborted).toBe(false);
+    expect(FakeWebSocket.instances).toHaveLength(1);
+
+    vi.advanceTimersByTime(1);
+    expect(capturedSignal?.aborted).toBe(true);
+    expect(expiredListener).not.toHaveBeenCalled();
+    expect(FakeWebSocket.instances).toHaveLength(1);
+
+    vi.advanceTimersByTime(999);
+    expect(FakeWebSocket.instances).toHaveLength(1);
+
+    vi.advanceTimersByTime(1);
+    expect(FakeWebSocket.instances).toHaveLength(2);
+    const ws2 = FakeWebSocket.instances[1];
+    expect(ws2).toBeDefined();
+    expect(client.getConnectionState()).toBe("connecting");
+    ws2?.emitOpen();
+    expect(client.getConnectionState()).toBe("connected");
+  });
+
+  it("aborts pending verifySession and ignores late resolution/rejection when connect() starts a new epoch (P2-R13-001, P2-R15-001)", async () => {
+    /**
+     * Contract: Calling connect() while an earlier verifySession probe is still pending aborts
+     * the old probe's AbortSignal, cancels its deadline timer, and ignores any late rejection or
+     * resolution from the superseded probe without affecting the active socket.
+     * Defect caught: Superseded verifySession probe expiring session or scheduling duplicate reconnects on a new connect() epoch.
+     */
+    const signals: AbortSignal[] = [];
+    const resolvers: Array<(value: boolean) => void> = [];
+    const rejectors: Array<(reason?: unknown) => void> = [];
+    const verifySession = vi.fn<(signal: AbortSignal) => Promise<boolean>>((signal) => {
+      signals.push(signal);
+      return new Promise<boolean>((resolve, reject) => {
+        resolvers.push(resolve);
+        rejectors.push(reject);
+      });
+    });
+
+    const client = new MarketWsClient(() => "ws://127.0.0.1:8000/ws/market", verifySession);
+    const expiredListener = vi.fn();
+    client.onSessionExpired(expiredListener);
+
+    // Cycle 1: direct connect() while probe #1 is pending -> old signal aborted, late rejection ignored
+    client.connect();
+    const ws1 = FakeWebSocket.instances[0];
+    expect(ws1).toBeDefined();
+    ws1?.emitClose(1006, "");
+    expect(verifySession).toHaveBeenCalledTimes(1);
+    expect(signals[0]?.aborted).toBe(false);
+
+    client.connect();
+    expect(signals[0]?.aborted).toBe(true);
+    expect(FakeWebSocket.instances).toHaveLength(2);
+    const ws2 = FakeWebSocket.instances[1];
+    expect(ws2).toBeDefined();
+    ws2?.emitOpen();
+    expect(client.getConnectionState()).toBe("connected");
+
+    rejectors[0]?.(new Error("late probe rejection"));
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(expiredListener).not.toHaveBeenCalled();
+    expect(client.getConnectionState()).toBe("connected");
+    expect(FakeWebSocket.instances).toHaveLength(2);
+
+    // Cycle 2: disconnect() + connect() while probe #2 is pending -> old signal aborted, late resolve(false) ignored
+    ws2?.emitClose(1006, "drop_after_open");
+    vi.advanceTimersByTime(1_000);
+    expect(FakeWebSocket.instances).toHaveLength(3);
+    const ws3 = FakeWebSocket.instances[2];
+    expect(ws3).toBeDefined();
+    ws3?.emitClose(1006, "");
+    expect(verifySession).toHaveBeenCalledTimes(2);
+    expect(signals[1]?.aborted).toBe(false);
+
+    client.disconnect();
+    client.connect();
+    expect(signals[1]?.aborted).toBe(true);
+    expect(FakeWebSocket.instances).toHaveLength(4);
+    const ws4 = FakeWebSocket.instances[3];
+    expect(ws4).toBeDefined();
+    ws4?.emitOpen();
+    expect(client.getConnectionState()).toBe("connected");
+
+    resolvers[1]?.(false);
+    await Promise.resolve();
+    await Promise.resolve();
+    vi.advanceTimersByTime(10_000);
+
+    expect(expiredListener).not.toHaveBeenCalled();
+    expect(client.getConnectionState()).toBe("connected");
+    expect(FakeWebSocket.instances).toHaveLength(4);
+  });
 });

@@ -27,6 +27,7 @@ interface SubscriptionEntry {
 const INITIAL_BACKOFF_MS = 1000;
 const MAX_BACKOFF_MS = 30000;
 const PING_INTERVAL_MS = 20000;
+const SESSION_CHECK_TIMEOUT_MS = 5000;
 const WS_CLOSE_POLICY_VIOLATION = 1008;
 const WS_CLOSE_SLOW_CONSUMER = 4008;
 
@@ -59,6 +60,7 @@ export class MarketWsClient {
   private readonly urlFactory: () => string;
   private readonly verifySession: ((signal: AbortSignal) => Promise<boolean>) | undefined;
   private sessionCheckController: AbortController | null = null;
+  private sessionCheckTimer: ReturnType<typeof setTimeout> | null = null;
   private connectionEpoch = 0;
 
   constructor(
@@ -316,16 +318,20 @@ export class MarketWsClient {
       if (!socketOpened && this.verifySession !== undefined) {
         const epoch = this.connectionEpoch;
         this.abortSessionCheck();
+        let settled = false;
         const controller = new AbortController();
         this.sessionCheckController = controller;
         const settleSessionCheck = (isSessionValid: boolean): void => {
           if (
+            settled ||
             controller.signal.aborted ||
             !this.shouldRun ||
             epoch !== this.connectionEpoch
           ) {
             return;
           }
+          settled = true;
+          this.clearSessionCheckTimer();
           if (this.sessionCheckController === controller) {
             this.sessionCheckController = null;
           }
@@ -338,6 +344,20 @@ export class MarketWsClient {
           }
           this.scheduleReconnect();
         };
+        this.sessionCheckTimer = setTimeout(() => {
+          if (settled || !this.shouldRun || epoch !== this.connectionEpoch) {
+            return;
+          }
+          settled = true;
+          this.sessionCheckTimer = null;
+          if (this.sessionCheckController === controller) {
+            this.sessionCheckController = null;
+          }
+          controller.abort();
+          if (this.shouldRun && epoch === this.connectionEpoch) {
+            this.scheduleReconnect();
+          }
+        }, SESSION_CHECK_TIMEOUT_MS);
 
         let checkPromise: Promise<boolean>;
         try {
@@ -391,9 +411,17 @@ export class MarketWsClient {
   }
 
   private abortSessionCheck(): void {
+    this.clearSessionCheckTimer();
     if (this.sessionCheckController !== null) {
       this.sessionCheckController.abort();
       this.sessionCheckController = null;
+    }
+  }
+
+  private clearSessionCheckTimer(): void {
+    if (this.sessionCheckTimer !== null) {
+      clearTimeout(this.sessionCheckTimer);
+      this.sessionCheckTimer = null;
     }
   }
 
