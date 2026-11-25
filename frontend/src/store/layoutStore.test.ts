@@ -653,4 +653,198 @@ describe("useLayoutStore (Phase 3 Part 2)", () => {
     expect(useLayoutStore.getState().activeLayout?.template_id).toBe(base.template_id);
     expect(useLayoutStore.getState().activeLayout?.panes).toHaveLength(4);
   });
+
+  it("syncs clean activeLayout when re-selecting the same layout while Save/Rename/SetDefault is in flight (P1-001)", async () => {
+    /**
+     * Contract: Editing A (MES -> MNQ), starting saveActiveLayout(), and calling selectLayout(A)
+     * (directly or via A -> B -> A) while Save is pending updates activeLayout to the saved MNQ
+     * record with dirty === false once Save resolves, instead of leaving stale MES with dirty === false.
+     * Defect caught: draftRevision mismatch blocking activeLayout sync on clean re-selected layout.
+     */
+    const layoutA = makeFourPaneLayout({ id: "layout-a", name: "Layout A", is_default: false });
+    const layoutB = makeFourPaneLayout({
+      id: "layout-b",
+      name: "Layout B",
+      is_default: true,
+      panes: [
+        { pane_id: "pane-1", root_symbol: "MGC", timeframe: "15m", live_mode: false, playback_mode: "live" },
+      ],
+      template_id: "1-single",
+    });
+
+    useLayoutStore.getState().hydrateLayouts([layoutA, layoutB]);
+
+    // Case 1: selectLayout(A) directly while saveActiveLayout is pending
+    useLayoutStore.getState().selectLayout("layout-a");
+    useLayoutStore.getState().setPaneSymbol("pane-1", "MNQ");
+    expect(useLayoutStore.getState().dirty).toBe(true);
+
+    let resolveSaveDirect!: (val: LayoutRecord) => void;
+    updateLayoutMock.mockImplementationOnce(
+      () =>
+        new Promise<LayoutRecord>((resolve) => {
+          resolveSaveDirect = resolve;
+        }),
+    );
+    const saveDirectPromise = useLayoutStore.getState().saveActiveLayout();
+    useLayoutStore.getState().selectLayout("layout-a");
+    expect(useLayoutStore.getState().dirty).toBe(false);
+    expect(useLayoutStore.getState().activeLayout?.panes[0]?.root_symbol).toBe("MES");
+
+    const savedMnq: LayoutRecord = {
+      ...layoutA,
+      panes: layoutA.panes.map((p) => (p.pane_id === "pane-1" ? { ...p, root_symbol: "MNQ" } : p)),
+    };
+    resolveSaveDirect(savedMnq);
+    await saveDirectPromise;
+
+    expect(useLayoutStore.getState().activeLayout?.id).toBe("layout-a");
+    expect(useLayoutStore.getState().activeLayout?.panes[0]?.root_symbol).toBe("MNQ");
+    expect(useLayoutStore.getState().dirty).toBe(false);
+
+    // Case 2: A -> B -> A while saveActiveLayout is pending
+    useLayoutStore.getState().setPaneSymbol("pane-1", "MYM");
+    let resolveSaveRoundTrip!: (val: LayoutRecord) => void;
+    updateLayoutMock.mockImplementationOnce(
+      () =>
+        new Promise<LayoutRecord>((resolve) => {
+          resolveSaveRoundTrip = resolve;
+        }),
+    );
+    const saveRoundTripPromise = useLayoutStore.getState().saveActiveLayout();
+    useLayoutStore.getState().selectLayout("layout-b");
+    useLayoutStore.getState().selectLayout("layout-a");
+    expect(useLayoutStore.getState().dirty).toBe(false);
+    expect(useLayoutStore.getState().activeLayout?.panes[0]?.root_symbol).toBe("MNQ");
+
+    const savedMym: LayoutRecord = {
+      ...layoutA,
+      panes: layoutA.panes.map((p) => (p.pane_id === "pane-1" ? { ...p, root_symbol: "MYM" } : p)),
+    };
+    resolveSaveRoundTrip(savedMym);
+    await saveRoundTripPromise;
+
+    expect(useLayoutStore.getState().activeLayout?.id).toBe("layout-a");
+    expect(useLayoutStore.getState().activeLayout?.panes[0]?.root_symbol).toBe("MYM");
+    expect(useLayoutStore.getState().dirty).toBe(false);
+
+    // Case 3: renameActiveLayout and setActiveLayoutDefault also sync clean re-selected layout
+    useLayoutStore.getState().setPaneSymbol("pane-1", "MGC");
+    let resolveRename!: (val: LayoutRecord) => void;
+    updateLayoutMock.mockImplementationOnce(
+      () =>
+        new Promise<LayoutRecord>((resolve) => {
+          resolveRename = resolve;
+        }),
+    );
+    const renamePromise = useLayoutStore.getState().renameActiveLayout("Layout A Renamed");
+    useLayoutStore.getState().selectLayout("layout-a");
+    const savedRenamed: LayoutRecord = {
+      ...layoutA,
+      name: "Layout A Renamed",
+      panes: layoutA.panes.map((p) => (p.pane_id === "pane-1" ? { ...p, root_symbol: "MGC" } : p)),
+    };
+    resolveRename(savedRenamed);
+    await renamePromise;
+
+    expect(useLayoutStore.getState().activeLayout?.name).toBe("Layout A Renamed");
+    expect(useLayoutStore.getState().activeLayout?.panes[0]?.root_symbol).toBe("MGC");
+    expect(useLayoutStore.getState().dirty).toBe(false);
+
+    useLayoutStore.getState().setPaneSymbol("pane-1", "MES");
+    let resolveDefault!: (val: LayoutRecord) => void;
+    updateLayoutMock.mockImplementationOnce(
+      () =>
+        new Promise<LayoutRecord>((resolve) => {
+          resolveDefault = resolve;
+        }),
+    );
+    const defaultPromise = useLayoutStore.getState().setActiveLayoutDefault();
+    useLayoutStore.getState().selectLayout("layout-a");
+    const savedDefault: LayoutRecord = {
+      ...savedRenamed,
+      is_default: true,
+      panes: layoutA.panes.map((p) => (p.pane_id === "pane-1" ? { ...p, root_symbol: "MES" } : p)),
+    };
+    resolveDefault(savedDefault);
+    await defaultPromise;
+
+    expect(useLayoutStore.getState().activeLayout?.is_default).toBe(true);
+    expect(useLayoutStore.getState().activeLayout?.panes[0]?.root_symbol).toBe("MES");
+    expect(useLayoutStore.getState().dirty).toBe(false);
+  });
+
+  it("promotes oldest remaining layout by (created_at_utc ASC, id ASC) on delete fallback when listLayouts fails (P1-002)", async () => {
+    /**
+     * Contract: When deleting an is_default layout and listLayouts() rejects with a non-auth error,
+     * deleteLayoutById promotes the oldest remaining layout ordered by (created_at_utc ASC, id ASC)
+     * matching sqlite_store.py rather than remaining[0].
+     * Defect caught: Fallback promoting remaining[0] regardless of created_at_utc/id.
+     */
+    const layoutA = makeFourPaneLayout({
+      id: "layout-a-newest",
+      name: "A Newest",
+      is_default: true,
+      created_at_utc: 3000,
+    });
+    const layoutB = makeFourPaneLayout({
+      id: "layout-b-oldest",
+      name: "B Oldest",
+      is_default: false,
+      created_at_utc: 1000,
+    });
+    const layoutC = makeFourPaneLayout({
+      id: "layout-c-middle",
+      name: "C Middle",
+      is_default: false,
+      created_at_utc: 2000,
+    });
+
+    useLayoutStore.getState().hydrateLayouts([layoutA, layoutB, layoutC]);
+    useLayoutStore.getState().selectLayout(layoutB.id);
+    updateLayoutMock.mockResolvedValueOnce({ ...layoutB, is_default: true });
+    await useLayoutStore.getState().setActiveLayoutDefault();
+
+    deleteLayoutMock.mockResolvedValueOnce({ deleted: true, id: layoutB.id });
+    listLayoutsMock.mockRejectedValueOnce(new TypeError("Network error"));
+
+    const ok = await useLayoutStore.getState().deleteLayoutById(layoutB.id);
+    expect(ok).toBe(true);
+    expect(useLayoutStore.getState().activeLayout?.id).toBe(layoutC.id);
+    expect(useLayoutStore.getState().activeLayout?.is_default).toBe(true);
+    expect(useLayoutStore.getState().layouts.find((l) => l.id === layoutC.id)?.is_default).toBe(
+      true,
+    );
+    expect(useLayoutStore.getState().layouts.find((l) => l.id === layoutA.id)?.is_default).toBe(
+      false,
+    );
+
+    // Also verify id ASC tie-breaker when created_at_utc is equal
+    const layoutZ = makeFourPaneLayout({
+      id: "layout-zeta",
+      name: "Zeta",
+      is_default: false,
+      created_at_utc: 2000,
+    });
+    const layoutAlpha = makeFourPaneLayout({
+      id: "layout-alpha",
+      name: "Alpha",
+      is_default: false,
+      created_at_utc: 2000,
+    });
+    useLayoutStore.getState().hydrateLayouts([layoutZ, layoutC, layoutAlpha]);
+    useLayoutStore.getState().selectLayout(layoutC.id);
+    updateLayoutMock.mockResolvedValueOnce({ ...layoutC, is_default: true });
+    await useLayoutStore.getState().setActiveLayoutDefault();
+
+    deleteLayoutMock.mockResolvedValueOnce({ deleted: true, id: layoutC.id });
+    listLayoutsMock.mockRejectedValueOnce(new TypeError("Network error"));
+    const okTie = await useLayoutStore.getState().deleteLayoutById(layoutC.id);
+    expect(okTie).toBe(true);
+    expect(useLayoutStore.getState().activeLayout?.id).toBe("layout-alpha");
+    expect(useLayoutStore.getState().activeLayout?.is_default).toBe(true);
+    expect(
+      useLayoutStore.getState().layouts.find((l) => l.id === "layout-zeta")?.is_default,
+    ).toBe(false);
+  });
 });

@@ -92,6 +92,19 @@ function pickInitialLayout(layouts: readonly LayoutRecord[]): LayoutRecord | nul
   return layouts.find((item) => item.is_default) ?? layouts[0] ?? null;
 }
 
+function compareLayoutsByOldest(a: LayoutRecord, b: LayoutRecord): number {
+  if (a.created_at_utc !== b.created_at_utc) {
+    return a.created_at_utc - b.created_at_utc;
+  }
+  if (a.id < b.id) {
+    return -1;
+  }
+  if (a.id > b.id) {
+    return 1;
+  }
+  return 0;
+}
+
 function toLayoutPayload(
   layout: LayoutRecord,
   overrides?: Partial<LayoutPayload>,
@@ -447,7 +460,7 @@ export const useLayoutStore = create<LayoutStoreState>((set, get) => ({
         );
         const canReplaceActive =
           state.activeLayout?.id === targetLayoutId &&
-          state.draftRevision === targetDraftRevision;
+          (!state.dirty || state.draftRevision === targetDraftRevision);
         if (!canReplaceActive) {
           return {
             layouts: nextLayouts,
@@ -594,7 +607,8 @@ export const useLayoutStore = create<LayoutStoreState>((set, get) => ({
             error: null,
           };
         }
-        if (state.draftRevision !== targetDraftRevision) {
+        const canReplaceActive = !state.dirty || state.draftRevision === targetDraftRevision;
+        if (!canReplaceActive) {
           return {
             layouts: nextLayouts,
             activeLayout:
@@ -608,6 +622,7 @@ export const useLayoutStore = create<LayoutStoreState>((set, get) => ({
         return {
           layouts: nextLayouts,
           activeLayout: cloned,
+          activePaneId: resolveSurvivingActivePaneId(state.activePaneId, cloned.panes),
           paneArchive: { ...state.paneArchive, ...seedArchive(cloned.panes) },
           paneArchiveBySlot: {
             ...state.paneArchiveBySlot,
@@ -670,7 +685,8 @@ export const useLayoutStore = create<LayoutStoreState>((set, get) => ({
             error: null,
           };
         }
-        if (state.draftRevision !== targetDraftRevision) {
+        const canReplaceActive = !state.dirty || state.draftRevision === targetDraftRevision;
+        if (!canReplaceActive) {
           return {
             layouts: nextLayouts,
             activeLayout:
@@ -684,6 +700,7 @@ export const useLayoutStore = create<LayoutStoreState>((set, get) => ({
         return {
           layouts: nextLayouts,
           activeLayout: cloned,
+          activePaneId: resolveSurvivingActivePaneId(state.activePaneId, cloned.panes),
           paneArchive: { ...state.paneArchive, ...seedArchive(cloned.panes) },
           paneArchiveBySlot: {
             ...state.paneArchiveBySlot,
@@ -749,8 +766,19 @@ export const useLayoutStore = create<LayoutStoreState>((set, get) => ({
         }
         if (syncedFromServer !== null) {
           remaining = syncedFromServer;
-        } else if (!remaining.some((item) => item.is_default) && remaining[0] !== undefined) {
-          remaining[0] = { ...remaining[0], is_default: true };
+        } else if (!remaining.some((item) => item.is_default) && remaining.length > 0) {
+          let oldest = remaining[0]!;
+          for (let i = 1; i < remaining.length; i += 1) {
+            const candidate = remaining[i]!;
+            if (compareLayoutsByOldest(candidate, oldest) < 0) {
+              oldest = candidate;
+            }
+          }
+          remaining = remaining.map((item) =>
+            item.id === oldest.id
+              ? { ...item, is_default: true }
+              : { ...item, is_default: false },
+          );
         }
       }
 

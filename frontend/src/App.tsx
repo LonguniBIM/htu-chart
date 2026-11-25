@@ -100,7 +100,7 @@ export function App() {
   const activeAuthControllerRef = useRef<AbortController | null>(null);
   const pendingLogoutPromiseRef = useRef<Promise<void> | null>(null);
   const retryAbortControllerRef = useRef<AbortController | null>(null);
-  const layoutResolveControllerRef = useRef<AbortController | null>(null);
+  const inFlightLayoutControllersRef = useRef<Set<AbortController>>(new Set());
   const sessionEpochRef = useRef<number>(0);
   const retryGenerationRef = useRef<number>(0);
   const layoutResolveGenerationRef = useRef<number>(0);
@@ -129,6 +129,15 @@ export function App() {
     [],
   );
 
+  const abortAllLayoutControllers = useCallback(() => {
+    layoutResolveGenerationRef.current += 1;
+    for (const controller of inFlightLayoutControllersRef.current) {
+      inFlightContractControllersRef.current.delete(controller);
+      controller.abort();
+    }
+    inFlightLayoutControllersRef.current.clear();
+  }, []);
+
   useEffect(() => {
     if (activeLayout !== null) {
       syncController.setSyncConfig(activeLayout.sync_config);
@@ -140,19 +149,18 @@ export function App() {
     return () => {
       sessionEpochRef.current += 1;
       retryGenerationRef.current += 1;
-      layoutResolveGenerationRef.current += 1;
       prevActiveLayoutIdRef.current = null;
       activeAuthControllerRef.current?.abort();
       activeAuthControllerRef.current = null;
       abortAndClearController(retryAbortControllerRef);
-      abortAndClearController(layoutResolveControllerRef);
+      abortAllLayoutControllers();
       inFlightControllers.clear();
       wsClient.disconnect();
       coordinator.dispose();
       useLayoutStore.getState().setAuthErrorHandler(null);
       useLayoutStore.getState().reset();
     };
-  }, [abortAndClearController, coordinator, wsClient]);
+  }, [abortAllLayoutControllers, abortAndClearController, coordinator, wsClient]);
 
   const invalidateSessionLocally = useCallback(
     (errorMessage?: string | null, options?: { preserveCsrfForLogout?: boolean }) => {
@@ -161,11 +169,10 @@ export function App() {
       }
       sessionEpochRef.current += 1;
       retryGenerationRef.current += 1;
-      layoutResolveGenerationRef.current += 1;
       activeAuthControllerRef.current?.abort();
       activeAuthControllerRef.current = null;
       abortAndClearController(retryAbortControllerRef);
-      abortAndClearController(layoutResolveControllerRef);
+      abortAllLayoutControllers();
       inFlightContractControllersRef.current.clear();
       contractsRetryNeededRef.current = false;
       unresolvedModesRef.current.clear();
@@ -185,7 +192,7 @@ export function App() {
       setAuthStage("unauthenticated");
       setAuthError(errorMessage ?? null);
     },
-    [abortAndClearController, coordinator, wsClient],
+    [abortAllLayoutControllers, abortAndClearController, coordinator, wsClient],
   );
 
   useEffect(() => {
@@ -312,12 +319,11 @@ export function App() {
   const retryUnresolvedContracts = useCallback(
     async (options?: { countAsAutoAttempt?: boolean; resetAttempt?: boolean }) => {
       abortAndClearController(retryAbortControllerRef);
-      abortAndClearController(layoutResolveControllerRef);
+      abortAllLayoutControllers();
       const controller = new AbortController();
       retryAbortControllerRef.current = controller;
       const requestEpoch = sessionEpochRef.current;
       const generation = ++retryGenerationRef.current;
-      layoutResolveGenerationRef.current += 1;
       setIsRetryingContracts(true);
       if (options?.resetAttempt) {
         setRetrySchedule((prev) => ({ attempt: 0, nonce: prev.nonce + 1 }));
@@ -416,6 +422,7 @@ export function App() {
       }
     },
     [
+      abortAllLayoutControllers,
       abortAndClearController,
       applyContractResolutionError,
       applyContractResolutionResult,
@@ -501,11 +508,11 @@ export function App() {
       sessionEpochRef.current += 1;
       const requestEpoch = sessionEpochRef.current;
       const retryGeneration = ++retryGenerationRef.current;
-      const layoutGeneration = ++layoutResolveGenerationRef.current;
       prevActiveLayoutIdRef.current = null;
       setLoadError(null);
       abortAndClearController(retryAbortControllerRef);
-      abortAndClearController(layoutResolveControllerRef);
+      abortAllLayoutControllers();
+      const layoutGeneration = layoutResolveGenerationRef.current;
       inFlightContractControllersRef.current.clear();
       contractsRetryNeededRef.current = false;
       unresolvedModesRef.current.clear();
@@ -604,6 +611,7 @@ export function App() {
       wsClient.connect();
     },
     [
+      abortAllLayoutControllers,
       abortAndClearController,
       applyContractResolutionError,
       fetchContractsForModes,
@@ -656,9 +664,8 @@ export function App() {
     setAuthError(null);
     sessionEpochRef.current += 1;
     retryGenerationRef.current += 1;
-    layoutResolveGenerationRef.current += 1;
     abortAndClearController(retryAbortControllerRef);
-    abortAndClearController(layoutResolveControllerRef);
+    abortAllLayoutControllers();
     inFlightContractControllersRef.current.clear();
     activeAuthControllerRef.current?.abort();
     const controller = new AbortController();
@@ -745,20 +752,25 @@ export function App() {
   }, []);
 
   const resolveMissingContractModes = useCallback(
-    (missingModes: readonly boolean[], options?: { cancelRetry?: boolean }) => {
+    (
+      missingModes: readonly boolean[],
+      options?: { cancelRetry?: boolean; replaceExisting?: boolean },
+    ) => {
       if (missingModes.length === 0) {
         return;
       }
-      abortAndClearController(layoutResolveControllerRef);
+      if (options?.replaceExisting || options?.cancelRetry) {
+        abortAllLayoutControllers();
+      }
       const requestEpoch = sessionEpochRef.current;
-      const generation = ++layoutResolveGenerationRef.current;
+      const generation = layoutResolveGenerationRef.current;
       if (options?.cancelRetry) {
         retryGenerationRef.current += 1;
         abortAndClearController(retryAbortControllerRef);
         setIsRetryingContracts(false);
       }
       const controller = new AbortController();
-      layoutResolveControllerRef.current = controller;
+      inFlightLayoutControllersRef.current.add(controller);
       inFlightContractControllersRef.current.set(controller, missingModes);
 
       void fetchContractsForModes(missingModes, controller.signal)
@@ -785,12 +797,11 @@ export function App() {
         })
         .finally(() => {
           inFlightContractControllersRef.current.delete(controller);
-          if (layoutResolveControllerRef.current === controller) {
-            layoutResolveControllerRef.current = null;
-          }
+          inFlightLayoutControllersRef.current.delete(controller);
         });
     },
     [
+      abortAllLayoutControllers,
       abortAndClearController,
       applyContractResolutionError,
       applyContractResolutionResult,
@@ -803,12 +814,12 @@ export function App() {
       return;
     }
     const distinctModes = distinctPaneLiveModes(activeLayout.panes);
-    if (layoutResolveControllerRef.current !== null) {
-      const inFlightModes =
-        inFlightContractControllersRef.current.get(layoutResolveControllerRef.current) ?? [];
+    for (const controller of Array.from(inFlightLayoutControllersRef.current)) {
+      const inFlightModes = inFlightContractControllersRef.current.get(controller) ?? [];
       if (inFlightModes.some((mode) => !distinctModes.includes(mode))) {
-        abortAndClearController(layoutResolveControllerRef);
-        layoutResolveGenerationRef.current += 1;
+        inFlightLayoutControllersRef.current.delete(controller);
+        inFlightContractControllersRef.current.delete(controller);
+        controller.abort();
       }
     }
 
@@ -830,7 +841,6 @@ export function App() {
       resolveMissingContractModes(modesToFetch);
     }
   }, [
-    abortAndClearController,
     activeLayout,
     authStage,
     isContractModeInFlight,
@@ -843,17 +853,16 @@ export function App() {
       const picked = useLayoutStore.getState().activeLayout;
       activeLayoutRef.current = picked;
       prevActiveLayoutIdRef.current = picked?.id ?? null;
-      abortAndClearController(layoutResolveControllerRef);
-      layoutResolveGenerationRef.current += 1;
+      abortAllLayoutControllers();
       if (picked === null) {
         return;
       }
       const missingModes = distinctPaneLiveModes(picked.panes).filter(
         (mode) => !resolvedModesRef.current.has(mode),
       );
-      resolveMissingContractModes(missingModes, { cancelRetry: true });
+      resolveMissingContractModes(missingModes, { cancelRetry: true, replaceExisting: true });
     },
-    [abortAndClearController, resolveMissingContractModes],
+    [abortAllLayoutControllers, resolveMissingContractModes],
   );
 
   if (authStage === "checking") {
