@@ -6525,7 +6525,9 @@ def test_g4_lock_loser_does_not_bill_foreign_raw_logs_on_abort(
 def test_codex_room_review_raises_timeouts_50pct_and_caps_agy_idle(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Default CLI uses +50% timeouts (1800/270 Codex, 1800/630 AGY) & caps AGY idle."""
+    """Default CLI uses +50% timeouts, honors policy/ledger/explicit CLI & caps AGY idle."""
+    from harness.scripts import task_runner
+
     repo_dir, sha1 = _init_policy_repo(
         tmp_path / "repo_50pct_timeouts", qualified_routes=["gemini-4-carbon-high"]
     )
@@ -6598,8 +6600,23 @@ def test_codex_room_review_raises_timeouts_50pct_and_caps_agy_idle(
                 "agy",
                 "--timeout",
                 "400",
+            ]
+        )
+        == 0
+    )
+    assert (
+        codex_room_review.main(
+            [
+                "--commit",
+                sha1,
+                "--repo-root",
+                str(repo_dir),
+                "--out-dir",
+                str(tmp_path / "out_agy_explicit_200"),
+                "--backend",
+                "agy",
                 "--idle-timeout",
-                "270",
+                "200",
             ]
         )
         == 0
@@ -6622,14 +6639,82 @@ def test_codex_room_review_raises_timeouts_50pct_and_caps_agy_idle(
         == 0
     )
 
-    codex_kw = codex_seen[0]
-    agy_kw = agy_seen[0]
-    agy_capped_kw = agy_seen[2]
-    agy_fast_kw = agy_seen[4]
-    assert codex_kw == (1800.0, 270.0)
-    assert agy_kw == (1800.0, 630.0)
-    assert agy_capped_kw == (400.0, 400.0)
-    assert agy_fast_kw == (1800.0, 5.0)
+    # Policy deadlines_sec.reviewer_agy_pass_idle = 500 is honored when no CLI flag is passed.
+    pol_path = repo_dir / "harness" / "model-policy.json"
+    pol_obj = json.loads(pol_path.read_text(encoding="utf-8"))
+    pol_obj.setdefault("circuit_breakers", {})["deadlines_sec"] = {
+        "reviewer_agy_pass_idle": 500
+    }
+    pol_path.write_text(json.dumps(pol_obj, indent=2), encoding="utf-8")
+    _commit_repo_change(repo_dir, "set policy reviewer_agy_pass_idle=500")
+    sha2 = subprocess.check_output(
+        ["git", "-C", str(repo_dir), "rev-parse", "HEAD"], text=True
+    ).strip()
+
+    def _spy_agy_sha2(**kwargs: Any) -> dict[str, Any]:
+        agy_seen.append((float(kwargs["timeout_sec"]), float(kwargs["idle_timeout_sec"])))
+        pass_name = str(kwargs["pass_name"])
+        lens = "security_and_invariants" if pass_name == "pass2" else "correctness_and_tests"
+        return _sample_pass(sha2, lens)
+
+    monkeypatch.setattr(codex_room_review, "_run_agy_pass", _spy_agy_sha2)
+    assert (
+        codex_room_review.main(
+            [
+                "--commit",
+                sha2,
+                "--repo-root",
+                str(repo_dir),
+                "--out-dir",
+                str(tmp_path / "out_agy_policy"),
+                "--backend",
+                "agy",
+            ]
+        )
+        == 0
+    )
+
+    # Ledger deadlines_sec.reviewer_agy_pass_idle = 480 overrides policy 500.
+    led_path = _setup_ledger_for_g4_test(
+        repo_dir, "T-AGY-LED-IDLE", state="REVIEW_FROZEN_G4", candidate_sha=sha2
+    )
+    led_data = task_runner.load_ledger(led_path)
+    led_data["deadlines_sec"]["reviewer_agy_pass_idle"] = 480
+    task_runner.save_ledger(led_path, led_data)
+    assert (
+        codex_room_review.main(
+            [
+                "--commit",
+                sha2,
+                "--task-id",
+                "T-AGY-LED-IDLE",
+                "--ledger",
+                str(led_path),
+                "--repo-root",
+                str(repo_dir),
+                "--out-dir",
+                str(tmp_path / "out_agy_ledger"),
+                "--backend",
+                "agy",
+            ]
+        )
+        == 0
+    )
+
+    assert codex_seen[0] == (1800.0, 270.0)
+    assert agy_seen[0] == (1800.0, 630.0)
+    assert agy_seen[2] == (400.0, 400.0)
+    assert agy_seen[4] == (1800.0, 200.0)
+    assert agy_seen[6] == (1800.0, 5.0)
+    assert agy_seen[8] == (1800.0, 500.0)
+    assert agy_seen[10] == (1800.0, 480.0)
+
+    assert (
+        codex_room_review.main(
+            ["--commit", sha2, "--repo-root", str(repo_dir), "--agy-idle-timeout", "-1"]
+        )
+        == 2
+    )
 
 
 

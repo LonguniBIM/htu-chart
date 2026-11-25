@@ -60,6 +60,7 @@ DEFAULT_DEADLINES_SEC: dict[str, int] = {
     "verifier_total": 420,
     "reviewer_pass_total": 900,
     "reviewer_pass_idle": 270,
+    "reviewer_agy_pass_idle": 630,
     "root_task_wall_clock": 5400,
 }
 
@@ -82,32 +83,66 @@ ZERO_OK_CIRCUIT_BREAKERS: frozenset[str] = frozenset(
 )
 
 
-def load_circuit_breakers(
+def _load_policy_int_map(
+    defaults: dict[str, int],
+    *,
+    section_getter: Any,
+    zero_ok_keys: frozenset[str] = frozenset(),
     repo_root: Path | None = None,
     policy_path: Path | None = None,
 ) -> dict[str, int]:
-    """Load integer circuit-breaker caps from model-policy.json with safe defaults."""
-    breakers = dict(DEFAULT_CIRCUIT_BREAKERS)
+    merged = dict(defaults)
     policy_file = (
         policy_path.resolve()
         if policy_path is not None
         else ((repo_root or REPO_ROOT).resolve() / "harness" / "model-policy.json")
     )
     if not policy_file.is_file():
-        return breakers
+        return merged
     try:
         data = json.loads(policy_file.read_text(encoding="utf-8"))
     except (OSError, UnicodeDecodeError, json.JSONDecodeError):
-        return breakers
-    raw_cb = data.get("circuit_breakers") if isinstance(data, dict) else None
-    if not isinstance(raw_cb, dict):
-        return breakers
-    for key in DEFAULT_CIRCUIT_BREAKERS:
-        val = raw_cb.get(key)
-        min_val = 0 if key in ZERO_OK_CIRCUIT_BREAKERS else 1
+        return merged
+    raw_sec = section_getter(data) if isinstance(data, dict) else None
+    if not isinstance(raw_sec, dict):
+        return merged
+    for key in defaults:
+        val = raw_sec.get(key)
+        min_val = 0 if key in zero_ok_keys else 1
         if is_strict_int(val) and val >= min_val:
-            breakers[key] = int(val)
-    return breakers
+            merged[key] = int(val)
+    return merged
+
+
+def load_circuit_breakers(
+    repo_root: Path | None = None,
+    policy_path: Path | None = None,
+) -> dict[str, int]:
+    """Load integer circuit-breaker caps from model-policy.json with safe defaults."""
+    return _load_policy_int_map(
+        DEFAULT_CIRCUIT_BREAKERS,
+        section_getter=lambda d: d.get("circuit_breakers"),
+        zero_ok_keys=ZERO_OK_CIRCUIT_BREAKERS,
+        repo_root=repo_root,
+        policy_path=policy_path,
+    )
+
+
+def load_deadlines_sec(
+    repo_root: Path | None = None,
+    policy_path: Path | None = None,
+) -> dict[str, int]:
+    """Load integer deadline settings from model-policy.json with safe defaults."""
+    return _load_policy_int_map(
+        DEFAULT_DEADLINES_SEC,
+        section_getter=lambda d: (
+            d["circuit_breakers"].get("deadlines_sec")
+            if isinstance(d.get("circuit_breakers"), dict)
+            else None
+        ),
+        repo_root=repo_root,
+        policy_path=policy_path,
+    )
 
 
 def _read_optional_json_dict(path: Path) -> dict[str, Any] | None:
@@ -1083,7 +1118,7 @@ def init_or_load_ledger(
             )
 
         now_iso = _now_utc().isoformat()
-        merged_deadlines = dict(DEFAULT_DEADLINES_SEC)
+        merged_deadlines = load_deadlines_sec(repo_root=repo_root, policy_path=policy_path)
         if deadlines_sec:
             merged_deadlines.update(deadlines_sec)
         merged_breakers = load_circuit_breakers(repo_root=repo_root, policy_path=policy_path)
@@ -1269,9 +1304,14 @@ def run_review_gate_step(
         except (OSError, UnicodeDecodeError, ValueError, json.JSONDecodeError):
             disk_ledger = None
     cfg_ledger = ledger if isinstance(ledger, dict) else disk_ledger
-    deadlines = (cfg_ledger or {}).get("deadlines_sec", DEFAULT_DEADLINES_SEC)
+    deadlines = (
+        cfg_ledger.get("deadlines_sec", DEFAULT_DEADLINES_SEC)
+        if isinstance(cfg_ledger, dict)
+        else load_deadlines_sec(repo_root=root)
+    )
     pass_total = int(deadlines.get("reviewer_pass_total", 900))
     pass_idle = int(deadlines.get("reviewer_pass_idle", 270))
+    pass_agy_idle = int(deadlines.get("reviewer_agy_pass_idle", 630))
     effective_base = base_sha or (str(cfg_ledger.get("base_sha", "")) if cfg_ledger else "")
     cb_cfg = cfg_ledger.get("circuit_breakers") if isinstance(cfg_ledger, dict) else None
     raw_retries = (
@@ -1307,6 +1347,8 @@ def run_review_gate_step(
         str(pass_total),
         "--idle-timeout",
         str(pass_idle),
+        "--agy-idle-timeout",
+        str(pass_agy_idle),
         "--max-transient-retries",
         str(max_retries),
         "--fail-on-blocking",

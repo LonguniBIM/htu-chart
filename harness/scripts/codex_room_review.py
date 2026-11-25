@@ -1924,6 +1924,12 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--agy-idle-timeout",
+        type=float,
+        default=None,
+        help="Optional AGY pass idle watchdog timeout override in seconds (>= 0; 0 disables).",
+    )
+    parser.add_argument(
         "--max-transient-retries",
         type=int,
         default=None,
@@ -3314,12 +3320,44 @@ def _release_g4_reservation_on_abort(
             _release_locked()
 
 
+def _extract_nonneg_finite_float(raw: Any) -> float | None:
+    if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+        return None
+    val = float(raw)
+    return val if math.isfinite(val) and val >= 0.0 else None
+
+
 def main(argv: list[str] | None = None) -> int:
+    raw_argv = list(argv) if argv is not None else sys.argv[1:]
+    explicit_idle_cli = any(
+        a == "--idle-timeout" or a.startswith("--idle-timeout=") for a in raw_argv
+    )
     args = _build_parser().parse_args(argv)
     if args.max_transient_retries is not None and args.max_transient_retries < 0:
         print(
             f"[codex_room_review] BLOCKED: --max-transient-retries must be >= 0, "
             f"got {args.max_transient_retries}.",
+            file=sys.stderr,
+        )
+        return 2
+    if not math.isfinite(args.timeout) or args.timeout < 0:
+        print(
+            f"[codex_room_review] BLOCKED: --timeout must be >= 0, got {args.timeout}.",
+            file=sys.stderr,
+        )
+        return 2
+    if not math.isfinite(args.idle_timeout) or args.idle_timeout < 0:
+        print(
+            f"[codex_room_review] BLOCKED: --idle-timeout must be >= 0, got {args.idle_timeout}.",
+            file=sys.stderr,
+        )
+        return 2
+    if args.agy_idle_timeout is not None and (
+        not math.isfinite(args.agy_idle_timeout) or args.agy_idle_timeout < 0
+    ):
+        print(
+            f"[codex_room_review] BLOCKED: --agy-idle-timeout must be >= 0, "
+            f"got {args.agy_idle_timeout}.",
             file=sys.stderr,
         )
         return 2
@@ -3466,6 +3504,8 @@ def main(argv: list[str] | None = None) -> int:
         "owns_lock": False,
     }
 
+    agy_idle_timeout_sec = DEFAULT_AGY_IDLE_TIMEOUT_SEC
+
     def _run_after_preflight() -> int:
         return _execute_after_preflight(
             args=args,
@@ -3477,6 +3517,7 @@ def main(argv: list[str] | None = None) -> int:
             effective_prefixes=effective_prefixes,
             qualified_routes=qualified_routes,
             max_transient_retries=max_transient_retries,
+            agy_idle_timeout_sec=agy_idle_timeout_sec,
             window_guard_enabled=window_guard_enabled,
             window_exhausted_pct=window_exhausted_pct,
             policy_sha256=policy_sha256,
@@ -3491,9 +3532,8 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         ledger_for_cfg = active_ledger_path or _resolve_g4_ledger_path(args, git_top)
-        if args.max_transient_retries is not None:
-            max_transient_retries = int(args.max_transient_retries)
-        elif ledger_for_cfg is not None and ledger_for_cfg.is_file():
+        loaded_cfg_ledger: dict[str, Any] | None = None
+        if ledger_for_cfg is not None and ledger_for_cfg.is_file():
             try:
                 loaded_cfg_ledger = task_runner.load_ledger(ledger_for_cfg, repo_root=git_top)
             except (OSError, UnicodeDecodeError, ValueError, json.JSONDecodeError) as exc:
@@ -3503,6 +3543,9 @@ def main(argv: list[str] | None = None) -> int:
                     file=sys.stderr,
                 )
                 return 2
+        if args.max_transient_retries is not None:
+            max_transient_retries = int(args.max_transient_retries)
+        elif loaded_cfg_ledger is not None:
             cb_cfg = loaded_cfg_ledger.get("circuit_breakers")
             raw_r = (
                 cb_cfg.get("max_transient_retries_per_provider_pass")
@@ -3511,6 +3554,36 @@ def main(argv: list[str] | None = None) -> int:
             )
             if is_strict_int(raw_r):
                 max_transient_retries = max(0, int(raw_r))
+
+        if args.agy_idle_timeout is not None:
+            agy_idle_timeout_sec = float(args.agy_idle_timeout)
+        elif explicit_idle_cli:
+            agy_idle_timeout_sec = float(args.idle_timeout)
+        else:
+            l_deadlines = (
+                loaded_cfg_ledger.get("deadlines_sec")
+                if isinstance(loaded_cfg_ledger, dict)
+                else None
+            )
+            l_agy_idle = (
+                _extract_nonneg_finite_float(l_deadlines.get("reviewer_agy_pass_idle"))
+                if isinstance(l_deadlines, dict)
+                else None
+            )
+            p_cb = policy_data.get("circuit_breakers") if isinstance(policy_data, dict) else None
+            p_deadlines = p_cb.get("deadlines_sec") if isinstance(p_cb, dict) else None
+            p_agy_idle = (
+                _extract_nonneg_finite_float(p_deadlines.get("reviewer_agy_pass_idle"))
+                if isinstance(p_deadlines, dict)
+                else None
+            )
+            if l_agy_idle is not None:
+                agy_idle_timeout_sec = l_agy_idle
+            elif p_agy_idle is not None:
+                agy_idle_timeout_sec = p_agy_idle
+            else:
+                agy_idle_timeout_sec = DEFAULT_AGY_IDLE_TIMEOUT_SEC
+
         return _run_after_preflight()
     finally:
         _release_g4_reservation_on_abort(
@@ -3541,6 +3614,7 @@ def _execute_after_preflight(
     effective_prefixes: tuple[str, ...],
     qualified_routes: list[str],
     max_transient_retries: int,
+    agy_idle_timeout_sec: float = DEFAULT_AGY_IDLE_TIMEOUT_SEC,
     window_guard_enabled: bool = True,
     window_exhausted_pct: float = 90.0,
     policy_sha256: str,
@@ -3974,14 +4048,12 @@ def _execute_after_preflight(
                 before_status = _git_output(git_top, ["status", "--porcelain"]).stdout
             except TimeoutError as exc:
                 return {p: None for p in target_passes}, f"Read-only check failed: {exc}"
-            if args.idle_timeout <= 0:
+            if agy_idle_timeout_sec <= 0:
                 eff_agy_idle = 0.0
-            elif args.idle_timeout >= 180.0:
-                eff_agy_idle = max(float(args.idle_timeout), DEFAULT_AGY_IDLE_TIMEOUT_SEC)
-                if args.timeout > 0:
-                    eff_agy_idle = min(eff_agy_idle, float(args.timeout))
+            elif args.timeout > 0:
+                eff_agy_idle = min(float(agy_idle_timeout_sec), float(args.timeout))
             else:
-                eff_agy_idle = float(args.idle_timeout)
+                eff_agy_idle = float(agy_idle_timeout_sec)
         else:
             eff_agy_idle = float(args.idle_timeout)
 

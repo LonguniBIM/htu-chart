@@ -834,6 +834,8 @@ def test_p1_001_003_004_005_006_007_hardening(
     assert "--strict-clean" in ver_cmd and "--commit" in ver_cmd
     assert "--repo-root" in rev_cmd and "--base" in rev_cmd
     assert "--timeout" in rev_cmd and "--idle-timeout" in rev_cmd
+    assert "--agy-idle-timeout" in rev_cmd
+    assert rev_cmd[rev_cmd.index("--agy-idle-timeout") + 1] == "630"
     assert rev_timeout >= 5520.0
     assert "--task-manifest" in rec_cmd and "--candidate-sha" in rec_cmd
 
