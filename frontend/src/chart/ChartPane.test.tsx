@@ -12,6 +12,7 @@ import type {
   WsSubscribedMessage,
 } from "../api/types";
 import type { MarketWsClient } from "../api/wsClient";
+import { LayoutSyncController } from "../layout/syncController";
 import { ChartPane } from "./ChartPane";
 import { PaneFetchCoordinator } from "./fetchGuard";
 
@@ -20,6 +21,13 @@ const candleUpdate = vi.fn();
 const volumeSetData = vi.fn();
 const volumeUpdate = vi.fn();
 const fitContentMock = vi.fn();
+const setCrosshairPositionMock = vi.fn();
+const clearCrosshairPositionMock = vi.fn();
+const getVisibleRangeMock = vi.fn<() => { from: number; to: number } | null>(() => null);
+const setVisibleRangeMock = vi.fn<(range: { from: number; to: number }) => void>();
+let crosshairMoveHandlers: Array<(param: unknown) => void> = [];
+let clickHandlers: Array<(param: unknown) => void> = [];
+let visibleRangeHandlers: Array<(range: { from: number; to: number } | null) => void> = [];
 
 vi.mock("lightweight-charts", () => {
   const CandlestickSeries = Symbol("CandlestickSeries");
@@ -44,11 +52,37 @@ vi.mock("lightweight-charts", () => {
           priceScale: () => ({ applyOptions: vi.fn() }),
         };
       }),
-      subscribeCrosshairMove: vi.fn(),
-      unsubscribeCrosshairMove: vi.fn(),
+      subscribeCrosshairMove: vi.fn((handler: (param: unknown) => void) => {
+        crosshairMoveHandlers.push(handler);
+      }),
+      unsubscribeCrosshairMove: vi.fn((handler: (param: unknown) => void) => {
+        crosshairMoveHandlers = crosshairMoveHandlers.filter((h) => h !== handler);
+      }),
+      subscribeClick: vi.fn((handler: (param: unknown) => void) => {
+        clickHandlers.push(handler);
+      }),
+      unsubscribeClick: vi.fn((handler: (param: unknown) => void) => {
+        clickHandlers = clickHandlers.filter((h) => h !== handler);
+      }),
+      setCrosshairPosition: setCrosshairPositionMock,
+      clearCrosshairPosition: clearCrosshairPositionMock,
       applyOptions: vi.fn(),
       remove: vi.fn(),
-      timeScale: () => ({ fitContent: fitContentMock }),
+      timeScale: () => ({
+        fitContent: fitContentMock,
+        subscribeVisibleTimeRangeChange: vi.fn(
+          (handler: (range: { from: number; to: number } | null) => void) => {
+            visibleRangeHandlers.push(handler);
+          },
+        ),
+        unsubscribeVisibleTimeRangeChange: vi.fn(
+          (handler: (range: { from: number; to: number } | null) => void) => {
+            visibleRangeHandlers = visibleRangeHandlers.filter((h) => h !== handler);
+          },
+        ),
+        getVisibleRange: getVisibleRangeMock,
+        setVisibleRange: setVisibleRangeMock,
+      }),
     })),
   };
 });
@@ -171,6 +205,14 @@ describe("ChartPane (F06, P1-R3-01, P1-R3-02)", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     fetchBarsMock.mockReset();
+    crosshairMoveHandlers = [];
+    clickHandlers = [];
+    visibleRangeHandlers = [];
+    getVisibleRangeMock.mockReset();
+    getVisibleRangeMock.mockReturnValue(null);
+    setVisibleRangeMock.mockReset();
+    setCrosshairPositionMock.mockReset();
+    clearCrosshairPositionMock.mockReset();
     vi.stubGlobal("ResizeObserver", MockResizeObserver);
   });
 
@@ -1360,5 +1402,167 @@ describe("ChartPane (F06, P1-R3-01, P1-R3-02)", () => {
       await Promise.resolve();
     });
     expect(fetchBarsMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("registers imperative LayoutSyncController handle and applies crosshair, range, and centerOnTime with error isolation", async () => {
+    /**
+     * Contract: ChartPane registers a ChartPaneSyncHandle with LayoutSyncController, resolves
+     * bar close price (exact or nearest) for setCrosshairPosition, calls clearCrosshairPosition
+     * on null, applies setVisibleRange, computes centerOnTime from getVisibleRange or loaded bars,
+     * and isolates chart errors without crashing.
+     * Defect caught: Missing imperative sync registration, broken price lookup, or uncaught chart exceptions.
+     */
+    const initialFetch = createDeferred<BarsResponse>();
+    fetchBarsMock.mockReturnValueOnce(initialFetch.promise);
+
+    const coordinator = new PaneFetchCoordinator();
+    const fakeWs = createFakeWsClient();
+    const syncController = new LayoutSyncController({
+      symbol: false,
+      interval: false,
+      crosshair: true,
+      time: true,
+      dateRange: true,
+    });
+    const pane: PaneConfig = {
+      pane_id: "pane-1",
+      root_symbol: "MES",
+      timeframe: "5m",
+      live_mode: false,
+      playback_mode: "live",
+    };
+
+    const { unmount } = render(
+      <ChartPane
+        pane={pane}
+        contractId="CON.F.US.MES.H26"
+        activeFeedLive={false}
+        wsClient={fakeWs.client}
+        coordinator={coordinator}
+        syncController={syncController}
+      />,
+    );
+
+    await act(async () => {
+      initialFetch.resolve(
+        makeBarsResponse("CON.F.US.MES.H26", [
+          makeBar(1000, 5000),
+          makeBar(1300, 5012),
+          makeBar(1600, 5025),
+        ]),
+      );
+      await initialFetch.promise;
+    });
+
+    // Exact bar close match -> setCrosshairPosition(5012, 1300, series)
+    syncController.onCrosshairMove("pane-2", 1300 as never);
+    expect(setCrosshairPositionMock).toHaveBeenCalledWith(5012, 1300, expect.any(Object));
+
+    // Nearest bar close match (1400 is closer to 1300 than 1600)
+    syncController.onCrosshairMove("pane-2", 1400 as never);
+    expect(setCrosshairPositionMock).toHaveBeenLastCalledWith(5012, 1400, expect.any(Object));
+
+    // Null clears crosshair
+    syncController.onCrosshairMove("pane-2", null);
+    expect(clearCrosshairPositionMock).toHaveBeenCalledTimes(1);
+
+    // Date range sync forwards to timeScale().setVisibleRange
+    const targetRange = { from: 1000 as never, to: 1600 as never };
+    syncController.onVisibleTimeRangeChange("pane-2", targetRange);
+    expect(setVisibleRangeMock).toHaveBeenCalledWith(targetRange);
+
+    // Time click sync with null getVisibleRange derives positive halfSpan from loaded bars ((1600-1000)/2 = 300)
+    getVisibleRangeMock.mockReturnValueOnce(null);
+    syncController.onTimeClick("pane-2", 1300 as never);
+    expect(setVisibleRangeMock).toHaveBeenLastCalledWith({ from: 1000, to: 1600 });
+
+    // Time click sync with existing getVisibleRange preserves halfSpan ((2000-1200)/2 = 400)
+    getVisibleRangeMock.mockReturnValueOnce({ from: 1200, to: 2000 });
+    syncController.onTimeClick("pane-2", 1500 as never);
+    expect(setVisibleRangeMock).toHaveBeenLastCalledWith({ from: 1100, to: 1900 });
+
+    // Chart errors are isolated cleanly
+    setCrosshairPositionMock.mockImplementationOnce(() => {
+      throw new Error("Out of range");
+    });
+    expect(() => syncController.onCrosshairMove("pane-2", 1300 as never)).not.toThrow();
+
+    setVisibleRangeMock.mockImplementationOnce(() => {
+      throw new Error("No data");
+    });
+    expect(() => syncController.onVisibleTimeRangeChange("pane-2", targetRange)).not.toThrow();
+
+    // Unmount unregisters handle and unsubscribes listeners
+    unmount();
+    expect(crosshairMoveHandlers).toHaveLength(0);
+    expect(clickHandlers).toHaveLength(0);
+    expect(visibleRangeHandlers).toHaveLength(0);
+    setCrosshairPositionMock.mockClear();
+    syncController.onCrosshairMove("pane-2", 1300 as never);
+    expect(setCrosshairPositionMock).not.toHaveBeenCalled();
+  });
+
+  it("forwards chart crosshair, click, and visible range events to LayoutSyncController", async () => {
+    /**
+     * Contract: User crosshair move, click, and visible time range changes inside ChartPane
+     * invoke syncController.onCrosshairMove, onTimeClick, and onVisibleTimeRangeChange for other panes.
+     * Defect caught: ChartPane chart events failing to propagate to peer panes via syncController.
+     */
+    const initialFetch = createDeferred<BarsResponse>();
+    fetchBarsMock.mockReturnValueOnce(initialFetch.promise);
+
+    const coordinator = new PaneFetchCoordinator();
+    const fakeWs = createFakeWsClient();
+    const syncController = new LayoutSyncController({
+      symbol: false,
+      interval: false,
+      crosshair: true,
+      time: true,
+      dateRange: true,
+    });
+    const peerHandle = {
+      paneId: "pane-2",
+      applyCrosshairTime: vi.fn(),
+      applyVisibleTimeRange: vi.fn(),
+      centerOnTime: vi.fn(),
+    };
+    syncController.registerPane(peerHandle);
+
+    const pane: PaneConfig = {
+      pane_id: "pane-1",
+      root_symbol: "MES",
+      timeframe: "5m",
+      live_mode: false,
+      playback_mode: "live",
+    };
+
+    render(
+      <ChartPane
+        pane={pane}
+        contractId="CON.F.US.MES.H26"
+        activeFeedLive={false}
+        wsClient={fakeWs.client}
+        coordinator={coordinator}
+        syncController={syncController}
+      />,
+    );
+
+    await act(async () => {
+      initialFetch.resolve(makeBarsResponse("CON.F.US.MES.H26", [makeBar(1000, 5000)]));
+      await initialFetch.promise;
+    });
+
+    const emptySeriesData = new Map();
+    crosshairMoveHandlers[0]!({ time: 1000, seriesData: emptySeriesData });
+    expect(peerHandle.applyCrosshairTime).toHaveBeenCalledWith(1000);
+
+    crosshairMoveHandlers[0]!({ time: undefined, seriesData: emptySeriesData });
+    expect(peerHandle.applyCrosshairTime).toHaveBeenLastCalledWith(null);
+
+    clickHandlers[0]!({ time: 1000, seriesData: emptySeriesData });
+    expect(peerHandle.centerOnTime).toHaveBeenCalledWith(1000);
+
+    visibleRangeHandlers[0]!({ from: 900, to: 1200 });
+    expect(peerHandle.applyVisibleTimeRange).toHaveBeenCalledWith({ from: 900, to: 1200 });
   });
 });

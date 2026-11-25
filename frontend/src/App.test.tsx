@@ -5,6 +5,7 @@ import { ApiError } from "./api/client";
 import type {
   BarsResponse,
   ContractsResponse,
+  LayoutPayload,
   LayoutRecord,
   RootSymbol,
   StatusResponse,
@@ -17,6 +18,7 @@ import type {
 } from "./api/types";
 import type { WsConnectionState } from "./api/wsClient";
 import { App } from "./App";
+import { useLayoutStore } from "./store/layoutStore";
 
 const mockWsConnect = vi.fn();
 const mockWsDisconnect = vi.fn();
@@ -126,9 +128,19 @@ vi.mock("lightweight-charts", () => {
       })),
       subscribeCrosshairMove: vi.fn(),
       unsubscribeCrosshairMove: vi.fn(),
+      subscribeClick: vi.fn(),
+      unsubscribeClick: vi.fn(),
+      setCrosshairPosition: vi.fn(),
+      clearCrosshairPosition: vi.fn(),
       applyOptions: vi.fn(),
       remove: vi.fn(),
-      timeScale: () => ({ fitContent: vi.fn() }),
+      timeScale: () => ({
+        fitContent: vi.fn(),
+        subscribeVisibleTimeRangeChange: vi.fn(),
+        unsubscribeVisibleTimeRangeChange: vi.fn(),
+        getVisibleRange: vi.fn(() => null),
+        setVisibleRange: vi.fn(),
+      }),
     })),
   };
 });
@@ -142,6 +154,15 @@ const fetchSessionMock = vi.fn<
 >();
 const fetchStatusMock = vi.fn<(signal?: AbortSignal) => Promise<StatusResponse>>();
 const listLayoutsMock = vi.fn<(signal?: AbortSignal) => Promise<LayoutRecord[]>>();
+const createLayoutMock = vi.fn<
+  (payload: LayoutPayload, signal?: AbortSignal) => Promise<LayoutRecord>
+>();
+const updateLayoutMock = vi.fn<
+  (layoutId: string, payload: LayoutPayload, signal?: AbortSignal) => Promise<LayoutRecord>
+>();
+const deleteLayoutMock = vi.fn<
+  (layoutId: string, signal?: AbortSignal) => Promise<{ deleted: boolean; id: string }>
+>();
 const fetchContractsMock = vi.fn<
   (
     symbols?: readonly RootSymbol[],
@@ -166,6 +187,12 @@ vi.mock("./api/client", async (importOriginal) => {
     fetchSession: (signal?: AbortSignal) => fetchSessionMock(signal),
     fetchStatus: (signal?: AbortSignal) => fetchStatusMock(signal),
     listLayouts: (signal?: AbortSignal) => listLayoutsMock(signal),
+    createLayout: (payload: LayoutPayload, signal?: AbortSignal) =>
+      createLayoutMock(payload, signal),
+    updateLayout: (layoutId: string, payload: LayoutPayload, signal?: AbortSignal) =>
+      updateLayoutMock(layoutId, payload, signal),
+    deleteLayout: (layoutId: string, signal?: AbortSignal) =>
+      deleteLayoutMock(layoutId, signal),
     fetchContracts: (
       symbols?: readonly RootSymbol[],
       live?: boolean,
@@ -223,9 +250,14 @@ describe("App bootstrap and R03 503 recovery (P1-R3-03, P1-R3-04, P2-005)", () =
     fetchSessionMock.mockReset();
     fetchStatusMock.mockReset();
     listLayoutsMock.mockReset();
+    createLayoutMock.mockReset();
+    updateLayoutMock.mockReset();
+    deleteLayoutMock.mockReset();
     fetchContractsMock.mockReset();
     fetchBarsMock.mockReset();
     clearCsrfTokenMock.mockReset();
+    useLayoutStore.getState().setAuthErrorHandler(null);
+    useLayoutStore.getState().reset();
     feedStatusListeners = new Set();
     connectionStateListeners = new Set();
     barUpdateListeners = new Set();
@@ -240,6 +272,8 @@ describe("App bootstrap and R03 503 recovery (P1-R3-03, P1-R3-04, P2-005)", () =
   afterEach(() => {
     vi.useRealTimers();
     cleanup();
+    useLayoutStore.getState().setAuthErrorHandler(null);
+    useLayoutStore.getState().reset();
     vi.unstubAllGlobals();
   });
 
@@ -2183,6 +2217,208 @@ describe("App bootstrap and R03 503 recovery (P1-R3-03, P1-R3-04, P2-005)", () =
       ws3.emitOpen();
     });
     expect(screen.getByText("CON.F.US.MES.H26")).toBeTruthy();
+  });
+
+  it("integrates LayoutPicker, SyncControls, WorkspaceGrid, CRUD persistence, and Logout store reset (Phase 3 Part 2)", async () => {
+    /**
+     * Contract: App hydrates useLayoutStore into WorkspaceGrid, supports template switches,
+     * Symbol/Interval sync toggles across panes, Save/Save As/Rename/Delete via LayoutPicker,
+     * fail-closed 403 invalidation on layout save, and resets useLayoutStore on Logout.
+     * Defect caught: Disconnected layout store, stale store state after Logout, or unhandled 403 on layout save.
+     */
+    const fourFutureLayout: LayoutRecord = {
+      id: "layout-4-future",
+      name: "4 Future",
+      template_id: "4-grid-2x2",
+      panes: [
+        { pane_id: "pane-1", root_symbol: "MES", timeframe: "5m", live_mode: false, playback_mode: "live" },
+        { pane_id: "pane-2", root_symbol: "MNQ", timeframe: "5m", live_mode: false, playback_mode: "live" },
+        { pane_id: "pane-3", root_symbol: "MYM", timeframe: "5m", live_mode: false, playback_mode: "live" },
+        { pane_id: "pane-4", root_symbol: "MGC", timeframe: "5m", live_mode: false, playback_mode: "live" },
+      ],
+      sync_config: {
+        symbol: false,
+        interval: true,
+        crosshair: true,
+        time: false,
+        dateRange: false,
+      },
+      is_default: true,
+      created_at_utc: 1700000000,
+      updated_at_utc: 1700000000,
+    };
+
+    fetchSessionMock.mockResolvedValue({
+      authenticated: true,
+      csrf_token: "csrf-token-1234567890",
+    });
+    fetchStatusMock.mockResolvedValue({
+      connected: true,
+      live: false,
+      feed_state: "LIVE",
+    });
+    listLayoutsMock.mockResolvedValue([fourFutureLayout]);
+    fetchContractsMock.mockResolvedValue({
+      live: false,
+      contracts: {
+        MES: { selected: { id: "CON.F.US.MES.H26" }, error_type: null, error: null },
+        MNQ: { selected: { id: "CON.F.US.MNQ.H26" }, error_type: null, error: null },
+        MYM: { selected: { id: "CON.F.US.MYM.H26" }, error_type: null, error: null },
+        MGC: { selected: { id: "CON.F.US.MGC.H26" }, error_type: null, error: null },
+      },
+    });
+    fetchBarsMock.mockResolvedValue({
+      provider: "topstepx",
+      live: false,
+      contract_id: "CON.F.US.MES.H26",
+      root_symbol: "MES",
+      timeframe: "5m",
+      start_time: 1000,
+      end_time: 1000,
+      count: 0,
+      include_partial: true,
+      quality: {
+        is_complete: true,
+        truncated: false,
+        provider_gap: false,
+        quarantined_count: 0,
+      },
+      bars: [],
+    });
+    logoutMock.mockResolvedValue({ authenticated: false });
+
+    render(<App />);
+    await act(async () => {
+      await flushMicrotasks();
+    });
+
+    const grid = document.querySelector(".terminal-grid") as HTMLElement;
+    expect(grid.getAttribute("data-template-id")).toBe("4-grid-2x2");
+    expect(grid.getAttribute("data-pane-count")).toBe("4");
+
+    // Interval sync is ON by default -> changing pane-1 timeframe updates all 4 panes
+    fireEvent.change(screen.getByLabelText("pane-1 timeframe"), {
+      target: { value: "15m" },
+    });
+    expect((screen.getByLabelText("pane-2 timeframe") as HTMLSelectElement).value).toBe("15m");
+    expect((screen.getByLabelText("pane-4 timeframe") as HTMLSelectElement).value).toBe("15m");
+
+    // Enable Symbol sync -> changing pane-1 symbol updates all panes
+    fireEvent.click(screen.getByRole("switch", { name: "Sync Symbol" }));
+    fireEvent.change(screen.getByLabelText("pane-1 symbol"), {
+      target: { value: "MNQ" },
+    });
+    expect((screen.getByLabelText("pane-3 symbol") as HTMLSelectElement).value).toBe("MNQ");
+
+    // Open LayoutPicker -> Save As -> Rename -> Delete -> Save 403 fail-closed
+    fireEvent.click(screen.getByRole("button", { name: "Layout picker" }));
+    const savedCopy: LayoutRecord = {
+      ...useLayoutStore.getState().activeLayout!,
+      id: "layout-copy",
+      name: "Copy Layout",
+      is_default: false,
+    };
+    createLayoutMock.mockResolvedValueOnce(savedCopy);
+    fireEvent.change(screen.getByLabelText("Save layout as"), {
+      target: { value: "Copy Layout" },
+    });
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Save As" }));
+      await flushMicrotasks();
+    });
+    expect(createLayoutMock).toHaveBeenCalledTimes(1);
+    expect(useLayoutStore.getState().activeLayout?.id).toBe("layout-copy");
+
+    const renamedCopy: LayoutRecord = { ...savedCopy, name: "Copy Renamed" };
+    updateLayoutMock.mockResolvedValueOnce(renamedCopy);
+    fireEvent.change(screen.getByLabelText("Rename layout"), {
+      target: { value: "Copy Renamed" },
+    });
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Rename" }));
+      await flushMicrotasks();
+    });
+    expect(useLayoutStore.getState().activeLayout?.name).toBe("Copy Renamed");
+
+    deleteLayoutMock.mockResolvedValueOnce({ deleted: true, id: "layout-copy" });
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Delete Copy Renamed" }));
+      await flushMicrotasks();
+    });
+    expect(useLayoutStore.getState().activeLayout?.id).toBe("layout-4-future");
+
+    // 403 during Save fails closed and clears session + store
+    updateLayoutMock.mockRejectedValueOnce(new ApiError(403, "Invalid CSRF token"));
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Save" }));
+      await flushMicrotasks();
+    });
+    expect(clearCsrfTokenMock).toHaveBeenCalledTimes(1);
+    expect(useLayoutStore.getState().activeLayout).toBeNull();
+    expect(useLayoutStore.getState().layouts).toEqual([]);
+    expect(screen.getByPlaceholderText("Enter terminal password")).toBeTruthy();
+  });
+
+  it("resets useLayoutStore state cleanly when Logout is clicked (Phase 3 Part 2)", async () => {
+    /**
+     * Contract: Clicking Logout invokes invalidateSessionLocally(), calling
+     * useLayoutStore.getState().reset() so layouts, activeLayout, activePaneId, and dirty reset.
+     * Defect caught: Layout store retaining previous user session's layouts/dirty state after Logout.
+     */
+    fetchSessionMock.mockResolvedValue({
+      authenticated: true,
+      csrf_token: "csrf-token-1234567890",
+    });
+    fetchStatusMock.mockResolvedValue({
+      connected: true,
+      live: false,
+      feed_state: "LIVE",
+    });
+    listLayoutsMock.mockResolvedValue([SAMPLE_LAYOUT]);
+    fetchContractsMock.mockResolvedValue({
+      live: false,
+      contracts: {
+        MES: { selected: { id: "CON.F.US.MES.H26" }, error_type: null, error: null },
+      },
+    });
+    fetchBarsMock.mockResolvedValue({
+      provider: "topstepx",
+      live: false,
+      contract_id: "CON.F.US.MES.H26",
+      root_symbol: "MES",
+      timeframe: "5m",
+      start_time: 1000,
+      end_time: 1000,
+      count: 0,
+      include_partial: true,
+      quality: {
+        is_complete: true,
+        truncated: false,
+        provider_gap: false,
+        quarantined_count: 0,
+      },
+      bars: [],
+    });
+    logoutMock.mockResolvedValue({ authenticated: false });
+
+    render(<App />);
+    await act(async () => {
+      await flushMicrotasks();
+    });
+
+    fireEvent.click(screen.getByRole("switch", { name: "Sync Crosshair" }));
+    expect(useLayoutStore.getState().dirty).toBe(true);
+    expect(useLayoutStore.getState().activeLayout).not.toBeNull();
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Logout" }));
+      await flushMicrotasks();
+    });
+
+    expect(useLayoutStore.getState().activeLayout).toBeNull();
+    expect(useLayoutStore.getState().layouts).toEqual([]);
+    expect(useLayoutStore.getState().activePaneId).toBeNull();
+    expect(useLayoutStore.getState().dirty).toBe(false);
   });
 });
 

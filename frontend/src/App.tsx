@@ -18,8 +18,11 @@ import type {
   Timeframe,
 } from "./api/types";
 import { MarketWsClient, type WsConnectionState } from "./api/wsClient";
-import { ChartPane } from "./chart/ChartPane";
 import { PaneFetchCoordinator } from "./chart/fetchGuard";
+import { LayoutSyncController } from "./layout/syncController";
+import { TopToolbar } from "./layout/TopToolbar";
+import { WorkspaceGrid } from "./layout/WorkspaceGrid";
+import { useLayoutStore } from "./store/layoutStore";
 
 type AuthStage = "checking" | "unauthenticated" | "authenticated";
 
@@ -47,20 +50,9 @@ function mergeResolvedContracts(
   return next;
 }
 
-function contractCacheKey(liveMode: boolean, rootSymbol: RootSymbol): string {
-  return `${liveMode ? "live" : "sim"}:${rootSymbol}`;
-}
-
 function distinctPaneLiveModes(panes: readonly PaneConfig[]): boolean[] {
   const modes = Array.from(new Set(panes.map((pane) => pane.live_mode)));
   return modes.length > 0 ? modes : [false];
-}
-
-function resolveContractId(entry: ContractResolutionEntry | undefined): string | null {
-  if (entry === undefined || entry.selected === null) {
-    return null;
-  }
-  return entry.selected.id ?? entry.selected.contractId ?? null;
 }
 
 export function App() {
@@ -68,11 +60,12 @@ export function App() {
   const [passwordInput, setPasswordInput] = useState<string>("");
   const [authError, setAuthError] = useState<string | null>(null);
   const [statusData, setStatusData] = useState<StatusResponse | null>(null);
-  const [layouts, setLayouts] = useState<LayoutRecord[]>([]);
-  const [activeLayout, setActiveLayout] = useState<LayoutRecord | null>(null);
   const [contracts, setContracts] = useState<Record<string, ContractResolutionEntry>>({});
   const [wsState, setWsState] = useState<WsConnectionState>("disconnected");
   const [loadError, setLoadError] = useState<string | null>(null);
+
+  const activeLayout = useLayoutStore((state) => state.activeLayout);
+  const activePaneId = useLayoutStore((state) => state.activePaneId);
 
   const wsClient = useMemo(
     () =>
@@ -90,6 +83,7 @@ export function App() {
     [],
   );
   const coordinator = useMemo(() => new PaneFetchCoordinator(), []);
+  const syncController = useMemo(() => new LayoutSyncController(), []);
   const resolvedModesRef = useRef<Set<boolean>>(new Set());
   const [contractsPendingRetry, setContractsPendingRetry] = useState<boolean>(false);
   const [isRetryingContracts, setIsRetryingContracts] = useState<boolean>(false);
@@ -110,6 +104,12 @@ export function App() {
   activeLayoutRef.current = activeLayout;
 
   useEffect(() => {
+    if (activeLayout !== null) {
+      syncController.setSyncConfig(activeLayout.sync_config);
+    }
+  }, [activeLayout, syncController]);
+
+  useEffect(() => {
     return () => {
       sessionEpochRef.current += 1;
       contractResolveGenerationRef.current += 1;
@@ -121,6 +121,8 @@ export function App() {
       layoutResolveControllerRef.current = null;
       wsClient.disconnect();
       coordinator.dispose();
+      useLayoutStore.getState().setAuthErrorHandler(null);
+      useLayoutStore.getState().reset();
     };
   }, [coordinator, wsClient]);
 
@@ -147,9 +149,8 @@ export function App() {
       setLoadError(null);
       wsClient.disconnect();
       coordinator.dispose();
-      setActiveLayout(null);
+      useLayoutStore.getState().reset();
       activeLayoutRef.current = null;
-      setLayouts([]);
       setContracts({});
       setStatusData(null);
       setAuthStage("unauthenticated");
@@ -157,6 +158,12 @@ export function App() {
     },
     [coordinator, wsClient],
   );
+
+  useEffect(() => {
+    useLayoutStore.getState().setAuthErrorHandler((status, message) => {
+      invalidateSessionLocally(status === 403 ? message : null);
+    });
+  }, [invalidateSessionLocally]);
 
   const fetchContractsForModes = useCallback(
     async (
@@ -493,10 +500,8 @@ export function App() {
       if (isStale()) {
         return;
       }
-      setLayouts(loadedLayouts);
-      const defaultLayout =
-        loadedLayouts.find((item) => item.is_default) ?? loadedLayouts[0] ?? null;
-      setActiveLayout(defaultLayout);
+      useLayoutStore.getState().hydrateLayouts(loadedLayouts);
+      const defaultLayout = useLayoutStore.getState().activeLayout;
       activeLayoutRef.current = defaultLayout;
 
       resolvedModesRef.current.clear();
@@ -666,85 +671,72 @@ export function App() {
     [invalidateSessionLocally],
   );
 
-  const handlePaneSymbolChange = (paneId: string, nextSymbol: RootSymbol) => {
-    setActiveLayout((prev) => {
-      if (prev === null) {
-        return prev;
+  const handlePaneSymbolChange = useCallback((paneId: string, nextSymbol: RootSymbol) => {
+    useLayoutStore.getState().setPaneSymbol(paneId, nextSymbol);
+  }, []);
+
+  const handlePaneTimeframeChange = useCallback((paneId: string, nextTimeframe: Timeframe) => {
+    useLayoutStore.getState().setPaneTimeframe(paneId, nextTimeframe);
+  }, []);
+
+  const handleSelectPane = useCallback((paneId: string) => {
+    useLayoutStore.getState().selectPane(paneId);
+  }, []);
+
+  const handleLayoutChange = useCallback(
+    (nextLayoutId: string) => {
+      useLayoutStore.getState().selectLayout(nextLayoutId);
+      const picked = useLayoutStore.getState().activeLayout;
+      activeLayoutRef.current = picked;
+      layoutResolveControllerRef.current?.abort();
+      layoutResolveControllerRef.current = null;
+      if (picked === null) {
+        return;
       }
-      return {
-        ...prev,
-        panes: prev.panes.map((pane) =>
-          pane.pane_id === paneId ? { ...pane, root_symbol: nextSymbol } : pane,
-        ),
-      };
-    });
-  };
-
-  const handlePaneTimeframeChange = (paneId: string, nextTimeframe: Timeframe) => {
-    setActiveLayout((prev) => {
-      if (prev === null) {
-        return prev;
+      const missingModes = distinctPaneLiveModes(picked.panes).filter(
+        (mode) => !resolvedModesRef.current.has(mode),
+      );
+      if (missingModes.length === 0) {
+        return;
       }
-      return {
-        ...prev,
-        panes: prev.panes.map((pane) =>
-          pane.pane_id === paneId ? { ...pane, timeframe: nextTimeframe } : pane,
-        ),
-      };
-    });
-  };
+      retryAbortControllerRef.current?.abort();
+      retryAbortControllerRef.current = null;
+      setIsRetryingContracts(false);
+      const controller = new AbortController();
+      layoutResolveControllerRef.current = controller;
+      const requestEpoch = sessionEpochRef.current;
+      const generation = ++contractResolveGenerationRef.current;
 
-  const handleLayoutChange = (nextLayoutId: string) => {
-    const picked = layouts.find((item) => item.id === nextLayoutId) ?? null;
-    setActiveLayout(picked);
-    activeLayoutRef.current = picked;
-    layoutResolveControllerRef.current?.abort();
-    layoutResolveControllerRef.current = null;
-    if (picked === null) {
-      return;
-    }
-    const missingModes = distinctPaneLiveModes(picked.panes).filter(
-      (mode) => !resolvedModesRef.current.has(mode),
-    );
-    if (missingModes.length === 0) {
-      return;
-    }
-    retryAbortControllerRef.current?.abort();
-    retryAbortControllerRef.current = null;
-    setIsRetryingContracts(false);
-    const controller = new AbortController();
-    layoutResolveControllerRef.current = controller;
-    const requestEpoch = sessionEpochRef.current;
-    const generation = ++contractResolveGenerationRef.current;
-
-    void fetchContractsForModes(missingModes, controller.signal)
-      .then((result) => {
-        if (
-          controller.signal.aborted ||
-          requestEpoch !== sessionEpochRef.current ||
-          generation !== contractResolveGenerationRef.current
-        ) {
-          return;
-        }
-        applyContractResolutionResult(result);
-      })
-      .catch((err: unknown) => {
-        if (
-          controller.signal.aborted ||
-          requestEpoch !== sessionEpochRef.current ||
-          generation !== contractResolveGenerationRef.current ||
-          (err instanceof DOMException && err.name === "AbortError")
-        ) {
-          return;
-        }
-        applyContractResolutionError(err, missingModes);
-      })
-      .finally(() => {
-        if (layoutResolveControllerRef.current === controller) {
-          layoutResolveControllerRef.current = null;
-        }
-      });
-  };
+      void fetchContractsForModes(missingModes, controller.signal)
+        .then((result) => {
+          if (
+            controller.signal.aborted ||
+            requestEpoch !== sessionEpochRef.current ||
+            generation !== contractResolveGenerationRef.current
+          ) {
+            return;
+          }
+          applyContractResolutionResult(result);
+        })
+        .catch((err: unknown) => {
+          if (
+            controller.signal.aborted ||
+            requestEpoch !== sessionEpochRef.current ||
+            generation !== contractResolveGenerationRef.current ||
+            (err instanceof DOMException && err.name === "AbortError")
+          ) {
+            return;
+          }
+          applyContractResolutionError(err, missingModes);
+        })
+        .finally(() => {
+          if (layoutResolveControllerRef.current === controller) {
+            layoutResolveControllerRef.current = null;
+          }
+        });
+    },
+    [applyContractResolutionError, applyContractResolutionResult, fetchContractsForModes],
+  );
 
   if (authStage === "checking") {
     return (
@@ -781,72 +773,30 @@ export function App() {
     );
   }
 
-  const panes = activeLayout?.panes ?? [];
-
   return (
     <div className="terminal-shell">
-      <header className="terminal-topbar">
-        <div className="terminal-topbar__brand">
-          <span>TopstepX Terminal</span>
-          <span className="terminal-badge">
-            {activeLayout !== null
-              ? `${activeLayout.name} (${activeLayout.template_id})`
-              : "No layout"}
-          </span>
-          {layouts.length > 1 && (
-            <select
-              aria-label="Active layout"
-              value={activeLayout?.id ?? ""}
-              onChange={(e) => {
-                handleLayoutChange(e.target.value);
-              }}
-            >
-              {layouts.map((item) => (
-                <option key={item.id} value={item.id}>
-                  {item.name}
-                </option>
-              ))}
-            </select>
-          )}
-        </div>
-        <div className="terminal-topbar__meta">
-          <span>WS: {wsState}</span>
-          <span>Feed: {String(statusData?.feed_state ?? "DISCONNECTED")}</span>
-          {contractsPendingRetry && (
-            <>
-              <span className="terminal-badge">Contracts pending</span>
-              <button
-                type="button"
-                className="terminal-button"
-                onClick={() => void retryUnresolvedContracts({ resetAttempt: true })}
-              >
-                Retry Contracts
-              </button>
-            </>
-          )}
-          {loadError !== null && <span className="login-error">{loadError}</span>}
-          <button type="button" className="terminal-button" onClick={() => void handleLogout()}>
-            Logout
-          </button>
-        </div>
-      </header>
-      <main className="terminal-grid" data-pane-count={panes.length}>
-        {panes.map((pane) => (
-          <ChartPane
-            key={pane.pane_id}
-            pane={pane}
-            contractId={resolveContractId(
-              contracts[contractCacheKey(pane.live_mode, pane.root_symbol)],
-            )}
-            activeFeedLive={statusData?.live ?? null}
-            wsClient={wsClient}
-            coordinator={coordinator}
-            onSymbolChange={handlePaneSymbolChange}
-            onTimeframeChange={handlePaneTimeframeChange}
-            onAuthError={handlePaneAuthError}
-          />
-        ))}
-      </main>
+      <TopToolbar
+        wsState={wsState}
+        statusData={statusData}
+        contractsPendingRetry={contractsPendingRetry}
+        loadError={loadError}
+        onSelectLayout={handleLayoutChange}
+        onRetryContracts={() => void retryUnresolvedContracts({ resetAttempt: true })}
+        onLogout={() => void handleLogout()}
+      />
+      <WorkspaceGrid
+        layout={activeLayout}
+        activePaneId={activePaneId}
+        contracts={contracts}
+        activeFeedLive={statusData?.live ?? null}
+        wsClient={wsClient}
+        coordinator={coordinator}
+        syncController={syncController}
+        onSelectPane={handleSelectPane}
+        onSymbolChange={handlePaneSymbolChange}
+        onTimeframeChange={handlePaneTimeframeChange}
+        onAuthError={handlePaneAuthError}
+      />
     </div>
   );
 }

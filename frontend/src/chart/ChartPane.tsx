@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState, type CSSProperties } from "react";
 import {
   CandlestickSeries,
   ColorType,
@@ -8,6 +8,7 @@ import {
   type CandlestickData,
   type HistogramData,
   type IChartApi,
+  type IRange,
   type ISeriesApi,
   type MouseEventParams,
   type Time,
@@ -26,6 +27,7 @@ import {
   type Timeframe,
 } from "../api/types";
 import type { MarketWsClient } from "../api/wsClient";
+import type { ChartPaneSyncHandle, LayoutSyncController } from "../layout/syncController";
 import {
   PaneFetchCoordinator,
   appendBoundedWsBar,
@@ -41,9 +43,13 @@ export interface ChartPaneProps {
   activeFeedLive: boolean | null;
   wsClient: MarketWsClient;
   coordinator: PaneFetchCoordinator;
-  onSymbolChange?: (paneId: string, symbol: RootSymbol) => void;
-  onTimeframeChange?: (paneId: string, timeframe: Timeframe) => void;
-  onAuthError?: (status: number, message: string) => void;
+  syncController?: LayoutSyncController | undefined;
+  isActive?: boolean | undefined;
+  onSelectPane?: ((paneId: string) => void) | undefined;
+  gridStyle?: CSSProperties | undefined;
+  onSymbolChange?: ((paneId: string, symbol: RootSymbol) => void) | undefined;
+  onTimeframeChange?: ((paneId: string, timeframe: Timeframe) => void) | undefined;
+  onAuthError?: ((status: number, message: string) => void) | undefined;
 }
 
 const SNAPSHOT_RETRY_BACKOFF_MS = [1500, 3000, 6000] as const;
@@ -102,12 +108,62 @@ function formatQualityWarning(quality: BarsQuality | null): string | null {
   return flags.length > 0 ? `Warning: ${flags.join(", ")}` : null;
 }
 
+function resolveNearestClosePrice(
+  bars: readonly OhlcvBar[],
+  closeByTime: ReadonlyMap<number, number>,
+  timeSec: number,
+  fallbackClose: number | undefined,
+): number | undefined {
+  const exact = closeByTime.get(timeSec);
+  if (exact !== undefined) {
+    return exact;
+  }
+  if (bars.length === 0) {
+    return fallbackClose;
+  }
+  let lo = 0;
+  let hi = bars.length - 1;
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1;
+    if (bars[mid]!.time < timeSec) {
+      lo = mid + 1;
+    } else {
+      hi = mid;
+    }
+  }
+  const rightBar = bars[lo];
+  const leftBar = lo > 0 ? bars[lo - 1] : undefined;
+  if (leftBar === undefined) {
+    return rightBar?.close ?? fallbackClose;
+  }
+  if (rightBar === undefined) {
+    return leftBar.close;
+  }
+  return Math.abs(leftBar.time - timeSec) <= Math.abs(rightBar.time - timeSec)
+    ? leftBar.close
+    : rightBar.close;
+}
+
+function computeFallbackHalfSpan(bars: readonly OhlcvBar[]): number {
+  if (bars.length >= 2) {
+    const span = bars[bars.length - 1]!.time - bars[0]!.time;
+    if (Number.isFinite(span) && span > 0) {
+      return span / 2;
+    }
+  }
+  return 300;
+}
+
 export function ChartPane({
   pane,
   contractId,
   activeFeedLive,
   wsClient,
   coordinator,
+  syncController,
+  isActive = false,
+  onSelectPane,
+  gridStyle,
   onSymbolChange,
   onTimeframeChange,
   onAuthError,
@@ -117,6 +173,8 @@ export function ChartPane({
   const chartRef = useRef<IChartApi | null>(null);
   const candleSeriesRef = useRef<ISeriesApi<"Candlestick"> | null>(null);
   const volumeSeriesRef = useRef<ISeriesApi<"Histogram"> | null>(null);
+  const barsRef = useRef<OhlcvBar[]>([]);
+  const barCloseByTimeRef = useRef<Map<number, number>>(new Map());
   const latestBarRef = useRef<OhlcvBar | null>(null);
   const lastBarTimeRef = useRef<number | null>(null);
   const activeGenerationRef = useRef<number>(0);
@@ -146,6 +204,10 @@ export function ChartPane({
   symbolRef.current = pane.root_symbol;
   const timeframeRef = useRef<Timeframe>(pane.timeframe);
   timeframeRef.current = pane.timeframe;
+  const paneIdRef = useRef<string>(pane.pane_id);
+  paneIdRef.current = pane.pane_id;
+  const syncControllerRef = useRef<LayoutSyncController | undefined>(syncController);
+  syncControllerRef.current = syncController;
   const onAuthErrorRef = useRef(onAuthError);
   onAuthErrorRef.current = onAuthError;
 
@@ -163,6 +225,16 @@ export function ChartPane({
     }
     candleSeriesRef.current?.update(toCandleDatum(bar));
     volumeSeriesRef.current?.update(toVolumeDatum(bar));
+    barCloseByTimeRef.current.set(bar.time, bar.close);
+    const existingBars = barsRef.current;
+    if (
+      existingBars.length > 0 &&
+      existingBars[existingBars.length - 1]!.time === bar.time
+    ) {
+      existingBars[existingBars.length - 1] = bar;
+    } else {
+      existingBars.push(bar);
+    }
     latestBarRef.current = bar;
     lastBarTimeRef.current = bar.time;
     if (legendRef.current !== null) {
@@ -226,32 +298,56 @@ export function ChartPane({
 
     const handleCrosshair = (param: MouseEventParams<Time>) => {
       const legendEl = legendRef.current;
-      if (legendEl === null) {
-        return;
+      if (legendEl !== null) {
+        if (param.time === undefined) {
+          legendEl.textContent = formatLegendText(
+            symbolRef.current,
+            timeframeRef.current,
+            latestBarRef.current,
+          );
+        } else {
+          const candlePoint = param.seriesData.get(candleSeries);
+          if (candlePoint !== undefined && "open" in candlePoint) {
+            const volPoint = param.seriesData.get(volumeSeries);
+            const volValue =
+              volPoint !== undefined && "value" in volPoint ? volPoint.value : undefined;
+            legendEl.textContent = formatLegendText(symbolRef.current, timeframeRef.current, {
+              open: candlePoint.open,
+              high: candlePoint.high,
+              low: candlePoint.low,
+              close: candlePoint.close,
+              ...(volValue !== undefined ? { volume: volValue } : {}),
+            });
+          }
+        }
       }
-      if (param.time === undefined) {
-        legendEl.textContent = formatLegendText(
-          symbolRef.current,
-          timeframeRef.current,
-          latestBarRef.current,
-        );
-        return;
+
+      const syncTime = typeof param.time === "number" ? (param.time as UTCTimestamp) : null;
+      syncControllerRef.current?.onCrosshairMove(paneIdRef.current, syncTime);
+    };
+    chart.subscribeCrosshairMove(handleCrosshair);
+
+    const handleClick = (param: MouseEventParams<Time>) => {
+      if (typeof param.time === "number") {
+        syncControllerRef.current?.onTimeClick(paneIdRef.current, param.time as UTCTimestamp);
       }
-      const candlePoint = param.seriesData.get(candleSeries);
-      if (candlePoint !== undefined && "open" in candlePoint) {
-        const volPoint = param.seriesData.get(volumeSeries);
-        const volValue =
-          volPoint !== undefined && "value" in volPoint ? volPoint.value : undefined;
-        legendEl.textContent = formatLegendText(symbolRef.current, timeframeRef.current, {
-          open: candlePoint.open,
-          high: candlePoint.high,
-          low: candlePoint.low,
-          close: candlePoint.close,
-          ...(volValue !== undefined ? { volume: volValue } : {}),
+    };
+    chart.subscribeClick(handleClick);
+
+    const timeScale = chart.timeScale();
+    const handleVisibleTimeRangeChange = (range: IRange<Time> | null) => {
+      if (
+        range !== null &&
+        typeof range.from === "number" &&
+        typeof range.to === "number"
+      ) {
+        syncControllerRef.current?.onVisibleTimeRangeChange(paneIdRef.current, {
+          from: range.from as UTCTimestamp,
+          to: range.to as UTCTimestamp,
         });
       }
     };
-    chart.subscribeCrosshairMove(handleCrosshair);
+    timeScale.subscribeVisibleTimeRangeChange(handleVisibleTimeRangeChange);
 
     const resizeObserver = new ResizeObserver((entries) => {
       const entry = entries[0];
@@ -269,14 +365,105 @@ export function ChartPane({
     return () => {
       resizeObserver.disconnect();
       chart.unsubscribeCrosshairMove(handleCrosshair);
+      chart.unsubscribeClick(handleClick);
+      timeScale.unsubscribeVisibleTimeRangeChange(handleVisibleTimeRangeChange);
       chart.remove();
       chartRef.current = null;
       candleSeriesRef.current = null;
       volumeSeriesRef.current = null;
+      barsRef.current = [];
+      barCloseByTimeRef.current.clear();
       latestBarRef.current = null;
       lastBarTimeRef.current = null;
     };
   }, []);
+
+  useEffect(() => {
+    if (syncController === undefined) {
+      return;
+    }
+    const handle: ChartPaneSyncHandle = {
+      paneId: pane.pane_id,
+      applyCrosshairTime: (time) => {
+        const chart = chartRef.current;
+        if (chart === null) {
+          return;
+        }
+        if (time === null) {
+          try {
+            chart.clearCrosshairPosition();
+          } catch {
+            // Ignore chart disposal or uninitialized scale errors
+          }
+          return;
+        }
+        const series = candleSeriesRef.current;
+        if (series === null || barsRef.current.length === 0) {
+          return;
+        }
+        const price = resolveNearestClosePrice(
+          barsRef.current,
+          barCloseByTimeRef.current,
+          Number(time),
+          latestBarRef.current?.close,
+        );
+        if (price === undefined) {
+          return;
+        }
+        try {
+          chart.setCrosshairPosition(price, time, series);
+        } catch {
+          // Ignore when synced timestamp is outside current chart bounds
+        }
+      },
+      applyVisibleTimeRange: (range) => {
+        const chart = chartRef.current;
+        if (chart === null) {
+          return;
+        }
+        try {
+          chart.timeScale().setVisibleRange(range);
+        } catch {
+          // Ignore when chart has insufficient data for visible range
+        }
+      },
+      centerOnTime: (time) => {
+        const chart = chartRef.current;
+        if (chart === null) {
+          return;
+        }
+        let halfSpan = 0;
+        try {
+          const current = chart.timeScale().getVisibleRange();
+          if (
+            current !== null &&
+            typeof current.from === "number" &&
+            typeof current.to === "number"
+          ) {
+            const span = current.to - current.from;
+            if (Number.isFinite(span) && span > 0) {
+              halfSpan = span / 2;
+            }
+          }
+        } catch {
+          // Ignore unavailable visible range
+        }
+        if (halfSpan <= 0) {
+          halfSpan = computeFallbackHalfSpan(barsRef.current);
+        }
+        const center = Number(time);
+        try {
+          chart.timeScale().setVisibleRange({
+            from: (center - halfSpan) as UTCTimestamp,
+            to: (center + halfSpan) as UTCTimestamp,
+          });
+        } catch {
+          // Ignore when chart has no data
+        }
+      },
+    };
+    return syncController.registerPane(handle);
+  }, [pane.pane_id, syncController]);
 
   useEffect(() => {
     const resolvedContractId = contractId?.trim() ?? "";
@@ -297,6 +484,8 @@ export function ChartPane({
       retryCancelRef.current = null;
       candleSeriesRef.current?.setData([]);
       volumeSeriesRef.current?.setData([]);
+      barsRef.current = [];
+      barCloseByTimeRef.current.clear();
       latestBarRef.current = null;
       lastBarTimeRef.current = null;
       setBarsQuality(null);
@@ -314,6 +503,8 @@ export function ChartPane({
       activeGenerationRef.current += 1;
       pendingWsBarsRef.current = [];
       bufferOverflowRef.current = false;
+      barsRef.current = [];
+      barCloseByTimeRef.current.clear();
       setBarsQuality(null);
       if (legendRef.current !== null) {
         legendRef.current.textContent = formatLegendText(pane.root_symbol, pane.timeframe, null);
@@ -352,6 +543,12 @@ export function ChartPane({
         const volumes = mergedBars.map(toVolumeDatum);
         candleSeriesRef.current?.setData(candles);
         volumeSeriesRef.current?.setData(volumes);
+        barsRef.current = mergedBars;
+        const closeMap = new Map<number, number>();
+        for (const bar of mergedBars) {
+          closeMap.set(bar.time, bar.close);
+        }
+        barCloseByTimeRef.current = closeMap;
         snapshotReadyGenRef.current = ticket.generation;
         hasLoadedTargetKeyRef.current = nextTargetKey;
         snapshotRetryCountRef.current = 0;
@@ -390,6 +587,8 @@ export function ChartPane({
           pendingWsBarsRef.current = [];
           bufferOverflowRef.current = false;
           hasLoadedTargetKeyRef.current = "";
+          barsRef.current = [];
+          barCloseByTimeRef.current.clear();
           latestBarRef.current = null;
           lastBarTimeRef.current = null;
           if (legendRef.current !== null) {
@@ -507,7 +706,13 @@ export function ChartPane({
     loadStatus.startsWith("error:") || loadStatus.startsWith("resync error:");
 
   return (
-    <section className="chart-pane" data-pane-id={pane.pane_id}>
+    <section
+      className={isActive ? "chart-pane chart-pane--active" : "chart-pane"}
+      data-pane-id={pane.pane_id}
+      data-active={isActive ? "true" : "false"}
+      style={gridStyle}
+      onMouseDown={() => onSelectPane?.(pane.pane_id)}
+    >
       <header className="chart-pane__header">
         <div className="chart-pane__controls">
           <select
