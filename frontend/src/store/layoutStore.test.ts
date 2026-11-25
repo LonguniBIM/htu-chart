@@ -3,22 +3,28 @@ import { ApiError } from "../api/client";
 import type { LayoutPayload, LayoutRecord } from "../api/types";
 import { useLayoutStore } from "./layoutStore";
 
-const createLayoutMock = vi.fn<(payload: LayoutPayload) => Promise<LayoutRecord>>();
-const updateLayoutMock = vi.fn<
-  (layoutId: string, payload: LayoutPayload) => Promise<LayoutRecord>
+const createLayoutMock = vi.fn<
+  (payload: LayoutPayload, signal?: AbortSignal) => Promise<LayoutRecord>
 >();
-const deleteLayoutMock = vi.fn<(layoutId: string) => Promise<{ deleted: boolean; id: string }>>();
-const listLayoutsMock = vi.fn<() => Promise<LayoutRecord[]>>();
+const updateLayoutMock = vi.fn<
+  (layoutId: string, payload: LayoutPayload, signal?: AbortSignal) => Promise<LayoutRecord>
+>();
+const deleteLayoutMock = vi.fn<
+  (layoutId: string, signal?: AbortSignal) => Promise<{ deleted: boolean; id: string }>
+>();
+const listLayoutsMock = vi.fn<(signal?: AbortSignal) => Promise<LayoutRecord[]>>();
 
 vi.mock("../api/client", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../api/client")>();
   return {
     ...actual,
-    createLayout: (payload: LayoutPayload) => createLayoutMock(payload),
-    updateLayout: (layoutId: string, payload: LayoutPayload) =>
-      updateLayoutMock(layoutId, payload),
-    deleteLayout: (layoutId: string) => deleteLayoutMock(layoutId),
-    listLayouts: () => listLayoutsMock(),
+    createLayout: (payload: LayoutPayload, signal?: AbortSignal) =>
+      createLayoutMock(payload, signal),
+    updateLayout: (layoutId: string, payload: LayoutPayload, signal?: AbortSignal) =>
+      updateLayoutMock(layoutId, payload, signal),
+    deleteLayout: (layoutId: string, signal?: AbortSignal) =>
+      deleteLayoutMock(layoutId, signal),
+    listLayouts: (signal?: AbortSignal) => listLayoutsMock(signal),
   };
 });
 
@@ -212,6 +218,7 @@ describe("useLayoutStore (Phase 3 Part 2)", () => {
     expect(created?.id).toBe("layout-scalp");
     expect(createLayoutMock).toHaveBeenCalledWith(
       expect.objectContaining({ name: "Scalp MNQ", is_default: true }),
+      expect.any(AbortSignal),
     );
     expect(useLayoutStore.getState().dirty).toBe(false);
     expect(useLayoutStore.getState().layouts.filter((l) => l.is_default)).toHaveLength(1);
@@ -270,5 +277,361 @@ describe("useLayoutStore (Phase 3 Part 2)", () => {
     resolveUpdate(base);
     await first;
     expect(useLayoutStore.getState().saving).toBe(false);
+  });
+
+  it("aborts pending Save/SaveAs on reset() and ignores late 401 after hydrateLayouts() (P1-001, P2-001)", async () => {
+    /**
+     * Contract: reset() aborts active CRUD AbortController and bumps sessionEpoch; after
+     * hydrateLayouts() starts a new session, a late 401 rejection from the old session's
+     * Save or SaveAs neither mutates new session state nor calls onAuthError.
+     * Defect caught: Stale session 401 from in-flight save logging out a newly hydrated session.
+     */
+    const oldLayout = makeFourPaneLayout({ id: "old-layout", name: "Old" });
+    const newLayout = makeFourPaneLayout({ id: "new-layout", name: "New Session" });
+    const authHandler = vi.fn();
+
+    let rejectOldSave!: (reason?: unknown) => void;
+    let capturedSaveSignal: AbortSignal | undefined;
+    updateLayoutMock.mockImplementationOnce((_id, _payload, signal) => {
+      capturedSaveSignal = signal;
+      return new Promise<LayoutRecord>((_resolve, reject) => {
+        rejectOldSave = reject;
+      });
+    });
+
+    useLayoutStore.getState().setAuthErrorHandler(authHandler);
+    useLayoutStore.getState().hydrateLayouts([oldLayout]);
+    useLayoutStore.getState().setPaneSymbol("pane-1", "MGC");
+
+    const pendingSave = useLayoutStore.getState().saveActiveLayout();
+    expect(useLayoutStore.getState().saving).toBe(true);
+    expect(capturedSaveSignal?.aborted).toBe(false);
+
+    useLayoutStore.getState().reset();
+    expect(capturedSaveSignal?.aborted).toBe(true);
+    expect(useLayoutStore.getState().saving).toBe(false);
+
+    useLayoutStore.getState().hydrateLayouts([newLayout]);
+    expect(useLayoutStore.getState().activeLayout?.id).toBe("new-layout");
+
+    rejectOldSave(new ApiError(401, "Old session expired"));
+    const saveResult = await pendingSave;
+    expect(saveResult).toBeNull();
+    expect(authHandler).not.toHaveBeenCalled();
+    expect(useLayoutStore.getState().activeLayout?.id).toBe("new-layout");
+    expect(useLayoutStore.getState().dirty).toBe(false);
+    expect(useLayoutStore.getState().saving).toBe(false);
+    expect(useLayoutStore.getState().error).toBeNull();
+
+    // Also verify SaveAs across reset() + hydrateLayouts() + late 401
+    let rejectOldSaveAs!: (reason?: unknown) => void;
+    let capturedCreateSignal: AbortSignal | undefined;
+    createLayoutMock.mockImplementationOnce((_payload, signal) => {
+      capturedCreateSignal = signal;
+      return new Promise<LayoutRecord>((_resolve, reject) => {
+        rejectOldSaveAs = reject;
+      });
+    });
+
+    const pendingSaveAs = useLayoutStore.getState().saveLayoutAs("Should Abort");
+    expect(capturedCreateSignal?.aborted).toBe(false);
+
+    useLayoutStore.getState().reset();
+    expect(capturedCreateSignal?.aborted).toBe(true);
+    useLayoutStore.getState().hydrateLayouts([newLayout]);
+
+    rejectOldSaveAs(new ApiError(401, "Old session expired"));
+    expect(await pendingSaveAs).toBeNull();
+    expect(authHandler).not.toHaveBeenCalled();
+    expect(useLayoutStore.getState().layouts).toHaveLength(1);
+    expect(useLayoutStore.getState().activeLayout?.id).toBe("new-layout");
+    expect(useLayoutStore.getState().saving).toBe(false);
+  });
+
+  it("guards activeLayout and dirty when draft is edited or another layout is selected during pending Save/Rename/SetDefault (P1-002, P2-002)", async () => {
+    /**
+     * Contract: If the user edits the draft or switches to another layout while Save, Rename,
+     * or SetDefault is in flight, the resolved record updates layouts[] without clobbering
+     * the newer activeLayout draft or clearing dirty; Rename/SetDefault on the same layout
+     * merge only name/is_default metadata.
+     * Defect caught: In-flight save overwriting newer edits or switching activeLayout back.
+     */
+    const layoutA = makeFourPaneLayout({ id: "layout-a", name: "Layout A", is_default: false });
+    const layoutB = makeFourPaneLayout({
+      id: "layout-b",
+      name: "Layout B",
+      template_id: "2-cols",
+      panes: [
+        { pane_id: "pane-1", root_symbol: "MGC", timeframe: "15m", live_mode: false, playback_mode: "live" },
+        { pane_id: "pane-2", root_symbol: "MYM", timeframe: "15m", live_mode: false, playback_mode: "live" },
+      ],
+      is_default: true,
+    });
+
+    useLayoutStore.getState().hydrateLayouts([layoutA, layoutB]);
+    useLayoutStore.getState().selectLayout("layout-a");
+    useLayoutStore.getState().setPaneSymbol("pane-1", "MNQ");
+
+    // 1. Edit draft while saveActiveLayout is in flight -> newer edit & dirty preserved
+    let resolveSaveA!: (val: LayoutRecord) => void;
+    updateLayoutMock.mockImplementationOnce(
+      () =>
+        new Promise<LayoutRecord>((resolve) => {
+          resolveSaveA = resolve;
+        }),
+    );
+    const savePromise = useLayoutStore.getState().saveActiveLayout();
+    useLayoutStore.getState().setPaneSymbol("pane-2", "MGC");
+
+    const savedSnapshotA: LayoutRecord = {
+      ...layoutA,
+      panes: layoutA.panes.map((p) => (p.pane_id === "pane-1" ? { ...p, root_symbol: "MNQ" } : p)),
+    };
+    resolveSaveA(savedSnapshotA);
+    await savePromise;
+
+    expect(useLayoutStore.getState().layouts.find((l) => l.id === "layout-a")?.panes[0]?.root_symbol).toBe("MNQ");
+    expect(useLayoutStore.getState().activeLayout?.panes[1]?.root_symbol).toBe("MGC");
+    expect(useLayoutStore.getState().dirty).toBe(true);
+    expect(useLayoutStore.getState().saving).toBe(false);
+
+    // 2. Switch to Layout B while saveActiveLayout on A is in flight -> B stays active
+    let resolveSaveA2!: (val: LayoutRecord) => void;
+    updateLayoutMock.mockImplementationOnce(
+      () =>
+        new Promise<LayoutRecord>((resolve) => {
+          resolveSaveA2 = resolve;
+        }),
+    );
+    const savePromise2 = useLayoutStore.getState().saveActiveLayout();
+    useLayoutStore.getState().selectLayout("layout-b");
+    expect(useLayoutStore.getState().activeLayout?.id).toBe("layout-b");
+
+    resolveSaveA2({ ...savedSnapshotA, name: "Saved A2" });
+    await savePromise2;
+
+    expect(useLayoutStore.getState().activeLayout?.id).toBe("layout-b");
+    expect(useLayoutStore.getState().activeLayout?.panes).toHaveLength(2);
+    expect(useLayoutStore.getState().dirty).toBe(false);
+    expect(useLayoutStore.getState().layouts.find((l) => l.id === "layout-a")?.name).toBe("Saved A2");
+
+    // 3. Rename & SetDefault on same layout A with newer edits -> merge only metadata
+    useLayoutStore.getState().selectLayout("layout-a");
+    let resolveRename!: (val: LayoutRecord) => void;
+    updateLayoutMock.mockImplementationOnce(
+      () =>
+        new Promise<LayoutRecord>((resolve) => {
+          resolveRename = resolve;
+        }),
+    );
+    const renamePromise = useLayoutStore.getState().renameActiveLayout("Renamed A");
+    useLayoutStore.getState().setPaneSymbol("pane-3", "MES");
+    resolveRename({ ...savedSnapshotA, name: "Renamed A" });
+    await renamePromise;
+
+    expect(useLayoutStore.getState().activeLayout?.name).toBe("Renamed A");
+    expect(useLayoutStore.getState().activeLayout?.panes[2]?.root_symbol).toBe("MES");
+    expect(useLayoutStore.getState().dirty).toBe(true);
+
+    let resolveDefault!: (val: LayoutRecord) => void;
+    updateLayoutMock.mockImplementationOnce(
+      () =>
+        new Promise<LayoutRecord>((resolve) => {
+          resolveDefault = resolve;
+        }),
+    );
+    const defaultPromise = useLayoutStore.getState().setActiveLayoutDefault();
+    useLayoutStore.getState().setPaneSymbol("pane-4", "MNQ");
+    resolveDefault({ ...savedSnapshotA, name: "Renamed A", is_default: true });
+    await defaultPromise;
+
+    expect(useLayoutStore.getState().activeLayout?.is_default).toBe(true);
+    expect(useLayoutStore.getState().activeLayout?.panes[3]?.root_symbol).toBe("MNQ");
+    expect(useLayoutStore.getState().dirty).toBe(true);
+  });
+
+  it("preserves activeLayout dirty draft when deleting an inactive layout, even when inactive was default (P1-003)", async () => {
+    /**
+     * Contract: Deleting layoutId !== activeLayout.id never replaces activeLayout with the saved
+     * record from layouts/remaining; it preserves activeLayout's unsaved template/pane/sync edits,
+     * activePaneId, and dirty=true while syncing is_default if promoted.
+     * Defect caught: deleteLayoutById overwriting dirty activeLayout with stale saved record.
+     */
+    const layoutA = makeFourPaneLayout({ id: "layout-a", name: "Alpha", is_default: false });
+    const layoutB = makeFourPaneLayout({ id: "layout-b", name: "Beta Default", is_default: true });
+
+    useLayoutStore.getState().hydrateLayouts([layoutA, layoutB]);
+    useLayoutStore.getState().selectLayout("layout-a");
+    useLayoutStore.getState().selectPane("pane-2");
+    useLayoutStore.getState().setPaneSymbol("pane-2", "MGC");
+    useLayoutStore.getState().toggleSync("crosshair");
+    useLayoutStore.getState().setTemplate("2-cols");
+    expect(useLayoutStore.getState().dirty).toBe(true);
+
+    deleteLayoutMock.mockResolvedValueOnce({ deleted: true, id: "layout-b" });
+    listLayoutsMock.mockResolvedValueOnce([{ ...layoutA, is_default: true }]);
+
+    const ok = await useLayoutStore.getState().deleteLayoutById("layout-b");
+    expect(ok).toBe(true);
+
+    const active = useLayoutStore.getState().activeLayout!;
+    expect(active.id).toBe("layout-a");
+    expect(active.is_default).toBe(true);
+    expect(active.template_id).toBe("2-cols");
+    expect(active.panes).toHaveLength(2);
+    expect(active.panes[1]?.root_symbol).toBe("MGC");
+    expect(active.sync_config.crosshair).toBe(false);
+    expect(useLayoutStore.getState().activePaneId).toBe("pane-2");
+    expect(useLayoutStore.getState().dirty).toBe(true);
+  });
+
+  it("restores custom pane_ids (alpha/beta/gamma/delta) by slot index across 4 -> 2 -> 4 and generates pane-N only for unarchived slots (P1-005)", () => {
+    /**
+     * Contract: Shrinking a layout with custom pane_ids ["alpha", "beta", "gamma", "delta"]
+     * from 4 -> 2 and re-expanding 2 -> 4 restores "gamma" and "delta" in slots 2 and 3 with
+     * their exact pane_id, root_symbol, timeframe, live_mode, and playback_mode; expanding to 5
+     * creates pane-5 without colliding, and respects sync_config.symbol/interval when enabled.
+     * Defect caught: Re-expansion synthesizing pane-3/pane-4 instead of restoring custom pane_ids.
+     */
+    const customLayout = makeFourPaneLayout({
+      id: "layout-custom",
+      name: "Custom IDs",
+      template_id: "4-grid-2x2",
+      panes: [
+        { pane_id: "alpha", root_symbol: "MES", timeframe: "5m", live_mode: false, playback_mode: "live" },
+        { pane_id: "beta", root_symbol: "MNQ", timeframe: "15m", live_mode: true, playback_mode: "live" },
+        { pane_id: "gamma", root_symbol: "MYM", timeframe: "1h", live_mode: true, playback_mode: "replay" },
+        { pane_id: "delta", root_symbol: "MGC", timeframe: "4h", live_mode: false, playback_mode: "replay" },
+      ],
+      sync_config: {
+        symbol: false,
+        interval: false,
+        crosshair: false,
+        time: false,
+        dateRange: false,
+      },
+    });
+
+    useLayoutStore.getState().hydrateLayouts([customLayout]);
+    useLayoutStore.getState().setTemplate("2-cols");
+    expect(useLayoutStore.getState().activeLayout?.panes.map((p) => p.pane_id)).toEqual([
+      "alpha",
+      "beta",
+    ]);
+
+    useLayoutStore.getState().setTemplate("4-grid-2x2");
+    let restored = useLayoutStore.getState().activeLayout!.panes;
+    expect(restored[2]).toEqual({
+      pane_id: "gamma",
+      root_symbol: "MYM",
+      timeframe: "1h",
+      live_mode: true,
+      playback_mode: "replay",
+    });
+    expect(restored[3]).toEqual({
+      pane_id: "delta",
+      root_symbol: "MGC",
+      timeframe: "4h",
+      live_mode: false,
+      playback_mode: "replay",
+    });
+
+    // Expanding 4 -> 5 creates pane-5 because slot 4 has no archived pane
+    useLayoutStore.getState().setTemplate("5-top2-bot3");
+    restored = useLayoutStore.getState().activeLayout!.panes;
+    expect(restored[4]?.pane_id).toBe("pane-5");
+
+    // Shrinking 5 -> 2, enabling symbol+interval sync, editing alpha, and expanding 2 -> 4
+    // still restores gamma/delta IDs and modes while syncing symbol & timeframe from reference pane
+    useLayoutStore.getState().setTemplate("2-cols");
+    useLayoutStore.getState().toggleSync("symbol");
+    useLayoutStore.getState().toggleSync("interval");
+    useLayoutStore.getState().selectPane("alpha");
+    useLayoutStore.getState().setPaneSymbol("alpha", "MGC");
+    useLayoutStore.getState().setPaneTimeframe("alpha", "30m");
+    useLayoutStore.getState().setTemplate("4-grid-2x2");
+
+    restored = useLayoutStore.getState().activeLayout!.panes;
+    expect(restored[2]).toEqual({
+      pane_id: "gamma",
+      root_symbol: "MGC",
+      timeframe: "30m",
+      live_mode: true,
+      playback_mode: "replay",
+    });
+    expect(restored[3]).toEqual({
+      pane_id: "delta",
+      root_symbol: "MGC",
+      timeframe: "30m",
+      live_mode: false,
+      playback_mode: "replay",
+    });
+  });
+
+  it("sends exact payloads and AbortSignal for saveActiveLayout, renameActiveLayout, and setActiveLayoutDefault", async () => {
+    /**
+     * Contract: saveActiveLayout, renameActiveLayout, and setActiveLayoutDefault invoke
+     * updateLayout with exact layoutId, LayoutPayload fields, and AbortSignal, clearing dirty.
+     * Defect caught: Missing or malformed payload fields or omitted AbortSignal on CRUD updates.
+     */
+    const initial = makeFourPaneLayout({ id: "layout-1", name: "Main", is_default: false });
+    useLayoutStore.getState().hydrateLayouts([initial]);
+    useLayoutStore.getState().setPaneSymbol("pane-1", "MGC");
+
+    const savedAfterSave: LayoutRecord = {
+      ...initial,
+      panes: initial.panes.map((p) => (p.pane_id === "pane-1" ? { ...p, root_symbol: "MGC" } : p)),
+    };
+    updateLayoutMock.mockResolvedValueOnce(savedAfterSave);
+
+    const saveRes = await useLayoutStore.getState().saveActiveLayout();
+    expect(saveRes?.panes[0]?.root_symbol).toBe("MGC");
+    expect(useLayoutStore.getState().dirty).toBe(false);
+    expect(updateLayoutMock).toHaveBeenNthCalledWith(
+      1,
+      "layout-1",
+      {
+        name: "Main",
+        template_id: "4-grid-2x2",
+        panes: savedAfterSave.panes,
+        sync_config: initial.sync_config,
+        is_default: false,
+      },
+      expect.any(AbortSignal),
+    );
+
+    const savedAfterDefault: LayoutRecord = { ...savedAfterSave, is_default: true };
+    updateLayoutMock.mockResolvedValueOnce(savedAfterDefault);
+    const defaultRes = await useLayoutStore.getState().setActiveLayoutDefault();
+    expect(defaultRes?.is_default).toBe(true);
+    expect(updateLayoutMock).toHaveBeenNthCalledWith(
+      2,
+      "layout-1",
+      {
+        name: "Main",
+        template_id: "4-grid-2x2",
+        panes: savedAfterSave.panes,
+        sync_config: initial.sync_config,
+        is_default: true,
+      },
+      expect.any(AbortSignal),
+    );
+
+    const savedAfterRename: LayoutRecord = { ...savedAfterDefault, name: "Main Pro" };
+    updateLayoutMock.mockResolvedValueOnce(savedAfterRename);
+    const renameRes = await useLayoutStore.getState().renameActiveLayout("  Main Pro ");
+    expect(renameRes?.name).toBe("Main Pro");
+    expect(updateLayoutMock).toHaveBeenNthCalledWith(
+      3,
+      "layout-1",
+      {
+        name: "Main Pro",
+        template_id: "4-grid-2x2",
+        panes: savedAfterSave.panes,
+        sync_config: initial.sync_config,
+        is_default: true,
+      },
+      expect.any(AbortSignal),
+    );
   });
 });

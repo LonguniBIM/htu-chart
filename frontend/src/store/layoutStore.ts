@@ -28,6 +28,9 @@ export interface LayoutStoreState {
   saving: boolean;
   error: string | null;
   paneArchive: Record<string, PaneConfig>;
+  paneArchiveBySlot: Record<number, PaneConfig>;
+  sessionEpoch: number;
+  draftRevision: number;
   authErrorHandler: AuthErrorHandler | null;
 
   setAuthErrorHandler: (handler: AuthErrorHandler | null) => void;
@@ -77,6 +80,14 @@ function seedArchive(panes: readonly PaneConfig[]): Record<string, PaneConfig> {
   return archive;
 }
 
+function seedSlotArchive(panes: readonly PaneConfig[]): Record<number, PaneConfig> {
+  const archive: Record<number, PaneConfig> = {};
+  panes.forEach((pane, idx) => {
+    archive[idx] = clonePane(pane);
+  });
+  return archive;
+}
+
 function pickInitialLayout(layouts: readonly LayoutRecord[]): LayoutRecord | null {
   return layouts.find((item) => item.is_default) ?? layouts[0] ?? null;
 }
@@ -112,6 +123,70 @@ function isAuthStatusError(err: unknown): err is ApiError {
   return err instanceof ApiError && (err.status === 401 || err.status === 403);
 }
 
+let activeCrudController: AbortController | null = null;
+
+function abortActiveCrud(): void {
+  activeCrudController?.abort();
+  activeCrudController = null;
+}
+
+interface CrudRequestContext {
+  controller: AbortController;
+  isStale: () => boolean;
+}
+
+function beginCrudRequest(
+  get: () => LayoutStoreState,
+  set: (partial: Partial<LayoutStoreState>) => void,
+): CrudRequestContext {
+  const controller = new AbortController();
+  activeCrudController = controller;
+  const requestEpoch = get().sessionEpoch;
+  set({ saving: true, error: null });
+  return {
+    controller,
+    isStale: () => controller.signal.aborted || requestEpoch !== get().sessionEpoch,
+  };
+}
+
+function finishCrudRequest(controller: AbortController): void {
+  if (activeCrudController === controller) {
+    activeCrudController = null;
+  }
+}
+
+function handleCrudError(
+  err: unknown,
+  isStale: () => boolean,
+  set: (partial: Partial<LayoutStoreState>) => void,
+  authErrorHandler: AuthErrorHandler | null,
+  onAuthError: AuthErrorHandler | undefined,
+  fallbackMessage: string,
+): void {
+  if (isStale()) {
+    return;
+  }
+  if (isAuthStatusError(err)) {
+    set({ saving: false });
+    (onAuthError ?? authErrorHandler)?.(err.status, err.detail);
+    return;
+  }
+  set({
+    saving: false,
+    error: err instanceof Error ? err.message : fallbackMessage,
+  });
+}
+
+function resolveSurvivingActivePaneId(
+  currentActivePaneId: string | null,
+  panes: readonly PaneConfig[],
+): string | null {
+  return currentActivePaneId !== null &&
+    panes.some((pane) => pane.pane_id === currentActivePaneId)
+    ? currentActivePaneId
+    : (panes[0]?.pane_id ?? null);
+}
+
 export const useLayoutStore = create<LayoutStoreState>((set, get) => ({
   layouts: [],
   activeLayout: null,
@@ -120,6 +195,9 @@ export const useLayoutStore = create<LayoutStoreState>((set, get) => ({
   saving: false,
   error: null,
   paneArchive: {},
+  paneArchiveBySlot: {},
+  sessionEpoch: 0,
+  draftRevision: 0,
   authErrorHandler: null,
 
   setAuthErrorHandler: (handler) => {
@@ -127,16 +205,21 @@ export const useLayoutStore = create<LayoutStoreState>((set, get) => ({
   },
 
   hydrateLayouts: (layouts) => {
+    abortActiveCrud();
     const clonedLayouts = layouts.map(cloneLayout);
     const picked = pickInitialLayout(clonedLayouts);
-    set({
+    set((state) => ({
       layouts: clonedLayouts,
       activeLayout: picked !== null ? cloneLayout(picked) : null,
       activePaneId: picked?.panes[0]?.pane_id ?? null,
       dirty: false,
+      saving: false,
       error: null,
       paneArchive: picked !== null ? seedArchive(picked.panes) : {},
-    });
+      paneArchiveBySlot: picked !== null ? seedSlotArchive(picked.panes) : {},
+      sessionEpoch: state.sessionEpoch + 1,
+      draftRevision: state.draftRevision + 1,
+    }));
   },
 
   selectLayout: (layoutId) => {
@@ -144,13 +227,15 @@ export const useLayoutStore = create<LayoutStoreState>((set, get) => ({
     if (found === undefined) {
       return;
     }
-    set({
+    set((state) => ({
       activeLayout: cloneLayout(found),
       activePaneId: found.panes[0]?.pane_id ?? null,
       dirty: false,
       error: null,
       paneArchive: seedArchive(found.panes),
-    });
+      paneArchiveBySlot: seedSlotArchive(found.panes),
+      draftRevision: state.draftRevision + 1,
+    }));
   },
 
   selectPane: (paneId) => {
@@ -164,15 +249,17 @@ export const useLayoutStore = create<LayoutStoreState>((set, get) => ({
   },
 
   setTemplate: (templateId) => {
-    const { activeLayout, activePaneId, paneArchive } = get();
+    const { activeLayout, activePaneId, paneArchive, paneArchiveBySlot } = get();
     if (activeLayout === null) {
       return;
     }
     const targetCount = LAYOUT_TEMPLATE_PANE_COUNTS[templateId];
     const nextArchive: Record<string, PaneConfig> = { ...paneArchive };
-    for (const pane of activeLayout.panes) {
+    const nextArchiveBySlot: Record<number, PaneConfig> = { ...paneArchiveBySlot };
+    activeLayout.panes.forEach((pane, idx) => {
       nextArchive[pane.pane_id] = clonePane(pane);
-    }
+      nextArchiveBySlot[idx] = clonePane(pane);
+    });
 
     const referencePane =
       activeLayout.panes.find((pane) => pane.pane_id === activePaneId) ??
@@ -183,13 +270,20 @@ export const useLayoutStore = create<LayoutStoreState>((set, get) => ({
     const nextPanes: PaneConfig[] = [...surviving];
 
     while (nextPanes.length < targetCount) {
-      const slotNumber = nextPanes.length + 1;
-      const paneId = nextUniquePaneId(slotNumber, usedIds);
+      const slotIndex = nextPanes.length;
+      const slotNumber = slotIndex + 1;
+      const slotArchived = nextArchiveBySlot[slotIndex];
+      const paneId =
+        slotArchived !== undefined && !usedIds.has(slotArchived.pane_id)
+          ? slotArchived.pane_id
+          : nextUniquePaneId(slotNumber, usedIds);
       usedIds.add(paneId);
-      const archived = nextArchive[paneId];
+
+      const archived = slotArchived ?? nextArchive[paneId];
       if (archived !== undefined) {
         const restored: PaneConfig = {
           ...archived,
+          pane_id: paneId,
           root_symbol:
             activeLayout.sync_config.symbol && referencePane !== undefined
               ? referencePane.root_symbol
@@ -200,6 +294,7 @@ export const useLayoutStore = create<LayoutStoreState>((set, get) => ({
               : archived.timeframe,
         };
         nextArchive[paneId] = clonePane(restored);
+        nextArchiveBySlot[slotIndex] = clonePane(restored);
         nextPanes.push(restored);
       } else {
         const defaultSymbol =
@@ -218,6 +313,7 @@ export const useLayoutStore = create<LayoutStoreState>((set, get) => ({
           playback_mode: "live",
         };
         nextArchive[paneId] = clonePane(created);
+        nextArchiveBySlot[slotIndex] = clonePane(created);
         nextPanes.push(created);
       }
     }
@@ -227,7 +323,7 @@ export const useLayoutStore = create<LayoutStoreState>((set, get) => ({
         ? activePaneId
         : (nextPanes[0]?.pane_id ?? null);
 
-    set({
+    set((state) => ({
       activeLayout: {
         ...activeLayout,
         template_id: templateId,
@@ -235,61 +331,71 @@ export const useLayoutStore = create<LayoutStoreState>((set, get) => ({
       },
       activePaneId: nextActivePaneId,
       paneArchive: nextArchive,
+      paneArchiveBySlot: nextArchiveBySlot,
       dirty: true,
       error: null,
-    });
+      draftRevision: state.draftRevision + 1,
+    }));
   },
 
   setPaneSymbol: (paneId, rootSymbol) => {
-    const { activeLayout, paneArchive } = get();
+    const { activeLayout, paneArchive, paneArchiveBySlot } = get();
     if (activeLayout === null) {
       return;
     }
     const syncAll = activeLayout.sync_config.symbol;
     const nextArchive = { ...paneArchive };
-    const nextPanes = activeLayout.panes.map((pane) => {
+    const nextArchiveBySlot = { ...paneArchiveBySlot };
+    const nextPanes = activeLayout.panes.map((pane, idx) => {
       if (!syncAll && pane.pane_id !== paneId) {
         return pane;
       }
       const updated = { ...pane, root_symbol: rootSymbol };
       nextArchive[pane.pane_id] = clonePane(updated);
+      nextArchiveBySlot[idx] = clonePane(updated);
       return updated;
     });
-    set({
+    set((state) => ({
       activeLayout: {
         ...activeLayout,
         panes: nextPanes,
       },
       paneArchive: nextArchive,
+      paneArchiveBySlot: nextArchiveBySlot,
       dirty: true,
       error: null,
-    });
+      draftRevision: state.draftRevision + 1,
+    }));
   },
 
   setPaneTimeframe: (paneId, timeframe) => {
-    const { activeLayout, paneArchive } = get();
+    const { activeLayout, paneArchive, paneArchiveBySlot } = get();
     if (activeLayout === null) {
       return;
     }
     const syncAll = activeLayout.sync_config.interval;
     const nextArchive = { ...paneArchive };
-    const nextPanes = activeLayout.panes.map((pane) => {
+    const nextArchiveBySlot = { ...paneArchiveBySlot };
+    const nextPanes = activeLayout.panes.map((pane, idx) => {
       if (!syncAll && pane.pane_id !== paneId) {
         return pane;
       }
       const updated = { ...pane, timeframe };
       nextArchive[pane.pane_id] = clonePane(updated);
+      nextArchiveBySlot[idx] = clonePane(updated);
       return updated;
     });
-    set({
+    set((state) => ({
       activeLayout: {
         ...activeLayout,
         panes: nextPanes,
       },
       paneArchive: nextArchive,
+      paneArchiveBySlot: nextArchiveBySlot,
       dirty: true,
       error: null,
-    });
+      draftRevision: state.draftRevision + 1,
+    }));
   },
 
   toggleSync: (key) => {
@@ -297,7 +403,7 @@ export const useLayoutStore = create<LayoutStoreState>((set, get) => ({
     if (activeLayout === null) {
       return;
     }
-    set({
+    set((state) => ({
       activeLayout: {
         ...activeLayout,
         sync_config: {
@@ -307,45 +413,69 @@ export const useLayoutStore = create<LayoutStoreState>((set, get) => ({
       },
       dirty: true,
       error: null,
-    });
+      draftRevision: state.draftRevision + 1,
+    }));
   },
 
   saveActiveLayout: async (onAuthError) => {
-    const { activeLayout, saving, authErrorHandler } = get();
+    const { activeLayout, saving, draftRevision, authErrorHandler } = get();
     if (saving || activeLayout === null) {
       return null;
     }
-    set({ saving: true, error: null });
+    const targetLayoutId = activeLayout.id;
+    const targetDraftRevision = draftRevision;
+    const { controller, isStale } = beginCrudRequest(get, set);
     try {
-      const saved = await updateLayout(activeLayout.id, toLayoutPayload(activeLayout));
-      const cloned = cloneLayout(saved);
-      set((state) => ({
-        layouts: state.layouts.map((item) =>
-          item.id === cloned.id ? cloneLayout(cloned) : item,
-        ),
-        activeLayout: cloned,
-        activePaneId:
-          state.activePaneId !== null &&
-          cloned.panes.some((pane) => pane.pane_id === state.activePaneId)
-            ? state.activePaneId
-            : (cloned.panes[0]?.pane_id ?? null),
-        paneArchive: { ...state.paneArchive, ...seedArchive(cloned.panes) },
-        dirty: false,
-        saving: false,
-        error: null,
-      }));
-      return cloned;
-    } catch (err: unknown) {
-      if (isAuthStatusError(err)) {
-        set({ saving: false });
-        (onAuthError ?? authErrorHandler)?.(err.status, err.detail);
+      const saved = await updateLayout(
+        targetLayoutId,
+        toLayoutPayload(activeLayout),
+        controller.signal,
+      );
+      if (isStale()) {
         return null;
       }
-      set({
-        saving: false,
-        error: err instanceof Error ? err.message : "Failed to save layout",
+      const cloned = cloneLayout(saved);
+      set((state) => {
+        const nextLayouts = state.layouts.map((item) =>
+          item.id === cloned.id ? cloneLayout(cloned) : item,
+        );
+        const canReplaceActive =
+          state.activeLayout?.id === targetLayoutId &&
+          state.draftRevision === targetDraftRevision;
+        if (!canReplaceActive) {
+          return {
+            layouts: nextLayouts,
+            saving: false,
+            error: null,
+          };
+        }
+        return {
+          layouts: nextLayouts,
+          activeLayout: cloned,
+          activePaneId: resolveSurvivingActivePaneId(state.activePaneId, cloned.panes),
+          paneArchive: { ...state.paneArchive, ...seedArchive(cloned.panes) },
+          paneArchiveBySlot: {
+            ...state.paneArchiveBySlot,
+            ...seedSlotArchive(cloned.panes),
+          },
+          dirty: false,
+          saving: false,
+          error: null,
+        };
       });
+      return cloned;
+    } catch (err: unknown) {
+      handleCrudError(
+        err,
+        isStale,
+        set,
+        authErrorHandler,
+        onAuthError,
+        "Failed to save layout",
+      );
       return null;
+    } finally {
+      finishCrudRequest(controller);
     }
   },
 
@@ -355,32 +485,53 @@ export const useLayoutStore = create<LayoutStoreState>((set, get) => ({
       set({ error: "Layout name cannot be empty" });
       return null;
     }
-    const { activeLayout, saving, authErrorHandler } = get();
+    const { activeLayout, saving, draftRevision, authErrorHandler } = get();
     if (saving || activeLayout === null) {
       return null;
     }
-    set({ saving: true, error: null });
+    const targetLayoutId = activeLayout.id;
+    const targetDraftRevision = draftRevision;
+    const { controller, isStale } = beginCrudRequest(get, set);
     try {
       const created = await createLayout(
         toLayoutPayload(activeLayout, {
           name: trimmed,
           is_default: setDefault,
         }),
+        controller.signal,
       );
+      if (isStale()) {
+        return null;
+      }
       const cloned = cloneLayout(created);
       set((state) => {
         const baseLayouts = cloned.is_default
           ? state.layouts.map((item) => ({ ...item, is_default: false }))
           : [...state.layouts];
+        const nextLayouts = [...baseLayouts, cloneLayout(cloned)];
+        const canReplaceActive =
+          state.activeLayout?.id === targetLayoutId &&
+          state.draftRevision === targetDraftRevision;
+        if (!canReplaceActive) {
+          return {
+            layouts: nextLayouts,
+            activeLayout:
+              cloned.is_default && state.activeLayout !== null
+                ? { ...state.activeLayout, is_default: false }
+                : state.activeLayout,
+            saving: false,
+            error: null,
+          };
+        }
         return {
-          layouts: [...baseLayouts, cloneLayout(cloned)],
+          layouts: nextLayouts,
           activeLayout: cloned,
-          activePaneId:
-            state.activePaneId !== null &&
-            cloned.panes.some((pane) => pane.pane_id === state.activePaneId)
-              ? state.activePaneId
-              : (cloned.panes[0]?.pane_id ?? null),
+          activePaneId: resolveSurvivingActivePaneId(state.activePaneId, cloned.panes),
           paneArchive: { ...state.paneArchive, ...seedArchive(cloned.panes) },
+          paneArchiveBySlot: {
+            ...state.paneArchiveBySlot,
+            ...seedSlotArchive(cloned.panes),
+          },
           dirty: false,
           saving: false,
           error: null,
@@ -388,16 +539,17 @@ export const useLayoutStore = create<LayoutStoreState>((set, get) => ({
       });
       return cloned;
     } catch (err: unknown) {
-      if (isAuthStatusError(err)) {
-        set({ saving: false });
-        (onAuthError ?? authErrorHandler)?.(err.status, err.detail);
-        return null;
-      }
-      set({
-        saving: false,
-        error: err instanceof Error ? err.message : "Failed to create layout",
-      });
+      handleCrudError(
+        err,
+        isStale,
+        set,
+        authErrorHandler,
+        onAuthError,
+        "Failed to create layout",
+      );
       return null;
+    } finally {
+      finishCrudRequest(controller);
     }
   },
 
@@ -407,78 +559,148 @@ export const useLayoutStore = create<LayoutStoreState>((set, get) => ({
       set({ error: "Layout name cannot be empty" });
       return null;
     }
-    const { activeLayout, saving, authErrorHandler } = get();
+    const { activeLayout, saving, draftRevision, authErrorHandler } = get();
     if (saving || activeLayout === null) {
       return null;
     }
-    set({ saving: true, error: null });
+    const targetLayoutId = activeLayout.id;
+    const targetDraftRevision = draftRevision;
+    const { controller, isStale } = beginCrudRequest(get, set);
     try {
       const updated = await updateLayout(
-        activeLayout.id,
+        targetLayoutId,
         toLayoutPayload(activeLayout, { name: trimmed }),
+        controller.signal,
       );
-      const cloned = cloneLayout(updated);
-      set((state) => ({
-        layouts: state.layouts.map((item) =>
-          item.id === cloned.id ? cloneLayout(cloned) : item,
-        ),
-        activeLayout: cloned,
-        paneArchive: { ...state.paneArchive, ...seedArchive(cloned.panes) },
-        dirty: false,
-        saving: false,
-        error: null,
-      }));
-      return cloned;
-    } catch (err: unknown) {
-      if (isAuthStatusError(err)) {
-        set({ saving: false });
-        (onAuthError ?? authErrorHandler)?.(err.status, err.detail);
+      if (isStale()) {
         return null;
       }
-      set({
-        saving: false,
-        error: err instanceof Error ? err.message : "Failed to rename layout",
+      const cloned = cloneLayout(updated);
+      set((state) => {
+        const nextLayouts = state.layouts.map((item) =>
+          item.id === cloned.id ? cloneLayout(cloned) : item,
+        );
+        const isSameLayout = state.activeLayout?.id === targetLayoutId;
+        if (!isSameLayout) {
+          return {
+            layouts: nextLayouts,
+            saving: false,
+            error: null,
+          };
+        }
+        if (state.draftRevision !== targetDraftRevision) {
+          return {
+            layouts: nextLayouts,
+            activeLayout:
+              state.activeLayout !== null
+                ? { ...state.activeLayout, name: cloned.name }
+                : null,
+            saving: false,
+            error: null,
+          };
+        }
+        return {
+          layouts: nextLayouts,
+          activeLayout: cloned,
+          paneArchive: { ...state.paneArchive, ...seedArchive(cloned.panes) },
+          paneArchiveBySlot: {
+            ...state.paneArchiveBySlot,
+            ...seedSlotArchive(cloned.panes),
+          },
+          dirty: false,
+          saving: false,
+          error: null,
+        };
       });
+      return cloned;
+    } catch (err: unknown) {
+      handleCrudError(
+        err,
+        isStale,
+        set,
+        authErrorHandler,
+        onAuthError,
+        "Failed to rename layout",
+      );
       return null;
+    } finally {
+      finishCrudRequest(controller);
     }
   },
 
   setActiveLayoutDefault: async (onAuthError) => {
-    const { activeLayout, saving, authErrorHandler } = get();
+    const { activeLayout, saving, draftRevision, authErrorHandler } = get();
     if (saving || activeLayout === null) {
       return null;
     }
-    set({ saving: true, error: null });
+    const targetLayoutId = activeLayout.id;
+    const targetDraftRevision = draftRevision;
+    const { controller, isStale } = beginCrudRequest(get, set);
     try {
       const updated = await updateLayout(
-        activeLayout.id,
+        targetLayoutId,
         toLayoutPayload(activeLayout, { is_default: true }),
+        controller.signal,
       );
+      if (isStale()) {
+        return null;
+      }
       const cloned = cloneLayout({ ...updated, is_default: true });
-      set((state) => ({
-        layouts: state.layouts.map((item) =>
+      set((state) => {
+        const nextLayouts = state.layouts.map((item) =>
           item.id === cloned.id
             ? cloneLayout(cloned)
             : { ...item, is_default: false },
-        ),
-        activeLayout: cloned,
-        paneArchive: { ...state.paneArchive, ...seedArchive(cloned.panes) },
-        dirty: false,
-        saving: false,
-        error: null,
-      }));
+        );
+        const isSameLayout = state.activeLayout?.id === targetLayoutId;
+        if (!isSameLayout) {
+          return {
+            layouts: nextLayouts,
+            activeLayout:
+              state.activeLayout !== null
+                ? { ...state.activeLayout, is_default: false }
+                : null,
+            saving: false,
+            error: null,
+          };
+        }
+        if (state.draftRevision !== targetDraftRevision) {
+          return {
+            layouts: nextLayouts,
+            activeLayout:
+              state.activeLayout !== null
+                ? { ...state.activeLayout, is_default: true }
+                : null,
+            saving: false,
+            error: null,
+          };
+        }
+        return {
+          layouts: nextLayouts,
+          activeLayout: cloned,
+          paneArchive: { ...state.paneArchive, ...seedArchive(cloned.panes) },
+          paneArchiveBySlot: {
+            ...state.paneArchiveBySlot,
+            ...seedSlotArchive(cloned.panes),
+          },
+          dirty: false,
+          saving: false,
+          error: null,
+        };
+      });
       return cloned;
     } catch (err: unknown) {
-      if (isAuthStatusError(err)) {
-        set({ saving: false });
-        (onAuthError ?? authErrorHandler)?.(err.status, err.detail);
-        return null;
-      }
-      set({
-        saving: false,
-        error: err instanceof Error ? err.message : "Failed to set default layout",
-      });
+      handleCrudError(
+        err,
+        isStale,
+        set,
+        authErrorHandler,
+        onAuthError,
+        "Failed to set default layout",
+      );
       return null;
+    } finally {
+      finishCrudRequest(controller);
     }
   },
 
@@ -487,10 +709,13 @@ export const useLayoutStore = create<LayoutStoreState>((set, get) => ({
     if (saving) {
       return false;
     }
-    set({ saving: true, error: null });
+    const { controller, isStale } = beginCrudRequest(get, set);
     try {
       const targetRecord = get().layouts.find((item) => item.id === layoutId);
-      await deleteLayout(layoutId);
+      await deleteLayout(layoutId, controller.signal);
+      if (isStale()) {
+        return false;
+      }
 
       let remaining = get().layouts
         .filter((item) => item.id !== layoutId)
@@ -499,11 +724,17 @@ export const useLayoutStore = create<LayoutStoreState>((set, get) => ({
       if (targetRecord?.is_default && remaining.length > 0) {
         let syncedFromServer: LayoutRecord[] | null = null;
         try {
-          const fetched = await listLayouts();
+          const fetched = await listLayouts(controller.signal);
+          if (isStale()) {
+            return false;
+          }
           if (Array.isArray(fetched) && fetched.length > 0) {
             syncedFromServer = fetched.map(cloneLayout);
           }
         } catch (refreshErr: unknown) {
+          if (isStale()) {
+            return false;
+          }
           if (isAuthStatusError(refreshErr)) {
             set({ saving: false });
             (onAuthError ?? authErrorHandler)?.(refreshErr.status, refreshErr.detail);
@@ -517,39 +748,47 @@ export const useLayoutStore = create<LayoutStoreState>((set, get) => ({
         }
       }
 
-      const currentActive = get().activeLayout;
-      const nextActive =
-        currentActive !== null && currentActive.id !== layoutId
-          ? (remaining.find((item) => item.id === currentActive.id) ?? currentActive)
-          : pickInitialLayout(remaining);
-      const nextActiveWasReplaced =
-        currentActive === null || currentActive.id === layoutId;
-
-      set((state) => ({
-        layouts: remaining,
-        activeLayout: nextActive !== null ? cloneLayout(nextActive) : null,
-        activePaneId: nextActiveWasReplaced
-          ? (nextActive?.panes[0]?.pane_id ?? null)
-          : state.activePaneId,
-        paneArchive: nextActiveWasReplaced
-          ? (nextActive !== null ? seedArchive(nextActive.panes) : {})
-          : state.paneArchive,
-        dirty: nextActiveWasReplaced ? false : state.dirty,
-        saving: false,
-        error: null,
-      }));
+      set((state) => {
+        const currentActive = state.activeLayout;
+        if (currentActive !== null && currentActive.id !== layoutId) {
+          const matchedRecord = remaining.find((item) => item.id === currentActive.id);
+          return {
+            layouts: remaining,
+            activeLayout:
+              matchedRecord !== undefined
+                ? { ...currentActive, is_default: matchedRecord.is_default }
+                : currentActive,
+            saving: false,
+            error: null,
+          };
+        }
+        const nextActive = pickInitialLayout(remaining);
+        return {
+          layouts: remaining,
+          activeLayout: nextActive !== null ? cloneLayout(nextActive) : null,
+          activePaneId: nextActive?.panes[0]?.pane_id ?? null,
+          paneArchive: nextActive !== null ? seedArchive(nextActive.panes) : {},
+          paneArchiveBySlot:
+            nextActive !== null ? seedSlotArchive(nextActive.panes) : {},
+          dirty: false,
+          saving: false,
+          error: null,
+          draftRevision: state.draftRevision + 1,
+        };
+      });
       return true;
     } catch (err: unknown) {
-      if (isAuthStatusError(err)) {
-        set({ saving: false });
-        (onAuthError ?? authErrorHandler)?.(err.status, err.detail);
-        return false;
-      }
-      set({
-        saving: false,
-        error: err instanceof Error ? err.message : "Failed to delete layout",
-      });
+      handleCrudError(
+        err,
+        isStale,
+        set,
+        authErrorHandler,
+        onAuthError,
+        "Failed to delete layout",
+      );
       return false;
+    } finally {
+      finishCrudRequest(controller);
     }
   },
 
@@ -558,7 +797,8 @@ export const useLayoutStore = create<LayoutStoreState>((set, get) => ({
   },
 
   reset: () => {
-    set({
+    abortActiveCrud();
+    set((state) => ({
       layouts: [],
       activeLayout: null,
       activePaneId: null,
@@ -566,6 +806,9 @@ export const useLayoutStore = create<LayoutStoreState>((set, get) => ({
       saving: false,
       error: null,
       paneArchive: {},
-    });
+      paneArchiveBySlot: {},
+      sessionEpoch: state.sessionEpoch + 1,
+      draftRevision: state.draftRevision + 1,
+    }));
   },
 }));

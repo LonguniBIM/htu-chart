@@ -225,7 +225,7 @@ export function LayoutPicker({ onSelectLayout }: LayoutPickerProps) {
               <button
                 type="button"
                 className="terminal-button"
-                disabled={activeLayout === null || saving}
+                disabled={activeLayout === null || !dirty || saving}
                 onClick={() => void saveActiveLayout()}
               >
                 {saving ? "Saving..." : "Save"}

@@ -2347,10 +2347,16 @@ describe("App bootstrap and R03 503 recovery (P1-R3-03, P1-R3-04, P2-005)", () =
     });
     expect(useLayoutStore.getState().activeLayout?.id).toBe("layout-4-future");
 
+    // Save button is disabled while clean, then enabled after editing
+    const saveButton = screen.getByRole("button", { name: "Save" }) as HTMLButtonElement;
+    expect(saveButton.disabled).toBe(true);
+    fireEvent.click(screen.getByRole("switch", { name: "Sync Time" }));
+    expect(saveButton.disabled).toBe(false);
+
     // 403 during Save fails closed and clears session + store
     updateLayoutMock.mockRejectedValueOnce(new ApiError(403, "Invalid CSRF token"));
     await act(async () => {
-      fireEvent.click(screen.getByRole("button", { name: "Save" }));
+      fireEvent.click(saveButton);
       await flushMicrotasks();
     });
     expect(clearCsrfTokenMock).toHaveBeenCalledTimes(1);
@@ -2419,6 +2425,117 @@ describe("App bootstrap and R03 503 recovery (P1-R3-03, P1-R3-04, P2-005)", () =
     expect(useLayoutStore.getState().layouts).toEqual([]);
     expect(useLayoutStore.getState().activePaneId).toBeNull();
     expect(useLayoutStore.getState().dirty).toBe(false);
+  });
+
+  it("resolves missing Sim contracts when expanding a Live-only layout via setTemplate (P1-004, P2-003)", async () => {
+    /**
+     * Contract: When App bootstraps a Live-only layout (live_mode=true) and the user expands
+     * the template via LayoutPicker to create a Sim pane (live_mode=false), App's effect
+     * resolves fetchContracts(..., false, signal) while preserving existing Live contracts.
+     * Defect caught: Newly expanded Sim pane stuck Unresolved after template expansion.
+     */
+    const liveOnlyLayout: LayoutRecord = {
+      id: "layout-live-only",
+      name: "Live Single",
+      template_id: "1-single",
+      panes: [
+        {
+          pane_id: "pane-1",
+          root_symbol: "MES",
+          timeframe: "5m",
+          live_mode: true,
+          playback_mode: "live",
+        },
+      ],
+      sync_config: {
+        symbol: false,
+        interval: false,
+        crosshair: false,
+        time: false,
+        dateRange: false,
+      },
+      is_default: true,
+      created_at_utc: 1700000000,
+      updated_at_utc: 1700000000,
+    };
+
+    fetchSessionMock.mockResolvedValue({
+      authenticated: true,
+      csrf_token: "csrf-token-live-sim",
+    });
+    fetchStatusMock.mockResolvedValue({
+      connected: true,
+      live: true,
+      feed_state: "LIVE",
+    });
+    listLayoutsMock.mockResolvedValue([liveOnlyLayout]);
+    fetchContractsMock
+      .mockResolvedValueOnce({
+        live: true,
+        contracts: {
+          MES: { selected: { id: "CON.F.US.MES.LIVE" }, error_type: null, error: null },
+          MNQ: { selected: { id: "CON.F.US.MNQ.LIVE" }, error_type: null, error: null },
+          MYM: { selected: { id: "CON.F.US.MYM.LIVE" }, error_type: null, error: null },
+          MGC: { selected: { id: "CON.F.US.MGC.LIVE" }, error_type: null, error: null },
+        },
+      })
+      .mockResolvedValueOnce({
+        live: false,
+        contracts: {
+          MES: { selected: { id: "CON.F.US.MES.SIM" }, error_type: null, error: null },
+          MNQ: { selected: { id: "CON.F.US.MNQ.SIM" }, error_type: null, error: null },
+          MYM: { selected: { id: "CON.F.US.MYM.SIM" }, error_type: null, error: null },
+          MGC: { selected: { id: "CON.F.US.MGC.SIM" }, error_type: null, error: null },
+        },
+      });
+    fetchBarsMock.mockResolvedValue({
+      provider: "topstepx",
+      live: true,
+      contract_id: "CON.F.US.MES.LIVE",
+      root_symbol: "MES",
+      timeframe: "5m",
+      start_time: 1000,
+      end_time: 1000,
+      count: 0,
+      include_partial: true,
+      quality: {
+        is_complete: true,
+        truncated: false,
+        provider_gap: false,
+        quarantined_count: 0,
+      },
+      bars: [],
+    });
+
+    render(<App />);
+    await act(async () => {
+      await flushMicrotasks();
+    });
+
+    expect(fetchContractsMock).toHaveBeenCalledTimes(1);
+    expect(fetchContractsMock).toHaveBeenNthCalledWith(
+      1,
+      ["MES", "MNQ", "MYM", "MGC"],
+      true,
+      expect.any(AbortSignal),
+    );
+    expect(screen.getByText("CON.F.US.MES.LIVE")).toBeTruthy();
+
+    fireEvent.click(screen.getByRole("button", { name: "Layout picker" }));
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "2 Columns" }));
+      await flushMicrotasks();
+    });
+
+    expect(fetchContractsMock).toHaveBeenCalledTimes(2);
+    expect(fetchContractsMock).toHaveBeenNthCalledWith(
+      2,
+      ["MES", "MNQ", "MYM", "MGC"],
+      false,
+      expect.any(AbortSignal),
+    );
+    expect(screen.getByText("CON.F.US.MES.LIVE")).toBeTruthy();
+    expect(screen.getByText("CON.F.US.MNQ.SIM")).toBeTruthy();
   });
 });
 

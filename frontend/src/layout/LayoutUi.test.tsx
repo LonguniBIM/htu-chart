@@ -7,22 +7,28 @@ import { useLayoutStore } from "../store/layoutStore";
 import { LayoutPicker } from "./LayoutPicker";
 import { SyncControls } from "./SyncControls";
 
-const createLayoutMock = vi.fn<(payload: LayoutPayload) => Promise<LayoutRecord>>();
-const updateLayoutMock = vi.fn<
-  (layoutId: string, payload: LayoutPayload) => Promise<LayoutRecord>
+const createLayoutMock = vi.fn<
+  (payload: LayoutPayload, signal?: AbortSignal) => Promise<LayoutRecord>
 >();
-const deleteLayoutMock = vi.fn<(layoutId: string) => Promise<{ deleted: boolean; id: string }>>();
-const listLayoutsMock = vi.fn<() => Promise<LayoutRecord[]>>();
+const updateLayoutMock = vi.fn<
+  (layoutId: string, payload: LayoutPayload, signal?: AbortSignal) => Promise<LayoutRecord>
+>();
+const deleteLayoutMock = vi.fn<
+  (layoutId: string, signal?: AbortSignal) => Promise<{ deleted: boolean; id: string }>
+>();
+const listLayoutsMock = vi.fn<(signal?: AbortSignal) => Promise<LayoutRecord[]>>();
 
 vi.mock("../api/client", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../api/client")>();
   return {
     ...actual,
-    createLayout: (payload: LayoutPayload) => createLayoutMock(payload),
-    updateLayout: (layoutId: string, payload: LayoutPayload) =>
-      updateLayoutMock(layoutId, payload),
-    deleteLayout: (layoutId: string) => deleteLayoutMock(layoutId),
-    listLayouts: () => listLayoutsMock(),
+    createLayout: (payload: LayoutPayload, signal?: AbortSignal) =>
+      createLayoutMock(payload, signal),
+    updateLayout: (layoutId: string, payload: LayoutPayload, signal?: AbortSignal) =>
+      updateLayoutMock(layoutId, payload, signal),
+    deleteLayout: (layoutId: string, signal?: AbortSignal) =>
+      deleteLayoutMock(layoutId, signal),
+    listLayouts: (signal?: AbortSignal) => listLayoutsMock(signal),
   };
 });
 
@@ -130,7 +136,6 @@ describe("LayoutPicker and SyncControls UI (Phase 3 Part 2)", () => {
     };
 
     createLayoutMock.mockResolvedValueOnce(scalp);
-    updateLayoutMock.mockResolvedValueOnce(scalpRenamed);
     deleteLayoutMock
       .mockRejectedValueOnce(new ApiError(409, "Cannot delete the last remaining layout"))
       .mockResolvedValueOnce({ deleted: true, id: "layout-4-future" });
@@ -139,11 +144,28 @@ describe("LayoutPicker and SyncControls UI (Phase 3 Part 2)", () => {
     render(<LayoutPicker />);
     fireEvent.click(screen.getByRole("button", { name: "Layout picker" }));
 
-    // Only 1 layout -> Delete button is disabled
+    // Only 1 layout -> Delete button is disabled, Save is disabled while clean
     const deleteBaseBtn = screen.getByRole("button", { name: "Delete 4 Future" }) as HTMLButtonElement;
     expect(deleteBaseBtn.disabled).toBe(true);
+    const saveBtn = screen.getByRole("button", { name: "Save" }) as HTMLButtonElement;
+    expect(saveBtn.disabled).toBe(true);
 
-    // Save As "Scalp"
+    // Editing template marks dirty -> Save enables, and Save disables again after resolving
+    fireEvent.click(screen.getByRole("button", { name: "2 Columns" }));
+    expect(saveBtn.disabled).toBe(false);
+    const savedBase: LayoutRecord = {
+      ...base,
+      template_id: "2-cols",
+      panes: base.panes.slice(0, 2),
+    };
+    updateLayoutMock.mockResolvedValueOnce(savedBase);
+    await act(async () => {
+      fireEvent.click(saveBtn);
+    });
+    expect(updateLayoutMock).toHaveBeenCalledTimes(1);
+    expect(saveBtn.disabled).toBe(true);
+
+    // Save As "Scalp" (non-default)
     fireEvent.change(screen.getByLabelText("Save layout as"), {
       target: { value: "Scalp" },
     });
@@ -152,8 +174,10 @@ describe("LayoutPicker and SyncControls UI (Phase 3 Part 2)", () => {
     });
     expect(createLayoutMock).toHaveBeenCalledTimes(1);
     expect(useLayoutStore.getState().activeLayout?.name).toBe("Scalp");
+    expect(saveBtn.disabled).toBe(true);
 
     // Rename "Scalp" -> "Scalp V2"
+    updateLayoutMock.mockResolvedValueOnce(scalpRenamed);
     fireEvent.change(screen.getByLabelText("Rename layout"), {
       target: { value: "Scalp V2" },
     });
@@ -162,10 +186,32 @@ describe("LayoutPicker and SyncControls UI (Phase 3 Part 2)", () => {
     });
     expect(useLayoutStore.getState().activeLayout?.name).toBe("Scalp V2");
 
-    // Delete 409 surfaces inline alert
+    // Set Default on active non-default layout "Scalp V2"
+    const scalpDefault: LayoutRecord = { ...scalpRenamed, is_default: true };
+    updateLayoutMock.mockResolvedValueOnce(scalpDefault);
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Set Default" }));
+    });
+    expect(updateLayoutMock).toHaveBeenLastCalledWith(
+      "layout-scalp",
+      expect.objectContaining({ name: "Scalp V2", is_default: true }),
+      expect.any(AbortSignal),
+    );
+    expect(useLayoutStore.getState().activeLayout?.is_default).toBe(true);
+    expect(screen.getByText("Default", { selector: ".terminal-badge" })).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Set Default" })).toBeNull();
+
+    // Delete 409 surfaces inline alert, then successful Delete removes "4 Future"
     await act(async () => {
       fireEvent.click(screen.getByRole("button", { name: "Delete 4 Future" }));
     });
     expect(screen.getByRole("alert").textContent).toContain("409");
+
+    deleteLayoutMock.mockResolvedValueOnce({ deleted: true, id: "layout-4-future" });
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Delete 4 Future" }));
+    });
+    expect(screen.queryByRole("button", { name: "Delete 4 Future" })).toBeNull();
+    expect(useLayoutStore.getState().layouts).toHaveLength(1);
   });
 });
