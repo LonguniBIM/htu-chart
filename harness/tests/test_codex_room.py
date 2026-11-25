@@ -4374,18 +4374,30 @@ def test_codex_window_guard_secondary_snake_case_invalid_config_and_probe_timeou
     assert rc == 2
     assert _count_calls(calls) == 0
 
+    pid_file = tmp_path / "hung_probe.pid"
     hanging_script = tmp_path / "fake_codex_hang_probe.py"
     hang_prefix = _write_fake_codex_script(
         hanging_script,
-        "import time\ntime.sleep(30)\n",
+        (
+            "import os, pathlib, time\n"
+            f"pathlib.Path({str(pid_file)!r}).write_text(str(os.getpid()), encoding='utf-8')\n"
+            "time.sleep(60)\n"
+        ),
     )
     res = codex_room_review.probe_codex_rate_limits(
         hang_prefix,
         rt_root / "topstep-review-pass1",
-        init_timeout_sec=0.15,
-        read_timeout_sec=0.15,
+        init_timeout_sec=0.25,
+        read_timeout_sec=0.25,
     )
     assert res is None
+    hung_pid = int(pid_file.read_text(encoding="utf-8").strip())
+    import time as _time
+
+    deadline = _time.monotonic() + 1.5
+    while _is_pid_alive(hung_pid) and _time.monotonic() < deadline:
+        _time.sleep(0.05)
+    assert not _is_pid_alive(hung_pid)
 
 
 def test_g4_canary_prefix_with_attempts_or_packet_enforces_caps(
@@ -4687,6 +4699,333 @@ def test_g4_preflight_blocks_when_spent_plus_reserved_exceeds_budget(
     led_after = json.loads(ledger_path.read_text(encoding="utf-8"))
     assert led_after["state"] == "PAUSED_BUDGET"
     assert any(ev.get("kind") == "BUDGET_EXCEEDED_G4_PREFLIGHT" for ev in led_after["events"])
+
+
+def _is_pid_alive(pid: int) -> bool:
+    import ctypes
+
+    if os.name == "nt":
+        process_query_limited = 0x1000
+        still_active = 259
+        error_access_denied = 5
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        handle = k32.OpenProcess(process_query_limited, False, pid)
+        if not handle:
+            return ctypes.get_last_error() == error_access_denied
+        try:
+            exit_code = ctypes.c_ulong(0)
+            if not k32.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
+                return False
+            return exit_code.value == still_active
+        finally:
+            k32.CloseHandle(handle)
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+
+
+def test_codex_5h_allowlist_strips_nested_oauth_cookies_and_unknown_keys(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """codex-ratelimits-preflight.json allows only safe primitives and strips OAuth secrets."""
+    repo_dir, sha1 = _init_policy_repo(
+        tmp_path / "repo_allowlist", qualified_routes=["gemini-4-carbon-high"]
+    )
+    rt_root = tmp_path / "rt_allowlist"
+    (rt_root / "topstep-review-pass1").mkdir(parents=True)
+    fake_codex = tmp_path / "fake_codex_oauth_probe.py"
+    codex_prefix = _write_fake_codex_script(
+        fake_codex,
+        (
+            "import json, sys\n"
+            "if sys.argv[1:2] == ['app-server']:\n"
+            "    for raw in sys.stdin:\n"
+            "        raw = raw.strip()\n"
+            "        if not raw: continue\n"
+            "        msg = json.loads(raw)\n"
+            "        mid, method = msg.get('id'), msg.get('method')\n"
+            "        if method == 'initialize':\n"
+            "            print(json.dumps({'jsonrpc': '2.0', 'id': mid, 'result': {}}), "
+            "flush=True)\n"
+            "        elif method == 'account/rateLimits/read':\n"
+            "            res = {\n"
+            "                'access_token': 'secret-top-at',\n"
+            "                'cookies': 'secret-cookie-1',\n"
+            "                'rateLimits': {\n"
+            "                    'limitId': 'codex',\n"
+            "                    'accountId': 'secret-acct',\n"
+            "                    'accessToken': 'secret-camel-at',\n"
+            "                    'refresh_token': 'secret-rt',\n"
+            "                    'oauthToken': 'secret-oauth',\n"
+            "                    'primary': {'usedPercent': 92.5, 'resetsAt': 1795651200, "
+            "'refreshToken': 'secret-nested-rt'},\n"
+            "                    'secondary': {'usedPercent': 10.0, 'resetsAt': 1796000000},\n"
+            "                    'credits': {'hasCredits': True, 'unlimited': False, "
+            "'balance': '99', 'sessionKey': 'secret-cred'},\n"
+            "                },\n"
+            "            }\n"
+            "            print(json.dumps({'jsonrpc': '2.0', 'id': mid, 'result': res}), "
+            "flush=True)\n"
+            "    sys.exit(0)\n"
+            "sys.exit(1)\n"
+        ),
+    )
+    fake_agy = tmp_path / "fake_agy_allowlist.py"
+    agy_prefix = _write_fake_codex_script(
+        fake_agy,
+        (
+            "import json, sys\n"
+            "args = sys.argv[1:]\n"
+            "prompt = args[args.index('-p') + 1]\n"
+            "lens = 'security_and_invariants' if 'security_and_invariants' in prompt "
+            "else 'correctness_and_tests'\n"
+            f"payload = {{'revision_sha': {sha1!r}, 'lens': lens, 'verdict': 'APPROVE', "
+            "'summary': 'ok', 'findings': [], 'test_quality_issues': [], "
+            "'unverified_areas': []}\n"
+            "print(json.dumps({'event': 'result', "
+            "'result': {'status': 'SUCCESS', 'structured_output': payload}}), flush=True)\n"
+        ),
+    )
+    monkeypatch.setattr(
+        codex_room_review, "verify_role", lambda role, root: {"ok": True, "errors": []}
+    )
+    monkeypatch.setattr(codex_room_review, "resolve_codex_command", lambda: codex_prefix)
+    monkeypatch.setattr(codex_room_review, "resolve_agy_command", lambda: agy_prefix)
+
+    out_dir = tmp_path / "out_allowlist"
+    rc = codex_room_review.main(
+        [
+            "--commit",
+            sha1,
+            "--runtime-root",
+            str(rt_root),
+            "--repo-root",
+            str(repo_dir),
+            "--out-dir",
+            str(out_dir),
+            "--backend",
+            "auto",
+        ]
+    )
+    assert rc == 0
+    snap_raw = (out_dir / "codex-ratelimits-preflight.json").read_text(encoding="utf-8")
+    assert "secret-" not in snap_raw
+    for bad_key in (
+        "access_token",
+        "accessToken",
+        "refresh_token",
+        "refreshToken",
+        "oauthToken",
+        "cookies",
+        "accountId",
+        "sessionKey",
+        "balance",
+    ):
+        assert bad_key not in snap_raw
+    snap = json.loads(snap_raw)
+    assert set(snap.keys()) == {
+        "limitId",
+        "planType",
+        "ordinaryUsageAllowed",
+        "spendControlReached",
+        "rateLimitReachedType",
+        "primary",
+        "secondary",
+        "credits",
+    }
+    assert set(snap["primary"].keys()) == {"usedPercent", "windowDurationMins", "resetsAt"}
+    assert set(snap["credits"].keys()) == {"hasCredits", "unlimited"}
+
+
+def test_g4_hybrid_packet_cap_blocks_when_ledger_packet_lower_than_tracker(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Hybrid G4 blocks NEEDS_REPLAN when tracker packet rounds == 3 even if ledger has 0."""
+    from harness.scripts import task_runner
+
+    repo_dir, sha1 = _init_policy_repo(tmp_path / "repo_hybrid_pkt", qualified_routes=[])
+    pkt = repo_dir / "harness" / "runs" / "T-HYB-PKT" / "packet.md"
+    pkt.parent.mkdir(parents=True, exist_ok=True)
+    pkt.write_text("# Packet\n\n- **Root Task ID**: `T-HYB-PKT`\n- **Packet Version**: `1`\n")
+    epoch = task_runner.extract_packet_epoch(pkt)
+    assert epoch is not None
+
+    trk_path = task_runner.default_g4_tracker_path("T-HYB-PKT", repo_root=repo_dir)
+    trk = task_runner.load_g4_tracker(trk_path, task_id="T-HYB-PKT")
+    trk["completed_rounds"] = 3
+    trk["packet_rounds"][epoch] = 3
+    task_runner.save_g4_tracker(trk_path, trk)
+
+    (repo_dir / "app.py").write_text("x = 99\n", encoding="utf-8")
+    sha4 = _commit_repo_change(repo_dir, "cand4")
+    ledger_path = _setup_ledger_for_g4_test(
+        repo_dir,
+        "T-HYB-PKT",
+        state="REVIEW_FROZEN_G4",
+        candidate_sha=sha4,
+        g4_rounds_total=3,
+        g4_rounds_in_packet=0,
+    )
+    calls = _install_counting_codex_stub(tmp_path, monkeypatch, sha4)
+    out_dir = pkt.parent / "attempts" / f"r4-{sha4[:12]}"
+    rc = codex_room_review.main(
+        [
+            "--commit",
+            sha4,
+            "--task-id",
+            "T-HYB-PKT",
+            "--task-packet",
+            str(pkt),
+            "--ledger",
+            str(ledger_path),
+            "--repo-root",
+            str(repo_dir),
+            "--out-dir",
+            str(out_dir),
+            "--backend",
+            "codex",
+        ]
+    )
+    assert rc == 2
+    assert _count_calls(calls) == 0
+    assert not out_dir.exists()
+    led_after = json.loads(ledger_path.read_text(encoding="utf-8"))
+    assert led_after["state"] == "NEEDS_REPLAN"
+    assert any(ev.get("kind") == "G4_PACKET_CAP_REPLAN" for ev in led_after["events"])
+
+
+def test_g4_counter_only_sha_invocations_sum_across_trackers_and_block_resume(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Distinct counter-only sha_invocations sum across root/sibling and stay idempotent."""
+    from harness.scripts import task_runner
+
+    repo_dir, sha1 = _init_policy_repo(tmp_path / "repo_sha_gcounter", qualified_routes=[])
+    root_trk_path = task_runner.default_g4_tracker_path("ROOT-SHA", repo_root=repo_dir)
+    root_trk = task_runner.load_g4_tracker(root_trk_path, task_id="ROOT-SHA")
+    root_trk["completed_rounds"] = 1
+    root_trk["sha_invocations"][sha1] = 1
+    task_runner.save_g4_tracker(root_trk_path, root_trk)
+
+    c1_dir = repo_dir / "harness" / "runs" / "CHILD-S1"
+    c1_dir.mkdir(parents=True, exist_ok=True)
+    (c1_dir / "packet.md").write_text(
+        "# P\n\n- **Root Task ID**: `ROOT-SHA`\n", encoding="utf-8"
+    )
+    c1_trk = task_runner.load_g4_tracker(c1_dir / "g4-tracker.json", task_id="CHILD-S1")
+    c1_trk["completed_rounds"] = 1
+    c1_trk["sha_invocations"][sha1] = 1
+    task_runner.save_g4_tracker(c1_dir / "g4-tracker.json", c1_trk)
+
+    resume_dir = tmp_path / "prior_infra"
+    resume_dir.mkdir()
+    (resume_dir / "consolidated-review.json").write_text(
+        json.dumps({"revision_sha": sha1, "review_gate_status": "BLOCKED_INFRA"}),
+        encoding="utf-8",
+    )
+    c2_pkt = tmp_path / "c2_sha.md"
+    c2_pkt.write_text("# P\n\n- **Root Task ID**: `ROOT-SHA`\n", encoding="utf-8")
+
+    calls = _install_counting_codex_stub(tmp_path, monkeypatch, sha1)
+    for idx in (1, 2):
+        out_dir = (
+            repo_dir / "harness" / "runs" / "CHILD-S2" / "attempts" / f"r{idx}-{sha1[:12]}"
+        )
+        rc = codex_room_review.main(
+            [
+                "--commit",
+                sha1,
+                "--task-id",
+                "CHILD-S2",
+                "--task-packet",
+                str(c2_pkt),
+                "--resume-from",
+                str(resume_dir),
+                "--repo-root",
+                str(repo_dir),
+                "--out-dir",
+                str(out_dir),
+                "--backend",
+                "codex",
+            ]
+        )
+        assert rc == 2
+        assert _count_calls(calls) == 0
+        assert not out_dir.exists()
+
+    persisted = json.loads(root_trk_path.read_text(encoding="utf-8"))
+    assert persisted["sha_invocations"][sha1] == 2
+    assert persisted["completed_rounds"] == 2
+
+
+def test_g4_valid_json_wrong_field_type_tracker_fails_closed_no_artifacts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Valid-JSON tracker with malformed field types blocks G4 before creating artifacts."""
+    repo_dir, sha1 = _init_policy_repo(tmp_path / "repo_bad_type_trk", qualified_routes=[])
+    calls = _install_counting_codex_stub(tmp_path, monkeypatch, sha1)
+    root_trk = repo_dir / "harness" / "runs" / "ROOT-BT" / "g4-tracker.json"
+    root_trk.parent.mkdir(parents=True, exist_ok=True)
+    root_trk.write_text(
+        json.dumps({"schema_version": 1, "task_id": "ROOT-BT", "in_flight": ["x"]}),
+        encoding="utf-8",
+    )
+    out1 = repo_dir / "harness" / "runs" / "ROOT-BT" / "attempts" / f"r1-{sha1[:12]}"
+    rc1 = codex_room_review.main(
+        [
+            "--commit",
+            sha1,
+            "--task-id",
+            "ROOT-BT",
+            "--repo-root",
+            str(repo_dir),
+            "--out-dir",
+            str(out1),
+            "--backend",
+            "codex",
+        ]
+    )
+    assert rc1 == 2
+    assert _count_calls(calls) == 0
+    assert not out1.exists()
+
+    # Valid root tracker + wrong-type sibling tracker also fails closed.
+    root_trk.write_text(
+        json.dumps({"schema_version": 1, "task_id": "ROOT-BT", "completed_rounds": 0}),
+        encoding="utf-8",
+    )
+    sib_dir = repo_dir / "harness" / "runs" / "SIB-BT"
+    sib_dir.mkdir(parents=True, exist_ok=True)
+    (sib_dir / "packet.md").write_text("# P\n\n- **Root Task ID**: `ROOT-BT`\n")
+    (sib_dir / "g4-tracker.json").write_text(
+        json.dumps({"schema_version": 1, "task_id": "SIB-BT", "packet_rounds": []}),
+        encoding="utf-8",
+    )
+    child_pkt = tmp_path / "child_bt.md"
+    child_pkt.write_text("# P\n\n- **Root Task ID**: `ROOT-BT`\n")
+    out2 = repo_dir / "harness" / "runs" / "CHILD-BT" / "attempts" / f"r1-{sha1[:12]}"
+    rc2 = codex_room_review.main(
+        [
+            "--commit",
+            sha1,
+            "--task-id",
+            "CHILD-BT",
+            "--task-packet",
+            str(child_pkt),
+            "--repo-root",
+            str(repo_dir),
+            "--out-dir",
+            str(out2),
+            "--backend",
+            "codex",
+        ]
+    )
+    assert rc2 == 2
+    assert _count_calls(calls) == 0
+    assert not out2.exists()
+
 
 
 

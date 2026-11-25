@@ -2275,6 +2275,95 @@ def test_g5_receipt_blocks_corrupt_root_and_sibling_g4_tracker(tmp_path: Path) -
     assert any("sibling g4-tracker.json" in b for b in rec_sib["blockers"])
 
 
+def test_g5_receipt_blocks_hybrid_tracker_packet_cap_and_wrong_type_tracker(
+    tmp_path: Path,
+) -> None:
+    """G5 blocks when tracker packet rounds > 3 even with low-count ledger, or bad field type."""
+    from harness.scripts import receipt as receipt_mod
+    from harness.scripts import task_runner
+
+    cand_sha = "e" * 40
+    base_sha = "d" * 40
+    pkt = tmp_path / "harness" / "runs" / "T-HYB-G5" / "packet.md"
+    pkt.parent.mkdir(parents=True, exist_ok=True)
+    pkt.write_text("# P\n\n- **Root Task ID**: `T-HYB-G5`\n- **Packet Version**: `1`\n")
+    epoch = task_runner.extract_packet_epoch(pkt)
+    assert epoch is not None
+
+    trk_path = task_runner.default_g4_tracker_path("T-HYB-G5", repo_root=tmp_path)
+    trk = task_runner.load_g4_tracker(trk_path, task_id="T-HYB-G5")
+    trk["completed_rounds"] = 4
+    trk["packet_rounds"][epoch] = 4
+    task_runner.save_g4_tracker(trk_path, trk)
+
+    rec_hyb = receipt_mod.evaluate_receipt(
+        task_id="T-HYB-G5",
+        phase=1,
+        base_sha=base_sha,
+        candidate_sha=cand_sha,
+        verifier_data=_verifier(cand_sha),
+        review_data=_review(cand_sha),
+        repo_root=tmp_path,
+        packet_candidate=pkt,
+        ledger_data={
+            "schema_version": 1,
+            "root_task_id": "T-HYB-G5",
+            "task_id": "T-HYB-G5",
+            "state": "READY_FOR_ACCEPTANCE",
+            "candidate_sha": cand_sha,
+            "g4_rounds_total": 4,
+            "g4_rounds_in_packet": 1,
+            "candidates_in_packet": 1,
+            "total_candidates": 4,
+            "g4_invocations_by_sha": {cand_sha: 1},
+            "active_g4_reservations": {},
+        },
+        require_ledger=True,
+    )
+    assert rec_hyb["conclusion"] == "BLOCKED"
+    assert any("max_g4_rounds_per_packet_version" in b for b in rec_hyb["blockers"])
+
+    # Valid-JSON wrong-field-type tracker fails closed via receipt CLI too.
+    repo = tmp_path / "repo_g5_bad_type"
+    repo.mkdir()
+    root_dir = repo / "harness" / "runs" / "ROOT-G5BT"
+    root_dir.mkdir(parents=True, exist_ok=True)
+    (root_dir / "g4-tracker.json").write_text(
+        json.dumps({"schema_version": 1, "task_id": "ROOT-G5BT", "in_flight": ["x"]}),
+        encoding="utf-8",
+    )
+    v_path = tmp_path / "v_g5bt.json"
+    r_path = tmp_path / "r_g5bt.json"
+    v_path.write_text(json.dumps(_verifier(cand_sha)), encoding="utf-8")
+    r_path.write_text(json.dumps(_review(cand_sha)), encoding="utf-8")
+    out_bt = tmp_path / "out_g5bt"
+    rc_bt = receipt_mod.main(
+        [
+            "--task-id",
+            "ROOT-G5BT",
+            "--phase",
+            "1",
+            "--base-sha",
+            base_sha,
+            "--candidate-sha",
+            cand_sha,
+            "--verifier-json",
+            str(v_path),
+            "--review-json",
+            str(r_path),
+            "--repo-root",
+            str(repo),
+            "--out-dir",
+            str(out_bt),
+        ]
+    )
+    assert rc_bt == 2
+    assert json.loads((out_bt / "receipt.json").read_text(encoding="utf-8"))["conclusion"] == (
+        "BLOCKED"
+    )
+
+
+
 
 
 

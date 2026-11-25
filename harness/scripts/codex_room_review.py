@@ -636,21 +636,6 @@ def extract_max_transient_retries(policy: dict[str, Any] | None) -> int:
     return 1
 
 
-_SENSITIVE_RATE_LIMIT_KEYS = frozenset(
-    {
-        "accountid",
-        "account_id",
-        "email",
-        "userid",
-        "user_id",
-        "token",
-        "oauth",
-        "cookie",
-        "session",
-    }
-)
-
-
 def extract_codex_window_guard_config(
     policy: dict[str, Any] | None,
 ) -> tuple[bool, float, str | None]:
@@ -701,19 +686,6 @@ def extract_codex_window_guard_config(
         threshold = float(raw_pct)
 
     return enabled, threshold, None
-
-
-def _strip_sensitive_rate_limit_keys(val: Any) -> Any:
-    if isinstance(val, dict):
-        cleaned: dict[str, Any] = {}
-        for k, v in val.items():
-            if str(k).strip().lower() in _SENSITIVE_RATE_LIMIT_KEYS:
-                continue
-            cleaned[str(k)] = _strip_sensitive_rate_limit_keys(v)
-        return cleaned
-    if isinstance(val, list):
-        return [_strip_sensitive_rate_limit_keys(item) for item in val]
-    return val
 
 
 def probe_codex_rate_limits(
@@ -862,12 +834,28 @@ def _parse_rl_pct(val: Any) -> float | None:
     return f_val if math.isfinite(f_val) else None
 
 
+def _parse_rl_int(val: Any) -> int | None:
+    return int(val) if is_strict_int(val) else None
+
+
+def _build_rl_window_snapshot(win: Any) -> dict[str, Any] | None:
+    if not isinstance(win, dict):
+        return None
+    return {
+        "usedPercent": _parse_rl_pct(_rl_field(win, "usedPercent", "used_percent")),
+        "windowDurationMins": _parse_rl_int(
+            _rl_field(win, "windowDurationMins", "window_duration_mins")
+        ),
+        "resetsAt": _parse_rl_int(_rl_field(win, "resetsAt", "resets_at")),
+    }
+
+
 def evaluate_codex_window_exhaustion(
     rate_limits_result: dict[str, Any] | None,
     *,
     threshold_pct: float = 90.0,
 ) -> tuple[bool, str | None, dict[str, Any] | None]:
-    """Evaluate Codex 5h/secondary window limits and strip PII from preflight snapshot."""
+    """Evaluate Codex 5h/secondary window limits and build allowlisted preflight snapshot."""
     if not isinstance(rate_limits_result, dict):
         return False, None, None
     by_id = _rl_field(rate_limits_result, "rateLimitsByLimitId", "rate_limits_by_limit_id")
@@ -881,13 +869,12 @@ def evaluate_codex_window_exhaustion(
     if not isinstance(bucket, dict):
         return False, None, None
 
-    sanitized = _strip_sensitive_rate_limit_keys(bucket)
     primary = bucket.get("primary")
     secondary = bucket.get("secondary")
     primary_used = _parse_rl_pct(_rl_field(primary, "usedPercent", "used_percent"))
-    primary_resets = _rl_field(primary, "resetsAt", "resets_at")
+    primary_resets = _parse_rl_int(_rl_field(primary, "resetsAt", "resets_at"))
     secondary_used = _parse_rl_pct(_rl_field(secondary, "usedPercent", "used_percent"))
-    secondary_resets = _rl_field(secondary, "resetsAt", "resets_at")
+    secondary_resets = _parse_rl_int(_rl_field(secondary, "resetsAt", "resets_at"))
     rate_limit_type = _rl_field(bucket, "rateLimitReachedType", "rate_limit_reached_type")
     if rate_limit_type is None:
         rate_limit_type = _rl_field(
@@ -903,8 +890,35 @@ def evaluate_codex_window_exhaustion(
         ordinary_allowed = _rl_field(
             rate_limits_result, "ordinaryUsageAllowed", "ordinary_usage_allowed"
         )
-    if ordinary_allowed is not None:
-        sanitized["ordinaryUsageAllowed"] = ordinary_allowed
+
+    raw_limit_id = _rl_field(bucket, "limitId", "limit_id")
+    raw_plan_type = _rl_field(bucket, "planType", "plan_type")
+    raw_credits = bucket.get("credits")
+    credits_snap: dict[str, Any] | None = None
+    if isinstance(raw_credits, dict):
+        raw_has = _rl_field(raw_credits, "hasCredits", "has_credits")
+        raw_unlim = _rl_field(raw_credits, "unlimited", "unlimited")
+        credits_snap = {
+            "hasCredits": raw_has if isinstance(raw_has, bool) else None,
+            "unlimited": raw_unlim if isinstance(raw_unlim, bool) else None,
+        }
+    clean_rlt = (
+        rate_limit_type.strip()
+        if isinstance(rate_limit_type, str) and rate_limit_type.strip()
+        else None
+    )
+    sanitized: dict[str, Any] = {
+        "limitId": raw_limit_id if isinstance(raw_limit_id, str) and raw_limit_id else "codex",
+        "planType": raw_plan_type if isinstance(raw_plan_type, str) else None,
+        "ordinaryUsageAllowed": (
+            ordinary_allowed if isinstance(ordinary_allowed, bool) else None
+        ),
+        "spendControlReached": spend_reached if isinstance(spend_reached, bool) else None,
+        "rateLimitReachedType": clean_rlt,
+        "primary": _build_rl_window_snapshot(primary),
+        "secondary": _build_rl_window_snapshot(secondary),
+        "credits": credits_snap,
+    }
 
     if primary_used is not None and primary_used >= threshold_pct:
         reason = (
@@ -2249,18 +2263,28 @@ def _preflight_g4_caps(
             return 2, None, None
 
         g4_pkt = int(ledger.get("g4_rounds_in_packet", 0))
-        if g4_pkt >= l_max_pkt:
+        tracker_pkt = (
+            task_runner.count_tracker_packet_rounds(tracker, packet_epoch)
+            if packet_epoch is not None
+            else 0
+        )
+        effective_pkt = max(g4_pkt, tracker_pkt)
+        if effective_pkt >= l_max_pkt:
             if ledger_in_flight == 0 and ledger["state"] not in {"PAUSED_BUDGET", "VERIFIED"}:
                 ledger["state"] = "NEEDS_REPLAN"
                 task_runner._append_event(
                     ledger,
                     "G4_PACKET_CAP_REPLAN",
-                    {"g4_rounds_in_packet": g4_pkt, "cap": l_max_pkt},
+                    {
+                        "g4_rounds_in_packet": g4_pkt,
+                        "tracker_packet_rounds": tracker_pkt,
+                        "cap": l_max_pkt,
+                    },
                 )
                 task_runner.save_ledger(ledger_path, ledger)
             print(
                 f"[codex_room_review] NEEDS_REPLAN: G4 packet cap reached "
-                f"(packet_rounds={g4_pkt}, cap={l_max_pkt}).",
+                f"(ledger={g4_pkt}, tracker={tracker_pkt}, cap={l_max_pkt}).",
                 file=sys.stderr,
             )
             return 2, None, None
@@ -2626,7 +2650,27 @@ def _record_g4_outcome(
     def _update_locked() -> str | None:
         prior_sha_statuses: set[str] = set()
         if tracker_path is not None:
-            tracker = task_runner.load_g4_tracker(tracker_path)
+            try:
+                tracker = task_runner.load_g4_tracker(tracker_path)
+            except (OSError, UnicodeDecodeError, ValueError, json.JSONDecodeError) as exc:
+                err_msg = f"Corrupt g4-tracker.json at {tracker_path}: {exc}"
+                report["review_gate_status"] = "BLOCKED"
+                report.setdefault("errors", []).append(err_msg)
+                if ledger_path is not None and ledger_path.is_file():
+                    ledger = task_runner.load_ledger(ledger_path, repo_root=git_top)
+                    if reservation_id is not None:
+                        ledger.setdefault("active_g4_reservations", {}).pop(
+                            reservation_id, None
+                        )
+                    ledger["state"] = "BLOCKED"
+                    ledger["last_g4_candidate_sha"] = candidate_sha
+                    ledger["last_g4_status"] = "BLOCKED"
+                    task_runner._append_event(
+                        ledger, "G4_TRACKER_CORRUPT_BLOCKED", {"error": err_msg}
+                    )
+                    task_runner.save_ledger(ledger_path, ledger)
+                    return "BLOCKED"
+                return None
             prior_union = task_runner.collect_g4_attempt_union(
                 attempt_roots, tracker, candidate_sha=candidate_sha
             )
@@ -2812,8 +2856,11 @@ def _release_g4_reservation_on_abort(
 
     def _release_locked() -> None:
         if tracker_path is not None and tracker_path.is_file():
-            tracker = task_runner.load_g4_tracker(tracker_path)
-            if reservation_id in tracker.get("in_flight", {}):
+            try:
+                tracker = task_runner.load_g4_tracker(tracker_path)
+            except (OSError, UnicodeDecodeError, ValueError, json.JSONDecodeError):
+                tracker = None
+            if tracker is not None and reservation_id in tracker.get("in_flight", {}):
                 entry = tracker["in_flight"].pop(reservation_id, None)
                 raw_out = entry.get("out_dir") if isinstance(entry, dict) else None
                 if raw_out:

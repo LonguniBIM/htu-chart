@@ -1320,5 +1320,89 @@ def test_packet_epoch_discover_child_runs_and_merge_packet_rounds(tmp_path: Path
     assert task_runner.count_tracker_packet_rounds(merged, e1) == 4
 
 
+def test_merge_g4_trackers_idempotent_gcounter_and_rejects_corrupt_types(
+    tmp_path: Path,
+) -> None:
+    """CRDT GCounter merges counter-only rounds/packets/SHAs idempotently; bad types raise."""
+    pkt = tmp_path / "p_idemp.md"
+    pkt.write_text("# P\n\n- **Packet Version**: `1`\n", encoding="utf-8")
+    epoch = task_runner.extract_packet_epoch(pkt)
+    assert epoch is not None
+    sha1 = "a" * 40
+    sha2 = "b" * 40
+
+    root = task_runner.load_g4_tracker(tmp_path / "root_trk.json", task_id="ROOT")
+    root["completed_rounds"] = 2
+    root["packet_rounds"][epoch] = 2
+    root["sha_invocations"][sha1] = 1
+
+    child = task_runner.load_g4_tracker(tmp_path / "child_trk.json", task_id="CHILD-V1")
+    child["completed_rounds"] = 1
+    child["packet_rounds"][epoch] = 1
+    child["sha_invocations"][sha1] = 1
+    child["sha_invocations"][sha2] = 1
+
+    m1 = task_runner.merge_g4_trackers(root, child)
+    assert m1 is not None
+    assert m1["completed_rounds"] == 3
+    assert m1["packet_rounds"][epoch] == 3
+    assert m1["sha_invocations"][sha1] == 2
+    assert m1["sha_invocations"][sha2] == 1
+
+    m2 = task_runner.merge_g4_trackers(m1, child)
+    m3 = task_runner.merge_g4_trackers(m2, child)
+    assert m2 == m1 and m3 == m1
+
+    # Valid-JSON wrong-type fields must raise ValueError instead of being reset to {}.
+    for bad_payload in (
+        {"schema_version": 1, "task_id": "ROOT", "in_flight": ["x"]},
+        {"schema_version": 1, "task_id": "ROOT", "packet_rounds": []},
+        {"schema_version": 1, "task_id": "ROOT", "sha_invocations": {sha1: True}},
+        {"schema_version": 1, "task_id": "", "completed_rounds": 0},
+        {"schema_version": True, "task_id": "ROOT"},
+    ):
+        bad_path = tmp_path / "bad_trk.json"
+        bad_path.write_text(json.dumps(bad_payload), encoding="utf-8")
+        with pytest.raises(ValueError):
+            task_runner.load_g4_tracker(bad_path)
+
+    # record_replan refuses corrupt g4-tracker.json fail-closed.
+    replan_repo = tmp_path / "replan_repo"
+    replan_repo.mkdir()
+    _, pkt1, _ = _setup_repo_with_valid_packet(replan_repo, packet_version=1)
+    pkt2_text = pkt1.read_text(encoding="utf-8").replace(
+        "- **Packet Version**: `1`", "- **Packet Version**: `2`"
+    )
+    pkt2 = tmp_path / "replan_pkt_v2.md"
+    pkt2.write_text(pkt2_text, encoding="utf-8")
+    r2 = tmp_path / "replan_r2.json"
+    assert (
+        brief_gate.main(
+            ["--packet", str(pkt2), "--repo-root", str(replan_repo), "--out", str(r2)]
+        )
+        == 0
+    )
+    led_path = replan_repo / "harness" / "runs" / "T-RUN-01" / "ledger.json"
+    base_sha = _git(replan_repo, "rev-parse", "HEAD")
+    task_runner.init_or_load_ledger(
+        led_path, root_task_id="T-RUN-01", base_sha=base_sha, budget_usd=6.0
+    )
+    trk_path = task_runner.default_g4_tracker_path("T-RUN-01", repo_root=replan_repo)
+    trk_path.write_text(
+        json.dumps({"schema_version": 1, "task_id": "T-RUN-01", "in_flight": ["x"]}),
+        encoding="utf-8",
+    )
+    _, rc_rep, msg_rep = task_runner.record_replan(
+        led_path,
+        r2,
+        packet_path=pkt2,
+        human_approved=True,
+        repo_root=replan_repo,
+    )
+    assert rc_rep == 2
+    assert "corrupt g4-tracker.json" in msg_rep
+
+
+
 
 

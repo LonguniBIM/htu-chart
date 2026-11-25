@@ -587,21 +587,22 @@ def _evaluate_ledger_and_attempts(
             f"max_g4_invocations_per_candidate_sha ({max_g4_sha})."
         )
 
+    eff_packet = packet_candidate or (
+        active_root / "harness" / "runs" / task_id / "packet.md"
+    )
+    packet_epoch = task_runner.extract_packet_epoch(eff_packet)
+    pkt_rounds = task_runner.count_tracker_packet_rounds(effective_tracker, packet_epoch)
+    if packet_epoch is not None and pkt_rounds > max_g4_pkt:
+        blockers.append(
+            f"Packet G4 rounds ({pkt_rounds}) exceed "
+            f"max_g4_rounds_per_packet_version ({max_g4_pkt})."
+        )
+
     if require_ledger and ledger_data is None:
         blockers.append("Missing required ledger.json for G5 verification.")
         return blockers
 
     if ledger_data is None:
-        eff_packet = packet_candidate or (
-            active_root / "harness" / "runs" / task_id / "packet.md"
-        )
-        packet_epoch = task_runner.extract_packet_epoch(eff_packet)
-        pkt_rounds = task_runner.count_tracker_packet_rounds(effective_tracker, packet_epoch)
-        if packet_epoch is not None and pkt_rounds > max_g4_pkt:
-            blockers.append(
-                f"Packet G4 rounds ({pkt_rounds}) exceed "
-                f"max_g4_rounds_per_packet_version ({max_g4_pkt})."
-            )
         return blockers
 
     state = ledger_data.get("state")

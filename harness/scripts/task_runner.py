@@ -229,21 +229,24 @@ def collect_g4_attempt_union(
                     sha_statuses[norm_dir] = "IN_PROGRESS"
 
     seeded_legacy = 0
-    if isinstance(tracker, dict):
-        raw_comp = int(tracker.get("completed_rounds", 0))
-        seeded_legacy = max(0, raw_comp - len(native_tracker_round_dirs))
-
     seeded_sha = 0
-    if candidate_sha and isinstance(tracker, dict) and not sha_dirs:
-        sha_map = tracker.get("sha_invocations", {})
-        if isinstance(sha_map, dict):
-            seeded_sha = int(sha_map.get(candidate_sha, 0))
+    if isinstance(tracker, dict):
+        imp_rounds = _extract_legacy_rounds_by_source(tracker)
+        seeded_legacy = sum(imp_rounds.values())
+        if candidate_sha:
+            imp_sha = _extract_legacy_nested_by_source(
+                tracker,
+                imported_key="imported_legacy_sha",
+                counts_key="sha_invocations",
+                keyed_fn=_keyed_tracker_sha_dirs,
+            )
+            seeded_sha = sum(sub.get(candidate_sha, 0) for sub in imp_sha.values())
 
     return {
         "round_dirs": round_dirs,
         "total_rounds": len(round_dirs) + seeded_legacy,
         "sha_dirs": sha_dirs,
-        "sha_count": max(len(sha_dirs), seeded_sha),
+        "sha_count": len(sha_dirs) + seeded_sha,
         "sha_statuses": sha_statuses,
         "discovered_entries": discovered_entries,
     }
@@ -605,20 +608,57 @@ def load_g4_tracker(tracker_path: Path, *, task_id: str = "") -> dict[str, Any]:
         if not isinstance(loaded, dict):
             raise ValueError(f"Invalid g4-tracker payload at {resolved}")
         data = loaded
-    data.setdefault("schema_version", 1)
-    if task_id:
-        data.setdefault("task_id", task_id)
-    data.setdefault("completed_rounds", 0)
-    if not isinstance(data.get("sha_invocations"), dict):
-        data["sha_invocations"] = {}
-    if not isinstance(data.get("in_flight"), dict):
-        data["in_flight"] = {}
-    if not isinstance(data.get("completed_attempts"), dict):
-        data["completed_attempts"] = {}
-    if not isinstance(data.get("attempts"), dict):
-        data["attempts"] = {}
-    if not isinstance(data.get("packet_rounds"), dict):
-        data["packet_rounds"] = {}
+
+    if "schema_version" not in data:
+        data["schema_version"] = 1
+    elif not is_strict_int(data["schema_version"]) or data["schema_version"] < 1:
+        raise ValueError(f"Invalid 'schema_version' in g4-tracker at {resolved}.")
+
+    if "task_id" not in data:
+        if task_id:
+            data["task_id"] = _validate_safe_task_id(task_id, "task_id")
+    else:
+        raw_tid = data["task_id"]
+        if not isinstance(raw_tid, str) or not raw_tid.strip():
+            raise ValueError(f"Invalid 'task_id' in g4-tracker at {resolved}.")
+        _validate_safe_task_id(raw_tid, "task_id")
+
+    if "completed_rounds" not in data:
+        data["completed_rounds"] = 0
+    elif not is_strict_int(data["completed_rounds"]) or data["completed_rounds"] < 0:
+        raise ValueError(f"Invalid 'completed_rounds' in g4-tracker at {resolved}.")
+
+    entry_map_keys = ("in_flight", "completed_attempts", "attempts")
+    count_map_keys = ("sha_invocations", "packet_rounds", "imported_legacy_rounds")
+    nested_map_keys = ("imported_legacy_packets", "imported_legacy_sha")
+    for key in (*entry_map_keys, *count_map_keys, *nested_map_keys):
+        if key not in data:
+            data[key] = {}
+        elif not isinstance(data[key], dict):
+            raise ValueError(f"Invalid {key!r} in g4-tracker at {resolved}: expected dict.")
+
+    for key in entry_map_keys:
+        for k, v in data[key].items():
+            if not isinstance(k, str) or not isinstance(v, dict):
+                raise ValueError(f"Invalid entry under {key!r} in g4-tracker at {resolved}.")
+
+    for key in count_map_keys:
+        for k, v in data[key].items():
+            if not isinstance(k, str) or not k or not is_strict_int(v) or v < 0:
+                raise ValueError(f"Invalid counter under {key!r} in g4-tracker at {resolved}.")
+
+    for key in nested_map_keys:
+        for src_k, sub in data[key].items():
+            if not isinstance(src_k, str) or not src_k or not isinstance(sub, dict):
+                raise ValueError(f"Invalid source map under {key!r} at {resolved}.")
+            for sub_k, sub_v in sub.items():
+                if (
+                    not isinstance(sub_k, str)
+                    or not sub_k
+                    or not is_strict_int(sub_v)
+                    or sub_v < 0
+                ):
+                    raise ValueError(f"Invalid counter under {key!r}[{src_k!r}] at {resolved}.")
     return data
 
 
@@ -699,11 +739,83 @@ def count_tracker_packet_rounds(
     return len(round_dirs) + max(0, legacy_raw - native_count)
 
 
+def _tracker_source_id(tracker: dict[str, Any]) -> str:
+    tid = tracker.get("task_id")
+    return tid.strip() if isinstance(tid, str) and tid.strip() else "_anon"
+
+
+def _keyed_tracker_sha_dirs(tracker: dict[str, Any], candidate_sha: str) -> set[str]:
+    keyed: set[str] = set()
+    for raw_out, ent in (tracker.get("completed_attempts") or {}).items():
+        if isinstance(ent, dict) and ent.get("candidate_sha") == candidate_sha:
+            keyed.add(_norm_attempt_dir(raw_out))
+    for res_id, ent in (tracker.get("attempts") or {}).items():
+        if isinstance(ent, dict) and ent.get("candidate_sha") == candidate_sha:
+            raw_out = ent.get("out_dir")
+            keyed.add(_norm_attempt_dir(raw_out) if raw_out else f"attempt:{res_id}")
+    for res_id, ent in (tracker.get("in_flight") or {}).items():
+        if isinstance(ent, dict) and ent.get("candidate_sha") == candidate_sha:
+            raw_out = ent.get("out_dir")
+            keyed.add(_norm_attempt_dir(raw_out) if raw_out else f"in-flight:{res_id}")
+    return keyed
+
+
+def _extract_legacy_rounds_by_source(tracker: dict[str, Any]) -> dict[str, int]:
+    src = _tracker_source_id(tracker)
+    imp: dict[str, int] = {}
+    raw_imp = tracker.get("imported_legacy_rounds") or {}
+    if isinstance(raw_imp, dict):
+        for k, v in raw_imp.items():
+            if is_strict_int(v) and v >= 0:
+                imp[str(k)] = int(v)
+    other_sum = sum(v for k, v in imp.items() if k != src)
+    raw_comp = tracker.get("completed_rounds", 0)
+    comp_val = int(raw_comp) if is_strict_int(raw_comp) and raw_comp >= 0 else 0
+    own_legacy = max(0, comp_val - len(_native_tracker_round_dirs(tracker)) - other_sum)
+    if own_legacy > 0 or src in imp:
+        imp[src] = max(imp.get(src, 0), own_legacy)
+    return imp
+
+
+def _extract_legacy_nested_by_source(
+    tracker: dict[str, Any],
+    *,
+    imported_key: str,
+    counts_key: str,
+    keyed_fn: Any,
+) -> dict[str, dict[str, int]]:
+    src = _tracker_source_id(tracker)
+    imp: dict[str, dict[str, int]] = {}
+    raw_imp = tracker.get(imported_key) or {}
+    if isinstance(raw_imp, dict):
+        for s_id, sub in raw_imp.items():
+            if isinstance(sub, dict):
+                imp[str(s_id)] = {
+                    str(k): int(v)
+                    for k, v in sub.items()
+                    if is_strict_int(v) and v >= 0
+                }
+    counts_map = tracker.get(counts_key) or {}
+    if isinstance(counts_map, dict):
+        for item_key, total_val in counts_map.items():
+            if not is_strict_int(total_val) or total_val < 0:
+                continue
+            k_str = str(item_key)
+            other_sum = sum(
+                sub.get(k_str, 0) for s_id, sub in imp.items() if s_id != src
+            )
+            own_legacy = max(0, int(total_val) - len(keyed_fn(tracker, k_str)) - other_sum)
+            if own_legacy > 0 or (src in imp and k_str in imp[src]):
+                src_map = imp.setdefault(src, {})
+                src_map[k_str] = max(src_map.get(k_str, 0), own_legacy)
+    return imp
+
+
 def merge_g4_trackers(
     base_tracker: dict[str, Any] | None,
     extra_tracker: dict[str, Any] | None,
 ) -> dict[str, Any] | None:
-    """Merge a child task's ``g4-tracker.json`` into the root tracker for union checks."""
+    """Merge ``extra_tracker`` into ``base_tracker`` idempotently (CRDT GCounter + set union)."""
     if extra_tracker is None:
         return base_tracker
     if base_tracker is None:
@@ -715,24 +827,51 @@ def merge_g4_trackers(
         if isinstance(dst, dict) and isinstance(src, dict):
             for k, v in src.items():
                 dst.setdefault(k, v)
-    sha_dst = merged.setdefault("sha_invocations", {})
-    sha_src = extra_tracker.get("sha_invocations", {})
-    if isinstance(sha_dst, dict) and isinstance(sha_src, dict):
-        for sha_k, cnt in sha_src.items():
-            sha_dst[sha_k] = max(int(sha_dst.get(sha_k, 0)), int(cnt or 0))
-    base_legacy = max(
-        0,
-        int(base_tracker.get("completed_rounds", 0))
-        - len(_native_tracker_round_dirs(base_tracker)),
-    )
-    extra_legacy = max(
-        0,
-        int(extra_tracker.get("completed_rounds", 0))
-        - len(_native_tracker_round_dirs(extra_tracker)),
-    )
+
+    b_imp_rounds = _extract_legacy_rounds_by_source(base_tracker)
+    e_imp_rounds = _extract_legacy_rounds_by_source(extra_tracker)
+    merged_imp_rounds: dict[str, int] = {}
+    for s_id in sorted(set(b_imp_rounds) | set(e_imp_rounds)):
+        val = max(b_imp_rounds.get(s_id, 0), e_imp_rounds.get(s_id, 0))
+        if val > 0:
+            merged_imp_rounds[s_id] = val
+    merged["imported_legacy_rounds"] = merged_imp_rounds
     merged["completed_rounds"] = (
-        len(_native_tracker_round_dirs(merged)) + base_legacy + extra_legacy
+        len(_native_tracker_round_dirs(merged)) + sum(merged_imp_rounds.values())
     )
+
+    def _merge_nested_legacy(
+        imported_key: str, counts_key: str, keyed_fn: Any
+    ) -> dict[str, dict[str, int]]:
+        b_nested = _extract_legacy_nested_by_source(
+            base_tracker,
+            imported_key=imported_key,
+            counts_key=counts_key,
+            keyed_fn=keyed_fn,
+        )
+        e_nested = _extract_legacy_nested_by_source(
+            extra_tracker,
+            imported_key=imported_key,
+            counts_key=counts_key,
+            keyed_fn=keyed_fn,
+        )
+        merged_nested: dict[str, dict[str, int]] = {}
+        for s_id in sorted(set(b_nested) | set(e_nested)):
+            b_sub = b_nested.get(s_id, {})
+            e_sub = e_nested.get(s_id, {})
+            sub_out: dict[str, int] = {}
+            for k_str in sorted(set(b_sub) | set(e_sub)):
+                val = max(b_sub.get(k_str, 0), e_sub.get(k_str, 0))
+                if val > 0:
+                    sub_out[k_str] = val
+            if sub_out:
+                merged_nested[s_id] = sub_out
+        return merged_nested
+
+    merged_imp_packets = _merge_nested_legacy(
+        "imported_legacy_packets", "packet_rounds", _native_tracker_packet_round_dirs
+    )
+    merged["imported_legacy_packets"] = merged_imp_packets
     all_epochs: set[str] = set()
     for trk in (base_tracker, extra_tracker, merged):
         pkt_map = trk.get("packet_rounds")
@@ -744,22 +883,36 @@ def merge_g4_trackers(
                 for ent in sec_map.values():
                     if isinstance(ent, dict) and isinstance(ent.get("packet_epoch"), str):
                         all_epochs.add(ent["packet_epoch"])
-    merged_pkt: dict[str, int] = {}
-    base_pkt = base_tracker.get("packet_rounds") or {}
-    extra_pkt = extra_tracker.get("packet_rounds") or {}
-    for ep in sorted(all_epochs):
-        b_leg = max(
-            0,
-            (int(base_pkt.get(ep, 0)) if isinstance(base_pkt, dict) else 0)
-            - len(_native_tracker_packet_round_dirs(base_tracker, ep)),
-        )
-        e_leg = max(
-            0,
-            (int(extra_pkt.get(ep, 0)) if isinstance(extra_pkt, dict) else 0)
-            - len(_native_tracker_packet_round_dirs(extra_tracker, ep)),
-        )
-        merged_pkt[ep] = len(_native_tracker_packet_round_dirs(merged, ep)) + b_leg + e_leg
-    merged["packet_rounds"] = merged_pkt
+    for sub in merged_imp_packets.values():
+        all_epochs.update(sub.keys())
+    merged["packet_rounds"] = {
+        ep: len(_native_tracker_packet_round_dirs(merged, ep))
+        + sum(sub.get(ep, 0) for sub in merged_imp_packets.values())
+        for ep in sorted(all_epochs)
+    }
+
+    merged_imp_sha = _merge_nested_legacy(
+        "imported_legacy_sha", "sha_invocations", _keyed_tracker_sha_dirs
+    )
+    merged["imported_legacy_sha"] = merged_imp_sha
+    all_shas: set[str] = set()
+    for trk in (base_tracker, extra_tracker, merged):
+        sha_map = trk.get("sha_invocations")
+        if isinstance(sha_map, dict):
+            all_shas.update(str(k) for k in sha_map)
+        for sec in ("completed_attempts", "attempts", "in_flight"):
+            sec_map = trk.get(sec)
+            if isinstance(sec_map, dict):
+                for ent in sec_map.values():
+                    if isinstance(ent, dict) and isinstance(ent.get("candidate_sha"), str):
+                        all_shas.add(ent["candidate_sha"])
+    for sub in merged_imp_sha.values():
+        all_shas.update(sub.keys())
+    merged["sha_invocations"] = {
+        sha: len(_keyed_tracker_sha_dirs(merged, sha))
+        + sum(sub.get(sha, 0) for sub in merged_imp_sha.values())
+        for sha in sorted(all_shas)
+    }
     return merged
 
 
@@ -2007,8 +2160,15 @@ def record_replan(
                 )
             for cand_t in tracker_candidates:
                 if cand_t.is_file():
-                    t_data = _read_optional_json_dict(cand_t)
-                    if isinstance(t_data, dict) and t_data.get("in_flight"):
+                    try:
+                        t_data = load_g4_tracker(cand_t)
+                    except (OSError, UnicodeDecodeError, ValueError, json.JSONDecodeError) as exc:
+                        return (
+                            ledger,
+                            2,
+                            f"Refusing replan: corrupt g4-tracker.json at {cand_t}: {exc}",
+                        )
+                    if t_data.get("in_flight"):
                         in_flight_g4 = True
                         break
         if in_flight_g4:
