@@ -6815,6 +6815,189 @@ def test_codex_room_review_raises_timeouts_50pct_and_caps_agy_idle(
     )
 
 
+def test_g4_new_candidate_sha_passes_after_prior_sha_changes_requested(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """New candidate sha2 returning PASSED after sha1 CHANGES_REQUESTED reaches acceptance."""
+    import hashlib
+    from harness.scripts import task_runner
+
+    repo_dir, base_sha = _init_policy_repo(tmp_path / "repo_sha1_cr_sha2_pass")
+    (repo_dir / "app.py").write_text("x = 1\n", encoding="utf-8")
+    sha1 = _commit_repo_change(repo_dir, "candidate sha1")
+
+    pkt_path = tmp_path / "packet.md"
+    pkt_path.write_text("# Task Packet\n", encoding="utf-8")
+    readiness_path = tmp_path / "readiness.json"
+    readiness_path.write_text(
+        json.dumps(
+            {
+                "status": "VALID",
+                "root_task_id": "T-CR-TO-PASS",
+                "packet_version": 1,
+                "packet_path": str(pkt_path),
+                "packet_sha256": hashlib.sha256(pkt_path.read_bytes()).hexdigest(),
+                "base_sha": base_sha,
+                "owned_paths": ["app.py"],
+                "denied_paths": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    led_path = tmp_path / "ledger_cr_to_pass.json"
+    led = task_runner.init_or_load_ledger(
+        led_path, root_task_id="T-CR-TO-PASS", base_sha=base_sha, budget_usd=6.0
+    )
+    led["state"] = "REVIEW_FROZEN_G4"
+    led["candidate_sha"] = sha1
+    task_runner.save_ledger(led_path, led)
+
+    target_sha: dict[str, str] = {"val": sha1}
+    emit_cr: dict[str, bool] = {"val": True}
+
+    def _stub_codex_pass(**kwargs: Any) -> dict[str, Any]:
+        csha = target_sha["val"]
+        assert csha in str(kwargs["prompt_text"])
+        pname = str(kwargs["pass_name"])
+        lens = "security_and_invariants" if pname == "pass2" else "correctness_and_tests"
+        if emit_cr["val"] and pname == "pass1":
+            return _sample_pass(
+                csha,
+                lens,
+                verdict="CHANGES_REQUESTED",
+                findings=[_sample_finding("P1-1", "medium", "Fix candidate sha1")],
+            )
+        return _sample_pass(csha, lens)
+
+    monkeypatch.setattr(
+        codex_room_review, "verify_role", lambda role, root, **_kw: {"ok": True, "errors": []}
+    )
+    monkeypatch.setattr(codex_room_review, "resolve_codex_command", lambda: ["codex"])
+    monkeypatch.setattr(codex_room_review, "probe_codex_rate_limits", lambda *a, **kw: None)
+    monkeypatch.setattr(codex_room_review, "_run_codex_pass", _stub_codex_pass)
+
+    # Round 1: sha1 receives CHANGES_REQUESTED.
+    rc1 = codex_room_review.main(
+        [
+            "--commit",
+            sha1,
+            "--task-id",
+            "T-CR-TO-PASS",
+            "--ledger",
+            str(led_path),
+            "--repo-root",
+            str(repo_dir),
+            "--out-dir",
+            str(tmp_path / "out_r1_sha1"),
+            "--backend",
+            "codex",
+            "--fail-on-blocking",
+        ]
+    )
+    assert rc1 == 1
+    led_r1 = task_runner.load_ledger(led_path)
+    assert led_r1["state"] == "ACTIVE_PEER_G1"
+    assert led_r1["last_g4_candidate_sha"] == sha1
+    assert led_r1["last_g4_status"] == "CHANGES_REQUESTED"
+
+    # Commit sha2 and advance ledger cleanly: CANDIDATE_READY -> G3 PASSED -> REVIEW_FROZEN_G4.
+    (repo_dir / "app.py").write_text("x = 2\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(repo_dir), "add", "app.py"], check=True, capture_output=True)
+    subprocess.run(
+        ["git", "-C", str(repo_dir), "commit", "-m", "candidate sha2"],
+        check=True,
+        capture_output=True,
+    )
+    sha2 = subprocess.check_output(
+        ["git", "-C", str(repo_dir), "rev-parse", "HEAD"], text=True
+    ).strip()
+    sig, led_g3_wait, rc_peer = task_runner.record_peer_outcome(
+        led_path,
+        signal="CANDIDATE_READY",
+        candidate_sha=sha2,
+        readiness_path=readiness_path,
+        packet_path=pkt_path,
+        base_sha=base_sha,
+        repo_root=repo_dir,
+    )
+    assert sig == "CANDIDATE_READY"
+    assert rc_peer == 0
+    assert led_g3_wait["state"] == "VERIFY_FROZEN_G3"
+
+    led_g4_wait, rc_g3 = task_runner.record_gate_outcome(
+        led_path, gate="G3", outcome="PASSED", candidate_sha=sha2
+    )
+    assert rc_g3 == 0
+    assert led_g4_wait["state"] == "REVIEW_FROZEN_G4"
+    assert led_g4_wait["candidate_sha"] == sha2
+
+    # Round 2: new sha2 returns APPROVE on both passes -> READY_FOR_ACCEPTANCE.
+    target_sha["val"] = sha2
+    emit_cr["val"] = False
+    rc2 = codex_room_review.main(
+        [
+            "--commit",
+            sha2,
+            "--task-id",
+            "T-CR-TO-PASS",
+            "--ledger",
+            str(led_path),
+            "--repo-root",
+            str(repo_dir),
+            "--out-dir",
+            str(tmp_path / "out_r2_sha2"),
+            "--backend",
+            "codex",
+            "--fail-on-blocking",
+        ]
+    )
+    assert rc2 == 0
+    led_after = task_runner.load_ledger(led_path)
+    assert led_after["state"] == "READY_FOR_ACCEPTANCE"
+    assert led_after["candidate_sha"] == sha2
+    assert led_after["last_g4_candidate_sha"] == sha2
+    assert led_after["last_g4_status"] == "PASSED"
+    assert "G4_BLOCKED_PRIOR_CHANGES_REQUESTED" not in [
+        e["kind"] for e in led_after["events"]
+    ]
+
+    # Re-evaluating the same sha1 after CHANGES_REQUESTED still fails closed (BLOCKED).
+    led_same_path = _setup_ledger_for_g4_test(
+        repo_dir,
+        "T-SAME-SHA-CR",
+        state="REVIEW_FROZEN_G4",
+        candidate_sha=sha1,
+        last_g4_candidate_sha=sha1,
+        last_g4_status="CHANGES_REQUESTED",
+    )
+    target_sha["val"] = sha1
+    rc_same = codex_room_review.main(
+        [
+            "--commit",
+            sha1,
+            "--task-id",
+            "T-SAME-SHA-CR",
+            "--ledger",
+            str(led_same_path),
+            "--repo-root",
+            str(repo_dir),
+            "--out-dir",
+            str(tmp_path / "out_same_sha1"),
+            "--backend",
+            "codex",
+            "--fail-on-blocking",
+        ]
+    )
+    led_same = task_runner.load_ledger(led_same_path)
+    assert rc_same == 2
+    assert led_same["state"] == "BLOCKED"
+    assert "G4_BLOCKED_PRIOR_CHANGES_REQUESTED" in [
+        e["kind"] for e in led_same["events"]
+    ]
+
+
+
 
 
 

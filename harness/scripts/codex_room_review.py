@@ -2559,7 +2559,6 @@ def _preflight_g4_caps(
             "reserved_at_utc": now_iso,
         }
         inv_map[candidate_sha] = sha_count + 1
-        ledger["last_g4_candidate_sha"] = candidate_sha
         task_runner._append_event(
             ledger,
             "G4_INVOCATION_RESERVED",
