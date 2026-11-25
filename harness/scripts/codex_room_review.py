@@ -2533,18 +2533,7 @@ def _preflight_g4_caps(
             )
             return 2, None, None
 
-        slot_meta = {
-            "candidate_sha": candidate_sha,
-            "out_dir": norm_out,
-            "pid": os.getpid(),
-            "reserved_at_utc": now_iso,
-        }
-        if packet_epoch is not None:
-            slot_meta["packet_epoch"] = packet_epoch
-        tracker["in_flight"][reservation_id] = slot_meta
-        tracker["sha_invocations"][candidate_sha] = sha_count + 1
-        task_runner.save_g4_tracker(tracker_path, tracker)
-
+        orig_ledger_bytes = ledger_path.read_bytes()
         active_g4 = ledger.setdefault("active_g4_reservations", {})
         active_g4[reservation_id] = {
             "candidate_sha": candidate_sha,
@@ -2561,7 +2550,37 @@ def _preflight_g4_caps(
             "G4_INVOCATION_RESERVED",
             {"candidate_sha": candidate_sha, "invocation": sha_count + 1},
         )
-        task_runner.save_ledger(ledger_path, ledger)
+        try:
+            task_runner.save_ledger(ledger_path, ledger)
+        except OSError as exc:
+            print(
+                f"[codex_room_review] BLOCKED: Failed to save ledger G4 reservation: {exc}",
+                file=sys.stderr,
+            )
+            return 2, None, None
+
+        slot_meta = {
+            "candidate_sha": candidate_sha,
+            "out_dir": norm_out,
+            "pid": os.getpid(),
+            "reserved_at_utc": now_iso,
+        }
+        if packet_epoch is not None:
+            slot_meta["packet_epoch"] = packet_epoch
+        tracker["in_flight"][reservation_id] = slot_meta
+        tracker["sha_invocations"][candidate_sha] = sha_count + 1
+        try:
+            task_runner.save_g4_tracker(tracker_path, tracker)
+        except OSError as exc:
+            try:
+                task_runner._atomic_write_bytes(ledger_path, orig_ledger_bytes)
+            except OSError:
+                pass
+            print(
+                f"[codex_room_review] BLOCKED: Failed to save tracker G4 reservation: {exc}",
+                file=sys.stderr,
+            )
+            return 2, None, None
         return None, tracker_path, reservation_id
 
     with task_runner._ledger_lock(tracker_path):
@@ -3168,6 +3187,7 @@ def _release_g4_reservation_on_abort(
     active_model: str | None = None,
     primary_model: str | None = None,
     route_models_by_tag: dict[str, str] | None = None,
+    owns_lock: bool = True,
 ) -> None:
     """Reconcile unbilled raw spend and release G4 reservation on abnormal exit."""
     if not reservation_id:
@@ -3206,7 +3226,7 @@ def _release_g4_reservation_on_abort(
                 p: PassState(pass_name=p, lens=lens) for p, lens in PASS_LENS_MAP.items()
             }
             bill_entries: list[dict[str, Any]] = []
-            if eff_out_dir is not None and eff_out_dir.is_dir():
+            if owns_lock and eff_out_dir is not None and eff_out_dir.is_dir():
                 bill_entries, _ = _plan_raw_log_billing(
                     out_dir=eff_out_dir,
                     states=eff_states,
@@ -3217,8 +3237,8 @@ def _release_g4_reservation_on_abort(
                     route_models_by_tag=dict(route_models_by_tag or {}),
                 )
 
-            if has_ledger_res or _has_unbilled_entries(ledger, bill_entries):
-                if bill_entries:
+            if has_ledger_res or (owns_lock and _has_unbilled_entries(ledger, bill_entries)):
+                if owns_lock and bill_entries:
                     _apply_bill_entries_in_memory(ledger, bill_entries)
                 res_meta = active.pop(reservation_id, None) if has_ledger_res else None
                 spent = float(ledger.get("spent_api_equiv_usd", 0.0))
@@ -3265,11 +3285,12 @@ def _release_g4_reservation_on_abort(
                     "out_dir": norm_out,
                     "completed_at_utc": completed_at,
                 }
-                tracker.setdefault("completed_attempts", {})[norm_out] = {
-                    "candidate_sha": candidate_sha,
-                    "status": "ABORTED",
-                    "completed_at_utc": completed_at,
-                }
+                if owns_lock:
+                    tracker.setdefault("completed_attempts", {})[norm_out] = {
+                        "candidate_sha": candidate_sha,
+                        "status": "ABORTED",
+                        "completed_at_utc": completed_at,
+                    }
             task_runner.save_g4_tracker(tracker_path, tracker)
 
     if tracker_path is not None:
@@ -3426,6 +3447,7 @@ def main(argv: list[str] | None = None) -> int:
         "active_model": args.model,
         "primary_model": args.model,
         "route_models_by_tag": {},
+        "owns_lock": False,
     }
 
     def _run_after_preflight() -> int:
@@ -3467,6 +3489,7 @@ def main(argv: list[str] | None = None) -> int:
             active_model=abort_ctx["active_model"],
             primary_model=abort_ctx["primary_model"],
             route_models_by_tag=abort_ctx["route_models_by_tag"],
+            owns_lock=bool(abort_ctx["owns_lock"]),
         )
 
 
@@ -3516,6 +3539,8 @@ def _execute_after_preflight(
             file=sys.stderr,
         )
         return 2
+    if abort_ctx is not None:
+        abort_ctx["owns_lock"] = True
 
     if args.consolidate_only:
         p1_path, p2_path = args.consolidate_only
@@ -4229,6 +4254,11 @@ def _execute_after_preflight(
                     and p_state.payload
                     and p_state.payload.get("verdict") != "BLOCKED"
                 ):
+                    actual_tag = _archive_pass_logs(out_dir, p_name, "codex-completed")
+                    route_models_by_tag[actual_tag] = (
+                        p_state.model or primary_model or EXPECTED_REVIEW_MODEL
+                    )
+                    prior_unreused_findings[p_name] = dict(p_state.payload)
                     p_state.is_complete = False
 
         candidate_routes = (

@@ -1497,10 +1497,11 @@ def test_run_review_gate_step_outer_timeout_handles_late_quota_and_sequential_ag
             repo_root=repo_scale,
             ledger={"deadlines_sec": {"reviewer_pass_total": 600, "reviewer_pass_idle": 180}},
         )
-    assert seen_timeouts == [pytest.approx(4920.0)]
+    assert seen_timeouts == [pytest.approx(6120.0)]
 
-    # 2. Live integration: reviewer_pass_total=1 (margin=0.5s; old 2*1+0.5=2.5s would fail),
-    # Codex hits quota after 0.85s, followed by two sequential 0.85s AGY passes (~2.7s+).
+    # 2. Live integration: reviewer_pass_total=1 (new 6.5s ceiling vs 5.5s old ceiling):
+    # Codex hits transient -> quota (2 * 0.85s), and both sequential AGY passes hit
+    # transient -> success (4 * 0.85s), exceeding 5.5s wall clock while finishing < 6.5s.
     repo_dir = tmp_path / "repo_live_timeout"
     repo_dir.mkdir(parents=True)
     _git(repo_dir, "init")
@@ -1548,33 +1549,53 @@ def test_run_review_gate_step_outer_timeout_handles_late_quota_and_sequential_ag
             encoding="utf-8",
         )
 
+    codex_state_dir = tmp_path / "codex_retry_state"
+    codex_state_dir.mkdir(parents=True)
     codex_py = tmp_path / "codex_stub.py"
     codex_py.write_text(
         (
-            "import sys, time\n"
+            "import pathlib, sys, time\n"
             "if sys.argv[1:2] == ['app-server']:\n"
             "    sys.exit(0)\n"
+            "args = sys.argv[1:]\n"
+            "out_name = pathlib.Path(args[args.index('-o') + 1]).stem\n"
             "_ = sys.stdin.read()\n"
-            "time.sleep(0.85)\n"
-            "sys.stderr.write('error: usage_limit_reached 429\\n')\n"
+            f"sf = pathlib.Path({str(codex_state_dir)!r}) / (out_name + '.cnt')\n"
+            "n = int(sf.read_text()) + 1 if sf.is_file() else 1\n"
+            "sf.write_text(str(n))\n"
+            "time.sleep(0.75)\n"
+            "if n == 1:\n"
+            "    sys.stderr.write('error: temporary network connection reset\\n')\n"
+            "else:\n"
+            "    sys.stderr.write('error: usage_limit_reached 429\\n')\n"
             "sys.exit(1)\n"
         ),
         encoding="utf-8",
     )
+    agy_state_dir = tmp_path / "agy_retry_state"
+    agy_state_dir.mkdir(parents=True)
     agy_py = tmp_path / "agy_stub.py"
     agy_py.write_text(
         (
-            "import json, sys, time\n"
+            "import json, pathlib, sys, time\n"
             "args = sys.argv[1:]\n"
             "prompt = args[args.index('-p') + 1]\n"
             "lens = 'security_and_invariants' if 'security_and_invariants' in prompt "
             "else 'correctness_and_tests'\n"
-            "time.sleep(0.85)\n"
+            f"sf = pathlib.Path({str(agy_state_dir)!r}) / (lens + '.cnt')\n"
+            "n = int(sf.read_text()) + 1 if sf.is_file() else 1\n"
+            "sf.write_text(str(n))\n"
+            "time.sleep(0.75)\n"
+            "if n == 1:\n"
+            "    sys.stderr.write('error: temporary network connection reset\\n')\n"
+            "    sys.exit(1)\n"
             f"payload = {{'revision_sha': {sha!r}, 'lens': lens, 'verdict': 'APPROVE', "
             "'summary': 'agy ok', 'findings': [], 'test_quality_issues': [], "
             "'unverified_areas': []}\n"
-            "print(json.dumps({'event': 'result', "
-            "'result': {'status': 'SUCCESS', 'structured_output': payload}}), flush=True)\n"
+            "print(json.dumps({'event': 'result', 'result': {'status': 'SUCCESS', "
+            "'model': 'gemini-4-carbon-high', "
+            "'usage': {'input_tokens': 4000, 'output_tokens': 800}, "
+            "'structured_output': payload}}), flush=True)\n"
         ),
         encoding="utf-8",
     )
@@ -1630,8 +1651,11 @@ def test_run_review_gate_step_outer_timeout_handles_late_quota_and_sequential_ag
         ledger=ledger,
         ledger_path=ledger_path,
     )
-    assert seen_live_timeouts == [pytest.approx(5.5)]
+    assert seen_live_timeouts == [pytest.approx(6.5)]
     assert proc.returncode == 0, f"stderr={proc.stderr}\nstdout={proc.stdout}"
+    led_after = task_runner.load_ledger(ledger_path)
+    assert led_after["active_g4_reservations"] == {}
+    assert led_after["spent_api_equiv_usd"] == pytest.approx(0.044)
 
 
 

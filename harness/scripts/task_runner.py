@@ -1289,9 +1289,27 @@ def run_review_gate_step(
         )
     if effective_ledger is not None:
         cmd.extend(["--ledger", str(effective_ledger)])
+    cb_cfg = ledger.get("circuit_breakers") if isinstance(ledger, dict) else None
+    raw_retries = (
+        cb_cfg.get("max_transient_retries_per_provider_pass")
+        if isinstance(cb_cfg, dict)
+        else None
+    )
+    if is_strict_int(raw_retries):
+        max_retries = max(0, int(raw_retries))
+    else:
+        max_retries = max(
+            0,
+            int(
+                load_circuit_breakers(repo_root=root).get(
+                    "max_transient_retries_per_provider_pass", 1
+                )
+            ),
+        )
+    attempts_per_pass = 1 + max_retries
     n_routes = _count_qualified_reviewer_routes(root)
     margin = min(120.0, max(0.5, float(pass_total) * 0.2))
-    outer_timeout = float(pass_total * (2 + 3 * n_routes) + margin)
+    outer_timeout = float(pass_total * attempts_per_pass * (1 + 2 * n_routes) + margin)
     return run_managed_stage_cmd(
         "reviewer_pass_total",
         cmd,

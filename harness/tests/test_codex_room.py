@@ -5747,7 +5747,7 @@ def test_g4_agy_malformed_pass1_usage_classifies_blocked_and_bills_pass2(
     assert rep["review_gate_status"] == "BLOCKED"
     led = json.loads(ledger_path.read_text(encoding="utf-8"))
     assert led["state"] == "BLOCKED"
-    assert led["spent_api_equiv_usd"] > 0.0
+    assert led["spent_api_equiv_usd"] == pytest.approx(0.0275)
 
 
 def test_g4_agy_alias_model_bills_via_route_and_unpriceable_model_blocks(
@@ -5798,7 +5798,9 @@ def test_g4_agy_alias_model_bills_via_route_and_unpriceable_model_blocks(
         ]
     )
     assert rc_ok == 0
-    assert json.loads(led_ok.read_text(encoding="utf-8"))["spent_api_equiv_usd"] > 0.0
+    assert json.loads(led_ok.read_text(encoding="utf-8"))["spent_api_equiv_usd"] == pytest.approx(
+        0.044
+    )
 
     # Unpriceable event + route model fails closed (rc=2, BLOCKED).
     led_bad = _setup_ledger_for_g4_test(
@@ -6087,9 +6089,12 @@ def test_g4_atomic_billing_saves_ledger_before_tracker_and_reconciles_on_abort(
     orig_save_tracker = task_runner.save_g4_tracker
     outcome_save_failed = False
     tracker_statuses_written: list[str] = []
+    saved_spent_snapshots: list[float] = []
 
     def _faulty_save_ledger(path: Path, data: dict[str, Any]) -> None:
         nonlocal outcome_save_failed
+        if path.resolve() == ledger_path.resolve():
+            saved_spent_snapshots.append(float(data.get("spent_api_equiv_usd", 0.0)))
         if (
             not outcome_save_failed
             and path.resolve() == ledger_path.resolve()
@@ -6126,6 +6131,8 @@ def test_g4_atomic_billing_saves_ledger_before_tracker_and_reconciles_on_abort(
 
     assert outcome_save_failed is True
     assert "PASSED" not in tracker_statuses_written
+    assert 2.5 not in [round(v, 4) for v in saved_spent_snapshots]
+    assert all(round(v, 4) in (0.0, 5.0) for v in saved_spent_snapshots)
     ledger = task_runner.load_ledger(ledger_path)
     tracker = task_runner.load_g4_tracker(
         task_runner.default_g4_tracker_path("T-G4-ATOMIC-BILL", repo_root=repo_dir)
@@ -6141,7 +6148,7 @@ def test_g4_atomic_billing_saves_ledger_before_tracker_and_reconciles_on_abort(
 def test_g4_output_write_failure_cleans_partial_json_and_bills_once(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """PermissionError on consolidated-review.md cleans .json, returns 2, and bills once."""
+    """PermissionError mid-write on consolidated-review.md cleans both files & bills $5.00."""
     from harness.scripts import task_runner
 
     repo_dir, sha1 = _init_policy_repo(tmp_path / "repo_out_err", qualified_routes=[])
@@ -6152,13 +6159,36 @@ def test_g4_output_write_failure_cleans_partial_json_and_bills_once(
     out_dir = tmp_path / "out_write_err"
     norm_out = task_runner._norm_attempt_dir(out_dir)
     orig_path_open = Path.open
+    md_created_before_error = False
 
-    def _deny_md_open(self: Path, mode: str = "r", *args: Any, **kwargs: Any) -> Any:
+    class _PartialFailWriter:
+        def __init__(self, fh: Any) -> None:
+            self._fh = fh
+
+        def __enter__(self) -> _PartialFailWriter:
+            self._fh.__enter__()
+            return self
+
+        def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> Any:
+            return self._fh.__exit__(exc_type, exc, tb)
+
+        def write(self, data: str) -> int:
+            nonlocal md_created_before_error
+            self._fh.write(data[:16])
+            self._fh.flush()
+            md_created_before_error = True
+            raise PermissionError("simulated mid-write PermissionError")
+
+        def __getattr__(self, name: str) -> Any:
+            return getattr(self._fh, name)
+
+    def _deny_md_mid_write(self: Path, mode: str = "r", *args: Any, **kwargs: Any) -> Any:
+        fh = orig_path_open(self, mode, *args, **kwargs)
         if self.name == "consolidated-review.md" and "x" in mode:
-            raise PermissionError("simulated markdown output PermissionError")
-        return orig_path_open(self, mode, *args, **kwargs)
+            return _PartialFailWriter(fh)
+        return fh
 
-    monkeypatch.setattr(Path, "open", _deny_md_open)
+    monkeypatch.setattr(Path, "open", _deny_md_mid_write)
     rc = codex_room_review.main(
         [
             "--commit",
@@ -6174,21 +6204,320 @@ def test_g4_output_write_failure_cleans_partial_json_and_bills_once(
         ]
     )
 
-    expected_usd = 2.0 * task_runner.compute_usage_cost_usd(
-        "gpt-6.1-sol", input_tokens=1_000_000
-    )
     ledger = task_runner.load_ledger(ledger_path)
     tracker = task_runner.load_g4_tracker(
         task_runner.default_g4_tracker_path("T-G4-OUT-ERR", repo_root=repo_dir)
     )
     assert rc == 2
+    assert md_created_before_error is True
     assert not (out_dir / "consolidated-review.json").exists()
     assert not (out_dir / "consolidated-review.md").exists()
-    assert ledger["spent_api_equiv_usd"] == pytest.approx(expected_usd)
+    assert ledger["spent_api_equiv_usd"] == pytest.approx(5.0)
     assert ledger["active_g4_reservations"] == {}
     assert ledger["state"] == "BLOCKED"
     assert tracker["in_flight"] == {}
     assert tracker["completed_attempts"][norm_out]["status"] == "BLOCKED"
+
+
+def test_g4_codex_pass1_to_agy_fallback_archives_logs_and_preserves_findings(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """When pass1 succeeds on Codex before pass2 hits quota, AGY preserves logs + findings."""
+    from harness.scripts import task_runner
+
+    repo_dir, sha1 = _init_policy_repo(
+        tmp_path / "repo_p1_preserve", qualified_routes=["gemini-4-carbon-high"]
+    )
+    ledger_path = _setup_ledger_for_g4_test(
+        repo_dir,
+        "T-P1-PRESERVE",
+        state="BLOCKED_INFRA",
+        candidate_sha=sha1,
+        last_g4_candidate_sha=sha1,
+        last_g4_status="BLOCKED_INFRA",
+        g4_invocations_by_sha={sha1: 1},
+    )
+    prior_dir = tmp_path / "prior_blocked_infra"
+    prior_dir.mkdir(parents=True)
+    (prior_dir / "consolidated-review.json").write_text(
+        json.dumps(
+            {
+                "revision_sha": sha1,
+                "review_gate_status": "BLOCKED_INFRA",
+                "consolidated_findings": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    (prior_dir / "pass1.json").write_text(
+        json.dumps(
+            {
+                "revision_sha": sha1,
+                "lens": "correctness_and_tests",
+                "verdict": "CHANGES_REQUESTED",
+                "summary": "prior pass1 finding",
+                "findings": [
+                    {
+                        "id": "P1-OLD",
+                        "severity": "high",
+                        "category": "bug",
+                        "file": "app.py",
+                        "line_start": 1,
+                        "line_end": 2,
+                        "title": "Prior finding",
+                        "behavior_affected": "old",
+                        "trigger_condition": "old",
+                        "evidence": "old",
+                        "verification_method": "old",
+                        "plan_ref": "R03",
+                    }
+                ],
+                "test_quality_issues": [],
+                "unverified_areas": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    codex_script = tmp_path / "fake_codex_p1_preserve.py"
+    codex_prefix = _write_fake_codex_script(
+        codex_script,
+        (
+            "import json, pathlib, sys\n"
+            "if sys.argv[1:2] == ['app-server']:\n"
+            "    sys.exit(1)\n"
+            "args = sys.argv[1:]\n"
+            "out_path = pathlib.Path(args[args.index('-o') + 1])\n"
+            "prompt = sys.stdin.read()\n"
+            "if 'security_and_invariants' in prompt:\n"
+            "    sys.stderr.write('error: usage_limit_reached 429\\n')\n"
+            "    sys.exit(1)\n"
+            f"payload = {{'revision_sha': {sha1!r}, 'lens': 'correctness_and_tests', "
+            "'verdict': 'CHANGES_REQUESTED', 'summary': 'codex pass1', "
+            "'findings': [{'id': 'P1-NEW-CODEX', 'severity': 'high', "
+            "'category': 'bug', 'file': 'app.py', 'line_start': 3, 'line_end': 4, "
+            "'title': 'Codex new finding', 'behavior_affected': 'b', "
+            "'trigger_condition': 't', 'evidence': 'e', 'verification_method': 'v', "
+            "'plan_ref': 'R03'}], 'test_quality_issues': [], 'unverified_areas': []}\n"
+            "out_path.write_text(json.dumps(payload), encoding='utf-8')\n"
+            "print(json.dumps({'type': 'turn.completed', 'usage': "
+            "{'input_tokens': 1000000, 'cached_input_tokens': 0, "
+            "'output_tokens': 0}}), flush=True)\n"
+        ),
+    )
+    agy_script = tmp_path / "fake_agy_p1_preserve.py"
+    agy_prefix = _write_fake_codex_script(
+        agy_script,
+        (
+            "import json, sys\n"
+            "args = sys.argv[1:]\n"
+            "prompt = args[args.index('-p') + 1]\n"
+            "lens = 'security_and_invariants' if 'security_and_invariants' in prompt "
+            "else 'correctness_and_tests'\n"
+            f"payload = {{'revision_sha': {sha1!r}, 'lens': lens, 'verdict': 'APPROVE', "
+            "'summary': 'agy ok', 'findings': [], 'test_quality_issues': [], "
+            "'unverified_areas': []}\n"
+            "print(json.dumps({'event': 'result', 'result': {'status': 'SUCCESS', "
+            "'model': 'gemini-4-carbon-high', "
+            "'usage': {'input_tokens': 4000, 'output_tokens': 800}, "
+            "'structured_output': payload}}), flush=True)\n"
+        ),
+    )
+
+    monkeypatch.setattr(
+        codex_room_review, "verify_role", lambda role, root: {"ok": True, "errors": []}
+    )
+    monkeypatch.setattr(codex_room_review, "resolve_codex_command", lambda: codex_prefix)
+    monkeypatch.setattr(codex_room_review, "resolve_agy_command", lambda: agy_prefix)
+
+    out_dir = tmp_path / "out_p1_preserve"
+    rc = codex_room_review.main(
+        [
+            "--commit",
+            sha1,
+            "--task-id",
+            "T-P1-PRESERVE",
+            "--resume-from",
+            str(prior_dir),
+            "--out-dir",
+            str(out_dir),
+            "--repo-root",
+            str(repo_dir),
+            "--backend",
+            "auto",
+            "--fail-on-blocking",
+        ]
+    )
+
+    report = json.loads((out_dir / "consolidated-review.json").read_text(encoding="utf-8"))
+    finding_ids = {
+        sid
+        for f in report.get("consolidated_findings", [])
+        for sid in [f.get("id"), *(f.get("source_ids") or [])]
+        if isinstance(sid, str)
+    }
+    ledger = task_runner.load_ledger(ledger_path)
+    assert rc == 1
+    assert {"P1-OLD", "P1-NEW-CODEX"} <= finding_ids
+    assert (out_dir / "pass1.codex-completed.raw.jsonl").is_file()
+    assert ledger["spent_api_equiv_usd"] == pytest.approx(2.544)
+
+
+def test_g4_preflight_reservation_rolls_back_on_ledger_or_tracker_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Preflight save_ledger failure leaves tracker clean; tracker failure rolls back ledger."""
+    from harness.scripts import task_runner
+
+    repo_dir, sha1 = _init_policy_repo(tmp_path / "repo_preflight_rb", qualified_routes=[])
+    _install_counting_codex_stub(tmp_path, monkeypatch, sha1)
+    ledger_path = _setup_ledger_for_g4_test(
+        repo_dir, "T-PRE-RB", state="REVIEW_FROZEN_G4", candidate_sha=sha1
+    )
+    tracker_path = task_runner.default_g4_tracker_path("T-PRE-RB", repo_root=repo_dir)
+
+    orig_save_ledger = task_runner.save_ledger
+    orig_save_tracker = task_runner.save_g4_tracker
+    fail_mode = "ledger"
+
+    def _faulty_save_ledger(path: Path, data: dict[str, Any]) -> None:
+        if fail_mode == "ledger" and path.resolve() == ledger_path.resolve():
+            raise PermissionError("simulated preflight save_ledger PermissionError")
+        orig_save_ledger(path, data)
+
+    def _faulty_save_tracker(path: Path, data: dict[str, Any]) -> None:
+        if (
+            fail_mode == "tracker"
+            and path.resolve() == tracker_path.resolve()
+            and data.get("in_flight")
+        ):
+            raise PermissionError("simulated preflight save_g4_tracker PermissionError")
+        orig_save_tracker(path, data)
+
+    monkeypatch.setattr(task_runner, "save_ledger", _faulty_save_ledger)
+    monkeypatch.setattr(task_runner, "save_g4_tracker", _faulty_save_tracker)
+
+    rc_fail = codex_room_review.main(
+        [
+            "--commit",
+            sha1,
+            "--task-id",
+            "T-PRE-RB",
+            "--out-dir",
+            str(tmp_path / "out_rb_1"),
+            "--repo-root",
+            str(repo_dir),
+            "--backend",
+            "codex",
+        ]
+    )
+    assert rc_fail == 2
+    assert task_runner.load_g4_tracker(tracker_path)["in_flight"] == {}
+    assert task_runner.load_ledger(ledger_path)["active_g4_reservations"] == {}
+
+    fail_mode = "tracker"
+    rc_t_fail = codex_room_review.main(
+        [
+            "--commit",
+            sha1,
+            "--task-id",
+            "T-PRE-RB",
+            "--out-dir",
+            str(tmp_path / "out_rb_2"),
+            "--repo-root",
+            str(repo_dir),
+            "--backend",
+            "codex",
+        ]
+    )
+    assert rc_t_fail == 2
+    assert task_runner.load_ledger(ledger_path)["active_g4_reservations"] == {}
+    assert task_runner.load_g4_tracker(tracker_path)["in_flight"] == {}
+
+    fail_mode = "none"
+    rc_retry = codex_room_review.main(
+        [
+            "--commit",
+            sha1,
+            "--task-id",
+            "T-PRE-RB",
+            "--out-dir",
+            str(tmp_path / "out_rb_3"),
+            "--repo-root",
+            str(repo_dir),
+            "--backend",
+            "codex",
+        ]
+    )
+    assert rc_retry == 0
+
+
+def test_g4_lock_loser_does_not_bill_foreign_raw_logs_on_abort(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Task losing .review-attempt.lock race releases its reservation with $0.0 billed."""
+    from harness.scripts import task_runner
+
+    repo_dir, sha1 = _init_policy_repo(tmp_path / "repo_lock_race", qualified_routes=[])
+    _setup_ledger_for_g4_test(
+        repo_dir, "T-RACE-A", state="REVIEW_FROZEN_G4", candidate_sha=sha1
+    )
+    ledger_b_path = _setup_ledger_for_g4_test(
+        repo_dir, "T-RACE-B", state="REVIEW_FROZEN_G4", candidate_sha=sha1
+    )
+    shared_out_dir = tmp_path / "shared_race_out"
+
+    orig_exec = codex_room_review._execute_after_preflight
+
+    def _race_winner_writes_lock(*args: Any, **kwargs: Any) -> int:
+        shared_out_dir.mkdir(parents=True, exist_ok=True)
+        (shared_out_dir / ".review-attempt.lock").write_text(
+            json.dumps({"task_id": "T-RACE-A", "candidate_sha": sha1}),
+            encoding="utf-8",
+        )
+        (shared_out_dir / "pass1.raw.jsonl").write_text(
+            json.dumps(
+                {
+                    "type": "turn.completed",
+                    "usage": {
+                        "input_tokens": 1000000,
+                        "cached_input_tokens": 0,
+                        "output_tokens": 0,
+                    },
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        return orig_exec(*args, **kwargs)
+
+    monkeypatch.setattr(
+        codex_room_review, "_execute_after_preflight", _race_winner_writes_lock
+    )
+    rc_b = codex_room_review.main(
+        [
+            "--commit",
+            sha1,
+            "--task-id",
+            "T-RACE-B",
+            "--out-dir",
+            str(shared_out_dir),
+            "--repo-root",
+            str(repo_dir),
+            "--backend",
+            "codex",
+        ]
+    )
+
+    ledger_b = task_runner.load_ledger(ledger_b_path)
+    tracker_b = task_runner.load_g4_tracker(
+        task_runner.default_g4_tracker_path("T-RACE-B", repo_root=repo_dir)
+    )
+    assert rc_b == 2
+    assert ledger_b["spent_api_equiv_usd"] == 0.0
+    assert ledger_b["active_g4_reservations"] == {}
+    assert tracker_b["in_flight"] == {}
+    assert task_runner._norm_attempt_dir(shared_out_dir) not in tracker_b["completed_attempts"]
 
 
 
