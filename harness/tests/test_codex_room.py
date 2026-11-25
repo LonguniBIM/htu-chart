@@ -3909,6 +3909,405 @@ def test_g4_root_discovery_foreign_ledger_monotonic_counter_and_reused_billing(
     assert json.loads(led_reused.read_text(encoding="utf-8"))["spent_api_equiv_usd"] > 0.0
 
 
+def test_g4_ledgerless_root_packet_blocks_child_task_id(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Without ledger.json, CHILD-V2 declaring Root Task ID=ROOT shares ROOT's 6 attempts."""
+    repo_dir, sha1 = _init_policy_repo(tmp_path / "repo_nolog_root", qualified_routes=[])
+    calls = _install_counting_codex_stub(tmp_path, monkeypatch, sha1)
+
+    root_attempts = repo_dir / "harness" / "runs" / "ROOT" / "attempts"
+    for idx in range(6):
+        p_sha = f"{idx + 1}" * 40
+        p_dir = root_attempts / f"att-{idx}-{p_sha[:12]}"
+        p_dir.mkdir(parents=True, exist_ok=True)
+        (p_dir / "consolidated-review.json").write_text(
+            json.dumps(
+                {
+                    "revision_sha": p_sha,
+                    "passes_completed": 2,
+                    "independent_contexts": True,
+                    "review_gate_status": "CHANGES_REQUESTED",
+                    "blocking_open_count": 1,
+                    "consolidated_findings": [],
+                }
+            ),
+            encoding="utf-8",
+        )
+
+    pkt = tmp_path / "child_v2_packet.md"
+    pkt.write_text(
+        "# Task Packet\n\n- **Root Task ID**: `ROOT`\n- **Task ID**: `CHILD-V2`\n",
+        encoding="utf-8",
+    )
+    child_out = tmp_path / "child_v2_out"
+    rc = codex_room_review.main(
+        [
+            "--commit",
+            sha1,
+            "--task-id",
+            "CHILD-V2",
+            "--task-packet",
+            str(pkt),
+            "--out-dir",
+            str(child_out),
+            "--repo-root",
+            str(repo_dir),
+            "--backend",
+            "codex",
+        ]
+    )
+    assert rc == 2
+    assert _count_calls(calls) == 0
+    assert not (child_out / "frozen").exists()
+
+
+def test_g4_resume_preserves_blocking_findings_when_provenance_changes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Provenance-mismatched --resume-from preserves prior CHANGES_REQUESTED findings."""
+    repo_dir, sha1 = _init_policy_repo(tmp_path / "repo_res_preserve", qualified_routes=[])
+    finding = _sample_finding("P1-77", "high", "Critical unhandled exception")
+    findings_json = json.dumps([finding])
+
+    p2_fail_flag = tmp_path / "p2_fail_once.flag"
+    codex_script = tmp_path / "fake_codex_res_preserve.py"
+    codex_prefix = _write_fake_codex_script(
+        codex_script,
+        (
+            "import json, pathlib, sys\n"
+            "args = sys.argv[1:]\n"
+            "out_path = pathlib.Path(args[args.index('-o') + 1])\n"
+            "_ = sys.stdin.read()\n"
+            f"flag = pathlib.Path({str(p2_fail_flag)!r})\n"
+            "if not flag.is_file():\n"
+            "    if out_path.name == 'pass1.json':\n"
+            f"        payload = {{'revision_sha': {sha1!r}, 'lens': 'correctness_and_tests', "
+            f"'verdict': 'CHANGES_REQUESTED', 'summary': 'bad', 'findings': {findings_json}, "
+            "'test_quality_issues': [], 'unverified_areas': []}\n"
+            "        out_path.write_text(json.dumps(payload), encoding='utf-8')\n"
+            "        sys.exit(0)\n"
+            "    print(json.dumps({'type': 'error', 'message': 'usage_limit_reached'}), "
+            "flush=True)\n"
+            "    sys.exit(1)\n"
+            "lens = 'security_and_invariants' if out_path.name == 'pass2.json' "
+            "else 'correctness_and_tests'\n"
+            f"payload = {{'revision_sha': {sha1!r}, 'lens': lens, 'verdict': 'APPROVE', "
+            "'summary': 'new clean pass', 'findings': [], "
+            "'test_quality_issues': [], 'unverified_areas': []}\n"
+            "out_path.write_text(json.dumps(payload), encoding='utf-8')\n"
+        ),
+    )
+    monkeypatch.setattr(
+        codex_room_review, "verify_role", lambda role, root: {"ok": True, "errors": []}
+    )
+    monkeypatch.setattr(codex_room_review, "resolve_codex_command", lambda: codex_prefix)
+
+    pkt = tmp_path / "pkt_res_1.md"
+    pkt.write_text("# Task Packet v1\n", encoding="utf-8")
+    ledger_path = _setup_ledger_for_g4_test(
+        repo_dir, "T-RES-PRESERVE", state="REVIEW_FROZEN_G4", candidate_sha=sha1
+    )
+    att1 = repo_dir / "harness" / "runs" / "T-RES-PRESERVE" / "attempts" / f"att1-{sha1[:12]}"
+    rc1 = codex_room_review.main(
+        [
+            "--commit",
+            sha1,
+            "--task-id",
+            "T-RES-PRESERVE",
+            "--task-packet",
+            str(pkt),
+            "--out-dir",
+            str(att1),
+            "--repo-root",
+            str(repo_dir),
+            "--backend",
+            "codex",
+        ]
+    )
+    assert rc1 == 2
+
+    # Invalidate 7-tuple provenance by editing packet, and return APPROVE on resumed passes.
+    pkt.write_text("# Task Packet v1 amended\n", encoding="utf-8")
+    p2_fail_flag.write_text("1", encoding="utf-8")
+    att2 = repo_dir / "harness" / "runs" / "T-RES-PRESERVE" / "attempts" / f"att2-{sha1[:12]}"
+    rc2 = codex_room_review.main(
+        [
+            "--commit",
+            sha1,
+            "--task-id",
+            "T-RES-PRESERVE",
+            "--task-packet",
+            str(pkt),
+            "--resume-from",
+            str(att1),
+            "--out-dir",
+            str(att2),
+            "--repo-root",
+            str(repo_dir),
+            "--backend",
+            "codex",
+            "--fail-on-blocking",
+        ]
+    )
+    assert rc2 == 1
+    report2 = json.loads((att2 / "consolidated-review.json").read_text(encoding="utf-8"))
+    assert report2["review_gate_status"] == "CHANGES_REQUESTED"
+    assert report2["blocking_open_count"] == 1
+    assert any(f.get("id") == "P1-77" for f in report2["consolidated_findings"])
+    led_after = json.loads(ledger_path.read_text(encoding="utf-8"))
+    assert led_after["state"] != "READY_FOR_ACCEPTANCE"
+    assert led_after["candidate_sha"] is None
+
+
+def test_g4_stale_reservation_ignored_after_replan_barrier(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Stale G4 completion after packet_version replan bills spend without clobbering state."""
+    import threading
+
+    from harness.scripts import task_runner
+
+    repo_dir, sha1 = _init_policy_repo(tmp_path / "repo_stale_res", qualified_routes=[])
+    entered_flag = tmp_path / "codex_entered.flag"
+    release_flag = tmp_path / "codex_release.flag"
+
+    codex_script = tmp_path / "fake_codex_barrier.py"
+    codex_prefix = _write_fake_codex_script(
+        codex_script,
+        (
+            "import json, pathlib, sys, time\n"
+            "args = sys.argv[1:]\n"
+            "out_path = pathlib.Path(args[args.index('-o') + 1])\n"
+            "prompt = sys.stdin.read()\n"
+            f"entered = pathlib.Path({str(entered_flag)!r})\n"
+            f"release = pathlib.Path({str(release_flag)!r})\n"
+            "entered.write_text('1', encoding='utf-8')\n"
+            "deadline = time.monotonic() + 15.0\n"
+            "while not release.is_file() and time.monotonic() < deadline:\n"
+            "    time.sleep(0.02)\n"
+            "lens = 'security_and_invariants' if out_path.name == 'pass2.json' "
+            "else 'correctness_and_tests'\n"
+            f"payload = {{'revision_sha': {sha1!r}, 'lens': lens, 'verdict': 'APPROVE', "
+            "'summary': 'ok', 'findings': [], 'test_quality_issues': [], 'unverified_areas': []}\n"
+            "out_path.write_text(json.dumps(payload), encoding='utf-8')\n"
+            "print(json.dumps({'type': 'turn.completed', 'usage': "
+            "{'input_tokens': 10000, 'cached_input_tokens': 0, 'output_tokens': 1000}}), "
+            "flush=True)\n"
+        ),
+    )
+    monkeypatch.setattr(
+        codex_room_review, "verify_role", lambda role, root: {"ok": True, "errors": []}
+    )
+    monkeypatch.setattr(codex_room_review, "resolve_codex_command", lambda: codex_prefix)
+
+    ledger_path = _setup_ledger_for_g4_test(
+        repo_dir, "T-STALE-RES", state="REVIEW_FROZEN_G4", candidate_sha=sha1
+    )
+    rc_box: list[int] = []
+
+    def _run_g4() -> None:
+        rc_box.append(
+            codex_room_review.main(
+                [
+                    "--commit",
+                    sha1,
+                    "--task-id",
+                    "T-STALE-RES",
+                    "--out-dir",
+                    str(tmp_path / "stale_res_out"),
+                    "--repo-root",
+                    str(repo_dir),
+                    "--backend",
+                    "codex",
+                ]
+            )
+        )
+
+    th = threading.Thread(target=_run_g4)
+    th.start()
+    import time
+
+    deadline = time.monotonic() + 15.0
+    while not entered_flag.is_file() and time.monotonic() < deadline:
+        time.sleep(0.02)
+    assert entered_flag.is_file()
+
+    # Simulate packet_version advance while stale G4 is blocked inside reviewer subprocess.
+    with task_runner._ledger_lock(ledger_path):
+        cur = task_runner.load_ledger(ledger_path)
+        cur["packet_version"] = 2
+        cur["task_id"] = "T-STALE-RES-V2"
+        cur["candidate_sha"] = None
+        cur["g4_rounds_in_packet"] = 0
+        cur["state"] = "ACTIVE_PEER_G1"
+        task_runner.save_ledger(ledger_path, cur)
+
+    release_flag.write_text("go\n", encoding="utf-8")
+    th.join(timeout=20.0)
+
+    assert rc_box == [2]
+    led_after = json.loads(ledger_path.read_text(encoding="utf-8"))
+    assert led_after["state"] == "ACTIVE_PEER_G1"
+    assert led_after["candidate_sha"] is None
+    assert led_after["g4_rounds_in_packet"] == 0
+    assert led_after["g4_rounds_total"] == 1
+    assert led_after["spent_api_equiv_usd"] == pytest.approx(0.074, abs=1e-6)
+    assert any(ev.get("kind") == "G4_STALE_RESERVATION_IGNORED" for ev in led_after["events"])
+
+
+def test_codex_5h_window_exhausted_preflight_triggers_agy_fallback_and_strips_pii(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Real JSON-RPC app-server probe detects 5h window 100%, skips codex exec, strips PII."""
+    repo_dir, sha1 = _init_policy_repo(
+        tmp_path / "repo_5h_guard", qualified_routes=["gemini-4-carbon-high"]
+    )
+    exec_calls = tmp_path / "codex_exec_5h_calls.txt"
+    pct_file = tmp_path / "codex_window_pct.txt"
+    fake_codex = tmp_path / "fake_codex_app_server.py"
+    codex_prefix = _write_fake_codex_script(
+        fake_codex,
+        (
+            "import json, pathlib, sys\n"
+            f"pct_p = pathlib.Path({str(pct_file)!r})\n"
+            f"exec_p = pathlib.Path({str(exec_calls)!r})\n"
+            "if len(sys.argv) > 1 and sys.argv[1] == 'app-server':\n"
+            "    pct = float(pct_p.read_text(encoding='utf-8').strip())\n"
+            "    for raw in sys.stdin:\n"
+            "        raw = raw.strip()\n"
+            "        if not raw:\n"
+            "            continue\n"
+            "        msg = json.loads(raw)\n"
+            "        mid = msg.get('id')\n"
+            "        method = msg.get('method')\n"
+            "        if method == 'initialize':\n"
+            "            print(json.dumps({'jsonrpc': '2.0', 'id': mid, 'result': "
+            "{'userAgent': 'codex-test'}}), flush=True)\n"
+            "        elif method == 'account/rateLimits/read':\n"
+            "            res = {'rateLimits': {'limitId': 'codex', "
+            "'accountId': 'acct-secret-pii-999', "
+            "'primary': {'usedPercent': pct, 'windowDurationMins': 300, 'resetsAt': 1795651200}, "
+            "'secondary': {'usedPercent': 12.0, 'windowDurationMins': 10080, "
+            "'resetsAt': 1796000000}, "
+            "'credits': {'hasCredits': True, 'unlimited': False, 'balance': '50.0'}, "
+            "'ordinaryUsageAllowed': True, 'spendControlReached': False}}\n"
+            "            print(json.dumps({'jsonrpc': '2.0', 'id': mid, 'result': res}), "
+            "flush=True)\n"
+            "    sys.exit(0)\n"
+            "prev = exec_p.read_text(encoding='utf-8') if exec_p.is_file() else ''\n"
+            "exec_p.write_text(prev + 'exec\\n', encoding='utf-8')\n"
+            "args = sys.argv[1:]\n"
+            "out_path = pathlib.Path(args[args.index('-o') + 1])\n"
+            "lens = 'security_and_invariants' if out_path.name == 'pass2.json' "
+            "else 'correctness_and_tests'\n"
+            f"payload = {{'revision_sha': {sha1!r}, 'lens': lens, 'verdict': 'APPROVE', "
+            "'summary': 'codex ok', 'findings': [], 'test_quality_issues': [], "
+            "'unverified_areas': []}\n"
+            "out_path.write_text(json.dumps(payload), encoding='utf-8')\n"
+        ),
+    )
+
+    agy_calls = tmp_path / "agy_5h_calls.txt"
+    fake_agy = tmp_path / "fake_agy_5h.py"
+    agy_prefix = _write_fake_codex_script(
+        fake_agy,
+        (
+            "import json, pathlib, sys\n"
+            f"af = pathlib.Path({str(agy_calls)!r})\n"
+            "prev = af.read_text(encoding='utf-8') if af.is_file() else ''\n"
+            "af.write_text(prev + 'agy\\n', encoding='utf-8')\n"
+            "args = sys.argv[1:]\n"
+            "prompt = args[args.index('-p') + 1]\n"
+            "lens = 'security_and_invariants' if 'security_and_invariants' in prompt "
+            "else 'correctness_and_tests'\n"
+            f"payload = {{'revision_sha': {sha1!r}, 'lens': lens, 'verdict': 'APPROVE', "
+            "'summary': 'agy ok', 'findings': [], 'test_quality_issues': [], "
+            "'unverified_areas': []}\n"
+            "print(json.dumps({'event': 'result', "
+            "'result': {'status': 'SUCCESS', 'structured_output': payload}}), flush=True)\n"
+        ),
+    )
+    monkeypatch.setattr(
+        codex_room_review, "verify_role", lambda role, root: {"ok": True, "errors": []}
+    )
+    monkeypatch.setattr(codex_room_review, "resolve_codex_command", lambda: codex_prefix)
+    monkeypatch.setattr(codex_room_review, "resolve_agy_command", lambda: agy_prefix)
+
+    # Case 1: primary.usedPercent == 100 under --backend auto -> 0 codex exec calls, agy fallback.
+    pct_file.write_text("100.0", encoding="utf-8")
+    out_auto = tmp_path / "out_5h_auto"
+    rc_auto = codex_room_review.main(
+        [
+            "--commit",
+            sha1,
+            "--repo-root",
+            str(repo_dir),
+            "--out-dir",
+            str(out_auto),
+            "--backend",
+            "auto",
+        ]
+    )
+    assert rc_auto == 0
+    assert not exec_calls.exists()
+    assert len(agy_calls.read_text(encoding="utf-8").splitlines()) == 2
+    rep_auto = json.loads((out_auto / "consolidated-review.json").read_text(encoding="utf-8"))
+    assert rep_auto["review_backend"] == "agy"
+    assert rep_auto["fallback_used"] is True
+    assert "codex_5h_window_exhausted" in rep_auto["fallback_reason"]
+    assert "openai_codex" in rep_auto["exhausted_quota_pools"]
+    rl_snap_text = (out_auto / "codex-ratelimits-preflight.json").read_text(encoding="utf-8")
+    assert "accountId" not in rl_snap_text
+    assert "acct-secret-pii-999" not in rl_snap_text
+
+    # Case 2: primary.usedPercent == 100 under --backend codex -> 0 calls -> BLOCKED_INFRA.
+    agy_calls.unlink()
+    out_codex_only = tmp_path / "out_5h_codex_only"
+    rc_only = codex_room_review.main(
+        [
+            "--commit",
+            sha1,
+            "--repo-root",
+            str(repo_dir),
+            "--out-dir",
+            str(out_codex_only),
+            "--backend",
+            "codex",
+        ]
+    )
+    assert rc_only == 2
+    assert not exec_calls.exists()
+    assert not agy_calls.exists()
+    rep_only = json.loads(
+        (out_codex_only / "consolidated-review.json").read_text(encoding="utf-8")
+    )
+    assert rep_only["review_gate_status"] == "BLOCKED_INFRA"
+
+    # Case 3: primary.usedPercent == 47 (< 100) under --backend auto -> codex exec runs (2 calls).
+    pct_file.write_text("47.0", encoding="utf-8")
+    out_ok = tmp_path / "out_5h_ok"
+    rc_ok = codex_room_review.main(
+        [
+            "--commit",
+            sha1,
+            "--repo-root",
+            str(repo_dir),
+            "--out-dir",
+            str(out_ok),
+            "--backend",
+            "auto",
+        ]
+    )
+    assert rc_ok == 0
+    assert len(exec_calls.read_text(encoding="utf-8").splitlines()) == 2
+    assert not agy_calls.exists()
+    rep_ok = json.loads((out_ok / "consolidated-review.json").read_text(encoding="utf-8"))
+    assert rep_ok["review_backend"] == "codex"
+    assert rep_ok["fallback_used"] is False
+
+
+
 
 
 

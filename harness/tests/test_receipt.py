@@ -1991,6 +1991,113 @@ def test_g5_root_discovery_foreign_ledger_paused_with_findings_and_human_overrid
     assert rec_ext["conclusion"] == "VERIFIED"
 
 
+def test_g5_ledgerless_root_packet_blocks_child_over_cap(tmp_path: Path) -> None:
+    """Without ledger.json, CHILD-V2 declaring Root Task ID=ROOT shares ROOT's 6 attempts."""
+    from harness.scripts import receipt as receipt_mod
+
+    repo = tmp_path / "repo_g5_root_nolog"
+    repo.mkdir()
+    subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+    subprocess.run(
+        ["git", "config", "user.email", "test@example.com"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.name", "Test User"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+    )
+    src = repo / "mod.py"
+    src.write_text("x = 1\n", encoding="utf-8")
+    subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+    subprocess.run(["git", "commit", "-m", "base"], cwd=repo, check=True, capture_output=True)
+    base_sha = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=repo, check=True, capture_output=True, text=True
+    ).stdout.strip()
+    src.write_text("x = 2\n", encoding="utf-8")
+    subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+    subprocess.run(["git", "commit", "-m", "cand"], cwd=repo, check=True, capture_output=True)
+    cand_sha = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=repo, check=True, capture_output=True, text=True
+    ).stdout.strip()
+
+    root_attempts = repo / "harness" / "runs" / "ROOT" / "attempts"
+    for idx in range(6):
+        p_sha = f"{idx + 1}" * 40
+        att = root_attempts / f"att-{idx}-{p_sha[:12]}"
+        att.mkdir(parents=True, exist_ok=True)
+        (att / "consolidated-review.json").write_text(
+            json.dumps(
+                {
+                    "revision_sha": p_sha,
+                    "passes_completed": 2,
+                    "independent_contexts": True,
+                    "review_gate_status": "CHANGES_REQUESTED",
+                    "blocking_open_count": 1,
+                    "consolidated_findings": [],
+                }
+            ),
+            encoding="utf-8",
+        )
+    child_att = repo / "harness" / "runs" / "CHILD-V2" / "attempts" / f"att-7-{cand_sha[:12]}"
+    child_att.mkdir(parents=True, exist_ok=True)
+    (child_att / "consolidated-review.json").write_text(
+        json.dumps(
+            {
+                "revision_sha": cand_sha,
+                "passes_completed": 2,
+                "independent_contexts": True,
+                "review_gate_status": "PASSED",
+                "blocking_open_count": 0,
+                "consolidated_findings": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    pkt = tmp_path / "child_packet.md"
+    pkt.write_text(
+        "# Task Packet\n\n- **Root Task ID**: `ROOT`\n- **Task ID**: `CHILD-V2`\n",
+        encoding="utf-8",
+    )
+    v_path = tmp_path / "v_nolog_root.json"
+    r_path = tmp_path / "r_nolog_root.json"
+    v_path.write_text(json.dumps(_verifier(cand_sha)), encoding="utf-8")
+    r_path.write_text(json.dumps(_review(cand_sha)), encoding="utf-8")
+
+    out_dir = tmp_path / "out_g5_nolog_root"
+    rc = receipt_mod.main(
+        [
+            "--task-id",
+            "CHILD-V2",
+            "--phase",
+            "1",
+            "--base-sha",
+            base_sha,
+            "--candidate-sha",
+            cand_sha,
+            "--verifier-json",
+            str(v_path),
+            "--review-json",
+            str(r_path),
+            "--task-packet",
+            str(pkt),
+            "--repo-root",
+            str(repo),
+            "--out-dir",
+            str(out_dir),
+        ]
+    )
+    assert rc == 2
+    rec = json.loads((out_dir / "receipt.json").read_text(encoding="utf-8"))
+    assert rec["conclusion"] == "BLOCKED"
+    assert any("7" in b and "max_g4_rounds_per_root_task" in b for b in rec["blockers"])
+
+
+
 
 
 

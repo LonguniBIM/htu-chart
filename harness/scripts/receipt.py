@@ -496,7 +496,7 @@ def _evaluate_ledger_and_attempts(
     max_g4_sha = int(breakers.get("max_g4_invocations_per_candidate_sha", 2))
     max_total_cand = int(breakers.get("max_total_candidates_per_root_task", 6))
 
-    tracker_id = task_id
+    tracker_id = expected_root_task_id or task_id
     if isinstance(ledger_data, dict):
         bind_err = task_runner.validate_ledger_task_binding(
             ledger_data,
@@ -513,6 +513,12 @@ def _evaluate_ledger_and_attempts(
             max_g4_sha = int(cb.get("max_g4_invocations_per_candidate_sha", max_g4_sha))
             max_total_cand = int(cb.get("max_total_candidates_per_root_task", max_total_cand))
 
+    try:
+        task_runner._validate_safe_task_id(tracker_id, "root_task_id")
+    except ValueError as exc:
+        blockers.append(f"Invalid root_task_id for tracker binding: {exc}")
+        tracker_id = task_id
+
     attempt_roots = [active_root / "harness" / "runs" / task_id / "attempts"]
     if tracker_id != task_id:
         attempt_roots.append(active_root / "harness" / "runs" / tracker_id / "attempts")
@@ -524,6 +530,16 @@ def _evaluate_ledger_and_attempts(
                 effective_tracker = task_runner.load_g4_tracker(t_path, task_id=tracker_id)
         except (OSError, UnicodeDecodeError, ValueError, json.JSONDecodeError):
             effective_tracker = None
+    if tracker_id != task_id:
+        try:
+            child_t_path = task_runner.default_g4_tracker_path(task_id, repo_root=active_root)
+            if child_t_path.is_file():
+                child_tracker = task_runner.load_g4_tracker(child_t_path, task_id=task_id)
+                effective_tracker = task_runner.merge_g4_trackers(
+                    effective_tracker, child_tracker
+                )
+        except (OSError, UnicodeDecodeError, ValueError, json.JSONDecodeError):
+            pass
     attempt_union = task_runner.collect_g4_attempt_union(
         attempt_roots, effective_tracker, candidate_sha=candidate_sha
     )
@@ -831,6 +847,12 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--debate-json", type=Path, default=None)
     parser.add_argument("--task-manifest", type=Path, default=None, help="Optional task manifest JSON verifying is_bugfix and base_sha.")
     parser.add_argument(
+        "--task-packet",
+        type=Path,
+        default=None,
+        help="Optional Task Packet path for Root Task ID discovery.",
+    )
+    parser.add_argument(
         "--ledger",
         type=Path,
         default=None,
@@ -874,16 +896,25 @@ def main(argv: list[str] | None = None) -> int:
     out_dir.mkdir(parents=True, exist_ok=True)
 
     active_root = args.repo_root.resolve()
-    expected_root_id = task_runner.extract_root_task_id(task_manifest=args.task_manifest)
+    packet_candidate = args.task_packet or (
+        active_root / "harness" / "runs" / args.task_id / "packet.md"
+    )
+    expected_root_id = task_runner.extract_root_task_id(
+        task_packet=packet_candidate,
+        task_manifest=args.task_manifest,
+    )
     ledger_path: Path | None
     if args.ledger is not None:
         ledger_path = args.ledger.resolve()
     else:
         ledger_path = task_runner.find_ledger_path_for_task(
-            args.task_id, repo_root=active_root, task_manifest=args.task_manifest
+            args.task_id,
+            repo_root=active_root,
+            task_packet=packet_candidate,
+            task_manifest=args.task_manifest,
         )
 
-    tracker_id = args.task_id
+    tracker_id = expected_root_id or args.task_id
     if ledger_path is not None and ledger_path.is_file():
         raw_led = task_runner._read_optional_json_dict(ledger_path)
         if isinstance(raw_led, dict) and raw_led.get("root_task_id"):
@@ -891,6 +922,7 @@ def main(argv: list[str] | None = None) -> int:
 
     tracker_path: Path | None = None
     try:
+        task_runner._validate_safe_task_id(tracker_id, "root_task_id")
         cand_tracker = task_runner.default_g4_tracker_path(tracker_id, repo_root=active_root)
         if cand_tracker.is_file():
             tracker_path = cand_tracker
@@ -914,7 +946,7 @@ def main(argv: list[str] | None = None) -> int:
         tracker_data: dict[str, Any] | None = None
         if tracker_path is not None and tracker_path.is_file():
             try:
-                tracker_data = task_runner.load_g4_tracker(tracker_path, task_id=args.task_id)
+                tracker_data = task_runner.load_g4_tracker(tracker_path, task_id=tracker_id)
             except (OSError, UnicodeDecodeError, ValueError, json.JSONDecodeError) as exc:
                 if not ledger_load_err:
                     ledger_load_err = f"Invalid g4-tracker.json at {tracker_path}: {exc}"

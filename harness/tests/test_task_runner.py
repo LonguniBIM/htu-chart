@@ -1192,3 +1192,76 @@ def test_human_approved_ceiling_overrides_and_root_wrapper_forwarding(
     assert "--ledger" in seen_cmds[1] and str(ledger_path.resolve()) in seen_cmds[1]
 
 
+def test_record_replan_refuses_in_flight_g4_and_forwards_task_packet(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """record_replan refuses replans during in-flight G4; wrapper forwards --task-packet."""
+    base_sha, pkt1, _ = _setup_repo_with_valid_packet(tmp_path, packet_version=1, budget_usd=6.0)
+    pkt2_text = pkt1.read_text(encoding="utf-8").replace(
+        "- **Packet Version**: `1`", "- **Packet Version**: `2`"
+    )
+    pkt2 = tmp_path / "packet_inflight_v2.md"
+    pkt2.write_text(pkt2_text, encoding="utf-8")
+    r2 = tmp_path / "readiness_inflight_v2.json"
+    assert (
+        brief_gate.main(
+            ["--packet", str(pkt2), "--repo-root", str(tmp_path), "--out", str(r2)]
+        )
+        == 0
+    )
+
+    ledger_path = tmp_path / "harness" / "runs" / "T-RUN-01" / "ledger.json"
+    led = task_runner.init_or_load_ledger(
+        ledger_path, root_task_id="T-RUN-01", base_sha=base_sha, budget_usd=6.0
+    )
+    led["state"] = "REVIEW_FROZEN_G4"
+    led["active_g4_reservations"] = {"res-live": {"candidate_sha": base_sha}}
+    task_runner.save_ledger(ledger_path, led)
+
+    _, rc_active, msg_active = task_runner.record_replan(
+        ledger_path, r2, packet_path=pkt2, human_approved=True, repo_root=tmp_path
+    )
+    assert rc_active == 2
+    assert "active in flight" in msg_active
+
+    # Also block when ledger active_g4_reservations is empty yet g4-tracker in_flight is set.
+    led["active_g4_reservations"] = {}
+    task_runner.save_ledger(ledger_path, led)
+    t_path = task_runner.default_g4_tracker_path("T-RUN-01", repo_root=tmp_path)
+    t_data = task_runner.load_g4_tracker(t_path, task_id="T-RUN-01")
+    t_data["in_flight"]["res-trk"] = {"candidate_sha": base_sha}
+    task_runner.save_g4_tracker(t_path, t_data)
+
+    _, rc_trk, msg_trk = task_runner.record_replan(
+        ledger_path, r2, packet_path=pkt2, human_approved=True, repo_root=tmp_path
+    )
+    assert rc_trk == 2
+    assert "active in flight" in msg_trk
+
+    # run_receipt_gate_step forwards --task-packet when passed.
+    cmds: list[list[str]] = []
+    monkeypatch.setattr(
+        task_runner,
+        "run_managed_cmd",
+        lambda cmd, **_kw: (
+            cmds.append(cmd)
+            or subprocess.CompletedProcess(args=cmd, returncode=0, stdout="", stderr="")
+        ),
+    )
+    task_runner.run_receipt_gate_step(
+        task_id="T-RUN-01",
+        phase=2,
+        base_sha=base_sha,
+        candidate_sha=base_sha,
+        verifier_json=tmp_path / "v.json",
+        review_json=tmp_path / "r.json",
+        readiness_json=r2,
+        out_dir=tmp_path / "rec_pkt",
+        task_packet=pkt2,
+        repo_root=tmp_path,
+        ledger=None,
+    )
+    assert "--task-packet" in cmds[0] and str(pkt2) in cmds[0]
+
+
+

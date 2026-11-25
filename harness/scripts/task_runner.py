@@ -580,6 +580,57 @@ def save_g4_tracker(tracker_path: Path, tracker: dict[str, Any]) -> None:
     _atomic_write_json(tracker_path, tracker)
 
 
+def _native_tracker_round_dirs(tracker: dict[str, Any]) -> set[str]:
+    round_statuses = {"PASSED", "CHANGES_REQUESTED", "BLOCKED", "IN_PROGRESS"}
+    native: set[str] = set()
+    for raw_out, ent in (tracker.get("completed_attempts") or {}).items():
+        if isinstance(ent, dict) and str(ent.get("status") or "") in round_statuses:
+            if not ent.get("seeded_from_fs"):
+                native.add(_norm_attempt_dir(raw_out))
+    for res_id, ent in (tracker.get("attempts") or {}).items():
+        if isinstance(ent, dict) and str(ent.get("status") or "") in round_statuses:
+            raw_out = ent.get("out_dir")
+            native.add(_norm_attempt_dir(raw_out) if raw_out else f"attempt:{res_id}")
+    return native
+
+
+def merge_g4_trackers(
+    base_tracker: dict[str, Any] | None,
+    extra_tracker: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    """Merge a child task's ``g4-tracker.json`` into the root tracker for union checks."""
+    if extra_tracker is None:
+        return base_tracker
+    if base_tracker is None:
+        return extra_tracker
+    merged = json.loads(json.dumps(base_tracker))
+    for key in ("completed_attempts", "attempts", "in_flight"):
+        dst = merged.setdefault(key, {})
+        src = extra_tracker.get(key, {})
+        if isinstance(dst, dict) and isinstance(src, dict):
+            for k, v in src.items():
+                dst.setdefault(k, v)
+    sha_dst = merged.setdefault("sha_invocations", {})
+    sha_src = extra_tracker.get("sha_invocations", {})
+    if isinstance(sha_dst, dict) and isinstance(sha_src, dict):
+        for sha_k, cnt in sha_src.items():
+            sha_dst[sha_k] = max(int(sha_dst.get(sha_k, 0)), int(cnt or 0))
+    base_legacy = max(
+        0,
+        int(base_tracker.get("completed_rounds", 0))
+        - len(_native_tracker_round_dirs(base_tracker)),
+    )
+    extra_legacy = max(
+        0,
+        int(extra_tracker.get("completed_rounds", 0))
+        - len(_native_tracker_round_dirs(extra_tracker)),
+    )
+    merged["completed_rounds"] = (
+        len(_native_tracker_round_dirs(merged)) + base_legacy + extra_legacy
+    )
+    return merged
+
+
 def save_ledger(ledger_path: Path, ledger: dict[str, Any]) -> None:
     """Atomically write ``ledger`` to ``ledger_path`` via fsync + os.replace."""
     _require_finite_number(ledger.get("budget_limit_usd"), "budget_limit_usd", positive=True)
@@ -858,6 +909,7 @@ def run_receipt_gate_step(
     out_dir: Path,
     is_bugfix: bool = False,
     red_proof_json: Path | None = None,
+    task_packet: Path | None = None,
     repo_root: Path | None = None,
     ledger: dict[str, Any] | None = None,
     ledger_path: Path | None = None,
@@ -891,6 +943,8 @@ def run_receipt_gate_step(
         cmd.append("--bugfix")
     if red_proof_json is not None:
         cmd.extend(["--red-proof-json", str(red_proof_json)])
+    if task_packet is not None:
+        cmd.extend(["--task-packet", str(task_packet)])
     effective_ledger = ledger_path
     if effective_ledger is None and isinstance(ledger, dict) and ledger.get("root_task_id"):
         cand = default_ledger_path(str(ledger["root_task_id"]), repo_root=root)
@@ -1811,6 +1865,26 @@ def record_replan(
         current_state = ledger["state"]
         if current_state == "VERIFIED":
             return ledger, 2, "Refusing replan: ledger is already VERIFIED."
+        active_root = (repo_root or REPO_ROOT).resolve()
+        in_flight_g4 = bool(ledger.get("active_g4_reservations"))
+        if not in_flight_g4:
+            tracker_candidates = [ledger_path.resolve().parent / "g4-tracker.json"]
+            if repo_root is not None:
+                tracker_candidates.append(
+                    default_g4_tracker_path(str(ledger["root_task_id"]), repo_root=active_root)
+                )
+            for cand_t in tracker_candidates:
+                if cand_t.is_file():
+                    t_data = _read_optional_json_dict(cand_t)
+                    if isinstance(t_data, dict) and t_data.get("in_flight"):
+                        in_flight_g4 = True
+                        break
+        if in_flight_g4:
+            return (
+                ledger,
+                2,
+                "Refusing replan while G4 review reservation is active in flight.",
+            )
         if (max_total_candidates is not None or max_g4_rounds is not None) and (
             not human_approved
         ):

@@ -19,7 +19,9 @@ import concurrent.futures
 import hashlib
 import inspect
 import json
+import math
 import os
+import queue
 import re
 import shutil
 import stat
@@ -632,6 +634,284 @@ def extract_max_transient_retries(policy: dict[str, Any] | None) -> int:
     if is_strict_int(val) and val >= 0:
         return int(val)
     return 1
+
+
+_SENSITIVE_RATE_LIMIT_KEYS = frozenset(
+    {
+        "accountid",
+        "account_id",
+        "email",
+        "userid",
+        "user_id",
+        "token",
+        "oauth",
+        "cookie",
+        "session",
+    }
+)
+
+
+def extract_codex_window_guard_config(
+    policy: dict[str, Any] | None,
+) -> tuple[bool, float, str | None]:
+    """Validate 5h window preflight fallback settings under independent_reviewer_primary."""
+    if not isinstance(policy, dict):
+        return True, 100.0, None
+    roles = policy.get("roles")
+    if roles is None:
+        return True, 100.0, None
+    if not isinstance(roles, dict):
+        return False, 100.0, "model-policy.json roles must be an object."
+    primary = roles.get("independent_reviewer_primary")
+    if primary is None:
+        return True, 100.0, None
+    if not isinstance(primary, dict):
+        return (
+            False,
+            100.0,
+            "model-policy.json roles.independent_reviewer_primary must be an object.",
+        )
+
+    enabled = True
+    if "fallback_on_5h_window_exhausted" in primary:
+        raw_enabled = primary["fallback_on_5h_window_exhausted"]
+        if not isinstance(raw_enabled, bool):
+            return (
+                False,
+                100.0,
+                "fallback_on_5h_window_exhausted must be a strict boolean.",
+            )
+        enabled = raw_enabled
+
+    threshold = 100.0
+    if "primary_window_exhausted_percent" in primary:
+        raw_pct = primary["primary_window_exhausted_percent"]
+        if (
+            isinstance(raw_pct, bool)
+            or not isinstance(raw_pct, (int, float))
+            or not math.isfinite(float(raw_pct))
+            or float(raw_pct) <= 0.0
+            or float(raw_pct) > 100.0
+        ):
+            return (
+                False,
+                100.0,
+                "primary_window_exhausted_percent must be finite in (0, 100].",
+            )
+        threshold = float(raw_pct)
+
+    return enabled, threshold, None
+
+
+def _strip_sensitive_rate_limit_keys(val: Any) -> Any:
+    if isinstance(val, dict):
+        cleaned: dict[str, Any] = {}
+        for k, v in val.items():
+            if str(k).strip().lower() in _SENSITIVE_RATE_LIMIT_KEYS:
+                continue
+            cleaned[str(k)] = _strip_sensitive_rate_limit_keys(v)
+        return cleaned
+    if isinstance(val, list):
+        return [_strip_sensitive_rate_limit_keys(item) for item in val]
+    return val
+
+
+def probe_codex_rate_limits(
+    codex_prefix: list[str],
+    runtime_dir: Path,
+    *,
+    init_timeout_sec: float = 0.5,
+    read_timeout_sec: float = 4.0,
+) -> dict[str, Any] | None:
+    """Query ``codex app-server`` ``account/rateLimits/read`` via JSON-RPC over stdio."""
+    env = dict(os.environ)
+    env["CODEX_HOME"] = str(runtime_dir)
+    proc: subprocess.Popen[str] | None = None
+    job_handle: int | None = None
+    out_queue: queue.Queue[str | None] = queue.Queue()
+    reader: threading.Thread | None = None
+    try:
+        proc, job_handle = spawn_managed_process(
+            [*codex_prefix, "app-server"],
+            env=env,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            bufsize=1,
+        )
+    except OSError:
+        return None
+
+    def _pump_stdout() -> None:
+        assert proc is not None and proc.stdout is not None
+        try:
+            for line in proc.stdout:
+                out_queue.put(line)
+        except OSError:
+            pass
+        finally:
+            out_queue.put(None)
+
+    def _read_response(target_id: int, timeout_sec: float) -> dict[str, Any] | None:
+        deadline = time.monotonic() + max(0.05, timeout_sec)
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return None
+            try:
+                line = out_queue.get(timeout=remaining)
+            except queue.Empty:
+                return None
+            if line is None:
+                return None
+            stripped = line.strip()
+            if not stripped:
+                continue
+            try:
+                msg = json.loads(stripped)
+            except json.JSONDecodeError:
+                return None
+            if not isinstance(msg, dict):
+                return None
+            if msg.get("id") != target_id:
+                continue
+            if "error" in msg:
+                return None
+            return msg
+
+    try:
+        if proc.stdin is None or proc.stdout is None:
+            return None
+        reader = threading.Thread(target=_pump_stdout, daemon=True)
+        reader.start()
+        init_req = json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {
+                    "clientInfo": {"name": "codex_room_review", "version": "1.0"}
+                },
+            }
+        )
+        proc.stdin.write(init_req + "\n")
+        proc.stdin.flush()
+        init_msg = _read_response(1, init_timeout_sec)
+        if not init_msg or not isinstance(init_msg.get("result"), dict):
+            return None
+
+        notif = json.dumps({"jsonrpc": "2.0", "method": "initialized", "params": {}})
+        read_req = json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "account/rateLimits/read",
+                "params": {},
+            }
+        )
+        proc.stdin.write(notif + "\n" + read_req + "\n")
+        proc.stdin.flush()
+        read_msg = _read_response(2, read_timeout_sec)
+        if not read_msg or not isinstance(read_msg.get("result"), dict):
+            return None
+        return read_msg["result"]
+    except OSError:
+        return None
+    finally:
+        if proc is not None:
+            if proc.stdin is not None:
+                try:
+                    proc.stdin.close()
+                except OSError:
+                    pass
+            try:
+                terminate_process_tree(proc, job_handle)
+            except OSError:
+                pass
+            for stream in (proc.stdout, proc.stderr):
+                if stream is not None:
+                    try:
+                        stream.close()
+                    except OSError:
+                        pass
+        if job_handle is not None:
+            try:
+                close_job_handle(job_handle)
+            except OSError:
+                pass
+        if reader is not None:
+            reader.join(timeout=0.2)
+
+
+def _rl_field(obj: Any, camel: str, snake: str) -> Any:
+    if not isinstance(obj, dict):
+        return None
+    if camel in obj:
+        return obj[camel]
+    return obj.get(snake)
+
+
+def _parse_rl_pct(val: Any) -> float | None:
+    if isinstance(val, bool) or not isinstance(val, (int, float)):
+        return None
+    f_val = float(val)
+    return f_val if math.isfinite(f_val) else None
+
+
+def evaluate_codex_window_exhaustion(
+    rate_limits_result: dict[str, Any] | None,
+    *,
+    threshold_pct: float = 100.0,
+) -> tuple[bool, str | None, dict[str, Any] | None]:
+    """Evaluate Codex 5h/secondary window limits and strip PII from preflight snapshot."""
+    if not isinstance(rate_limits_result, dict):
+        return False, None, None
+    by_id = _rl_field(rate_limits_result, "rateLimitsByLimitId", "rate_limits_by_limit_id")
+    bucket: Any = None
+    if isinstance(by_id, dict) and isinstance(by_id.get("codex"), dict):
+        bucket = by_id["codex"]
+    if not isinstance(bucket, dict):
+        bucket = _rl_field(rate_limits_result, "rateLimits", "rate_limits")
+    if not isinstance(bucket, dict) and "primary" in rate_limits_result:
+        bucket = rate_limits_result
+    if not isinstance(bucket, dict):
+        return False, None, None
+
+    sanitized = _strip_sensitive_rate_limit_keys(bucket)
+    primary = bucket.get("primary")
+    secondary = bucket.get("secondary")
+    primary_used = _parse_rl_pct(_rl_field(primary, "usedPercent", "used_percent"))
+    primary_resets = _rl_field(primary, "resetsAt", "resets_at")
+    secondary_used = _parse_rl_pct(_rl_field(secondary, "usedPercent", "used_percent"))
+    secondary_resets = _rl_field(secondary, "resetsAt", "resets_at")
+    rate_limit_type = _rl_field(bucket, "rateLimitReachedType", "rate_limit_reached_type")
+    spend_reached = _rl_field(bucket, "spendControlReached", "spend_control_reached")
+    ordinary_allowed = _rl_field(bucket, "ordinaryUsageAllowed", "ordinary_usage_allowed")
+
+    if primary_used is not None and primary_used >= threshold_pct:
+        reason = (
+            f"codex_5h_window_exhausted "
+            f"(usedPercent={primary_used}, resetsAt={primary_resets})"
+        )
+        return True, reason, sanitized
+    if secondary_used is not None and secondary_used >= 100.0:
+        reason = (
+            f"codex_secondary_window_exhausted "
+            f"(usedPercent={secondary_used}, resetsAt={secondary_resets})"
+        )
+        return True, reason, sanitized
+    if isinstance(rate_limit_type, str) and rate_limit_type.strip():
+        return True, f"codex_rate_limit_reached ({rate_limit_type.strip()})", sanitized
+    if spend_reached is True or ordinary_allowed is False:
+        reason = (
+            f"codex_usage_disallowed "
+            f"(spendControlReached={spend_reached}, ordinaryUsageAllowed={ordinary_allowed})"
+        )
+        return True, reason, sanitized
+    return False, None, sanitized
 
 
 def _validate_pass_payload(
@@ -1621,13 +1901,17 @@ def _should_enforce_g4_caps(
         return False
     if str(args.task_id).startswith("canary-"):
         return False
+    packet_candidate = args.task_packet or (
+        git_top / "harness" / "runs" / args.task_id / "packet.md"
+    )
     if (
         args.ledger is None
         and not args.require_ledger
         and args.task_id == "adhoc"
         and out_dir.parent.name != "attempts"
+        and task_runner.extract_root_task_id(task_packet=packet_candidate) is None
         and task_runner.find_ledger_path_for_task(
-            args.task_id, repo_root=git_top, task_packet=args.task_packet
+            args.task_id, repo_root=git_top, task_packet=packet_candidate
         )
         is None
     ):
@@ -1638,8 +1922,11 @@ def _should_enforce_g4_caps(
 def _resolve_g4_ledger_path(args: argparse.Namespace, git_top: Path) -> Path | None:
     if args.ledger is not None:
         return args.ledger.resolve()
+    packet_candidate = args.task_packet or (
+        git_top / "harness" / "runs" / args.task_id / "packet.md"
+    )
     return task_runner.find_ledger_path_for_task(
-        args.task_id, repo_root=git_top, task_packet=args.task_packet
+        args.task_id, repo_root=git_top, task_packet=packet_candidate
     )
 
 
@@ -1696,8 +1983,11 @@ def _preflight_g4_caps(
         )
         return 2, None, None
 
-    expected_root = task_runner.extract_root_task_id(task_packet=args.task_packet)
-    tracker_id = args.task_id
+    packet_candidate = args.task_packet or (
+        git_top / "harness" / "runs" / args.task_id / "packet.md"
+    )
+    expected_root = task_runner.extract_root_task_id(task_packet=packet_candidate)
+    tracker_id = expected_root or args.task_id
     if ledger_path is not None and ledger_path.is_file():
         raw_ledger = task_runner._read_optional_json_dict(ledger_path)
         if isinstance(raw_ledger, dict) and raw_ledger.get("root_task_id"):
@@ -1712,6 +2002,7 @@ def _preflight_g4_caps(
             tracker_id = str(raw_ledger["root_task_id"])
 
     try:
+        task_runner._validate_safe_task_id(tracker_id, "root_task_id")
         tracker_path = task_runner.default_g4_tracker_path(tracker_id, repo_root=git_top)
     except ValueError as exc:
         print(f"[codex_room_review] BLOCKED: {exc}", file=sys.stderr)
@@ -1741,13 +2032,26 @@ def _preflight_g4_caps(
 
     def _check_and_reserve_locked() -> tuple[int | None, Path | None, str | None]:
         tracker = task_runner.load_g4_tracker(tracker_path, task_id=tracker_id)
+        child_tracker: dict[str, Any] | None = None
+        if tracker_id != args.task_id:
+            try:
+                child_t_path = task_runner.default_g4_tracker_path(
+                    args.task_id, repo_root=git_top
+                )
+                if child_t_path.is_file():
+                    child_tracker = task_runner.load_g4_tracker(
+                        child_t_path, task_id=args.task_id
+                    )
+            except (OSError, UnicodeDecodeError, ValueError, json.JSONDecodeError):
+                child_tracker = None
+        union_tracker = task_runner.merge_g4_trackers(tracker, child_tracker)
         union = task_runner.collect_g4_attempt_union(
-            attempt_roots, tracker, candidate_sha=candidate_sha
+            attempt_roots, union_tracker, candidate_sha=candidate_sha
         )
         if _seed_tracker_from_union(tracker, union, now_iso):
             task_runner.save_g4_tracker(tracker_path, tracker)
         effective_rounds = int(union["total_rounds"])
-        t_sha = int(tracker.get("sha_invocations", {}).get(candidate_sha, 0))
+        t_sha = int((union_tracker or tracker).get("sha_invocations", {}).get(candidate_sha, 0))
         effective_sha = max(int(union["sha_count"]), t_sha)
         prior_sha_statuses = {st for st in union["sha_statuses"].values() if st}
         non_infra_statuses = {st for st in prior_sha_statuses if st != "BLOCKED_INFRA"}
@@ -1828,6 +2132,7 @@ def _preflight_g4_caps(
         ledger_active = ledger.get("active_g4_reservations", {})
         if (
             tracker.get("in_flight")
+            or (isinstance(child_tracker, dict) and child_tracker.get("in_flight"))
             or ledger_active
             or "IN_PROGRESS" in prior_sha_statuses
         ):
@@ -1956,6 +2261,9 @@ def _preflight_g4_caps(
         active_g4[reservation_id] = {
             "candidate_sha": candidate_sha,
             "out_dir": norm_out,
+            "packet_version": int(ledger.get("packet_version", 1)),
+            "task_id": str(ledger.get("task_id", args.task_id)),
+            "base_sha": str(ledger.get("base_sha", "")),
             "reserved_at_utc": now_iso,
         }
         inv_map[candidate_sha] = sha_count + 1
@@ -2164,6 +2472,36 @@ def _bill_pass_raw_logs(
             )
 
 
+def _has_prior_blocking_review(
+    attempt_roots: list[Path],
+    candidate_sha: str,
+    *,
+    resume_dir: Path | None = None,
+) -> bool:
+    """Inspect historical consolidated-review.json files for prior blocking findings."""
+    candidate_dirs: list[Path] = []
+    for root_dir in attempt_roots:
+        if root_dir.is_dir():
+            candidate_dirs.extend(sorted(p for p in root_dir.iterdir() if p.is_dir()))
+    if resume_dir is not None and resume_dir.is_dir():
+        candidate_dirs.append(resume_dir)
+    for d_path in candidate_dirs:
+        rev = task_runner._read_optional_json_dict(d_path / "consolidated-review.json")
+        if not isinstance(rev, dict):
+            continue
+        if str(rev.get("revision_sha", "")).strip() != candidate_sha:
+            continue
+        if rev.get("pass1_verdict") == "CHANGES_REQUESTED":
+            return True
+        if rev.get("pass2_verdict") == "CHANGES_REQUESTED":
+            return True
+        if rev.get("review_gate_status") == "CHANGES_REQUESTED":
+            return True
+        if int(rev.get("blocking_open_count") or 0) > 0:
+            return True
+    return False
+
+
 def _record_g4_outcome(
     tracker_path: Path | None,
     ledger_path: Path | None,
@@ -2180,6 +2518,7 @@ def _record_g4_outcome(
     active_model: str | None,
     primary_model: str | None,
     route_models_by_tag: dict[str, str],
+    resume_dir: Path | None = None,
 ) -> str | None:
     """Release G4 in-flight reservation, record spend, and transition tracker + ledger."""
     gate_status = str(report.get("review_gate_status", "BLOCKED"))
@@ -2233,26 +2572,65 @@ def _record_g4_outcome(
             route_models_by_tag=route_models_by_tag,
         )
         ledger = task_runner.load_ledger(ledger_path, repo_root=git_top)
-        prior_changes_requested = "CHANGES_REQUESTED" in prior_sha_statuses or (
-            ledger.get("last_g4_candidate_sha") == candidate_sha
-            and ledger.get("last_g4_status") == "CHANGES_REQUESTED"
-        )
-        if reservation_id:
-            ledger.setdefault("active_g4_reservations", {}).pop(reservation_id, None)
+        res_meta: Any = None
+        if reservation_id is not None:
+            res_meta = ledger.setdefault("active_g4_reservations", {}).pop(
+                reservation_id, None
+            )
         if gate_status in {"PASSED", "CHANGES_REQUESTED"}:
             ledger["g4_rounds_total"] = int(ledger.get("g4_rounds_total", 0)) + 1
-            ledger["g4_rounds_in_packet"] = int(ledger.get("g4_rounds_in_packet", 0)) + 1
-        ledger["last_g4_candidate_sha"] = candidate_sha
-        ledger["last_g4_status"] = gate_status
-        ledger["transient_retries_in_stage"] = 0
 
         spent = float(ledger.get("spent_api_equiv_usd", 0.0))
         limit = float(ledger.get("budget_limit_usd", 0.0))
         reserved = task_runner._active_reserved_usd(ledger)
         committed = round(spent + reserved, 8)
-        if ledger.get("state") == "PAUSED_BUDGET" or (
+        budget_exceeded = ledger.get("state") == "PAUSED_BUDGET" or (
             limit > 0 and committed > round(limit, 8)
-        ):
+        )
+
+        stale_reservation = False
+        if reservation_id is not None:
+            stale_reservation = not (
+                isinstance(res_meta, dict)
+                and res_meta.get("candidate_sha") == candidate_sha
+                and int(ledger.get("packet_version", 1))
+                == int(res_meta.get("packet_version", -1))
+                and str(ledger.get("task_id", "")) == str(res_meta.get("task_id", ""))
+                and str(ledger.get("base_sha", "")) == str(res_meta.get("base_sha", ""))
+                and ledger.get("state") in {"REVIEW_FROZEN_G4", "BLOCKED_INFRA", "PAUSED_BUDGET"}
+            )
+        if stale_reservation:
+            if budget_exceeded:
+                ledger["state"] = "PAUSED_BUDGET"
+            task_runner._append_event(
+                ledger,
+                "G4_STALE_RESERVATION_IGNORED",
+                {
+                    "candidate_sha": candidate_sha,
+                    "reservation_id": reservation_id,
+                    "ledger_packet_version": ledger.get("packet_version"),
+                    "ledger_state": ledger.get("state"),
+                    "reservation": res_meta,
+                },
+            )
+            task_runner.save_ledger(ledger_path, ledger)
+            return "STALE_RESERVATION"
+
+        prior_changes_requested = (
+            "CHANGES_REQUESTED" in prior_sha_statuses
+            or _has_prior_blocking_review(attempt_roots, candidate_sha, resume_dir=resume_dir)
+            or (
+                ledger.get("last_g4_candidate_sha") == candidate_sha
+                and ledger.get("last_g4_status") == "CHANGES_REQUESTED"
+            )
+        )
+        if gate_status in {"PASSED", "CHANGES_REQUESTED"}:
+            ledger["g4_rounds_in_packet"] = int(ledger.get("g4_rounds_in_packet", 0)) + 1
+        ledger["last_g4_candidate_sha"] = candidate_sha
+        ledger["last_g4_status"] = gate_status
+        ledger["transient_retries_in_stage"] = 0
+
+        if budget_exceeded:
             ledger["state"] = "PAUSED_BUDGET"
             task_runner._append_event(
                 ledger,
@@ -2349,13 +2727,20 @@ def _release_g4_reservation_on_abort(
             ledger = task_runner.load_ledger(ledger_path, repo_root=git_top)
             active = ledger.get("active_g4_reservations", {})
             if reservation_id in active:
-                active.pop(reservation_id, None)
-                ledger["state"] = "BLOCKED"
-                ledger["last_g4_candidate_sha"] = candidate_sha
-                ledger["last_g4_status"] = "ABORTED"
+                res_meta = active.pop(reservation_id, None)
+                epoch_ok = (
+                    isinstance(res_meta, dict)
+                    and int(ledger.get("packet_version", 1))
+                    == int(res_meta.get("packet_version", -1))
+                    and str(ledger.get("task_id", "")) == str(res_meta.get("task_id", ""))
+                )
+                if epoch_ok:
+                    ledger["state"] = "BLOCKED"
+                    ledger["last_g4_candidate_sha"] = candidate_sha
+                    ledger["last_g4_status"] = "ABORTED"
                 task_runner._append_event(
                     ledger,
-                    "G4_ABORTED_RELEASE",
+                    "G4_ABORTED_RELEASE" if epoch_ok else "G4_STALE_RESERVATION_ABORTED",
                     {"candidate_sha": candidate_sha, "reservation_id": reservation_id},
                 )
                 task_runner.save_ledger(ledger_path, ledger)
@@ -2441,6 +2826,12 @@ def main(argv: list[str] | None = None) -> int:
     if routes_err:
         print(f"[codex_room_review] BLOCKED: {routes_err}", file=sys.stderr)
         return 2
+    window_guard_enabled, window_exhausted_pct, guard_err = extract_codex_window_guard_config(
+        policy_data
+    )
+    if guard_err:
+        print(f"[codex_room_review] BLOCKED: {guard_err}", file=sys.stderr)
+        return 2
     max_transient_retries = extract_max_transient_retries(policy_data)
     policy_file = git_top / "harness" / "model-policy.json"
     policy_sha256 = (
@@ -2511,6 +2902,8 @@ def main(argv: list[str] | None = None) -> int:
             effective_prefixes=effective_prefixes,
             qualified_routes=qualified_routes,
             max_transient_retries=max_transient_retries,
+            window_guard_enabled=window_guard_enabled,
+            window_exhausted_pct=window_exhausted_pct,
             policy_sha256=policy_sha256,
             schema=schema,
             schema_sha256=schema_sha256,
@@ -2543,6 +2936,8 @@ def _execute_after_preflight(
     effective_prefixes: tuple[str, ...],
     qualified_routes: list[str],
     max_transient_retries: int,
+    window_guard_enabled: bool = True,
+    window_exhausted_pct: float = 100.0,
     policy_sha256: str,
     schema: dict[str, Any],
     schema_sha256: str,
@@ -2706,7 +3101,16 @@ def _execute_after_preflight(
             exhausted_quota_pools.append(pool)
         return pool
 
+    prior_unreused_findings: dict[str, dict[str, Any]] = {}
+    resume_block_errors: list[str] = []
     if resume_dir is not None:
+        resume_consolidated = task_runner._read_optional_json_dict(
+            resume_dir / "consolidated-review.json"
+        )
+        consol_same_sha = (
+            isinstance(resume_consolidated, dict)
+            and str(resume_consolidated.get("revision_sha", "")).strip() == candidate_sha
+        )
         for pass_name, state in states.items():
             loaded = _try_load_reusable_pass(
                 resume_dir,
@@ -2715,23 +3119,88 @@ def _execute_after_preflight(
                 schema,
                 effective_prefixes,
             )
-            if loaded is None:
+            if loaded is not None:
+                loaded_payload, loaded_prov = loaded
+                (out_dir / f"{pass_name}.json").write_text(
+                    json.dumps(loaded_payload, indent=2) + "\n",
+                    encoding="utf-8",
+                )
+                (out_dir / f"{pass_name}.provenance.json").write_text(
+                    json.dumps(loaded_prov, indent=2) + "\n",
+                    encoding="utf-8",
+                )
+                state.payload = loaded_payload
+                state.backend = loaded_prov["backend"]
+                state.model = loaded_prov["model"]
+                state.reused = True
+                state.is_complete = True
+                reused_passes.append(pass_name)
                 continue
-            loaded_payload, loaded_prov = loaded
-            (out_dir / f"{pass_name}.json").write_text(
-                json.dumps(loaded_payload, indent=2) + "\n",
-                encoding="utf-8",
+
+            consol_pass_cr = consol_same_sha and isinstance(resume_consolidated, dict) and (
+                resume_consolidated.get(f"{pass_name}_verdict") == "CHANGES_REQUESTED"
+                or any(
+                    isinstance(f, dict)
+                    and f.get("blocking") is True
+                    and pass_name in (f.get("detected_by") or [])
+                    for f in (resume_consolidated.get("consolidated_findings") or [])
+                )
             )
-            (out_dir / f"{pass_name}.provenance.json").write_text(
-                json.dumps(loaded_prov, indent=2) + "\n",
-                encoding="utf-8",
+            resume_pass_path = resume_dir / f"{pass_name}.json"
+            if not resume_pass_path.is_file():
+                if consol_pass_cr:
+                    resume_block_errors.append(
+                        f"Missing {pass_name}.json in --resume-from {resume_dir} "
+                        f"despite prior CHANGES_REQUESTED/blocking findings."
+                    )
+                continue
+            try:
+                raw_pass_obj = json.loads(resume_pass_path.read_text(encoding="utf-8"))
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+                resume_block_errors.append(
+                    f"Malformed {pass_name}.json in --resume-from {resume_dir}: {exc}"
+                )
+                continue
+            if not isinstance(raw_pass_obj, dict):
+                resume_block_errors.append(
+                    f"Invalid {pass_name}.json in --resume-from {resume_dir}: not an object."
+                )
+                continue
+            raw_sha = str(raw_pass_obj.get("revision_sha", "")).strip()
+            if raw_sha != candidate_sha:
+                if consol_pass_cr:
+                    resume_block_errors.append(
+                        f"Stale revision_sha in {pass_name}.json under --resume-from "
+                        f"{resume_dir} despite prior CHANGES_REQUESTED for {candidate_sha[:12]}."
+                    )
+                continue
+            pass_val_errs = _validate_pass_payload(
+                raw_pass_obj,
+                schema,
+                expected_sha=candidate_sha,
+                expected_lens=state.lens,
             )
-            state.payload = loaded_payload
-            state.backend = loaded_prov["backend"]
-            state.model = loaded_prov["model"]
-            state.reused = True
-            state.is_complete = True
-            reused_passes.append(pass_name)
+            if pass_val_errs:
+                resume_block_errors.append(
+                    f"Invalid {pass_name}.json in --resume-from {resume_dir}: "
+                    f"{'; '.join(pass_val_errs)}"
+                )
+                continue
+            if raw_pass_obj.get("verdict") == "BLOCKED":
+                resume_block_errors.append(
+                    f"Prior {pass_name}.json in --resume-from {resume_dir} has verdict='BLOCKED'."
+                )
+                continue
+            has_blocking = raw_pass_obj.get("verdict") == "CHANGES_REQUESTED" or any(
+                isinstance(f, dict)
+                and (
+                    str(f.get("severity", "")).lower() in BLOCKING_SEVERITIES
+                    or f.get("blocking") is True
+                )
+                for f in (raw_pass_obj.get("findings") or [])
+            )
+            if has_blocking:
+                prior_unreused_findings[pass_name] = raw_pass_obj
 
     prompts_by_pass = {
         "pass1": (prompt1, frozen_prompt1_path),
@@ -2800,6 +3269,7 @@ def _execute_after_preflight(
             active_model=active_model,
             primary_model=primary_model,
             route_models_by_tag=route_models_by_tag,
+            resume_dir=resume_dir,
         )
 
         print(
@@ -2810,7 +3280,7 @@ def _execute_after_preflight(
         )
         if report["review_gate_status"] in {"BLOCKED", "BLOCKED_AUTH", "BLOCKED_INFRA"}:
             return 2
-        if resulting_ledger_state == "PAUSED_BUDGET" or (
+        if resulting_ledger_state in {"PAUSED_BUDGET", "STALE_RESERVATION"} or (
             report["review_gate_status"] == "PASSED"
             and resulting_ledger_state
             in {"BLOCKED", "BLOCKED_AUTH", "BLOCKED_INFRA", "NEEDS_REPLAN"}
@@ -2824,6 +3294,11 @@ def _execute_after_preflight(
         if args.fail_on_blocking and report["blocking_open_count"] > 0:
             return 1
         return 0
+
+    if resume_block_errors:
+        forced_gate_status = "BLOCKED"
+        stage_extra_errors.extend(resume_block_errors)
+        return _finalize_and_exit()
 
     def _verify_agy_readonly(before_status: str) -> str | None:
         try:
@@ -2933,12 +3408,25 @@ def _execute_after_preflight(
                         expected_lens=state.lens,
                     )
                     if not val_errs:
+                        if pass_name in prior_unreused_findings:
+                            merged_payload = _merge_prior_pass_findings(
+                                payload, prior_unreused_findings[pass_name], candidate_sha
+                            )
+                            if merged_payload is not None:
+                                payload = merged_payload
+                                (out_dir / f"{pass_name}.json").write_text(
+                                    json.dumps(payload, indent=2) + "\n",
+                                    encoding="utf-8",
+                                )
                         state.payload = payload
                         state.backend = backend_name
                         state.model = model_name
                         state.is_complete = True
                         failures.pop(pass_name, None)
-                        if payload.get("verdict") != "BLOCKED":
+                        if (
+                            payload.get("verdict") != "BLOCKED"
+                            and pass_name not in prior_unreused_findings
+                        ):
                             _write_pass_provenance(
                                 out_dir,
                                 pass_name,
@@ -3087,6 +3575,27 @@ def _execute_after_preflight(
             return _finalize_and_exit()
         fallback_reason = "codex_cli_not_found"
         _mark_pool_exhausted(EXPECTED_REVIEW_MODEL)
+
+    if codex_prefix is not None and window_guard_enabled and any(
+        not s.is_complete for s in states.values()
+    ):
+        rl_result = probe_codex_rate_limits(codex_prefix, args.runtime_root)
+        rl_exhausted, rl_reason, rl_snapshot = evaluate_codex_window_exhaustion(
+            rl_result, threshold_pct=window_exhausted_pct
+        )
+        if rl_snapshot is not None:
+            (out_dir / "codex-ratelimits-preflight.json").write_text(
+                json.dumps(rl_snapshot, indent=2) + "\n",
+                encoding="utf-8",
+            )
+        if rl_exhausted and rl_reason:
+            _mark_pool_exhausted(EXPECTED_REVIEW_MODEL)
+            if args.backend == "codex":
+                forced_gate_status = "BLOCKED_INFRA"
+                stage_extra_errors.append(rl_reason)
+                return _finalize_and_exit()
+            fallback_reason = rl_reason
+            codex_prefix = None
 
     if codex_prefix is not None:
         outcome, st_errs, failed_passes = _run_provider_stage(
