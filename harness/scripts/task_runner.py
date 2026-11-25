@@ -309,6 +309,7 @@ def _ensure_ledger_defaults(
     data: dict[str, Any],
     *,
     policy_breakers: dict[str, int] | None = None,
+    policy_deadlines: dict[str, int] | None = None,
 ) -> dict[str, Any]:
     defaults = policy_breakers or DEFAULT_CIRCUIT_BREAKERS
     if "circuit_breakers" not in data:
@@ -325,6 +326,23 @@ def _ensure_ledger_defaults(
                 f"Invalid circuit_breakers[{br_k!r}]={br_v!r} in ledger.json "
                 f"(expected int >= {min_val})."
             )
+
+    dl_defaults = policy_deadlines or DEFAULT_DEADLINES_SEC
+    if "deadlines_sec" not in data:
+        data["deadlines_sec"] = {}
+    elif not isinstance(data["deadlines_sec"], dict):
+        raise ValueError("Invalid 'deadlines_sec' in ledger.json: expected dict.")
+    deadlines = data["deadlines_sec"]
+    for dl_key, dl_val in dl_defaults.items():
+        deadlines.setdefault(dl_key, dl_val)
+    for dl_k, dl_v in deadlines.items():
+        if not isinstance(dl_k, str) or not dl_k:
+            raise ValueError(f"Invalid deadlines_sec key {dl_k!r} in ledger.json.")
+        _require_finite_number(
+            dl_v,
+            f"deadlines_sec[{dl_k!r}]",
+            allow_zero=(dl_k in {"reviewer_pass_idle", "reviewer_agy_pass_idle"}),
+        )
 
     if "packet_version" in data and (
         not is_strict_int(data["packet_version"]) or data["packet_version"] < 1
@@ -1083,7 +1101,12 @@ def load_ledger(
             f"cannot bind {expected_root_task_id!r}."
         )
     policy_breakers = load_circuit_breakers(repo_root=repo_root, policy_path=policy_path)
-    return _ensure_ledger_defaults(data, policy_breakers=policy_breakers)
+    policy_deadlines = load_deadlines_sec(repo_root=repo_root, policy_path=policy_path)
+    return _ensure_ledger_defaults(
+        data,
+        policy_breakers=policy_breakers,
+        policy_deadlines=policy_deadlines,
+    )
 
 
 def init_or_load_ledger(

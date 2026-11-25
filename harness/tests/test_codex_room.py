@@ -6525,7 +6525,7 @@ def test_g4_lock_loser_does_not_bill_foreign_raw_logs_on_abort(
 def test_codex_room_review_raises_timeouts_50pct_and_caps_agy_idle(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Default CLI uses +50% timeouts, honors policy/ledger/explicit CLI & caps AGY idle."""
+    """Default CLI + --idle-timeout>=180 enforce AGY floor, cap by timeout, & honor overrides."""
     from harness.scripts import task_runner
 
     repo_dir, sha1 = _init_policy_repo(
@@ -6533,6 +6533,7 @@ def test_codex_room_review_raises_timeouts_50pct_and_caps_agy_idle(
     )
     codex_seen: list[tuple[float, float]] = []
     agy_seen: list[tuple[float, float]] = []
+    probe_state: dict[str, Any] = {"result": None}
 
     def _spy_codex(**kwargs: Any) -> dict[str, Any]:
         codex_seen.append((float(kwargs["timeout_sec"]), float(kwargs["idle_timeout_sec"])))
@@ -6552,10 +6553,34 @@ def test_codex_room_review_raises_timeouts_50pct_and_caps_agy_idle(
     monkeypatch.setattr(codex_room_review, "resolve_codex_command", lambda: ["codex"])
     monkeypatch.setattr(codex_room_review, "resolve_agy_command", lambda: ["agy"])
     monkeypatch.setattr(
-        codex_room_review, "probe_codex_rate_limits", lambda *a, **kw: None
+        codex_room_review, "probe_codex_rate_limits", lambda *a, **kw: probe_state["result"]
     )
     monkeypatch.setattr(codex_room_review, "_run_codex_pass", _spy_codex)
     monkeypatch.setattr(codex_room_review, "_run_agy_pass", _spy_agy)
+
+    def _run_agy_case(
+        out_name: str, extra_args: list[str], *, fallback_auto: bool = False
+    ) -> tuple[float, float]:
+        agy_seen.clear()
+        probe_state["result"] = (
+            {"rateLimits": {"primary": {"usedPercent": 95.0}}} if fallback_auto else None
+        )
+        backend = "auto" if fallback_auto else "agy"
+        rc = codex_room_review.main(
+            [
+                "--commit",
+                sha1,
+                "--repo-root",
+                str(repo_dir),
+                "--out-dir",
+                str(tmp_path / out_name),
+                "--backend",
+                backend,
+                *extra_args,
+            ]
+        )
+        assert rc == 0
+        return agy_seen[0]
 
     assert (
         codex_room_review.main(
@@ -6572,72 +6597,29 @@ def test_codex_room_review_raises_timeouts_50pct_and_caps_agy_idle(
         )
         == 0
     )
-    assert (
-        codex_room_review.main(
-            [
-                "--commit",
-                sha1,
-                "--repo-root",
-                str(repo_dir),
-                "--out-dir",
-                str(tmp_path / "out_agy_def"),
-                "--backend",
-                "agy",
-            ]
-        )
-        == 0
+    codex_kw = codex_seen[0]
+    agy_def = _run_agy_case("out_agy_def", [])
+    agy_270 = _run_agy_case("out_agy_270", ["--idle-timeout", "270"])
+    auto_270 = _run_agy_case("out_auto_270", ["--idle-timeout", "270"], fallback_auto=True)
+    agy_400_270 = _run_agy_case("out_agy_400_270", ["--timeout", "400", "--idle-timeout", "270"])
+    auto_400_270 = _run_agy_case(
+        "out_auto_400_270", ["--timeout", "400", "--idle-timeout", "270"], fallback_auto=True
     )
-    assert (
-        codex_room_review.main(
-            [
-                "--commit",
-                sha1,
-                "--repo-root",
-                str(repo_dir),
-                "--out-dir",
-                str(tmp_path / "out_agy_cap"),
-                "--backend",
-                "agy",
-                "--timeout",
-                "400",
-            ]
-        )
-        == 0
-    )
-    assert (
-        codex_room_review.main(
-            [
-                "--commit",
-                sha1,
-                "--repo-root",
-                str(repo_dir),
-                "--out-dir",
-                str(tmp_path / "out_agy_explicit_200"),
-                "--backend",
-                "agy",
-                "--idle-timeout",
-                "200",
-            ]
-        )
-        == 0
-    )
-    assert (
-        codex_room_review.main(
-            [
-                "--commit",
-                sha1,
-                "--repo-root",
-                str(repo_dir),
-                "--out-dir",
-                str(tmp_path / "out_agy_fast"),
-                "--backend",
-                "agy",
-                "--idle-timeout",
-                "5",
-            ]
-        )
-        == 0
-    )
+    agy_200 = _run_agy_case("out_agy_200", ["--idle-timeout", "200"])
+    agy_explicit_200 = _run_agy_case("out_agy_explicit_200", ["--agy-idle-timeout", "200"])
+    agy_5 = _run_agy_case("out_agy_5", ["--idle-timeout", "5"])
+    agy_0 = _run_agy_case("out_agy_0", ["--idle-timeout", "0"])
+
+    assert codex_kw == (1800.0, 270.0)
+    assert agy_def == (1800.0, 630.0)
+    assert agy_270 == (1800.0, 630.0)
+    assert auto_270 == (1800.0, 630.0)
+    assert agy_400_270 == (400.0, 400.0)
+    assert auto_400_270 == (400.0, 400.0)
+    assert agy_200 == (1800.0, 630.0)
+    assert agy_explicit_200 == (1800.0, 200.0)
+    assert agy_5 == (1800.0, 5.0)
+    assert agy_0 == (1800.0, 0.0)
 
     # Policy deadlines_sec.reviewer_agy_pass_idle = 500 is honored when no CLI flag is passed.
     pol_path = repo_dir / "harness" / "model-policy.json"
@@ -6658,6 +6640,8 @@ def test_codex_room_review_raises_timeouts_50pct_and_caps_agy_idle(
         return _sample_pass(sha2, lens)
 
     monkeypatch.setattr(codex_room_review, "_run_agy_pass", _spy_agy_sha2)
+    probe_state["result"] = None
+    agy_seen.clear()
     assert (
         codex_room_review.main(
             [
@@ -6673,6 +6657,7 @@ def test_codex_room_review_raises_timeouts_50pct_and_caps_agy_idle(
         )
         == 0
     )
+    agy_policy = agy_seen[0]
 
     # Ledger deadlines_sec.reviewer_agy_pass_idle = 480 overrides policy 500.
     led_path = _setup_ledger_for_g4_test(
@@ -6681,6 +6666,7 @@ def test_codex_room_review_raises_timeouts_50pct_and_caps_agy_idle(
     led_data = task_runner.load_ledger(led_path)
     led_data["deadlines_sec"]["reviewer_agy_pass_idle"] = 480
     task_runner.save_ledger(led_path, led_data)
+    agy_seen.clear()
     assert (
         codex_room_review.main(
             [
@@ -6700,15 +6686,10 @@ def test_codex_room_review_raises_timeouts_50pct_and_caps_agy_idle(
         )
         == 0
     )
+    agy_ledger = agy_seen[0]
 
-    assert codex_seen[0] == (1800.0, 270.0)
-    assert agy_seen[0] == (1800.0, 630.0)
-    assert agy_seen[2] == (400.0, 400.0)
-    assert agy_seen[4] == (1800.0, 200.0)
-    assert agy_seen[6] == (1800.0, 5.0)
-    assert agy_seen[8] == (1800.0, 500.0)
-    assert agy_seen[10] == (1800.0, 480.0)
-
+    assert agy_policy == (1800.0, 500.0)
+    assert agy_ledger == (1800.0, 480.0)
     assert (
         codex_room_review.main(
             ["--commit", sha2, "--repo-root", str(repo_dir), "--agy-idle-timeout", "-1"]

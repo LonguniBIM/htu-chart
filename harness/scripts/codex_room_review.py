@@ -1919,8 +1919,8 @@ def _build_parser() -> argparse.ArgumentParser:
         type=float,
         default=DEFAULT_CODEX_IDLE_TIMEOUT_SEC,
         help=(
-            "Inactivity watchdog timeout per pass in seconds; resets on stdout/stderr "
-            "activity (0 disables). Default: 270 (630 for agy)."
+            "Default: 270 for codex; agy enforces >=630 floor when >=180 "
+            "unless --agy-idle-timeout is set."
         ),
     )
     parser.add_argument(
@@ -3555,34 +3555,41 @@ def main(argv: list[str] | None = None) -> int:
             if is_strict_int(raw_r):
                 max_transient_retries = max(0, int(raw_r))
 
+        l_deadlines = (
+            loaded_cfg_ledger.get("deadlines_sec")
+            if isinstance(loaded_cfg_ledger, dict)
+            else None
+        )
+        l_agy_idle = (
+            _extract_nonneg_finite_float(l_deadlines.get("reviewer_agy_pass_idle"))
+            if isinstance(l_deadlines, dict)
+            else None
+        )
+        p_cb = policy_data.get("circuit_breakers") if isinstance(policy_data, dict) else None
+        p_deadlines = p_cb.get("deadlines_sec") if isinstance(p_cb, dict) else None
+        p_agy_idle = (
+            _extract_nonneg_finite_float(p_deadlines.get("reviewer_agy_pass_idle"))
+            if isinstance(p_deadlines, dict)
+            else None
+        )
+        if l_agy_idle is not None:
+            configured_agy_idle = l_agy_idle
+        elif p_agy_idle is not None:
+            configured_agy_idle = p_agy_idle
+        else:
+            configured_agy_idle = DEFAULT_AGY_IDLE_TIMEOUT_SEC
+
         if args.agy_idle_timeout is not None:
             agy_idle_timeout_sec = float(args.agy_idle_timeout)
         elif explicit_idle_cli:
-            agy_idle_timeout_sec = float(args.idle_timeout)
-        else:
-            l_deadlines = (
-                loaded_cfg_ledger.get("deadlines_sec")
-                if isinstance(loaded_cfg_ledger, dict)
-                else None
-            )
-            l_agy_idle = (
-                _extract_nonneg_finite_float(l_deadlines.get("reviewer_agy_pass_idle"))
-                if isinstance(l_deadlines, dict)
-                else None
-            )
-            p_cb = policy_data.get("circuit_breakers") if isinstance(policy_data, dict) else None
-            p_deadlines = p_cb.get("deadlines_sec") if isinstance(p_cb, dict) else None
-            p_agy_idle = (
-                _extract_nonneg_finite_float(p_deadlines.get("reviewer_agy_pass_idle"))
-                if isinstance(p_deadlines, dict)
-                else None
-            )
-            if l_agy_idle is not None:
-                agy_idle_timeout_sec = l_agy_idle
-            elif p_agy_idle is not None:
-                agy_idle_timeout_sec = p_agy_idle
+            if args.idle_timeout <= 0:
+                agy_idle_timeout_sec = 0.0
+            elif args.idle_timeout >= 180.0:
+                agy_idle_timeout_sec = max(float(args.idle_timeout), configured_agy_idle)
             else:
-                agy_idle_timeout_sec = DEFAULT_AGY_IDLE_TIMEOUT_SEC
+                agy_idle_timeout_sec = float(args.idle_timeout)
+        else:
+            agy_idle_timeout_sec = configured_agy_idle
 
         return _run_after_preflight()
     finally:

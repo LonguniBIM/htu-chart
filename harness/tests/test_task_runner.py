@@ -1427,6 +1427,12 @@ def test_ensure_ledger_defaults_rejects_wrong_typed_maps_and_counters(tmp_path: 
         {"circuit_breakers": {"max_g4_rounds_per_root_task": True}},
         {"circuit_breakers": {"max_g4_rounds_per_root_task": None}},
         {"circuit_breakers": {"max_g4_rounds_per_root_task": 0}},
+        {"deadlines_sec": []},
+        {"deadlines_sec": {"reviewer_pass_total": "bad"}},
+        {"deadlines_sec": {"reviewer_pass_total": True}},
+        {"deadlines_sec": {"reviewer_pass_total": -1}},
+        {"deadlines_sec": {"reviewer_pass_total": 0}},
+        {"deadlines_sec": {"reviewer_agy_pass_idle": -1}},
     ):
         corrupted = dict(base_data)
         corrupted.update(bad_patch)
@@ -1434,6 +1440,17 @@ def test_ensure_ledger_defaults_rejects_wrong_typed_maps_and_counters(tmp_path: 
         bad_file.write_text(json.dumps(corrupted), encoding="utf-8")
         with pytest.raises(ValueError):
             task_runner.load_ledger(bad_file)
+
+    legacy_dl = dict(base_data)
+    legacy_dl["deadlines_sec"] = {
+        k: v
+        for k, v in base_data["deadlines_sec"].items()
+        if k != "reviewer_agy_pass_idle"
+    }
+    leg_file = tmp_path / "legacy_deadlines_ledger.json"
+    leg_file.write_text(json.dumps(legacy_dl), encoding="utf-8")
+    loaded_legacy = task_runner.load_ledger(leg_file)
+    assert loaded_legacy["deadlines_sec"]["reviewer_agy_pass_idle"] == 630
 
     missing_spent = dict(base_data)
     missing_spent.pop("spent_api_equiv_usd", None)
