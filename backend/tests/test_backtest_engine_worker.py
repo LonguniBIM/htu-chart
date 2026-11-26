@@ -2489,3 +2489,346 @@ async def test_preexisting_defective_coverage_fails_backtest(tmp_path: Path) -> 
                 break
             await asyncio.sleep(0.05)
         assert stc["status"] == "COMPLETED"
+
+
+def test_order_blocks_beyond_lookback_bullish_and_bearish() -> None:
+    """Contract: detect_order_blocks locates the last prior opposing candle even > lookback away.
+
+    Defect caught: Bounding opposing-candle search to [idx - lookback, idx) missing real OBs.
+    """
+    t0 = 1_760_000_000
+    # 1) Bullish OB: bar 0 bearish, bars 1..3 bullish consolidation, bar 4 breaks prior 3-bar high.
+    bull_bars = [
+        _bar(t0 + 0 * 60, 102.0, 103.0, 100.0, 100.5),  # 0: bearish OB candidate
+        _bar(t0 + 1 * 60, 100.5, 102.0, 100.25, 101.0), # 1: bullish
+        _bar(t0 + 2 * 60, 101.0, 102.25, 100.75, 101.5),# 2: bullish
+        _bar(t0 + 3 * 60, 101.5, 102.5, 101.0, 102.0),  # 3: bullish (prior 3 high = 102.5)
+        _bar(t0 + 4 * 60, 102.0, 104.0, 101.75, 103.5), # 4: displacement close > 102.5
+    ]
+    bull_obs = detect_order_blocks(bull_bars, lookback=3)
+    assert len(bull_obs) == 1
+    assert bull_obs[0].direction == "bullish"
+    assert bull_obs[0].start_time == bull_bars[0].time
+    assert bull_obs[0].end_time == bull_bars[4].time
+    assert bull_obs[0].detected_at_time == bull_bars[4].time
+    assert bull_obs[0].top == 103.0
+    assert bull_obs[0].bottom == 100.0
+
+    # 2) Bearish OB: bar 0 bullish, bars 1..3 bearish consolidation, bar 4 breaks prior 3-bar low.
+    bear_bars = [
+        _bar(t0 + 0 * 60, 100.5, 103.0, 100.0, 102.5),  # 0: bullish OB candidate
+        _bar(t0 + 1 * 60, 102.5, 102.75, 101.0, 102.0), # 1: bearish
+        _bar(t0 + 2 * 60, 102.0, 102.25, 100.75, 101.5),# 2: bearish
+        _bar(t0 + 3 * 60, 101.5, 102.0, 100.5, 101.0),  # 3: bearish (prior 3 low = 100.5)
+        _bar(t0 + 4 * 60, 101.0, 101.25, 99.0, 99.5),   # 4: displacement close < 100.5
+    ]
+    bear_obs = detect_order_blocks(bear_bars, lookback=3)
+    assert len(bear_obs) == 1
+    assert bear_obs[0].direction == "bearish"
+    assert bear_obs[0].start_time == bear_bars[0].time
+    assert bear_obs[0].end_time == bear_bars[4].time
+    assert bear_obs[0].detected_at_time == bear_bars[4].time
+    assert bear_obs[0].top == 103.0
+    assert bear_obs[0].bottom == 100.0
+
+
+async def test_fallback_json_sizing_timeout_unblocks_next_job(tmp_path: Path) -> None:
+    """Contract: Hung fallback _measure_result_bytes times out Job A and unblocks Job B.
+
+    Defect caught: Unbounded await on fallback _measure_result_bytes hanging RUNNING forever.
+    """
+    import app.services.backtest_service as bs_mod
+
+    sizing_entered = threading.Event()
+    sizing_release = threading.Event()
+    orig_measure = bs_mod._measure_result_bytes
+
+    def _gated_measure(result_dict: dict[str, Any]) -> int:
+        if result_dict.get("contract_id") == "CON.F.US.MES.SIZE_TO":
+            sizing_entered.set()
+            sizing_release.wait(timeout=15.0)
+        return orig_measure(result_dict)
+
+    bs_mod._measure_result_bytes = _gated_measure
+    try:
+        async with _async_client(
+            tmp_path,
+            backtest_timeout_sec=1.5,
+            worker_fn=worker_hang_or_fast,
+        ) as (client, _app):
+            csrf = await _login(client)
+            t0 = 1_760_000_000
+
+            ra = await client.post(
+                "/api/backtest",
+                headers={"X-CSRF-Token": csrf},
+                json={
+                    "contract_id": "CON.F.US.MES.SIZE_TO",
+                    "root_symbol": "MES",
+                    "timeframe": "5m",
+                    "start_time": t0,
+                    "end_time": t0 + 3600,
+                },
+            )
+            assert ra.status_code == 202
+            ja = ra.json()["job_id"]
+
+            for _ in range(100):
+                if sizing_entered.is_set():
+                    break
+                await asyncio.sleep(0.02)
+            assert sizing_entered.is_set()
+
+            rb = await client.post(
+                "/api/backtest",
+                headers={"X-CSRF-Token": csrf},
+                json={
+                    "contract_id": "CON.F.US.MES.SIZE_OK",
+                    "root_symbol": "MES",
+                    "timeframe": "5m",
+                    "start_time": t0,
+                    "end_time": t0 + 3600,
+                },
+            )
+            assert rb.status_code == 202
+            jb = rb.json()["job_id"]
+
+            sta: dict[str, Any] = {}
+            stb: dict[str, Any] = {}
+            for _ in range(120):
+                sta = (await client.get(f"/api/backtest/{ja}")).json()
+                stb = (await client.get(f"/api/backtest/{jb}")).json()
+                if sta["status"] == "TIMED_OUT" and stb["status"] == "COMPLETED":
+                    break
+                await asyncio.sleep(0.05)
+
+            assert sta["status"] == "TIMED_OUT"
+            assert stb["status"] == "COMPLETED"
+            assert not sizing_release.is_set()
+    finally:
+        sizing_release.set()
+        bs_mod._measure_result_bytes = orig_measure
+
+
+async def test_bounded_daemon_io_cap_prevents_unbounded_thread_spawns(tmp_path: Path) -> None:
+    """Contract: _run_bounded_daemon_io caps active threads at 4 and recovers after release.
+
+    Defect caught: Unbounded orphaned daemon thread spawning when storage metadata reads stall.
+    """
+    import app.services.backtest_service as bs_mod
+
+    gate = threading.Event()
+    entered_count_lock = threading.Lock()
+    entered_count = {"n": 0}
+    orig_read_meta = bs_mod._read_parquet_stored_root
+
+    def _gated_read_meta(target: Path) -> str | None:
+        if "CON.F.US.MES.SAT" in str(target):
+            with entered_count_lock:
+                entered_count["n"] += 1
+            gate.wait(timeout=15.0)
+        return orig_read_meta(target)
+
+    bs_mod._read_parquet_stored_root = _gated_read_meta
+    try:
+        async with _async_client(
+            tmp_path,
+            backtest_max_queue_depth=16,
+            backtest_timeout_sec=0.35,
+            worker_fn=worker_hang_or_fast,
+        ) as (client, app):
+            csrf = await _login(client)
+            svc = app.state.backtest_service
+            t0 = 1_760_000_000
+
+            job_ids: list[str] = []
+            for idx in range(8):
+                r = await client.post(
+                    "/api/backtest",
+                    headers={"X-CSRF-Token": csrf},
+                    json={
+                        "contract_id": f"CON.F.US.MES.SAT{idx}",
+                        "root_symbol": "MES",
+                        "timeframe": "5m",
+                        "start_time": t0,
+                        "end_time": t0 + 3600,
+                    },
+                )
+                assert r.status_code == 202
+                job_ids.append(r.json()["job_id"])
+
+            statuses: list[dict[str, Any]] = []
+            for _ in range(160):
+                assert svc.active_daemon_io_ops <= 4
+                statuses = [
+                    (await client.get(f"/api/backtest/{jid}")).json() for jid in job_ids
+                ]
+                if all(st["status"] in {"TIMED_OUT", "FAILED"} for st in statuses):
+                    break
+                await asyncio.sleep(0.05)
+
+            assert svc.active_daemon_io_ops == 4
+            assert entered_count["n"] == 4
+            assert [st["status"] for st in statuses[:4]] == ["TIMED_OUT"] * 4
+            assert [st["status"] for st in statuses[4:]] == ["FAILED"] * 4
+            assert all("saturated" in str(st["error"]).lower() for st in statuses[4:])
+
+            gate.set()
+            for _ in range(100):
+                if svc.active_daemon_io_ops == 0:
+                    break
+                await asyncio.sleep(0.02)
+            assert svc.active_daemon_io_ops == 0
+
+            app.state.settings.backtest_timeout_sec = 5.0
+            r_ok = await client.post(
+                "/api/backtest",
+                headers={"X-CSRF-Token": csrf},
+                json={
+                    "contract_id": "CON.F.US.MES.CLEAN",
+                    "root_symbol": "MES",
+                    "timeframe": "5m",
+                    "start_time": t0,
+                    "end_time": t0 + 3600,
+                },
+            )
+            j_ok = r_ok.json()["job_id"]
+            st_ok: dict[str, Any] = {}
+            for _ in range(100):
+                st_ok = (await client.get(f"/api/backtest/{j_ok}")).json()
+                if st_ok["status"] == "COMPLETED":
+                    break
+                await asyncio.sleep(0.05)
+            assert st_ok["status"] == "COMPLETED"
+    finally:
+        gate.set()
+        bs_mod._read_parquet_stored_root = orig_read_meta
+
+
+def test_limit_order_expiry_and_open_gap_fill_exit_pricing() -> None:
+    """Contract: Limit orders expire at max_wait_bars and open gaps fill/exit at bar.open.
+
+    Defect caught: Stale limit orders filling past max_wait_bars or gap fills using limit/SL/TP.
+    """
+    t0 = 1_760_000_000
+
+    # 1) Limit expiry strictly at max_wait_bars=2 (bar 3 touch must NOT fill).
+    exp_bars = [
+        _bar(t0 + 0 * 60, 102.0, 102.5, 101.5, 102.0),  # 0: signal limit LONG @ 100.0
+        _bar(t0 + 1 * 60, 102.0, 102.5, 101.0, 101.5),  # 1: wait=1, no touch
+        _bar(t0 + 2 * 60, 101.5, 102.0, 101.0, 101.5),  # 2: wait=2 == max_wait_bars -> expires
+        _bar(t0 + 3 * 60, 101.5, 102.0, 99.5, 100.5),   # 3: touches 100.0 after expiry
+    ]
+    exp_res = run_backtest(
+        exp_bars,
+        contract_id="CON.F.US.MES.Z26",
+        timeframe="1m",
+        strategy=_SingleSignalStrategy(
+            {
+                "signal_index": 0,
+                "direction": "LONG",
+                "order_type": "limit",
+                "limit_price": 100.0,
+                "stop_loss": 98.0,
+                "take_profit": 104.0,
+                "max_wait_bars": 2,
+            }
+        ),
+    )
+    assert len(exp_res.trades) == 0
+
+    # 2) Favorable open-gap limit fill + adverse open-gap SL exit (LONG)
+    long_gap_sl_bars = [
+        _bar(t0 + 0 * 60, 101.0, 101.5, 100.5, 101.0),  # 0: emit LONG limit @ 100.0
+        _bar(t0 + 1 * 60, 99.0, 100.0, 98.5, 99.5),     # 1: gaps open=99.0 <= 100.0 -> fill @ 99.0
+        _bar(t0 + 2 * 60, 97.0, 98.5, 96.5, 97.5),      # 2: gap open <= SL=98.0 -> exit @ 97.0
+    ]
+    r_l_sl = run_backtest(
+        long_gap_sl_bars,
+        contract_id="CON.F.US.MES.Z26",
+        timeframe="1m",
+        strategy=_SingleSignalStrategy(
+            {
+                "signal_index": 0,
+                "direction": "LONG",
+                "order_type": "limit",
+                "limit_price": 100.0,
+                "stop_loss": 98.0,
+                "take_profit": 104.0,
+            }
+        ),
+    )
+    assert r_l_sl.trades[0].entry_price == 99.0
+    assert r_l_sl.trades[0].exit_price == 97.0
+    assert r_l_sl.trades[0].exit_reason == "stop_loss"
+
+    # 3) Favorable open-gap TP exit (LONG)
+    long_gap_tp_bars = [
+        _bar(t0 + 0 * 60, 101.0, 101.5, 100.5, 101.0),  # 0: emit LONG market
+        _bar(t0 + 1 * 60, 101.0, 102.0, 100.5, 101.5),  # 1: fill @ 101.0
+        _bar(t0 + 2 * 60, 105.0, 105.5, 104.5, 105.0),  # 2: gap open >= TP=104.0 -> exit @ 105.0
+    ]
+    r_l_tp = run_backtest(
+        long_gap_tp_bars,
+        contract_id="CON.F.US.MES.Z26",
+        timeframe="1m",
+        strategy=_SingleSignalStrategy(
+            {
+                "signal_index": 0,
+                "direction": "LONG",
+                "order_type": "market",
+                "stop_loss": 98.0,
+                "take_profit": 104.0,
+            }
+        ),
+    )
+    assert r_l_tp.trades[0].exit_price == 105.0
+    assert r_l_tp.trades[0].exit_reason == "take_profit"
+
+    # 4) Favorable open-gap limit fill + adverse open-gap SL exit (SHORT)
+    short_gap_sl_bars = [
+        _bar(t0 + 0 * 60, 99.0, 99.5, 98.5, 99.0),     # 0: emit SHORT limit @ 100.0
+        _bar(t0 + 1 * 60, 101.0, 101.5, 100.5, 101.0),  # 1: gap open >= 100.0 -> fill @ 101.0
+        _bar(t0 + 2 * 60, 103.0, 103.5, 102.5, 103.0),  # 2: gap open >= SL=102.0 -> exit @ 103.0
+    ]
+    r_s_sl = run_backtest(
+        short_gap_sl_bars,
+        contract_id="CON.F.US.MES.Z26",
+        timeframe="1m",
+        strategy=_SingleSignalStrategy(
+            {
+                "signal_index": 0,
+                "direction": "SHORT",
+                "order_type": "limit",
+                "limit_price": 100.0,
+                "stop_loss": 102.0,
+                "take_profit": 96.0,
+            }
+        ),
+    )
+    assert r_s_sl.trades[0].entry_price == 101.0
+    assert r_s_sl.trades[0].exit_price == 103.0
+    assert r_s_sl.trades[0].exit_reason == "stop_loss"
+
+    # 5) Favorable open-gap TP exit (SHORT)
+    short_gap_tp_bars = [
+        _bar(t0 + 0 * 60, 99.0, 99.5, 98.5, 99.0),     # 0: emit SHORT market
+        _bar(t0 + 1 * 60, 99.0, 99.5, 98.0, 98.5),     # 1: fill @ 99.0
+        _bar(t0 + 2 * 60, 95.0, 95.5, 94.5, 95.0),     # 2: gaps open=95.0 <= TP=96.0 -> exit @ 95.0
+    ]
+    r_s_tp = run_backtest(
+        short_gap_tp_bars,
+        contract_id="CON.F.US.MES.Z26",
+        timeframe="1m",
+        strategy=_SingleSignalStrategy(
+            {
+                "signal_index": 0,
+                "direction": "SHORT",
+                "order_type": "market",
+                "stop_loss": 102.0,
+                "take_profit": 96.0,
+            }
+        ),
+    )
+    assert r_s_tp.trades[0].exit_price == 95.0
+    assert r_s_tp.trades[0].exit_reason == "take_profit"

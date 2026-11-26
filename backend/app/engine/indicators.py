@@ -273,52 +273,72 @@ def detect_order_blocks(
 ) -> list[OrderBlockZone]:
     """Detect strictly causal bullish/bearish Order Blocks confirmed on displacement bar i."""
     lb = _validate_positive_int(lookback, "lookback")
+    if len(bars) <= lb:
+        return []
+
     zones: list[OrderBlockZone] = []
     seen_bull_ob_indices: set[int] = set()
     seen_bear_ob_indices: set[int] = set()
+    last_bearish_idx: int | None = None
+    last_bullish_idx: int | None = None
+
+    for k in range(lb - 1):
+        bar = bars[k]
+        if bar.close < bar.open:
+            last_bearish_idx = k
+        elif bar.close > bar.open:
+            last_bullish_idx = k
 
     for idx in range(lb, len(bars)):
+        prev = bars[idx - 1]
+        if prev.close < prev.open:
+            last_bearish_idx = idx - 1
+        elif prev.close > prev.open:
+            last_bullish_idx = idx - 1
+
         current = bars[idx]
         prior_high = max(bars[k].high for k in range(idx - lb, idx))
         prior_low = min(bars[k].low for k in range(idx - lb, idx))
 
-        if current.close > current.open and current.close > prior_high:
-            for j in range(idx - 1, idx - lb - 1, -1):
-                candidate = bars[j]
-                if candidate.close < candidate.open:
-                    if j not in seen_bull_ob_indices:
-                        seen_bull_ob_indices.add(j)
-                        zones.append(
-                            OrderBlockZone(
-                                direction="bullish",
-                                top=float(candidate.high),
-                                bottom=float(candidate.low),
-                                start_time=candidate.time,
-                                end_time=current.time,
-                                detected_at_time=current.time,
-                                bar_index=idx,
-                            )
-                        )
-                    break
+        if (
+            current.close > current.open
+            and current.close > prior_high
+            and last_bearish_idx is not None
+            and last_bearish_idx not in seen_bull_ob_indices
+        ):
+            candidate = bars[last_bearish_idx]
+            seen_bull_ob_indices.add(last_bearish_idx)
+            zones.append(
+                OrderBlockZone(
+                    direction="bullish",
+                    top=float(candidate.high),
+                    bottom=float(candidate.low),
+                    start_time=candidate.time,
+                    end_time=current.time,
+                    detected_at_time=current.time,
+                    bar_index=idx,
+                )
+            )
 
-        if current.close < current.open and current.close < prior_low:
-            for j in range(idx - 1, idx - lb - 1, -1):
-                candidate = bars[j]
-                if candidate.close > candidate.open:
-                    if j not in seen_bear_ob_indices:
-                        seen_bear_ob_indices.add(j)
-                        zones.append(
-                            OrderBlockZone(
-                                direction="bearish",
-                                top=float(candidate.high),
-                                bottom=float(candidate.low),
-                                start_time=candidate.time,
-                                end_time=current.time,
-                                detected_at_time=current.time,
-                                bar_index=idx,
-                            )
-                        )
-                    break
+        if (
+            current.close < current.open
+            and current.close < prior_low
+            and last_bullish_idx is not None
+            and last_bullish_idx not in seen_bear_ob_indices
+        ):
+            candidate = bars[last_bullish_idx]
+            seen_bear_ob_indices.add(last_bullish_idx)
+            zones.append(
+                OrderBlockZone(
+                    direction="bearish",
+                    top=float(candidate.high),
+                    bottom=float(candidate.low),
+                    start_time=candidate.time,
+                    end_time=current.time,
+                    detected_at_time=current.time,
+                    bar_index=idx,
+                )
+            )
 
     return zones
 

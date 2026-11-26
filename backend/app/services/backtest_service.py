@@ -45,6 +45,7 @@ BacktestJobStatus = Literal[
 ]
 _TERMINAL_STATUSES = frozenset({"COMPLETED", "CANCELLED", "TIMED_OUT", "FAILED"})
 _ENVELOPE_FLAG = "__backtest_worker_envelope__"
+MAX_CONCURRENT_DAEMON_IO_OPS = 4
 
 
 def _set_future_result[T](fut: asyncio.Future[T], res: T) -> None:
@@ -371,6 +372,9 @@ class BacktestService:
         self._mp_context = multiprocessing.get_context("spawn")
         self._executor: ProcessPoolExecutor | None = None
         self._cleanup_lock = asyncio.Lock()
+        self._io_sem = threading.BoundedSemaphore(MAX_CONCURRENT_DAEMON_IO_OPS)
+        self._io_counter_lock = threading.Lock()
+        self._active_daemon_io_ops = 0
 
         self._jobs: dict[str, BacktestJobRecord] = {}
         self._queue: deque[str] = deque()
@@ -381,6 +385,52 @@ class BacktestService:
         self._dispatcher_task: asyncio.Task[None] | None = None
         self._wakeup = asyncio.Event()
         self._running = False
+
+    @property
+    def active_daemon_io_ops(self) -> int:
+        """Return the count of active bounded daemon I/O helper operations."""
+        with self._io_counter_lock:
+            return self._active_daemon_io_ops
+
+    async def _run_bounded_daemon_io[T](self, fn: Callable[[], T]) -> T:
+        """Execute non-teardown I/O or sizing on a semaphore-bounded daemon thread."""
+        if not self._io_sem.acquire(blocking=False):
+            raise RuntimeError("Backtest I/O helper pool saturated by in-flight operations")
+        with self._io_counter_lock:
+            self._active_daemon_io_ops += 1
+
+        loop = asyncio.get_running_loop()
+        fut: asyncio.Future[T] = loop.create_future()
+
+        def _runner() -> None:
+            try:
+                res = fn()
+            except BaseException as exc:
+                if not loop.is_closed():
+                    with contextlib.suppress(RuntimeError):
+                        loop.call_soon_threadsafe(_set_future_exception, fut, exc)
+            else:
+                if not loop.is_closed():
+                    with contextlib.suppress(RuntimeError):
+                        loop.call_soon_threadsafe(_set_future_result, fut, res)
+            finally:
+                with self._io_counter_lock:
+                    self._active_daemon_io_ops -= 1
+                self._io_sem.release()
+
+        try:
+            thread = threading.Thread(
+                target=_runner,
+                daemon=True,
+                name="backtest-bounded-io",
+            )
+            thread.start()
+        except BaseException:
+            with self._io_counter_lock:
+                self._active_daemon_io_ops -= 1
+            self._io_sem.release()
+            raise
+        return await fut
 
     def _track_orphaned_load_task(self, task: asyncio.Task[Any]) -> None:
         self._orphaned_load_tasks.add(task)
@@ -782,7 +832,7 @@ class BacktestService:
         )
         await self._ensure_no_defective_coverage(dataset_key, job.start_time, aligned_end)
         target_path = self._parquet_store.resolve_path(dataset_key)
-        stored_root = await _run_in_daemon_thread(
+        stored_root = await self._run_bounded_daemon_io(
             lambda: _read_parquet_stored_root(target_path)
         )
         validate_root_symbol(
@@ -909,9 +959,51 @@ class BacktestService:
                 result_bytes = int(raw_output["result_bytes"])
             else:
                 result_dict = raw_output
-                result_bytes = await _run_in_daemon_thread(
-                    lambda: _measure_result_bytes(result_dict)
+                remaining = _remaining_timeout()
+                if remaining <= 0.0:
+                    if job.status == "RUNNING":
+                        job.status = "TIMED_OUT"
+                        job.finished_at_utc = self._clock()
+                        job.error = (
+                            f"Backtest timed out after {self._settings.backtest_timeout_sec}s"
+                        )
+                    return
+
+                size_task = asyncio.create_task(
+                    self._run_bounded_daemon_io(lambda: _measure_result_bytes(result_dict)),
+                    name=f"backtest-size-{job.job_id[:8]}",
                 )
+                try:
+                    done, _ = await asyncio.wait(
+                        {size_task},
+                        timeout=remaining,
+                    )
+                except asyncio.CancelledError:
+                    self._track_orphaned_load_task(size_task)
+                    size_task.cancel()
+                    raise
+
+                if size_task not in done:
+                    self._track_orphaned_load_task(size_task)
+                    size_task.cancel()
+                    if job.status == "RUNNING":
+                        job.status = "TIMED_OUT"
+                        job.finished_at_utc = self._clock()
+                        job.error = (
+                            f"Backtest timed out after {self._settings.backtest_timeout_sec}s"
+                        )
+                    return
+
+                result_bytes = size_task.result()
+                if job.status != "RUNNING":
+                    return
+                if _remaining_timeout() <= 0.0:
+                    job.status = "TIMED_OUT"
+                    job.finished_at_utc = self._clock()
+                    job.error = (
+                        f"Backtest timed out after {self._settings.backtest_timeout_sec}s"
+                    )
+                    return
 
             if job.status != "RUNNING":
                 return
