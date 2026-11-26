@@ -15,10 +15,12 @@ from fastapi.testclient import TestClient
 
 from app.config import Settings
 from app.main import create_app
+from app.services.command_service import CommandService
 from app.services.ws_broadcaster import WS_CLOSE_SLOW_CONSUMER, WsBroadcaster
 from app.storage.sqlite_store import (
-    MAX_DRAWINGS_PER_SCOPE,
+    MAX_IDEMPOTENCY_ENTRIES_PER_SCOPE,
     MAX_UNDO_HISTORY,
+    ScopeLimitError,
     SqliteStore,
 )
 
@@ -109,7 +111,7 @@ async def test_drawings_auth_csrf_and_hard_readonly_guard(tmp_path: Path) -> Non
     Defect caught: Unauthenticated reads, CSRF-less mutations, or exposed order routes.
     """
     async with _async_client(tmp_path) as (client, _):
-        assert (await client.get("/api/drawings/MES")).status_code in {401, 403}
+        assert (await client.get("/api/drawings/MES")).status_code == 401
         assert (
             await client.post(
                 "/api/drawings/MES",
@@ -119,24 +121,21 @@ async def test_drawings_auth_csrf_and_hard_readonly_guard(tmp_path: Path) -> Non
                     "drawing": _fvg_drawing_payload(),
                 },
             )
-        ).status_code in {401, 403}
+        ).status_code == 401
         assert (
             await client.post("/api/drawings/MES/undo", json={"expected_revision": 0})
-        ).status_code in {401, 403}
+        ).status_code == 401
         assert (
             await client.post("/api/drawings/MES/redo", json={"expected_revision": 0})
-        ).status_code in {401, 403}
-        assert (await client.delete("/api/drawings/MES?expected_revision=0")).status_code in {
-            401,
-            403,
-        }
+        ).status_code == 401
+        assert (await client.delete("/api/drawings/MES?expected_revision=0")).status_code == 401
         assert (
             await client.delete("/api/drawings/MES/draw-fvg-1?expected_revision=0")
-        ).status_code in {401, 403}
+        ).status_code == 401
 
         headers = await _login(client)
 
-        # Missing CSRF token on authenticated mutations -> 403
+        # Missing or mismatched CSRF token on authenticated mutations -> exact 403
         no_csrf_post = await client.post(
             "/api/drawings/MES",
             json={
@@ -145,7 +144,7 @@ async def test_drawings_auth_csrf_and_hard_readonly_guard(tmp_path: Path) -> Non
                 "drawing": _fvg_drawing_payload(),
             },
         )
-        assert no_csrf_post.status_code in {401, 403}
+        assert no_csrf_post.status_code == 403
         bad_csrf_post = await client.post(
             "/api/drawings/MES",
             json={
@@ -155,14 +154,23 @@ async def test_drawings_auth_csrf_and_hard_readonly_guard(tmp_path: Path) -> Non
             },
             headers={"X-CSRF-Token": "wrong-csrf-token"},
         )
-        assert bad_csrf_post.status_code in {401, 403}
-        assert (await client.delete("/api/drawings/MES?expected_revision=0")).status_code in {
-            401,
-            403,
-        }
+        assert bad_csrf_post.status_code == 403
+        assert (await client.delete("/api/drawings/MES?expected_revision=0")).status_code == 403
+        assert (
+            await client.delete("/api/drawings/MES/draw-fvg-1?expected_revision=0")
+        ).status_code == 403
+        assert (
+            await client.delete(
+                "/api/drawings/MES/draw-fvg-1?expected_revision=0",
+                headers={"X-CSRF-Token": "wrong-csrf-token"},
+            )
+        ).status_code == 403
         assert (
             await client.post("/api/drawings/MES/undo", json={"expected_revision": 0})
-        ).status_code in {401, 403}
+        ).status_code == 403
+        assert (
+            await client.post("/api/drawings/MES/redo", json={"expected_revision": 0})
+        ).status_code == 403
 
         # Valid authenticated GET returns empty scope + CME instrument spec
         get_resp = await client.get("/api/drawings/mes")
@@ -476,6 +484,16 @@ async def test_drawings_occ_revision_conflict_across_all_commands(tmp_path: Path
         del_stale = await client.delete("/api/drawings/MES?expected_revision=0", headers=headers)
         assert del_stale.status_code == 409
         assert del_stale.json()["detail"]["code"] == "revision_conflict"
+
+        del_single_stale = await client.delete(
+            "/api/drawings/MES/d1?expected_revision=0",
+            headers=headers,
+        )
+        assert del_single_stale.status_code == 409
+        del_single_detail = del_single_stale.json()["detail"]
+        assert del_single_detail["code"] == "revision_conflict"
+        assert del_single_detail["current_revision"] == 1
+        assert del_single_detail["expected_revision"] == 0
 
         # Verify state remained untouched at revision 1
         snap = (await client.get("/api/drawings/MES")).json()
@@ -911,7 +929,7 @@ async def test_sqlite_store_bounds_undo_history_idempotency_and_scope_cap(tmp_pa
             rev = res.scope_revision
             assert len(res.drawings) == (batch_idx + 1) * 100
 
-        with pytest.raises(Exception) as exc_limit:
+        with pytest.raises(ScopeLimitError):
             await store.execute_drawing_command(
                 symbol="MES",
                 contract_id=None,
@@ -927,9 +945,9 @@ async def test_sqlite_store_bounds_undo_history_idempotency_and_scope_cap(tmp_pa
                 ],
                 request_fingerprint="fp-501",
             )
-        assert type(exc_limit.value).__name__ == "ScopeLimitError"
 
-        # 2) Clear and perform 105 updates to verify MAX_UNDO_HISTORY = 100 pruning
+        # 2) Clear and perform 505 updates with distinct idempotency keys to verify
+        #    MAX_UNDO_HISTORY = 100 and MAX_IDEMPOTENCY_ENTRIES_PER_SCOPE = 500 pruning.
         clr = await store.execute_drawing_command(
             symbol="MES",
             contract_id=None,
@@ -957,7 +975,7 @@ async def test_sqlite_store_bounds_undo_history_idempotency_and_scope_cap(tmp_pa
             request_fingerprint="fp-u-create",
         )
         rev = c1.scope_revision
-        for idx in range(105):
+        for idx in range(505):
             u = await store.execute_drawing_command(
                 symbol="MES",
                 contract_id=None,
@@ -979,8 +997,10 @@ async def test_sqlite_store_bounds_undo_history_idempotency_and_scope_cap(tmp_pa
 
         with sqlite3.connect(str(db_path)) as conn:
             hist_count = conn.execute("SELECT COUNT(*) FROM drawing_history").fetchone()[0]
+            idem_count = conn.execute("SELECT COUNT(*) FROM drawing_idempotency").fetchone()[0]
             assert hist_count == MAX_UNDO_HISTORY
-            assert MAX_DRAWINGS_PER_SCOPE == 500
+            assert idem_count <= MAX_IDEMPOTENCY_ENTRIES_PER_SCOPE
+            assert idem_count == MAX_IDEMPOTENCY_ENTRIES_PER_SCOPE
 
         # Undo all 100 retained steps -> reaches can_undo=False cleanly
         undo_count = 0
@@ -999,5 +1019,285 @@ async def test_sqlite_store_bounds_undo_history_idempotency_and_scope_cap(tmp_pa
             undo_count += 1
             assert undone.scope_revision == snap.scope_revision + 1
         assert undo_count == MAX_UNDO_HISTORY
+    finally:
+        store.close()
+
+
+async def test_drawings_partial_update_null_metadata_huge_price_and_batch_conflicts(
+    tmp_path: Path,
+) -> None:
+    """Contract: Partial updates validate merged state, null metadata survives, overflow->422.
+
+    Defect caught: Broken _merge_and_validate_update, stripped null JSON keys, 500 on 10**310,
+    or self-cancelling [create X, delete X] batches pushing empty Undo entries.
+    """
+    async with _async_client(tmp_path) as (client, _):
+        headers = await _login(client)
+
+        # Create long_position, ray, and fvg_box
+        c_long = await client.post(
+            "/api/drawings/MES",
+            json={
+                "action": "create",
+                "expected_revision": 0,
+                "drawing": {
+                    "id": "pos-1",
+                    "type": "long_position",
+                    "coordinates": {
+                        "anchors": [
+                            {"role": "entry", "time": BASE_TIME, "price": 5000.0},
+                            {"role": "target", "time": BASE_TIME + 300, "price": 5020.0},
+                            {"role": "stop", "time": BASE_TIME + 300, "price": 4990.0},
+                        ]
+                    },
+                },
+            },
+            headers=headers,
+        )
+        assert c_long.status_code == 200
+
+        c_ray = await client.post(
+            "/api/drawings/MES",
+            json={
+                "action": "create",
+                "expected_revision": 1,
+                "drawing": {
+                    "id": "ray-1",
+                    "type": "ray",
+                    "coordinates": {
+                        "anchors": [
+                            {"role": "start", "time": BASE_TIME, "price": 5000.0},
+                            {"role": "end", "time": BASE_TIME + 60, "price": 5002.0},
+                        ]
+                    },
+                },
+            },
+            headers=headers,
+        )
+        assert c_ray.status_code == 200
+
+        # Partial update patching coordinates WITHOUT type into invalid long_position -> 422
+        bad_partial_long = await client.post(
+            "/api/drawings/MES",
+            json={
+                "action": "update",
+                "expected_revision": 2,
+                "drawing": {
+                    "id": "pos-1",
+                    "coordinates": {
+                        "anchors": [
+                            {"role": "entry", "time": BASE_TIME, "price": 5000.0},
+                            {"role": "target", "time": BASE_TIME + 300, "price": 4995.0},
+                            {"role": "stop", "time": BASE_TIME + 300, "price": 4990.0},
+                        ]
+                    },
+                },
+            },
+            headers=headers,
+        )
+        assert bad_partial_long.status_code == 422
+
+        # Partial update patching coordinates WITHOUT type into degenerate ray -> 422
+        bad_partial_ray = await client.post(
+            "/api/drawings/MES",
+            json={
+                "action": "update",
+                "expected_revision": 2,
+                "drawing": {
+                    "id": "ray-1",
+                    "coordinates": {
+                        "anchors": [
+                            {"role": "start", "time": BASE_TIME, "price": 5000.0},
+                            {"role": "end", "time": BASE_TIME, "price": 5000.0},
+                        ]
+                    },
+                },
+            },
+            headers=headers,
+        )
+        assert bad_partial_ray.status_code == 422
+
+        # Partial update patching type WITHOUT coordinates into incompatible anchor count -> 422
+        bad_partial_type = await client.post(
+            "/api/drawings/MES",
+            json={
+                "action": "update",
+                "expected_revision": 2,
+                "drawing": {"id": "ray-1", "type": "hline"},
+            },
+            headers=headers,
+        )
+        assert bad_partial_type.status_code == 422
+
+        # Huge integer price (10**310) -> clean 422 instead of uncaught OverflowError 500
+        huge_price = await client.post(
+            "/api/drawings/MES",
+            json={
+                "action": "create",
+                "expected_revision": 2,
+                "drawing": {
+                    "type": "hline",
+                    "coordinates": {
+                        "anchors": [{"role": "level", "time": BASE_TIME, "price": 10**310}]
+                    },
+                },
+            },
+            headers=headers,
+        )
+        assert huge_price.status_code == 422
+
+        # Null-valued keys in style/metadata survive update AND affect idempotency fingerprint
+        null_meta_update = await client.post(
+            "/api/drawings/MES",
+            json={
+                "action": "update",
+                "expected_revision": 2,
+                "idempotency_key": "idem-null-meta",
+                "drawing": {
+                    "id": "ray-1",
+                    "style": {"stroke": None, "width": 2},
+                    "metadata": {"invalidated_at": None, "tag": "primary"},
+                },
+            },
+            headers=headers,
+        )
+        assert null_meta_update.status_code == 200
+        updated_ray = [d for d in null_meta_update.json()["drawings"] if d["id"] == "ray-1"][0]
+        assert updated_ray["style"] == {"stroke": None, "width": 2}
+        assert updated_ray["metadata"] == {"invalidated_at": None, "tag": "primary"}
+
+        # Reusing idem-null-meta without the null key must collide with 409
+        null_diff_conflict = await client.post(
+            "/api/drawings/MES",
+            json={
+                "action": "update",
+                "expected_revision": 2,
+                "idempotency_key": "idem-null-meta",
+                "drawing": {
+                    "id": "ray-1",
+                    "style": {"width": 2},
+                    "metadata": {"tag": "primary"},
+                },
+            },
+            headers=headers,
+        )
+        assert null_diff_conflict.status_code == 409
+        assert null_diff_conflict.json()["detail"]["code"] == "idempotency_key_conflict"
+
+        # Null metadata inside batch update also preserved
+        batch_null = await client.post(
+            "/api/drawings/MES",
+            json={
+                "action": "batch",
+                "expected_revision": 3,
+                "operations": [
+                    {
+                        "action": "update",
+                        "drawing_id": "pos-1",
+                        "drawing": {"metadata": {"cleared_reason": None}},
+                    }
+                ],
+            },
+            headers=headers,
+        )
+        assert batch_null.status_code == 200
+        pos_after = [d for d in batch_null.json()["drawings"] if d["id"] == "pos-1"][0]
+        assert pos_after["metadata"] == {"cleared_reason": None}
+
+        # Self-cancelling [create X, delete X] in one batch is rejected cleanly -> 422
+        self_cancel_batch = await client.post(
+            "/api/drawings/MES",
+            json={
+                "action": "batch",
+                "expected_revision": 4,
+                "operations": [
+                    {"action": "create", "drawing": _fvg_drawing_payload(drawing_id="ephemeral-x")},
+                    {"action": "delete", "drawing_id": "ephemeral-x"},
+                ],
+            },
+            headers=headers,
+        )
+        assert self_cancel_batch.status_code == 422
+        snap = (await client.get("/api/drawings/MES")).json()
+        assert snap["scope_revision"] == 4
+        assert all(d["id"] != "ephemeral-x" for d in snap["drawings"])
+
+
+async def test_sqlite_store_rejects_invalid_direct_scope_params(tmp_path: Path) -> None:
+    """Contract: SqliteStore enforces strict scope validation even when called directly.
+
+    Defect caught: Unvalidated pane_id or contract_id bypassing HTTP layer into SqliteStore.
+    """
+    store = SqliteStore(tmp_path / "direct-scope.db")
+    store.initialize()
+    try:
+        bad_panes: list[Any] = ["../bad", ".", "..", "pane with space", "x" * 65, 123]
+        for bad_pane in bad_panes:
+            with pytest.raises(ValueError):
+                await store.list_drawings_scope("MES", pane_id=bad_pane)
+        bad_contracts: list[Any] = ["../MES", "CON/BAD", 456]
+        for bad_contract in bad_contracts:
+            with pytest.raises(ValueError):
+                await store.list_drawings_scope("MES", contract_id=bad_contract)
+    finally:
+        store.close()
+
+
+async def test_command_service_concurrent_mutations_emit_monotonic_ws_revisions(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Contract: Concurrent CommandService calls on same scope emit strictly increasing revisions.
+
+    Defect caught: Unserialized thread-to-event-loop handoff emitting out-of-order WS frames.
+    """
+    store = SqliteStore(tmp_path / "concurrency.db")
+    store.initialize()
+    emitted: list[dict[str, Any]] = []
+
+    class _CapturingBroadcaster(WsBroadcaster):
+        def publish_drawings_update(self, payload: dict[str, Any]) -> None:
+            emitted.append(payload)
+
+    broadcaster = _CapturingBroadcaster()
+    service = CommandService(store, broadcaster=broadcaster)
+
+    original_execute = store.execute_drawing_command
+
+    async def _slow_first_execute(**kwargs: Any) -> Any:
+        result = await original_execute(**kwargs)
+        # Force the first revision's coroutine to yield after DB commit before returning
+        if result.scope_revision == 1:
+            await asyncio.sleep(0.05)
+        return result
+
+    monkeypatch.setattr(store, "execute_drawing_command", _slow_first_execute)
+
+    try:
+        task1 = asyncio.create_task(
+            service.execute_command(
+                "MES",
+                {
+                    "action": "create",
+                    "expected_revision": 0,
+                    "drawing": _fvg_drawing_payload(drawing_id="conc-1"),
+                },
+            )
+        )
+        await asyncio.sleep(0.01)
+        task2 = asyncio.create_task(
+            service.execute_command(
+                "MES",
+                {
+                    "action": "create",
+                    "expected_revision": 1,
+                    "drawing": _fvg_drawing_payload(drawing_id="conc-2"),
+                },
+            )
+        )
+        res1, res2 = await asyncio.gather(task1, task2)
+        assert res1["scope_revision"] == 1
+        assert res2["scope_revision"] == 2
+        assert [frame["scope_revision"] for frame in emitted] == [1, 2]
     finally:
         store.close()

@@ -2184,16 +2184,28 @@ class SqliteStore:
         pane_id: str | None,
     ) -> tuple[str, str, str]:
         clean_symbol = _validate_non_empty_str(symbol, "symbol").upper()
-        contract_scope = (
-            contract_id.strip().upper()
-            if isinstance(contract_id, str) and contract_id.strip()
-            else ""
-        )
-        pane_scope = (
-            pane_id.strip()
-            if isinstance(pane_id, str) and pane_id.strip()
-            else ""
-        )
+
+        contract_scope = ""
+        if contract_id is not None:
+            if not isinstance(contract_id, str):
+                raise ValueError("contract_id must be a string when provided")
+            stripped_cid = contract_id.strip()
+            if stripped_cid:
+                contract_scope = stripped_cid.upper()
+                StorageDatasetKey("topstepx", False, contract_scope, "1m")
+
+        pane_scope = ""
+        if pane_id is not None:
+            if not isinstance(pane_id, str):
+                raise ValueError("pane_id must be a string when provided")
+            stripped_pid = pane_id.strip()
+            if stripped_pid:
+                if stripped_pid in {".", ".."} or not _PANE_ID_RE.fullmatch(stripped_pid):
+                    raise ValueError(
+                        f"pane_id {pane_id!r} must match ^[A-Za-z0-9._-]{{1,64}}$"
+                    )
+                pane_scope = stripped_pid
+
         return clean_symbol, contract_scope, pane_scope
 
     @staticmethod
@@ -2629,9 +2641,12 @@ class SqliteStore:
                     seen_touched: set[str] = set()
 
                     def _mark_touched(target_id: str) -> None:
-                        if target_id not in seen_touched:
-                            seen_touched.add(target_id)
-                            touched_ids.append(target_id)
+                        if target_id in seen_touched:
+                            raise ValueError(
+                                f"Duplicate or conflicting batch operation targeting {target_id!r}"
+                            )
+                        seen_touched.add(target_id)
+                        touched_ids.append(target_id)
 
                     for op in operations:
                         action = str(op["action"])

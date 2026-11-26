@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import math
@@ -188,7 +189,10 @@ class DrawingAnchor(BaseModel):
     def _validate_price(cls, value: Any) -> float:
         if isinstance(value, bool) or not isinstance(value, (int, float)):
             raise ValueError("anchor.price must be a finite positive number")
-        fval = float(value)
+        try:
+            fval = float(value)
+        except OverflowError as exc:
+            raise ValueError("anchor.price must be a finite positive number") from exc
         if not math.isfinite(fval) or fval <= 0.0:
             raise ValueError("anchor.price must be finite and strictly > 0")
         return fval
@@ -407,7 +411,9 @@ class BatchOperation(BaseModel):
             except ValidationError as exc:
                 raise ValueError(str(exc)) from exc
             self.drawing_id = _resolve_update_target_id(self.drawing_id, parsed_update.id)
-            self.drawing = parsed_update.model_dump(exclude_none=True)
+            self.drawing = {
+                k: v for k, v in parsed_update.model_dump().items() if v is not None
+            }
             return self
 
         if self.action == "delete":
@@ -472,7 +478,9 @@ class DrawingCommandRequest(BaseModel):
             except ValidationError as exc:
                 raise ValueError(str(exc)) from exc
             self.drawing_id = _resolve_update_target_id(self.drawing_id, parsed_update.id)
-            self.drawing = parsed_update.model_dump(exclude_none=True)
+            self.drawing = {
+                k: v for k, v in parsed_update.model_dump().items() if v is not None
+            }
             return self
 
         if self.action == "delete":
@@ -613,6 +621,21 @@ class CommandService:
     ) -> None:
         self._sqlite_store = sqlite_store
         self._broadcaster = broadcaster
+        self._scope_locks: dict[tuple[str, str | None, str | None], asyncio.Lock] = {}
+        self._last_emitted_revision: dict[tuple[str, str | None, str | None], int] = {}
+
+    def _scope_lock(
+        self,
+        symbol: str,
+        contract_id: str | None,
+        pane_id: str | None,
+    ) -> asyncio.Lock:
+        key = (symbol, contract_id, pane_id)
+        lock = self._scope_locks.get(key)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._scope_locks[key] = lock
+        return lock
 
     async def list_scope_drawings(
         self,
@@ -646,7 +669,15 @@ class CommandService:
         result: DrawingCommandExecutionResult,
         serialized_drawings: list[dict[str, Any]],
     ) -> None:
-        if result.changed and not result.deduplicated and self._broadcaster is not None:
+        scope_key = (result.symbol, result.contract_id, result.pane_id)
+        last_rev = self._last_emitted_revision.get(scope_key, -1)
+        if (
+            result.changed
+            and not result.deduplicated
+            and result.scope_revision > last_rev
+            and self._broadcaster is not None
+        ):
+            self._last_emitted_revision[scope_key] = result.scope_revision
             self._broadcaster.publish_drawings_update(
                 {
                     "symbol": result.symbol,
@@ -768,19 +799,20 @@ class CommandService:
                         raise ValueError("batch delete requires drawing_id")
                     operations.append({"action": "delete", "drawing_id": op.drawing_id})
 
-        result = await self._sqlite_store.execute_drawing_command(
-            symbol=norm_symbol,
-            contract_id=norm_contract,
-            pane_id=norm_pane,
-            expected_revision=req.expected_revision,
-            command_type=req.action,
-            actor=req.created_by,
-            operations=operations,
-            request_fingerprint=fingerprint,
-            idempotency_key=req.idempotency_key,
-            merge_validator=_merge_and_validate_update,
-        )
-        return self._format_command_response(result)
+        async with self._scope_lock(norm_symbol, norm_contract, norm_pane):
+            result = await self._sqlite_store.execute_drawing_command(
+                symbol=norm_symbol,
+                contract_id=norm_contract,
+                pane_id=norm_pane,
+                expected_revision=req.expected_revision,
+                command_type=req.action,
+                actor=req.created_by,
+                operations=operations,
+                request_fingerprint=fingerprint,
+                idempotency_key=req.idempotency_key,
+                merge_validator=_merge_and_validate_update,
+            )
+            return self._format_command_response(result)
 
     async def undo(
         self,
@@ -815,16 +847,17 @@ class CommandService:
             command_type="undo",
             command_payload={"action": "undo", "actor": req.actor},
         )
-        result = await self._sqlite_store.undo_drawing_command(
-            symbol=norm_symbol,
-            contract_id=norm_contract,
-            pane_id=norm_pane,
-            expected_revision=req.expected_revision,
-            actor=req.actor,
-            request_fingerprint=fingerprint,
-            idempotency_key=req.idempotency_key,
-        )
-        return self._format_command_response(result)
+        async with self._scope_lock(norm_symbol, norm_contract, norm_pane):
+            result = await self._sqlite_store.undo_drawing_command(
+                symbol=norm_symbol,
+                contract_id=norm_contract,
+                pane_id=norm_pane,
+                expected_revision=req.expected_revision,
+                actor=req.actor,
+                request_fingerprint=fingerprint,
+                idempotency_key=req.idempotency_key,
+            )
+            return self._format_command_response(result)
 
     async def redo(
         self,
@@ -859,13 +892,14 @@ class CommandService:
             command_type="redo",
             command_payload={"action": "redo", "actor": req.actor},
         )
-        result = await self._sqlite_store.redo_drawing_command(
-            symbol=norm_symbol,
-            contract_id=norm_contract,
-            pane_id=norm_pane,
-            expected_revision=req.expected_revision,
-            actor=req.actor,
-            request_fingerprint=fingerprint,
-            idempotency_key=req.idempotency_key,
-        )
-        return self._format_command_response(result)
+        async with self._scope_lock(norm_symbol, norm_contract, norm_pane):
+            result = await self._sqlite_store.redo_drawing_command(
+                symbol=norm_symbol,
+                contract_id=norm_contract,
+                pane_id=norm_pane,
+                expected_revision=req.expected_revision,
+                actor=req.actor,
+                request_fingerprint=fingerprint,
+                idempotency_key=req.idempotency_key,
+            )
+            return self._format_command_response(result)
