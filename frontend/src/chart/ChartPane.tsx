@@ -174,6 +174,20 @@ function computeFallbackHalfSpan(bars: readonly OhlcvBar[]): number {
   return 300;
 }
 
+function anchorsEqual(a: readonly DrawingAnchor[], b: readonly DrawingAnchor[]): boolean {
+  if (a.length !== b.length) {
+    return false;
+  }
+  for (let i = 0; i < a.length; i += 1) {
+    const left = a[i]!;
+    const right = b[i]!;
+    if (left.role !== right.role || left.time !== right.time || left.price !== right.price) {
+      return false;
+    }
+  }
+  return true;
+}
+
 export function ChartPane({
   pane,
   contractId,
@@ -217,6 +231,8 @@ export function ChartPane({
     scopeKey: string;
     originalDrawing: DrawingRecord;
     anchorRole: string | null;
+    startPx: number;
+    startPy: number;
     startTime: number;
     startPrice: number;
     currentAnchors: DrawingAnchor[];
@@ -439,8 +455,25 @@ export function ChartPane({
     candleSeriesRef.current = candleSeries;
     volumeSeriesRef.current = volumeSeries;
 
+    const getPlotBounds = (rectWidth: number, rectHeight: number) => {
+      const tsApi = chart.timeScale();
+      const tsWidth = typeof tsApi.width === "function" ? tsApi.width() : rectWidth;
+      const plotWidth =
+        Number.isFinite(tsWidth) && tsWidth > 0 && tsWidth <= rectWidth ? tsWidth : rectWidth;
+      const tsHeight = typeof tsApi.height === "function" ? tsApi.height() : 0;
+      const plotHeight =
+        Number.isFinite(tsHeight) && tsHeight > 0 && tsHeight < rectHeight
+          ? rectHeight - tsHeight
+          : rectHeight;
+      return { plotWidth, plotHeight };
+    };
+
+    const initialBounds = getPlotBounds(
+      Math.max(container.clientWidth, 240),
+      Math.max(container.clientHeight, 200),
+    );
     const primitive = new DrawingsOverlayPrimitive();
-    primitive.setViewportWidth(Math.max(container.clientWidth, 240));
+    primitive.setViewportSize(initialBounds.plotWidth, initialBounds.plotHeight);
     primitiveRef.current = primitive;
     if (typeof candleSeries.attachPrimitive === "function") {
       candleSeries.attachPrimitive(primitive);
@@ -496,13 +529,17 @@ export function ChartPane({
     const resolveChartPoint = (
       clientX: number,
       clientY: number,
-    ): { px: number; py: number; time: number; price: number } | null => {
+      clampToPlot = false,
+    ): { px: number; py: number; time: number; price: number; plotWidth: number; plotHeight: number } | null => {
       const rect = container.getBoundingClientRect();
-      const px = clientX - rect.left;
-      const py = clientY - rect.top;
-      if (!Number.isFinite(px) || !Number.isFinite(py)) {
+      const rawPx = clientX - rect.left;
+      const rawPy = clientY - rect.top;
+      if (!Number.isFinite(rawPx) || !Number.isFinite(rawPy)) {
         return null;
       }
+      const { plotWidth, plotHeight } = getPlotBounds(rect.width, rect.height);
+      const px = clampToPlot ? Math.min(Math.max(rawPx, 0), Math.max(0, plotWidth - 1)) : rawPx;
+      const py = clampToPlot ? Math.min(Math.max(rawPy, 0), Math.max(0, plotHeight - 1)) : rawPy;
       if (typeof candleSeries.coordinateToPrice !== "function") {
         return null;
       }
@@ -527,6 +564,8 @@ export function ChartPane({
         py,
         time: Math.max(MIN_DRAWING_TIMESTAMP_SEC, Math.round(snapped.time)),
         price: Math.max(tickSize, snapped.price),
+        plotWidth,
+        plotHeight,
       };
     };
 
@@ -594,6 +633,22 @@ export function ChartPane({
       if (scope === null) {
         return;
       }
+      const rect = container.getBoundingClientRect();
+      const px = event.clientX - rect.left;
+      const py = event.clientY - rect.top;
+      const { plotWidth, plotHeight } = getPlotBounds(rect.width, rect.height);
+      if (
+        !Number.isFinite(px) ||
+        !Number.isFinite(py) ||
+        px < 0 ||
+        py < 0 ||
+        px >= plotWidth ||
+        py >= plotHeight
+      ) {
+        return;
+      }
+      primitive.setViewportSize(plotWidth, plotHeight);
+
       const pt = resolveChartPoint(event.clientX, event.clientY);
       const storeState = useDrawingStore.getState();
       const tool = storeState.activeTool;
@@ -602,9 +657,6 @@ export function ChartPane({
       const liveSelectedId = storeState.selectedByScope[scopeKey] ?? null;
 
       if (tool === "cursor") {
-        const rect = container.getBoundingClientRect();
-        const px = event.clientX - rect.left;
-        const py = event.clientY - rect.top;
         const hit = primitive.hitTestAt(px, py);
         if (hit === null) {
           suppressTimeClickRef.current = false;
@@ -625,6 +677,8 @@ export function ChartPane({
           scopeKey,
           originalDrawing: targetDrawing,
           anchorRole: hit.anchorRole,
+          startPx: px,
+          startPy: py,
           startTime: pt.time,
           startPrice: pt.price,
           currentAnchors: targetDrawing.coordinates.anchors.map((a) => ({ ...a })),
@@ -726,7 +780,13 @@ export function ChartPane({
           syncOverlayPrimitive(null);
           return;
         }
-        const pt = resolveChartPoint(event.clientX, event.clientY);
+        const rect = container.getBoundingClientRect();
+        const rawPx = event.clientX - rect.left;
+        const rawPy = event.clientY - rect.top;
+        if (!activeDrag.hasMoved && Math.hypot(rawPx - activeDrag.startPx, rawPy - activeDrag.startPy) < 5) {
+          return;
+        }
+        const pt = resolveChartPoint(event.clientX, event.clientY, true);
         if (pt === null) {
           return;
         }
@@ -781,7 +841,7 @@ export function ChartPane({
       }
 
       if (draftRef.current !== null) {
-        const pt = resolveChartPoint(event.clientX, event.clientY);
+        const pt = resolveChartPoint(event.clientX, event.clientY, true);
         if (pt === null) {
           return;
         }
@@ -803,15 +863,24 @@ export function ChartPane({
       if (finishedDrag !== null) {
         dragRef.current = null;
         syncOverlayPrimitive();
+        const currentState = useDrawingStore.getState();
+        const currentDrawings = currentState.scopes[finishedDrag.scopeKey]?.drawings ?? [];
+        const stillValid =
+          currentState.activeTool === "cursor" &&
+          currentState.selectedByScope[finishedDrag.scopeKey] === finishedDrag.drawingId &&
+          currentDrawings.some((d) => d.id === finishedDrag.drawingId);
         if (
+          stillValid &&
           finishedDrag.hasMoved &&
-          finishedDrag.scopeKey === drawingScopeKeyRef.current
+          finishedDrag.scopeKey === drawingScopeKeyRef.current &&
+          !anchorsEqual(
+            finishedDrag.originalDrawing.coordinates.anchors,
+            finishedDrag.currentAnchors,
+          )
         ) {
-          void useDrawingStore
-            .getState()
-            .updateDrawing(finishedDrag.scope, finishedDrag.drawingId, {
-              coordinates: { anchors: finishedDrag.currentAnchors },
-            });
+          void currentState.updateDrawing(finishedDrag.scope, finishedDrag.drawingId, {
+            coordinates: { anchors: finishedDrag.currentAnchors },
+          });
         }
         return;
       }
@@ -825,7 +894,7 @@ export function ChartPane({
           py - placementStartPxRef.current.py,
         );
         if (dist >= 5 && drawingScopeRef.current !== null) {
-          const pt = resolveChartPoint(event.clientX, event.clientY);
+          const pt = resolveChartPoint(event.clientX, event.clientY, true);
           if (pt !== null) {
             finalizeTwoPointTool(drawingScopeRef.current, draftRef.current, pt);
           }
@@ -848,6 +917,22 @@ export function ChartPane({
     container.addEventListener("pointermove", handlePointerMove);
     container.addEventListener("pointerup", handlePointerUp);
     container.addEventListener("pointercancel", handlePointerCancel);
+
+    const unsubscribeDrawingStore = useDrawingStore.subscribe((state) => {
+      const activeDrag = dragRef.current;
+      if (activeDrag === null) {
+        return;
+      }
+      const scopeDrawings = state.scopes[activeDrag.scopeKey]?.drawings ?? [];
+      const stillSelected = state.selectedByScope[activeDrag.scopeKey] === activeDrag.drawingId;
+      const stillExists = scopeDrawings.some((d) => d.id === activeDrag.drawingId);
+      if (state.activeTool !== "cursor" || !stillSelected || !stillExists) {
+        dragRef.current = null;
+        suppressTimeClickRef.current = false;
+        restoreChartInteraction();
+        syncOverlayPrimitive(null);
+      }
+    });
 
     const timeScale = chart.timeScale();
     const handleVisibleTimeRangeChange = (range: IRange<Time> | null) => {
@@ -877,13 +962,15 @@ export function ChartPane({
       const nextWidth = Math.floor(entry.contentRect.width);
       const nextHeight = Math.floor(entry.contentRect.height);
       if (nextWidth > 0 && nextHeight > 0) {
-        primitive.setViewportWidth(nextWidth);
         chart.applyOptions({ width: nextWidth, height: nextHeight });
+        const nextBounds = getPlotBounds(nextWidth, nextHeight);
+        primitive.setViewportSize(nextBounds.plotWidth, nextBounds.plotHeight);
       }
     });
     resizeObserver.observe(container);
 
     return () => {
+      unsubscribeDrawingStore();
       cancelPendingRangeSuppressionRaf();
       suppressRangeEchoRef.current = false;
       suppressTimeClickRef.current = false;

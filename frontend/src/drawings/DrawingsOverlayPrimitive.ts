@@ -361,8 +361,19 @@ class DrawingsPaneRenderer implements IPrimitivePaneRenderer {
     }
     const series = snapshot.series;
     target.useMediaCoordinateSpace(({ context, mediaSize }) => {
+      const plotWidth = Math.min(mediaSize.width, snapshot.viewportWidth);
+      const plotHeight = Math.min(mediaSize.height, snapshot.viewportHeight);
+      if (plotWidth <= 0 || plotHeight <= 0) {
+        return;
+      }
+      context.save();
+      if (typeof context.rect === "function" && typeof context.clip === "function") {
+        context.beginPath();
+        context.rect(0, 0, plotWidth, plotHeight);
+        context.clip();
+      }
       for (const item of snapshot.projectedDrawings) {
-        renderProjectedItem(context, mediaSize.width, mediaSize.height, item, {
+        renderProjectedItem(context, plotWidth, plotHeight, item, {
           selected: item.drawing.id === snapshot.selectedDrawingId,
           isDraft: false,
           bars: snapshot.bars,
@@ -372,7 +383,7 @@ class DrawingsPaneRenderer implements IPrimitivePaneRenderer {
         });
       }
       if (snapshot.projectedDraft !== null) {
-        renderProjectedItem(context, mediaSize.width, mediaSize.height, snapshot.projectedDraft, {
+        renderProjectedItem(context, plotWidth, plotHeight, snapshot.projectedDraft, {
           selected: false,
           isDraft: true,
           bars: snapshot.bars,
@@ -381,6 +392,7 @@ class DrawingsPaneRenderer implements IPrimitivePaneRenderer {
           series,
         });
       }
+      context.restore();
     });
   }
 }
@@ -419,6 +431,7 @@ export class DrawingsOverlayPrimitive implements ISeriesPrimitive<Time> {
   private _timeframeSec = 300;
   private _instrumentSpec: InstrumentDrawingSpec = { tickSize: 0.25, tickValue: 1.25 };
   private _viewportWidth = 800;
+  private _viewportHeight = 600;
 
   private _projectedDrawings: ProjectedDrawingGeometry[] = [];
   private _projectedDraft: ProjectedDrawingGeometry | null = null;
@@ -447,6 +460,15 @@ export class DrawingsOverlayPrimitive implements ISeriesPrimitive<Time> {
   setViewportWidth(width: number): void {
     if (Number.isFinite(width) && width > 0) {
       this._viewportWidth = width;
+    }
+  }
+
+  setViewportSize(width: number, height: number): void {
+    if (Number.isFinite(width) && width > 0) {
+      this._viewportWidth = width;
+    }
+    if (Number.isFinite(height) && height > 0) {
+      this._viewportHeight = height;
     }
   }
 
@@ -625,6 +647,8 @@ export class DrawingsOverlayPrimitive implements ISeriesPrimitive<Time> {
     bars: readonly OhlcvBar[];
     timeframeSec: number;
     instrumentSpec: InstrumentDrawingSpec;
+    viewportWidth: number;
+    viewportHeight: number;
   } {
     return {
       series: this._series,
@@ -634,11 +658,15 @@ export class DrawingsOverlayPrimitive implements ISeriesPrimitive<Time> {
       bars: this._bars,
       timeframeSec: this._timeframeSec,
       instrumentSpec: this._instrumentSpec,
+      viewportWidth: this._viewportWidth,
+      viewportHeight: this._viewportHeight,
     };
   }
 
   hitTestAt(px: number, py: number): DrawingHitResult | null {
     this.updateAllViews();
-    return hitTestDrawing(px, py, this._projectedDrawings, this._selectedDrawingId, this._viewportWidth);
+    return hitTestDrawing(px, py, this._projectedDrawings, this._selectedDrawingId, this._viewportWidth, {
+      viewportHeight: this._viewportHeight,
+    });
   }
 }

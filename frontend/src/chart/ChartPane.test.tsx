@@ -35,6 +35,8 @@ const timeToCoordinateMock = vi.fn<(time: number) => number | null>((time) => (t
 const coordinateToTimeMock = vi.fn<(x: number) => number | null>(() => null);
 const logicalToCoordinateMock = vi.fn<(logical: number) => number | null>((logical) => 100 + logical * 30);
 const coordinateToLogicalMock = vi.fn<(x: number) => number | null>((x) => (x - 100) / 30);
+const timeScaleWidthMock = vi.fn<() => number>(() => 530);
+const timeScaleHeightMock = vi.fn<() => number>(() => 28);
 const setCrosshairPositionMock = vi.fn();
 const clearCrosshairPositionMock = vi.fn();
 const getVisibleRangeMock = vi.fn<() => { from: number; to: number } | null>(() => null);
@@ -55,6 +57,8 @@ vi.mock("lightweight-charts", () => {
       let candleSeriesApi: unknown;
       const timeScaleApi = {
         fitContent: fitContentMock,
+        width: timeScaleWidthMock,
+        height: timeScaleHeightMock,
         timeToCoordinate: timeToCoordinateMock,
         coordinateToTime: coordinateToTimeMock,
         logicalToCoordinate: logicalToCoordinateMock,
@@ -2443,5 +2447,253 @@ describe("ChartPane (F06, P1-R3-01, P1-R3-02)", () => {
     expect(applyOptionsMock).toHaveBeenCalledWith({ handleScroll: true, handleScale: true });
     fireEvent.pointerUp(canvas, { clientX: 160, clientY: 160, button: 0, pointerType: "mouse", pointerId: 9 });
     expect(postDrawingCommandMock).toHaveBeenCalledTimes(callsBeforeSymbolSwitch);
+  });
+
+  it("supports whole-body drag, zoom re-projection, deadzone/jitter guard, mid-drag Escape/Delete cancellation, and axis scale isolation (Phase 4 Part 2)", async () => {
+    /**
+     * Contract:
+     * 1. Whole-body drag translation shifts all anchors by domain (deltaTime, deltaPrice).
+     * 2. Zooming updates projected coordinates from domain (time, price) via updateAllViews().
+     * 3. 0-2px jitter on body click and 6px off-center anchor click preserve canRedo=true without mutating.
+     * 4. Mid-drag Escape deselection or Delete removal cancels drag, restores handleScroll/handleScale, and blocks updateDrawing on pointerUp.
+     * 5. Clicks/drags on Right Price Scale (px >= 530) and Bottom Time Scale (py >= 372) are completely ignored.
+     * Defect caught: P1-001, P1-002, P1-003 regressions.
+     */
+    const bars = [
+      { time: 1700000000, open: 5000, high: 5012, low: 4996, close: 5005, volume: 25, is_closed: true },
+      { time: 1700000300, open: 5005, high: 5020, low: 5002, close: 5015, volume: 30, is_closed: true },
+    ];
+    const trendlineDrawing = {
+      id: "tl-body",
+      revision: 1,
+      type: "trendline" as const,
+      symbol: "MES" as const,
+      contract_id: "CON.F.US.MES.H26",
+      pane_id: "pane-1",
+      created_by: "user" as const,
+      source_bar_refs: [],
+      coordinates: {
+        anchors: [
+          { role: "start", time: 1700000000, price: 5000 },
+          { role: "end", time: 1700000300, price: 5000 },
+        ],
+      },
+      style: {},
+      metadata: {},
+      created_at_utc: 1700000000,
+      updated_at_utc: 1700000000,
+    };
+    const hlineDrawing = {
+      id: "hl-axis",
+      revision: 1,
+      type: "hline" as const,
+      symbol: "MES" as const,
+      contract_id: "CON.F.US.MES.H26",
+      pane_id: "pane-1",
+      created_by: "user" as const,
+      source_bar_refs: [],
+      coordinates: { anchors: [{ role: "level", time: 1700000000, price: 4980 }] },
+      style: {},
+      metadata: {},
+      created_at_utc: 1700000000,
+      updated_at_utc: 1700000000,
+    };
+
+    fetchBarsMock.mockResolvedValue(makeBarsResponse("CON.F.US.MES.H26", bars));
+    fetchDrawingsMock.mockResolvedValue({
+      symbol: "MES",
+      contract_id: "CON.F.US.MES.H26",
+      pane_id: "pane-1",
+      instrument: { root_symbol: "MES", name: "MES", exchange: "CME", tick_size: 0.25, tick_value: 1.25, currency: "USD" },
+      scope_revision: 3,
+      can_undo: true,
+      can_redo: true,
+      drawings: [trendlineDrawing, hlineDrawing],
+    });
+    postDrawingCommandMock.mockImplementation(async (symbol, cmd) => ({
+      symbol,
+      contract_id: "CON.F.US.MES.H26",
+      pane_id: "pane-1",
+      instrument: { root_symbol: "MES", name: "MES", exchange: "CME", tick_size: 0.25, tick_value: 1.25, currency: "USD" },
+      scope_revision: cmd.expected_revision + 1,
+      can_undo: true,
+      can_redo: false,
+      deduplicated: false,
+      affected_ids: ["tl-body"],
+      drawings: [
+        cmd.action === "update" && cmd.drawing.coordinates
+          ? { ...trendlineDrawing, coordinates: cmd.drawing.coordinates }
+          : trendlineDrawing,
+        hlineDrawing,
+      ],
+    }));
+
+    const coordinator = new PaneFetchCoordinator();
+    const fakeWs = createFakeWsClient();
+    const pane: PaneConfig = {
+      pane_id: "pane-1",
+      root_symbol: "MES",
+      timeframe: "5m",
+      live_mode: false,
+      playback_mode: "live",
+    };
+
+    render(
+      <ChartPane
+        pane={pane}
+        contractId="CON.F.US.MES.H26"
+        activeFeedLive={false}
+        wsClient={fakeWs.client}
+        coordinator={coordinator}
+      />,
+    );
+
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    const canvas = document.querySelector(".chart-pane__canvas") as HTMLElement;
+    vi.spyOn(canvas, "getBoundingClientRect").mockReturnValue({
+      left: 0,
+      top: 0,
+      right: 600,
+      bottom: 400,
+      width: 600,
+      height: 400,
+      x: 0,
+      y: 0,
+      toJSON: () => ({}),
+    });
+
+    const scope = { symbol: "MES" as const, contractId: "CON.F.US.MES.H26", paneId: "pane-1" };
+    const scopeKey = buildDrawingScopeKey("MES", "CON.F.US.MES.H26", "pane-1");
+
+    // 1. 0-2px jitter on body click (midpoint x=115, y=200) & 6px off-center handle click (x=106, y=200) keep canRedo=true and zero mutations
+    await act(async () => {
+      fireEvent.pointerDown(canvas, { clientX: 115, clientY: 200, button: 0, pointerType: "mouse", pointerId: 1 });
+      fireEvent.pointerMove(canvas, { clientX: 117, clientY: 200, button: 0, pointerType: "mouse", pointerId: 1 });
+      fireEvent.pointerUp(canvas, { clientX: 117, clientY: 200, button: 0, pointerType: "mouse", pointerId: 1 });
+      fireEvent.pointerDown(canvas, { clientX: 106, clientY: 200, button: 0, pointerType: "mouse", pointerId: 2 });
+      fireEvent.pointerMove(canvas, { clientX: 107, clientY: 200, button: 0, pointerType: "mouse", pointerId: 2 });
+      fireEvent.pointerUp(canvas, { clientX: 107, clientY: 200, button: 0, pointerType: "mouse", pointerId: 2 });
+      await Promise.resolve();
+    });
+    expect(postDrawingCommandMock).not.toHaveBeenCalled();
+    expect(useDrawingStore.getState().scopes[scopeKey]?.canRedo).toBe(true);
+
+    // 2. Whole-body drag translation (hit midpoint x=115, y=200 -> drag +30px right, -20px up => +300s, +5 price)
+    await act(async () => {
+      fireEvent.pointerDown(canvas, { clientX: 115, clientY: 200, button: 0, pointerType: "mouse", pointerId: 3 });
+      fireEvent.pointerMove(canvas, { clientX: 145, clientY: 180, button: 0, pointerType: "mouse", pointerId: 3 });
+      fireEvent.pointerUp(canvas, { clientX: 145, clientY: 180, button: 0, pointerType: "mouse", pointerId: 3 });
+      await Promise.resolve();
+    });
+    expect(postDrawingCommandMock).toHaveBeenCalledTimes(1);
+    const bodyUpdateCmd = postDrawingCommandMock.mock.calls[0]![1];
+    expect(bodyUpdateCmd.action).toBe("update");
+    if (bodyUpdateCmd.action === "update") {
+      expect(bodyUpdateCmd.drawing.coordinates?.anchors).toEqual([
+        { role: "start", time: 1700000300, price: 5005 },
+        { role: "end", time: 1700000600, price: 5005 },
+      ]);
+    }
+
+    // 3. Zoom coordinate scale re-projection from domain (time, price)
+    const attachedPrimitive = attachPrimitiveMock.mock.calls[0]![0] as {
+      updateAllViews: () => void;
+      getRenderSnapshot: () => { projectedDrawings: Array<{ drawing: { id: string }; anchors: Array<{ x: number; y: number }> }> };
+    };
+    const beforeZoom = attachedPrimitive
+      .getRenderSnapshot()
+      .projectedDrawings.find((d) => d.drawing.id === "hl-axis")!.anchors[0]!;
+    expect(beforeZoom.y).toBe(280);
+
+    priceToCoordinateMock.mockImplementation((price) => (5050 - price) * 8);
+    attachedPrimitive.updateAllViews();
+    const afterZoom = attachedPrimitive
+      .getRenderSnapshot()
+      .projectedDrawings.find((d) => d.drawing.id === "hl-axis")!.anchors[0]!;
+    expect(afterZoom.y).toBe(560);
+    priceToCoordinateMock.mockImplementation((price) => (5050 - price) * 4);
+    attachedPrimitive.updateAllViews();
+
+    // 4. Mid-drag Escape deselection & Delete removal cancel drag synchronously and block updateDrawing
+    applyOptionsMock.mockClear();
+    // Start dragging hline at (200, 280) -> moves > 5px
+    act(() => {
+      fireEvent.pointerDown(canvas, { clientX: 200, clientY: 280, button: 0, pointerType: "mouse", pointerId: 4 });
+      fireEvent.pointerMove(canvas, { clientX: 200, clientY: 240, button: 0, pointerType: "mouse", pointerId: 4 });
+    });
+    expect(applyOptionsMock).toHaveBeenCalledWith({ handleScroll: false, handleScale: false });
+    // Deselect (Escape) mid-drag -> synchronously restores handleScroll/handleScale and reverts
+    act(() => {
+      useDrawingStore.getState().setSelectedDrawing(scope, null);
+    });
+    expect(applyOptionsMock).toHaveBeenCalledWith({ handleScroll: true, handleScale: true });
+    await act(async () => {
+      fireEvent.pointerUp(canvas, { clientX: 200, clientY: 240, button: 0, pointerType: "mouse", pointerId: 4 });
+      await Promise.resolve();
+    });
+    expect(postDrawingCommandMock).toHaveBeenCalledTimes(1);
+
+    // Now test deletion mid-drag via WS drawings_update
+    applyOptionsMock.mockClear();
+    act(() => {
+      fireEvent.pointerDown(canvas, { clientX: 200, clientY: 280, button: 0, pointerType: "mouse", pointerId: 5 });
+      fireEvent.pointerMove(canvas, { clientX: 200, clientY: 240, button: 0, pointerType: "mouse", pointerId: 5 });
+      useDrawingStore.getState().applyWsDrawingsUpdate({
+        type: "drawings_update",
+        symbol: "MES",
+        contract_id: "CON.F.US.MES.H26",
+        pane_id: "pane-1",
+        scope_revision: 10,
+        command_type: "delete",
+        can_undo: true,
+        can_redo: false,
+        drawings: [trendlineDrawing],
+      });
+    });
+    expect(applyOptionsMock).toHaveBeenCalledWith({ handleScroll: true, handleScale: true });
+    await act(async () => {
+      fireEvent.pointerUp(canvas, { clientX: 200, clientY: 240, button: 0, pointerType: "mouse", pointerId: 5 });
+      await Promise.resolve();
+    });
+    expect(postDrawingCommandMock).toHaveBeenCalledTimes(1);
+
+    // 5. Right Price Scale (px=565 >= 530) & Bottom Time Scale (py=385 >= 372) isolation in hline & cursor modes (P1-003)
+    applyOptionsMock.mockClear();
+    useDrawingStore.getState().setActiveTool("hline");
+    await act(async () => {
+      fireEvent.pointerDown(canvas, { clientX: 565, clientY: 280, button: 0, pointerType: "mouse", pointerId: 6 });
+      fireEvent.pointerUp(canvas, { clientX: 565, clientY: 280, button: 0, pointerType: "mouse", pointerId: 6 });
+      fireEvent.pointerDown(canvas, { clientX: 200, clientY: 385, button: 0, pointerType: "mouse", pointerId: 7 });
+      fireEvent.pointerUp(canvas, { clientX: 200, clientY: 385, button: 0, pointerType: "mouse", pointerId: 7 });
+      await Promise.resolve();
+    });
+    expect(postDrawingCommandMock).toHaveBeenCalledTimes(1);
+
+    // Cursor mode click on Right Price Scale at exact hline Y=280 must NOT hit/drag hline or disable handleScale
+    useDrawingStore.getState().setActiveTool("cursor");
+    useDrawingStore.getState().applyWsDrawingsUpdate({
+      type: "drawings_update",
+      symbol: "MES",
+      contract_id: "CON.F.US.MES.H26",
+      pane_id: "pane-1",
+      scope_revision: 11,
+      command_type: "create",
+      can_undo: true,
+      can_redo: false,
+      drawings: [hlineDrawing],
+    });
+    await act(async () => {
+      fireEvent.pointerDown(canvas, { clientX: 565, clientY: 280, button: 0, pointerType: "mouse", pointerId: 8 });
+      fireEvent.pointerMove(canvas, { clientX: 565, clientY: 140, button: 0, pointerType: "mouse", pointerId: 8 });
+      fireEvent.pointerUp(canvas, { clientX: 565, clientY: 140, button: 0, pointerType: "mouse", pointerId: 8 });
+      await Promise.resolve();
+    });
+    expect(applyOptionsMock).not.toHaveBeenCalledWith({ handleScroll: false, handleScale: false });
+    expect(useDrawingStore.getState().selectedByScope[scopeKey]).toBeNull();
+    expect(postDrawingCommandMock).toHaveBeenCalledTimes(1);
   });
 });

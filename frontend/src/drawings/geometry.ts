@@ -489,7 +489,7 @@ function hitTestDrawingBody(
 
   if (drawing.type === "hline") {
     const level = anchors[0]!;
-    return Math.abs(py - level.y) <= tolerancePx;
+    return px >= 0 && px < viewportWidth && Math.abs(py - level.y) <= tolerancePx;
   }
 
   if (drawing.type === "trendline") {
@@ -520,7 +520,7 @@ function hitTestDrawingBody(
       (drawing.type === "order_block" && drawing.metadata?.extend_right !== false) ||
       (drawing.type === "fvg_box" && drawing.metadata?.extend_right === true);
     const minX = Math.min(start.x, end.x);
-    const maxX = extendRight ? Math.max(viewportWidth, Math.max(start.x, end.x)) : Math.max(start.x, end.x);
+    const maxX = extendRight ? viewportWidth : Math.max(start.x, end.x);
     const minY = Math.min(start.y, end.y);
     const maxY = Math.max(start.y, end.y);
     return (
@@ -551,7 +551,7 @@ function hitTestDrawingBody(
 }
 
 /**
- * Hit-test drawings in CSS pixel space.
+ * Hit-test drawings in CSS pixel space bounded strictly to the chart plot area.
  * Anchor handles strictly take priority over line/box bodies; selected drawing handles
  * are checked first, followed by all other handles, then drawing bodies top-to-bottom.
  */
@@ -561,8 +561,18 @@ export function hitTestDrawing(
   projectedDrawings: readonly ProjectedDrawingGeometry[],
   selectedDrawingId: string | null,
   viewportWidth: number,
-  options?: { handleRadiusPx?: number; bodyTolerancePx?: number },
+  options?: { handleRadiusPx?: number; bodyTolerancePx?: number; viewportHeight?: number },
 ): DrawingHitResult | null {
+  if (
+    !Number.isFinite(px) ||
+    !Number.isFinite(py) ||
+    px < 0 ||
+    py < 0 ||
+    px >= viewportWidth ||
+    (options?.viewportHeight !== undefined && py >= options.viewportHeight)
+  ) {
+    return null;
+  }
   const handleRadiusPx = options?.handleRadiusPx ?? 8;
   const bodyTolerancePx = options?.bodyTolerancePx ?? 6;
 

@@ -125,6 +125,9 @@ vi.mock("./api/wsClient", async (importOriginal) => {
   };
 });
 
+const appAttachPrimitiveMock = vi.fn();
+const appDetachPrimitiveMock = vi.fn();
+
 vi.mock("lightweight-charts", () => {
   const CandlestickSeries = Symbol("CandlestickSeries");
   const HistogramSeries = Symbol("HistogramSeries");
@@ -133,28 +136,64 @@ vi.mock("lightweight-charts", () => {
     HistogramSeries,
     ColorType: { Solid: "solid" },
     CrosshairMode: { Normal: 0 },
-    createChart: vi.fn(() => ({
-      addSeries: vi.fn(() => ({
-        setData: vi.fn(),
-        update: vi.fn(),
-        priceScale: () => ({ applyOptions: vi.fn() }),
-      })),
-      subscribeCrosshairMove: vi.fn(),
-      unsubscribeCrosshairMove: vi.fn(),
-      subscribeClick: vi.fn(),
-      unsubscribeClick: vi.fn(),
-      setCrosshairPosition: vi.fn(),
-      clearCrosshairPosition: vi.fn(),
-      applyOptions: vi.fn(),
-      remove: vi.fn(),
-      timeScale: () => ({
+    createChart: vi.fn(() => {
+      let candleSeriesApi: unknown;
+      const timeScaleApi = {
         fitContent: vi.fn(),
+        width: () => 530,
+        height: () => 28,
+        timeToCoordinate: () => 100,
+        coordinateToTime: () => null,
+        logicalToCoordinate: () => 100,
+        coordinateToLogical: () => 0,
         subscribeVisibleTimeRangeChange: vi.fn(),
         unsubscribeVisibleTimeRangeChange: vi.fn(),
         getVisibleRange: vi.fn(() => null),
         setVisibleRange: vi.fn(),
-      }),
-    })),
+      };
+      const chartApi = {
+        addSeries: vi.fn((seriesType: unknown) => {
+          if (seriesType === CandlestickSeries) {
+            candleSeriesApi = {
+              setData: vi.fn(),
+              update: vi.fn(),
+              attachPrimitive: vi.fn((primitive: { attached?: (param: unknown) => void }) => {
+                appAttachPrimitiveMock(primitive);
+                primitive.attached?.({
+                  chart: chartApi,
+                  series: candleSeriesApi,
+                  requestUpdate: vi.fn(),
+                  horzScaleBehavior: {},
+                });
+              }),
+              detachPrimitive: vi.fn((primitive: { detached?: () => void }) => {
+                appDetachPrimitiveMock(primitive);
+                primitive.detached?.();
+              }),
+              priceToCoordinate: vi.fn((price: number) => (5050 - price) * 4),
+              coordinateToPrice: vi.fn((y: number) => 5050 - y / 4),
+              priceScale: () => ({ applyOptions: vi.fn() }),
+            };
+            return candleSeriesApi;
+          }
+          return {
+            setData: vi.fn(),
+            update: vi.fn(),
+            priceScale: () => ({ applyOptions: vi.fn() }),
+          };
+        }),
+        subscribeCrosshairMove: vi.fn(),
+        unsubscribeCrosshairMove: vi.fn(),
+        subscribeClick: vi.fn(),
+        unsubscribeClick: vi.fn(),
+        setCrosshairPosition: vi.fn(),
+        clearCrosshairPosition: vi.fn(),
+        applyOptions: vi.fn(),
+        remove: vi.fn(),
+        timeScale: () => timeScaleApi,
+      };
+      return chartApi;
+    }),
   };
 });
 
@@ -3659,6 +3698,104 @@ describe("App bootstrap and R03 503 recovery (P1-R3-03, P1-R3-04, P2-005)", () =
     });
     expect(useDrawingStore.getState().scopes).toEqual({});
     expect(useDrawingStore.getState().selectedByScope).toEqual({});
+  });
+
+  it("preserves persisted drawings and re-attaches primitives cleanly across layout template switches 1-single -> 4-grid-2x2 -> 1-single (Phase 4 Part 2)", async () => {
+    /**
+     * Contract: Switching layout templates (1-single -> 4-grid-2x2 -> 1-single) keeps persisted
+     * pane-1 drawings intact in useDrawingStore, attaches DrawingsOverlayPrimitive to all active
+     * candlestick series, and cleanly detaches removed panes on template shrink.
+     * Defect caught: Template switch wiping drawingStore state or leaking detached chart primitives.
+     */
+    const persistedHline = {
+      id: "draw-persist-1",
+      revision: 1,
+      type: "hline" as const,
+      symbol: "MES" as const,
+      contract_id: "CON.F.US.MES.H26",
+      pane_id: "pane-1",
+      created_by: "user" as const,
+      source_bar_refs: [],
+      coordinates: { anchors: [{ role: "level", time: 1700000000, price: 5005 }] },
+      style: {},
+      metadata: {},
+      created_at_utc: 1700000000,
+      updated_at_utc: 1700000000,
+    };
+
+    fetchSessionMock.mockResolvedValue({
+      authenticated: true,
+      csrf_token: "csrf-token-tpl",
+    });
+    fetchStatusMock.mockResolvedValue({
+      connected: true,
+      live: false,
+      feed_state: "LIVE",
+    });
+    listLayoutsMock.mockResolvedValue([SAMPLE_LAYOUT]);
+    fetchContractsMock.mockResolvedValue({
+      live: false,
+      contracts: {
+        MES: { selected: { id: "CON.F.US.MES.H26" }, error_type: null, error: null },
+        MNQ: { selected: { id: "CON.F.US.MNQ.H26" }, error_type: null, error: null },
+        MYM: { selected: { id: "CON.F.US.MYM.H26" }, error_type: null, error: null },
+        MGC: { selected: { id: "CON.F.US.MGC.H26" }, error_type: null, error: null },
+      },
+    });
+    fetchBarsMock.mockResolvedValue({
+      provider: "topstepx",
+      live: false,
+      contract_id: "CON.F.US.MES.H26",
+      root_symbol: "MES",
+      timeframe: "5m",
+      start_time: 1000,
+      end_time: 1000,
+      count: 0,
+      include_partial: true,
+      quality: { is_complete: true, truncated: false, provider_gap: false, quarantined_count: 0 },
+      bars: [],
+    });
+    fetchDrawingsMock.mockImplementation(async (symbol, params) => ({
+      symbol,
+      contract_id: params?.contract_id ?? null,
+      pane_id: params?.pane_id ?? null,
+      instrument: { root_symbol: symbol, name: symbol, exchange: "CME", tick_size: 0.25, tick_value: 1.25, currency: "USD" },
+      scope_revision: params?.pane_id === "pane-1" ? 1 : 0,
+      can_undo: false,
+      can_redo: false,
+      drawings: params?.pane_id === "pane-1" ? [persistedHline] : [],
+    }));
+
+    const pane1ScopeKey = buildDrawingScopeKey("MES", "CON.F.US.MES.H26", "pane-1");
+
+    render(<App />);
+    await act(async () => {
+      await flushMicrotasks();
+    });
+
+    expect(appAttachPrimitiveMock).toHaveBeenCalledTimes(1);
+    expect(useDrawingStore.getState().scopes[pane1ScopeKey]?.drawings).toEqual([persistedHline]);
+
+    // Expand 1-single -> 4-grid-2x2
+    fireEvent.click(screen.getByRole("button", { name: "Layout picker" }));
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "4 Grid (2x2)" }));
+      await flushMicrotasks();
+    });
+
+    expect(document.querySelectorAll("[data-pane-id]")).toHaveLength(4);
+    expect(appAttachPrimitiveMock).toHaveBeenCalledTimes(4);
+    expect(useDrawingStore.getState().scopes[pane1ScopeKey]?.drawings).toEqual([persistedHline]);
+
+    // Shrink 4-grid-2x2 -> 1-single -> 3 panes detach, pane-1 retains persisted drawing
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "1 Pane" }));
+      await flushMicrotasks();
+    });
+
+    expect(document.querySelectorAll("[data-pane-id]")).toHaveLength(1);
+    expect(appDetachPrimitiveMock).toHaveBeenCalledTimes(3);
+    expect(useDrawingStore.getState().scopes[pane1ScopeKey]?.drawings).toEqual([persistedHline]);
   });
 });
 
