@@ -832,21 +832,51 @@ class BacktestService:
         )
         await self._ensure_no_defective_coverage(dataset_key, job.start_time, aligned_end)
         target_path = self._parquet_store.resolve_path(dataset_key)
-        stored_root = await self._run_bounded_daemon_io(
+        pre_root = await self._run_bounded_daemon_io(
             lambda: _read_parquet_stored_root(target_path)
         )
         validate_root_symbol(
             job.contract_id,
             job.root_symbol,
-            stored_root_symbol=stored_root,
+            stored_root_symbol=pre_root,
         )
-        return await self._parquet_store.read_bars(
-            dataset_key,
-            start_ts=job.start_time,
-            end_ts=job.end_time,
-            include_provisional=False,
-            limit=job.max_bars + 1,
+
+        async def _locked_work() -> tuple[list[OHLCVBar], str | None, bool]:
+            def _read_and_inspect() -> tuple[list[OHLCVBar], str | None, bool]:
+                bars = self._parquet_store._read_bars_sync(
+                    target_path,
+                    dataset_key,
+                    start_ts=job.start_time,
+                    end_ts=job.end_time,
+                    include_provisional=False,
+                    limit=job.max_bars + 1,
+                )
+                with self._parquet_store._get_thread_lock(dataset_key):
+                    exists_now = target_path.exists()
+                    post_root = _read_parquet_stored_root(target_path) if exists_now else None
+                return bars, post_root, exists_now
+
+            return await asyncio.to_thread(_read_and_inspect)
+
+        bars, post_root, exists_now = await self._parquet_store._run_locked(
+            dataset_key, _locked_work
         )
+        validate_root_symbol(
+            job.contract_id,
+            job.root_symbol,
+            stored_root_symbol=post_root,
+        )
+        if bars and not exists_now:
+            raise ValueError("Parquet file disappeared during root_symbol verification")
+        if self._sqlite_store is not None:
+            meta = await self._sqlite_store.get_dataset_metadata(dataset_key)
+            if meta and meta.get("root_symbol"):
+                validate_root_symbol(
+                    job.contract_id,
+                    job.root_symbol,
+                    stored_root_symbol=meta["root_symbol"],
+                )
+        return bars
 
     async def _execute_job(self, job: BacktestJobRecord) -> None:
         loop = asyncio.get_running_loop()

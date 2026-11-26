@@ -1595,15 +1595,15 @@ async def test_load_closed_bars_timeout_and_idle_worker_crash_recovery(tmp_path:
     ) as (client, app):
         csrf = await _login(client)
         t0 = 1_760_000_000
-        orig_read_bars = app.state.parquet_store.read_bars
+        orig_load_closed = app.state.backtest_service._load_closed_bars
         slow_flag = {"slow": True}
 
-        async def _maybe_slow_read_bars(*args: Any, **kwargs: Any) -> Any:
+        async def _maybe_slow_load_closed(*args: Any, **kwargs: Any) -> Any:
             if slow_flag["slow"]:
                 await asyncio.sleep(5.0)
-            return await orig_read_bars(*args, **kwargs)
+            return await orig_load_closed(*args, **kwargs)
 
-        app.state.parquet_store.read_bars = _maybe_slow_read_bars
+        app.state.backtest_service._load_closed_bars = _maybe_slow_load_closed
         r_slow = await client.post(
             "/api/backtest",
             headers={"X-CSRF-Token": csrf},
@@ -2832,3 +2832,234 @@ def test_limit_order_expiry_and_open_gap_fill_exit_pricing() -> None:
     )
     assert r_s_tp.trades[0].exit_price == 95.0
     assert r_s_tp.trades[0].exit_reason == "take_profit"
+
+
+async def test_toctou_opaque_contract_root_symbol_race_fails(tmp_path: Path) -> None:
+    """Contract: Concurrent upsert after root pre-check fails opaque root_symbol mismatch.
+
+    Defect caught: TOCTOU race between unlocked pre-check root_symbol read and Parquet read.
+    """
+    import app.services.backtest_service as bs_mod
+
+    orig_read_meta = bs_mod._read_parquet_stored_root
+    precheck_done = threading.Event()
+    release_precheck = threading.Event()
+    guard_lock = threading.Lock()
+    state = {"precheck_seen": False}
+
+    t0 = 1_760_000_000
+    opaque_id = "OPAQUE.TOCTOU.1"
+    key = StorageDatasetKey("topstepx", False, opaque_id, "5m")
+
+    try:
+        async with _async_client(
+            tmp_path / "toctou",
+            worker_fn=worker_hang_or_fast,
+        ) as (client, app):
+            csrf = await _login(client)
+            store = app.state.parquet_store
+            target_path = store.resolve_path(key)
+
+            def _barrier_read_meta(path: Path) -> str | None:
+                res = orig_read_meta(path)
+                should_wait = False
+                if path == target_path:
+                    with guard_lock:
+                        if not state["precheck_seen"] and res is None:
+                            state["precheck_seen"] = True
+                            should_wait = True
+                if should_wait:
+                    precheck_done.set()
+                    release_precheck.wait(timeout=15.0)
+                return res
+
+            bs_mod._read_parquet_stored_root = _barrier_read_meta
+
+            r_job = await client.post(
+                "/api/backtest",
+                headers={"X-CSRF-Token": csrf},
+                json={
+                    "contract_id": opaque_id,
+                    "root_symbol": "MES",
+                    "timeframe": "5m",
+                    "start_time": t0,
+                    "end_time": t0 + 5000,
+                },
+            )
+            assert r_job.status_code == 202
+            job_id = r_job.json()["job_id"]
+
+            for _ in range(100):
+                if precheck_done.is_set():
+                    break
+                await asyncio.sleep(0.02)
+            assert precheck_done.is_set()
+
+            await store.upsert_bars(key, _ict_long_setup_bars(t0, 300), root_symbol="MNQ")
+            release_precheck.set()
+
+            st: dict[str, Any] = {}
+            for _ in range(100):
+                st = (await client.get(f"/api/backtest/{job_id}")).json()
+                if st["status"] in {"FAILED", "COMPLETED", "TIMED_OUT", "CANCELLED"}:
+                    break
+                await asyncio.sleep(0.05)
+
+            assert st["status"] == "FAILED"
+            assert "conflicts with stored root_symbol" in str(st["error"])
+    finally:
+        release_precheck.set()
+        bs_mod._read_parquet_stored_root = orig_read_meta
+
+
+def test_short_intrabar_limit_tp_deferred_and_both_hit_sl_first() -> None:
+    """Contract: SHORT intrabar limit fill ignores fill-bar TP-only and picks SL on SL+TP.
+
+    Defect caught: Optimistic SHORT exit on intrabar fill bar or failing conservative SL-first.
+    """
+    t0 = 1_760_000_000
+
+    # 1) SHORT intrabar limit fill where fill bar touches ONLY TP (no exit until bar[i+1]).
+    tp_only_bars = [
+        _bar(t0 + 0 * 60, 99.0, 99.5, 98.5, 99.0),     # 0: emit SHORT limit @ 100.0
+        _bar(t0 + 1 * 60, 99.5, 100.5, 97.5, 98.5),    # 1: fill @ 100.0; touches TP=98.0 only
+        _bar(t0 + 2 * 60, 98.5, 99.0, 97.5, 98.0),     # 2: touches TP=98.0 -> exits here
+    ]
+    r_tp = run_backtest(
+        tp_only_bars,
+        contract_id="CON.F.US.MES.Z26",
+        timeframe="1m",
+        strategy=_SingleSignalStrategy(
+            {
+                "signal_index": 0,
+                "direction": "SHORT",
+                "order_type": "limit",
+                "limit_price": 100.0,
+                "stop_loss": 102.0,
+                "take_profit": 98.0,
+            }
+        ),
+    )
+    assert len(r_tp.trades) == 1
+    assert r_tp.trades[0].entry_price == 100.0
+    assert r_tp.trades[0].entry_time == tp_only_bars[1].time
+    assert r_tp.trades[0].exit_price == 98.0
+    assert r_tp.trades[0].exit_time == tp_only_bars[2].time
+    assert r_tp.trades[0].exit_reason == "take_profit"
+    assert r_tp.trades[0].ambiguous_fill is False
+
+    # 2) SHORT intrabar limit fill where fill bar touches BOTH SL and TP -> SL + ambiguous_fill.
+    both_bars = [
+        _bar(t0 + 0 * 60, 99.0, 99.5, 98.5, 99.0),     # 0: emit SHORT limit @ 100.0
+        _bar(t0 + 1 * 60, 99.5, 102.5, 97.5, 99.0),    # 1: fill @ 100.0 + hits SL=102 & TP=98
+    ]
+    r_both = run_backtest(
+        both_bars,
+        contract_id="CON.F.US.MES.Z26",
+        timeframe="1m",
+        strategy=_SingleSignalStrategy(
+            {
+                "signal_index": 0,
+                "direction": "SHORT",
+                "order_type": "limit",
+                "limit_price": 100.0,
+                "stop_loss": 102.0,
+                "take_profit": 98.0,
+            }
+        ),
+    )
+    assert len(r_both.trades) == 1
+    assert r_both.trades[0].entry_price == 100.0
+    assert r_both.trades[0].exit_price == 102.0
+    assert r_both.trades[0].exit_time == both_bars[1].time
+    assert r_both.trades[0].exit_reason == "stop_loss"
+    assert r_both.trades[0].ambiguous_fill is True
+
+
+def test_short_limit_expiry_and_last_allowed_bar_fills_long_short() -> None:
+    """Contract: SHORT limit expires after max_wait_bars; LONG/SHORT fill on exact last bar.
+
+    Defect caught: Off-by-one max_wait_bars expiry dropping last valid bar or allowing expired.
+    """
+    t0 = 1_760_000_000
+
+    # 1) SHORT limit expiry strictly at max_wait_bars=2 (bar 3 touch must NOT fill).
+    short_exp_bars = [
+        _bar(t0 + 0 * 60, 98.0, 98.5, 97.5, 98.0),     # 0: emit SHORT limit @ 100.0
+        _bar(t0 + 1 * 60, 98.0, 99.0, 97.5, 98.5),     # 1: wait=1, no touch
+        _bar(t0 + 2 * 60, 98.5, 99.0, 98.0, 98.5),     # 2: wait=2 == max_wait_bars -> expires
+        _bar(t0 + 3 * 60, 98.5, 100.5, 98.0, 99.5),    # 3: touches 100.0 after expiry
+    ]
+    r_exp = run_backtest(
+        short_exp_bars,
+        contract_id="CON.F.US.MES.Z26",
+        timeframe="1m",
+        strategy=_SingleSignalStrategy(
+            {
+                "signal_index": 0,
+                "direction": "SHORT",
+                "order_type": "limit",
+                "limit_price": 100.0,
+                "stop_loss": 102.0,
+                "take_profit": 96.0,
+                "max_wait_bars": 2,
+            }
+        ),
+    )
+    assert len(r_exp.trades) == 0
+
+    # 2) LONG limit fills on exact signal + max_wait_bars bar (index 2).
+    long_last_bars = [
+        _bar(t0 + 0 * 60, 102.0, 102.5, 101.5, 102.0),  # 0: emit LONG limit @ 100.0
+        _bar(t0 + 1 * 60, 102.0, 102.5, 101.0, 101.5),  # 1: wait=1, no touch
+        _bar(t0 + 2 * 60, 101.5, 102.0, 99.5, 101.0),   # 2: exact max_wait_bars=2 -> fill @ 100
+        _bar(t0 + 3 * 60, 101.0, 104.5, 100.5, 104.0),  # 3: TP hit @ 104.0
+    ]
+    r_long_last = run_backtest(
+        long_last_bars,
+        contract_id="CON.F.US.MES.Z26",
+        timeframe="1m",
+        strategy=_SingleSignalStrategy(
+            {
+                "signal_index": 0,
+                "direction": "LONG",
+                "order_type": "limit",
+                "limit_price": 100.0,
+                "stop_loss": 98.0,
+                "take_profit": 104.0,
+                "max_wait_bars": 2,
+            }
+        ),
+    )
+    assert len(r_long_last.trades) == 1
+    assert r_long_last.trades[0].entry_price == 100.0
+    assert r_long_last.trades[0].entry_time == long_last_bars[2].time
+    assert r_long_last.trades[0].exit_reason == "take_profit"
+
+    # 3) SHORT limit fills on exact signal + max_wait_bars bar (index 2).
+    short_last_bars = [
+        _bar(t0 + 0 * 60, 98.0, 98.5, 97.5, 98.0),     # 0: emit SHORT limit @ 100.0
+        _bar(t0 + 1 * 60, 98.0, 99.0, 97.5, 98.5),     # 1: wait=1, no touch
+        _bar(t0 + 2 * 60, 98.5, 100.5, 98.0, 99.0),    # 2: exact max_wait_bars=2 -> fill @ 100
+        _bar(t0 + 3 * 60, 99.0, 99.5, 95.5, 96.0),     # 3: TP hit @ 96.0
+    ]
+    r_short_last = run_backtest(
+        short_last_bars,
+        contract_id="CON.F.US.MES.Z26",
+        timeframe="1m",
+        strategy=_SingleSignalStrategy(
+            {
+                "signal_index": 0,
+                "direction": "SHORT",
+                "order_type": "limit",
+                "limit_price": 100.0,
+                "stop_loss": 102.0,
+                "take_profit": 96.0,
+                "max_wait_bars": 2,
+            }
+        ),
+    )
+    assert len(r_short_last.trades) == 1
+    assert r_short_last.trades[0].entry_price == 100.0
+    assert r_short_last.trades[0].entry_time == short_last_bars[2].time
+    assert r_short_last.trades[0].exit_reason == "take_profit"
