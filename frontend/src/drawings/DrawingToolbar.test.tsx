@@ -126,6 +126,7 @@ describe("DrawingToolbar (Phase 4 Part 2)", () => {
           initialized: true,
           drawings: [sampleDrawing],
           scopeRevision: 2,
+          mutationEpoch: 0,
           canUndo: true,
           canRedo: false,
           loading: false,

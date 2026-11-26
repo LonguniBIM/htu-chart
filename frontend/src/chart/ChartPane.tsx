@@ -229,6 +229,7 @@ export function ChartPane({
     drawingId: string;
     scope: DrawingScopeTarget;
     scopeKey: string;
+    startMutationEpoch: number;
     originalDrawing: DrawingRecord;
     anchorRole: string | null;
     startPx: number;
@@ -675,6 +676,7 @@ export function ChartPane({
           drawingId: targetDrawing.id,
           scope,
           scopeKey,
+          startMutationEpoch: storeState.scopes[scopeKey]?.mutationEpoch ?? 0,
           originalDrawing: targetDrawing,
           anchorRole: hit.anchorRole,
           startPx: px,
@@ -864,11 +866,15 @@ export function ChartPane({
         dragRef.current = null;
         syncOverlayPrimitive();
         const currentState = useDrawingStore.getState();
-        const currentDrawings = currentState.scopes[finishedDrag.scopeKey]?.drawings ?? [];
+        const scopeState = currentState.scopes[finishedDrag.scopeKey];
+        const currentDrawings = scopeState?.drawings ?? [];
+        const liveDrawing = currentDrawings.find((d) => d.id === finishedDrag.drawingId);
         const stillValid =
           currentState.activeTool === "cursor" &&
           currentState.selectedByScope[finishedDrag.scopeKey] === finishedDrag.drawingId &&
-          currentDrawings.some((d) => d.id === finishedDrag.drawingId);
+          (scopeState?.mutationEpoch ?? 0) === finishedDrag.startMutationEpoch &&
+          liveDrawing !== undefined &&
+          liveDrawing.revision === finishedDrag.originalDrawing.revision;
         if (
           stillValid &&
           finishedDrag.hasMoved &&
@@ -878,9 +884,12 @@ export function ChartPane({
             finishedDrag.currentAnchors,
           )
         ) {
-          void currentState.updateDrawing(finishedDrag.scope, finishedDrag.drawingId, {
-            coordinates: { anchors: finishedDrag.currentAnchors },
-          });
+          void currentState.updateDrawing(
+            finishedDrag.scope,
+            finishedDrag.drawingId,
+            { coordinates: { anchors: finishedDrag.currentAnchors } },
+            { expectedDrawingRevision: finishedDrag.originalDrawing.revision },
+          );
         }
         return;
       }
@@ -923,10 +932,19 @@ export function ChartPane({
       if (activeDrag === null) {
         return;
       }
-      const scopeDrawings = state.scopes[activeDrag.scopeKey]?.drawings ?? [];
+      const scopeState = state.scopes[activeDrag.scopeKey];
+      const scopeDrawings = scopeState?.drawings ?? [];
+      const liveDrawing = scopeDrawings.find((d) => d.id === activeDrag.drawingId);
       const stillSelected = state.selectedByScope[activeDrag.scopeKey] === activeDrag.drawingId;
-      const stillExists = scopeDrawings.some((d) => d.id === activeDrag.drawingId);
-      if (state.activeTool !== "cursor" || !stillSelected || !stillExists) {
+      const sameMutationEpoch = (scopeState?.mutationEpoch ?? 0) === activeDrag.startMutationEpoch;
+      const sameDrawingRevision =
+        liveDrawing !== undefined && liveDrawing.revision === activeDrag.originalDrawing.revision;
+      if (
+        state.activeTool !== "cursor" ||
+        !stillSelected ||
+        !sameMutationEpoch ||
+        !sameDrawingRevision
+      ) {
         dragRef.current = null;
         suppressTimeClickRef.current = false;
         restoreChartInteraction();

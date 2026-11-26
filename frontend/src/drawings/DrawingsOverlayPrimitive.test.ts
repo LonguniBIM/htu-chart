@@ -45,6 +45,8 @@ function makeFakeCanvasContext() {
   const dashCalls: number[][] = [];
   const fillRects: Array<[number, number, number, number]> = [];
   const lineSegments: Array<{ x1: number; y1: number; x2: number; y2: number }> = [];
+  const rectSpy = vi.fn();
+  const clipSpy = vi.fn();
   let moveX = 0;
   let moveY = 0;
 
@@ -58,6 +60,8 @@ function makeFakeCanvasContext() {
     save: vi.fn(),
     restore: vi.fn(),
     beginPath: vi.fn(),
+    rect: rectSpy,
+    clip: clipSpy,
     moveTo: vi.fn((x: number, y: number) => {
       moveX = x;
       moveY = y;
@@ -83,7 +87,7 @@ function makeFakeCanvasContext() {
     }),
   } as unknown as CanvasRenderingContext2D;
 
-  return { ctx, fillTexts, dashCalls, fillRects, lineSegments };
+  return { ctx, fillTexts, dashCalls, fillRects, lineSegments, rectSpy, clipSpy };
 }
 
 describe("DrawingsOverlayPrimitive (Phase 4 Part 2)", () => {
@@ -226,7 +230,7 @@ describe("DrawingsOverlayPrimitive (Phase 4 Part 2)", () => {
       requestUpdate,
       horzScaleBehavior: {} as never,
     });
-    primitive.setViewportWidth(900);
+    primitive.setViewportSize(850, 470);
     primitive.setData({
       drawings,
       selectedDrawingId: "pos-short",
@@ -258,7 +262,8 @@ describe("DrawingsOverlayPrimitive (Phase 4 Part 2)", () => {
     expect(snapshot.projectedDrawings).toHaveLength(9);
     expect(snapshot.projectedDraft?.drawing.id).toBe("__draft__");
 
-    const { ctx, fillTexts, dashCalls, fillRects, lineSegments } = makeFakeCanvasContext();
+    const { ctx, fillTexts, dashCalls, fillRects, lineSegments, rectSpy, clipSpy } =
+      makeFakeCanvasContext();
     const renderer = primitive.paneViews()[0]!.renderer();
     expect(renderer).not.toBeNull();
     renderer!.draw({
@@ -267,7 +272,18 @@ describe("DrawingsOverlayPrimitive (Phase 4 Part 2)", () => {
       },
     } as never);
 
+    // Plot-area clip bounded to viewportWidth/viewportHeight (850x470)
+    expect(rectSpy).toHaveBeenCalledWith(0, 0, 850, 470);
+    expect(clipSpy).toHaveBeenCalledTimes(1);
+
+    // hline at price 5005 => y = (5050 - 5005) * 4 = 180 across plotWidth (0..850)
+    expect(lineSegments).toContainEqual({ x1: 0, y1: 180, x2: 850, y2: 180 });
+    expect(ctx.stroke).toHaveBeenCalled();
+
+    // Exact FVG 50% CE dashed midlines: bullish (5005 -> y=180) and bearish (5015 -> y=140)
     expect(dashCalls).toContainEqual([5, 4]);
+    expect(lineSegments).toContainEqual({ x1: 100, y1: 180, x2: 150, y2: 180 });
+    expect(lineSegments).toContainEqual({ x1: 150, y1: 140, x2: 200, y2: 140 });
     expect(fillTexts).toContain("Bullish FVG · CE 5005.00");
     expect(fillTexts).toContain("Bearish FVG · CE 5015.00");
     expect(fillTexts).toContain("Bull OB");
@@ -275,11 +291,11 @@ describe("DrawingsOverlayPrimitive (Phase 4 Part 2)", () => {
     expect(fillTexts.some((t) => t.includes("R:R 2.00") && t.includes("20t ($25.00)"))).toBe(true);
     expect(fillTexts.some((t) => t.includes("R:R 2.00") && t.includes("40t ($50.00)"))).toBe(true);
     expect(fillTexts.some((t) => t.includes("+5.00") && t.includes("2 bars") && t.includes("10m"))).toBe(true);
-    // OB extend_right reaches mediaWidth (900 - 100 = 800 width)
-    expect(fillRects.some((r) => r[0] === 100 && r[2] === 800)).toBe(true);
-    // Trendline (100,240)->(150,200), ray extending past viewport (x2 > 900), and draft trendline (100,280)->(200,248)
+    // OB extend_right reaches plotWidth (850 - 100 = 750 width)
+    expect(fillRects.some((r) => r[0] === 100 && r[2] === 750)).toBe(true);
+    // Trendline (100,240)->(150,200), ray extending past viewport (x2 > 850), and draft trendline (100,280)->(200,248)
     expect(lineSegments).toContainEqual({ x1: 100, y1: 240, x2: 150, y2: 200 });
-    expect(lineSegments.some((s) => s.x1 === 100 && s.y1 === 232 && s.x2 > 900)).toBe(true);
+    expect(lineSegments.some((s) => s.x1 === 100 && s.y1 === 232 && s.x2 > 850)).toBe(true);
     expect(lineSegments).toContainEqual({ x1: 100, y1: 280, x2: 200, y2: 248 });
 
     // Hit-test selects anchor handle of selected short_position (entry at 100, (5050-5020)*4 = 120)

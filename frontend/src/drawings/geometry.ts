@@ -214,34 +214,58 @@ export function xToTime(
   if (!Number.isFinite(x)) {
     return null;
   }
+  if (typeof timeScale.coordinateToLogical === "function" && bars.length > 0) {
+    const logical = timeScale.coordinateToLogical(x);
+    if (logical !== null && Number.isFinite(logical)) {
+      const numLogical = Number(logical);
+      const lastIdx = bars.length - 1;
+      const nearestIdx = Math.round(numLogical);
+      if (
+        nearestIdx >= 0 &&
+        nearestIdx <= lastIdx &&
+        Math.abs(numLogical - nearestIdx) <= 1e-6
+      ) {
+        return Math.max(MIN_DRAWING_TIMESTAMP_SEC, Math.round(bars[nearestIdx]!.time));
+      }
+      let resolvedTime: number;
+      if (numLogical < 0) {
+        const leftStep =
+          timeframeSec > 0
+            ? timeframeSec
+            : bars.length >= 2
+              ? Math.max(1, bars[1]!.time - bars[0]!.time)
+              : 60;
+        resolvedTime = bars[0]!.time + numLogical * leftStep;
+      } else if (numLogical > lastIdx) {
+        const rightStep =
+          timeframeSec > 0
+            ? timeframeSec
+            : bars.length >= 2
+              ? Math.max(1, bars[lastIdx]!.time - bars[lastIdx - 1]!.time)
+              : 60;
+        resolvedTime = bars[lastIdx]!.time + (numLogical - lastIdx) * rightStep;
+      } else {
+        const leftIdx = Math.floor(numLogical);
+        const frac = numLogical - leftIdx;
+        resolvedTime =
+          bars[leftIdx]!.time + frac * (bars[leftIdx + 1]!.time - bars[leftIdx]!.time);
+      }
+      return Math.max(MIN_DRAWING_TIMESTAMP_SEC, Math.round(resolvedTime));
+    }
+  }
   if (typeof timeScale.coordinateToTime === "function") {
     const direct = timeScale.coordinateToTime(x);
     if (typeof direct === "number" && Number.isFinite(direct)) {
-      return Math.max(MIN_DRAWING_TIMESTAMP_SEC, Math.round(direct));
+      if (bars.length === 0 || typeof timeScale.timeToCoordinate !== "function") {
+        return Math.max(MIN_DRAWING_TIMESTAMP_SEC, Math.round(direct));
+      }
+      const barX = timeScale.timeToCoordinate(direct as Time);
+      if (barX !== null && Number.isFinite(barX) && Math.abs(Number(barX) - x) <= 0.5) {
+        return Math.max(MIN_DRAWING_TIMESTAMP_SEC, Math.round(direct));
+      }
     }
   }
-  if (typeof timeScale.coordinateToLogical !== "function" || bars.length === 0) {
-    return null;
-  }
-  const logical = timeScale.coordinateToLogical(x);
-  if (logical === null || !Number.isFinite(logical)) {
-    return null;
-  }
-  const step = timeframeSec > 0 ? timeframeSec : 60;
-  const lastIdx = bars.length - 1;
-  let resolvedTime: number;
-  if (logical <= 0) {
-    resolvedTime = bars[0]!.time + Number(logical) * step;
-  } else if (logical >= lastIdx) {
-    resolvedTime = bars[lastIdx]!.time + (Number(logical) - lastIdx) * step;
-  } else {
-    const leftIdx = Math.floor(Number(logical));
-    const frac = Number(logical) - leftIdx;
-    const leftBar = bars[leftIdx]!;
-    const rightBar = bars[leftIdx + 1]!;
-    resolvedTime = leftBar.time + frac * (rightBar.time - leftBar.time);
-  }
-  return Math.max(MIN_DRAWING_TIMESTAMP_SEC, Math.round(resolvedTime));
+  return null;
 }
 
 /**

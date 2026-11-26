@@ -312,4 +312,101 @@ describe("useDrawingStore and api/client drawing wire contract (Phase 4 Part 2)"
     await useDrawingStore.getState().loadScope(scope);
     expect(authErrors).toEqual([{ status: 401, detail: "Session expired" }]);
   });
+
+  it("ignores stale overlapping loadScope 200/401/403, fires authErrorHandler on active 403/mutation/409-resync auth errors, and skips stale queued expectedDrawingRevision", async () => {
+    /**
+     * Contract:
+     * (a) Overlapping loadScope calls ignore late 200/401/403 settlements from superseded requests.
+     * (b) Active 403 in loadScope, 401/403 in postDrawingCommand, and 401/403 in 409 conflict-resync invoke authErrorHandler.
+     * (c) updateDrawing with expectedDrawingRevision aborts cleanly without calling postDrawingCommand when a concurrent WS update bumps drawing.revision.
+     * Defect caught: Out-of-order loadScope overwriting newer drawings, swallowed 403s, or stale drag commit overwriting newer drawing revision.
+     */
+    const authErrors: Array<{ status: number; detail: string }> = [];
+    useDrawingStore.getState().setAuthErrorHandler((status, detail) => {
+      authErrors.push({ status, detail });
+    });
+
+    const rev1Drawing = makeDrawing("d-overlap", 5000);
+    const rev2Drawing: DrawingRecord = { ...rev1Drawing, revision: 2, coordinates: { anchors: [{ role: "level", time: 1700000000, price: 5020 }] } };
+
+    let rejectSlowLoad!: (err: unknown) => void;
+    let resolveFastLoad!: (res: Response) => void;
+    const fetchMock = vi
+      .fn()
+      // 1. Slow loadScope #1
+      .mockImplementationOnce(
+        () =>
+          new Promise<Response>((_resolve, reject) => {
+            rejectSlowLoad = reject;
+          }),
+      )
+      // 2. Newer loadScope #2
+      .mockImplementationOnce(
+        () =>
+          new Promise<Response>((resolve) => {
+            resolveFastLoad = resolve;
+          }),
+      )
+      // 3. Active 403 in loadScope
+      .mockResolvedValueOnce(jsonResponse(403, { detail: "Forbidden scope" }))
+      // 4. Active 401 in mutation POST
+      .mockResolvedValueOnce(jsonResponse(401, { detail: "Mutation unauthorized" }))
+      // 5. Mutation 409 revision_conflict -> conflict resync GET returns 403
+      .mockResolvedValueOnce(
+        jsonResponse(409, {
+          detail: { code: "revision_conflict", message: "conflict", current_revision: 5, expected_revision: 1 },
+        }),
+      )
+      .mockResolvedValueOnce(jsonResponse(403, { detail: "Resync forbidden" }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    // (a) Overlapping loadScope: #2 finishes with rev2Drawing, then superseded #1 rejects with 401 -> ignored
+    const slowPromise = useDrawingStore.getState().loadScope(scope);
+    const fastPromise = useDrawingStore.getState().loadScope(scope);
+    resolveFastLoad(
+      jsonResponse(200, {
+        symbol: "MES",
+        contract_id: "CON.F.US.MES.H26",
+        pane_id: "pane-1",
+        instrument: { root_symbol: "MES", name: "MES", exchange: "CME", tick_size: 0.25, tick_value: 1.25, currency: "USD" },
+        scope_revision: 2,
+        can_undo: false,
+        can_redo: false,
+        drawings: [rev2Drawing],
+      }),
+    );
+    await fastPromise;
+    rejectSlowLoad(new Response(JSON.stringify({ detail: "Old 401" }), { status: 401 }));
+    await slowPromise;
+
+    expect(useDrawingStore.getState().scopes[scopeKey]?.drawings).toEqual([rev2Drawing]);
+    expect(authErrors).toEqual([]);
+
+    // (b) Active 403 loadScope, active 401 mutation, and active 403 during 409 conflict-resync
+    await useDrawingStore.getState().loadScope(scope);
+    await useDrawingStore.getState().createDrawing(scope, {
+      type: "hline",
+      coordinates: { anchors: [{ role: "level", time: 1700000000, price: 5000 }] },
+    });
+    await useDrawingStore.getState().createDrawing(scope, {
+      type: "hline",
+      coordinates: { anchors: [{ role: "level", time: 1700000000, price: 5000 }] },
+    });
+    expect(authErrors).toEqual([
+      { status: 403, detail: "Forbidden scope" },
+      { status: 401, detail: "Mutation unauthorized" },
+      { status: 403, detail: "Resync forbidden" },
+    ]);
+
+    // (c) updateDrawing with expectedDrawingRevision=1 aborts cleanly when live drawing is at revision 2
+    const callsBeforeRevisionGuard = fetchMock.mock.calls.length;
+    const abortedRes = await useDrawingStore.getState().updateDrawing(
+      scope,
+      "d-overlap",
+      { coordinates: { anchors: [{ role: "level", time: 1700000000, price: 5010 }] } },
+      { expectedDrawingRevision: 1 },
+    );
+    expect(abortedRes).toBeNull();
+    expect(fetchMock.mock.calls.length).toBe(callsBeforeRevisionGuard);
+  });
 });

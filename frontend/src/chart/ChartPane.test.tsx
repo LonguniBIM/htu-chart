@@ -2696,4 +2696,133 @@ describe("ChartPane (F06, P1-R3-01, P1-R3-02)", () => {
     expect(useDrawingStore.getState().selectedByScope[scopeKey]).toBeNull();
     expect(postDrawingCommandMock).toHaveBeenCalledTimes(1);
   });
+
+  it("cancels active drag synchronously and blocks updateDrawing when WS drawings_update bumps the dragged drawing revision mid-drag (P1-C01, P2-001)", async () => {
+    /**
+     * Contract: When a concurrent WS drawings_update edits another anchor on the same drawing
+     * (bumping revision 1 -> 2, e.g. end.price 5010 -> 5020) while an anchor drag is in progress
+     * (>= 5px before pointerUp), ChartPane immediately restores handleScroll/handleScale, reverts
+     * the drag preview, sends zero updateDrawing calls on pointerUp, and preserves end.price === 5020.
+     * Defect caught: Stale drag commit clobbering concurrent agent/tab edit to another anchor.
+     */
+    const bars = [
+      { time: 1700000000, open: 5000, high: 5012, low: 4996, close: 5005, volume: 25, is_closed: true },
+      { time: 1700000300, open: 5005, high: 5020, low: 5002, close: 5015, volume: 30, is_closed: true },
+    ];
+    const initialTrendline = {
+      id: "tl-concurrent",
+      revision: 1,
+      type: "trendline" as const,
+      symbol: "MES" as const,
+      contract_id: "CON.F.US.MES.H26",
+      pane_id: "pane-1",
+      created_by: "user" as const,
+      source_bar_refs: [],
+      coordinates: {
+        anchors: [
+          { role: "start", time: 1700000000, price: 5000 },
+          { role: "end", time: 1700000300, price: 5010 },
+        ],
+      },
+      style: {},
+      metadata: {},
+      created_at_utc: 1700000000,
+      updated_at_utc: 1700000000,
+    };
+    const wsUpdatedTrendline = {
+      ...initialTrendline,
+      revision: 2,
+      coordinates: {
+        anchors: [
+          { role: "start", time: 1700000000, price: 5000 },
+          { role: "end", time: 1700000300, price: 5020 },
+        ],
+      },
+    };
+
+    fetchBarsMock.mockResolvedValue(makeBarsResponse("CON.F.US.MES.H26", bars));
+    fetchDrawingsMock.mockResolvedValue({
+      symbol: "MES",
+      contract_id: "CON.F.US.MES.H26",
+      pane_id: "pane-1",
+      instrument: { root_symbol: "MES", name: "MES", exchange: "CME", tick_size: 0.25, tick_value: 1.25, currency: "USD" },
+      scope_revision: 1,
+      can_undo: false,
+      can_redo: false,
+      drawings: [initialTrendline],
+    });
+
+    const coordinator = new PaneFetchCoordinator();
+    const fakeWs = createFakeWsClient();
+    const pane: PaneConfig = {
+      pane_id: "pane-1",
+      root_symbol: "MES",
+      timeframe: "5m",
+      live_mode: false,
+      playback_mode: "live",
+    };
+
+    render(
+      <ChartPane
+        pane={pane}
+        contractId="CON.F.US.MES.H26"
+        activeFeedLive={false}
+        wsClient={fakeWs.client}
+        coordinator={coordinator}
+      />,
+    );
+
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    const canvas = document.querySelector(".chart-pane__canvas") as HTMLElement;
+    vi.spyOn(canvas, "getBoundingClientRect").mockReturnValue({
+      left: 0,
+      top: 0,
+      right: 600,
+      bottom: 400,
+      width: 600,
+      height: 400,
+      x: 0,
+      y: 0,
+      toJSON: () => ({}),
+    });
+
+    applyOptionsMock.mockClear();
+    // Drag start handle at (100, 200) -> move >= 5px to (100, 180)
+    act(() => {
+      fireEvent.pointerDown(canvas, { clientX: 100, clientY: 200, button: 0, pointerType: "mouse", pointerId: 1 });
+      fireEvent.pointerMove(canvas, { clientX: 100, clientY: 180, button: 0, pointerType: "mouse", pointerId: 1 });
+    });
+    expect(applyOptionsMock).toHaveBeenCalledWith({ handleScroll: false, handleScale: false });
+
+    // Concurrent WS update bumps revision 1 -> 2 and moves end.price to 5020
+    act(() => {
+      useDrawingStore.getState().applyWsDrawingsUpdate({
+        type: "drawings_update",
+        symbol: "MES",
+        contract_id: "CON.F.US.MES.H26",
+        pane_id: "pane-1",
+        scope_revision: 2,
+        command_type: "update",
+        can_undo: true,
+        can_redo: false,
+        drawings: [wsUpdatedTrendline],
+      });
+    });
+
+    expect(applyOptionsMock).toHaveBeenCalledWith({ handleScroll: true, handleScale: true });
+
+    await act(async () => {
+      fireEvent.pointerUp(canvas, { clientX: 100, clientY: 180, button: 0, pointerType: "mouse", pointerId: 1 });
+      await Promise.resolve();
+    });
+
+    expect(postDrawingCommandMock).not.toHaveBeenCalled();
+    const scopeKey = buildDrawingScopeKey("MES", "CON.F.US.MES.H26", "pane-1");
+    const saved = useDrawingStore.getState().scopes[scopeKey]?.drawings[0];
+    expect(saved?.coordinates.anchors.find((a) => a.role === "end")?.price).toBe(5020);
+  });
 });

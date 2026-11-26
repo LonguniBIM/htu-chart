@@ -31,6 +31,7 @@ export interface DrawingScopeState {
   initialized: boolean;
   drawings: DrawingRecord[];
   scopeRevision: number;
+  mutationEpoch: number;
   canUndo: boolean;
   canRedo: boolean;
   loading: boolean;
@@ -67,6 +68,7 @@ export interface DrawingStoreState {
     target: DrawingScopeTarget,
     drawingId: string,
     drawing: DrawingUpdateInput,
+    options?: { expectedDrawingRevision?: number },
   ) => Promise<DrawingCommandResponse | null>;
   deleteDrawing: (
     target: DrawingScopeTarget,
@@ -108,6 +110,7 @@ function createEmptyScope(target: DrawingScopeTarget): DrawingScopeState {
     initialized: false,
     drawings: [],
     scopeRevision: 0,
+    mutationEpoch: 0,
     canUndo: false,
     canRedo: false,
     loading: false,
@@ -252,11 +255,45 @@ export const useDrawingStore = create<DrawingStoreState>((set, get) => {
       norm: { symbol: RootSymbol; contractId: string | null; paneId: string | null };
       signal: AbortSignal;
     }) => Promise<DrawingCommandResponse>,
-    options?: { selectCreated?: boolean },
+    options?: {
+      selectCreated?: boolean;
+      expectedDrawingId?: string;
+      expectedDrawingRevision?: number;
+      clearSelectedDrawingId?: string | "__all__";
+    },
   ): Promise<DrawingCommandResponse | null> => {
     const norm = normalizeScope(target);
     const key = buildDrawingScopeKey(norm.symbol, norm.contractId, norm.paneId);
     const requestEpoch = get().sessionEpoch;
+
+    // Synchronously advance mutationEpoch (and clear target selection on delete/clear)
+    // before awaiting the per-scope queue so mid-drag interactions cancel immediately.
+    set((state) => {
+      const prev = state.scopes[key] ?? createEmptyScope(norm);
+      const nextScopes = {
+        ...state.scopes,
+        [key]: {
+          ...prev,
+          mutationEpoch: prev.mutationEpoch + 1,
+        },
+      };
+      if (options?.clearSelectedDrawingId === "__all__") {
+        return {
+          scopes: nextScopes,
+          selectedByScope: { ...state.selectedByScope, [key]: null },
+        };
+      }
+      if (
+        options?.clearSelectedDrawingId !== undefined &&
+        state.selectedByScope[key] === options.clearSelectedDrawingId
+      ) {
+        return {
+          scopes: nextScopes,
+          selectedByScope: { ...state.selectedByScope, [key]: null },
+        };
+      }
+      return { scopes: nextScopes };
+    });
 
     return enqueueScopeMutation(key, async () => {
       if (requestEpoch !== get().sessionEpoch) {
@@ -264,6 +301,18 @@ export const useDrawingStore = create<DrawingStoreState>((set, get) => {
       }
 
       const currentScope = get().scopes[key] ?? createEmptyScope(norm);
+      if (
+        options?.expectedDrawingId !== undefined &&
+        options?.expectedDrawingRevision !== undefined
+      ) {
+        const targetDrawing = currentScope.drawings.find(
+          (d) => d.id === options.expectedDrawingId,
+        );
+        if (!targetDrawing || targetDrawing.revision !== options.expectedDrawingRevision) {
+          return null;
+        }
+      }
+
       const expectedRevision = currentScope.scopeRevision;
       const idempotencyKey = generateIdempotencyKey();
       const controller = new AbortController();
@@ -487,51 +536,65 @@ export const useDrawingStore = create<DrawingStoreState>((set, get) => {
         { selectCreated: true },
       ),
 
-    updateDrawing: (target, drawingId, drawing) =>
-      runSerializedMutation(target, ({ expectedRevision, idempotencyKey, norm, signal }) =>
-        postDrawingCommand(
-          norm.symbol,
-          {
-            action: "update",
-            expected_revision: expectedRevision,
-            idempotency_key: idempotencyKey,
-            contract_id: norm.contractId,
-            pane_id: norm.paneId,
-            drawing_id: drawingId,
-            drawing,
-          },
-          signal,
-        ),
+    updateDrawing: (target, drawingId, drawing, options) =>
+      runSerializedMutation(
+        target,
+        ({ expectedRevision, idempotencyKey, norm, signal }) =>
+          postDrawingCommand(
+            norm.symbol,
+            {
+              action: "update",
+              expected_revision: expectedRevision,
+              idempotency_key: idempotencyKey,
+              contract_id: norm.contractId,
+              pane_id: norm.paneId,
+              drawing_id: drawingId,
+              drawing,
+            },
+            signal,
+          ),
+        options?.expectedDrawingRevision !== undefined
+          ? {
+              expectedDrawingId: drawingId,
+              expectedDrawingRevision: options.expectedDrawingRevision,
+            }
+          : undefined,
       ),
 
     deleteDrawing: (target, drawingId) =>
-      runSerializedMutation(target, ({ expectedRevision, idempotencyKey, norm, signal }) =>
-        postDrawingCommand(
-          norm.symbol,
-          {
-            action: "delete",
-            expected_revision: expectedRevision,
-            idempotency_key: idempotencyKey,
-            contract_id: norm.contractId,
-            pane_id: norm.paneId,
-            drawing_id: drawingId,
-          },
-          signal,
-        ),
+      runSerializedMutation(
+        target,
+        ({ expectedRevision, idempotencyKey, norm, signal }) =>
+          postDrawingCommand(
+            norm.symbol,
+            {
+              action: "delete",
+              expected_revision: expectedRevision,
+              idempotency_key: idempotencyKey,
+              contract_id: norm.contractId,
+              pane_id: norm.paneId,
+              drawing_id: drawingId,
+            },
+            signal,
+          ),
+        { clearSelectedDrawingId: drawingId },
       ),
 
     clearScopeDrawings: (target) =>
-      runSerializedMutation(target, ({ expectedRevision, idempotencyKey, norm, signal }) =>
-        clearDrawings(
-          norm.symbol,
-          {
-            expected_revision: expectedRevision,
-            idempotency_key: idempotencyKey,
-            contract_id: norm.contractId,
-            pane_id: norm.paneId,
-          },
-          signal,
-        ),
+      runSerializedMutation(
+        target,
+        ({ expectedRevision, idempotencyKey, norm, signal }) =>
+          clearDrawings(
+            norm.symbol,
+            {
+              expected_revision: expectedRevision,
+              idempotency_key: idempotencyKey,
+              contract_id: norm.contractId,
+              pane_id: norm.paneId,
+            },
+            signal,
+          ),
+        { clearSelectedDrawingId: "__all__" },
       ),
 
     undoScope: (target) =>

@@ -159,3 +159,48 @@ stateDiagram-v2
 - **Isolated Contract Resolution & Retry (`App.tsx`)**: Mode fetches are tracked per `AbortController` (removed immediately on abort and in `.finally()`). `retryGenerationRef` (`retryUnresolvedContracts`) stays isolated from `layoutResolveGenerationRef` unless `cancelRetry` is set, and aborted mixed batches immediately re-dispatch still-needed modes even when already listed in `unresolvedModesRef`.
 - **Stale Response Guard (`F06`, `ChartPane.tsx` + `fetchGuard.ts`)**: Rapid symbol/timeframe/template/mode changes abort prior `fetchBars` calls and increment monotonic `requestGeneration` per pane so stale responses never mutate canvas series or `barsRef`.
 - **Loop-Free 5-Channel Sync (`syncController.ts` + `ChartPane.tsx`)**: Synchronous `activeCrosshairSource`/`activeRangeSource`/`activeTimeSource` guards pair with per-pane `suppressRangeEchoRef` + `requestAnimationFrame` cleanup (`SLOP-002`-compliant, zero `setTimeout`/`setInterval` inside `frontend/src/chart/`) so Lightweight Charts v5 async next-frame `subscribeVisibleTimeRangeChange` callbacks never bounce back to the source pane or cross-trigger `Date range` from `Time` centering.
+
+---
+
+## 7. Interactive Drawings, Unified CommandService & Mid-Drag Concurrency (Phase 4)
+
+### 7.1 `drawingStore` Scope State Machine
+
+```mermaid
+stateDiagram-v2
+    [*] --> UNINITIALIZED: "New scope (symbol, contractId, paneId)"
+    UNINITIALIZED --> LOADING: "loadScope() on target ready or resyncNonce"
+    UNINITIALIZED --> READY: "wsClient.onDrawingsUpdate arrives first"
+    LOADING --> READY: "GET 200 (preserves newer local scopeRevision)"
+    LOADING --> LOGIN_GATE: "401/403 on matching sessionEpoch -> onAuthError"
+    READY --> MUTATING: "Serialized queue executes command (mutationEpoch += 1)"
+    MUTATING --> READY: "HTTP 200 or aborted expectedDrawingRevision mismatch"
+    MUTATING --> CONFLICT_RESYNC: "HTTP 409 revision_conflict"
+    CONFLICT_RESYNC --> READY: "Re-fetch GET /api/drawings/{symbol} syncs scopeRevision"
+    CONFLICT_RESYNC --> LOGIN_GATE: "Re-fetch 401/403 on matching sessionEpoch"
+    MUTATING --> LOGIN_GATE: "401/403 on matching sessionEpoch -> onAuthError"
+    READY --> UNINITIALIZED: "reset() on Logout / session invalidation (sessionEpoch += 1)"
+```
+
+### 7.2 `ChartPane` Pointer, Draft & Drag Concurrency State Machine
+
+```mermaid
+stateDiagram-v2
+    [*] --> IDLE: "ChartPane mounted with DrawingsOverlayPrimitive attached"
+    IDLE --> DRAFT_PLACING: "Tool != cursor & pointerdown inside plot bounds"
+    DRAFT_PLACING --> IDLE: "2nd click or drag >= 5px -> createDrawing (ray/position clamped)"
+    DRAFT_PLACING --> IDLE: "Escape / tool switch / scope change / pointercancel"
+    IDLE --> DRAG_PENDING_DEADZONE: "Tool == cursor & hitTestAt != null inside plot bounds"
+    DRAG_PENDING_DEADZONE --> IDLE: "pointerup < 5px jitter -> pure selection (no updateDrawing)"
+    DRAG_PENDING_DEADZONE --> DRAGGING: "pointermove >= 5px deadzone"
+    DRAGGING --> COMMITTING: "pointerup with valid epoch, revision & changed anchors"
+    DRAGGING --> CANCELLED_SYNC: "Escape / Delete / Clear / Undo / Redo / WS revision change / scope change"
+    DRAG_PENDING_DEADZONE --> CANCELLED_SYNC: "Escape / Delete / Clear / WS revision change / pointercancel"
+    COMMITTING --> IDLE: "updateDrawing queued with expectedDrawingRevision"
+    CANCELLED_SYNC --> IDLE: "Restore handleScroll/handleScale & revert preview"
+```
+
+**Invariants**:
+- **Per-Scope Serialized Queue & `mutationEpoch` (`drawingStore.ts`)**: `createDrawing`, `updateDrawing`, `deleteDrawing`, `clearScopeDrawings`, `undoScope`, and `redoScope` synchronously increment `mutationEpoch` before awaiting the per-scope promise queue (`deleteDrawing` and `clearScopeDrawings` also clear `selectedByScope` synchronously). `updateDrawing(..., { expectedDrawingRevision })` re-checks the drawing's live revision inside the queue before setting `mutating: true` or issuing `POST`.
+- **Synchronous Mid-Drag Guard (`ChartPane.tsx`)**: Active drags capture `startMutationEpoch` and `originalDrawing.revision` on `pointerdown`. `useDrawingStore.subscribe` immediately aborts the drag, restores `handleScroll`/`handleScale`, and reverts the overlay preview if `activeTool !== "cursor"`, selection is lost, `mutationEpoch` advances, or `liveDrawing.revision` changes; `handlePointerUp` enforces the same guard plus `anchorsEqual(...)`.
+- **Plot-Area Axis Isolation (`ChartPane.tsx` + `DrawingsOverlayPrimitive.ts` + `geometry.ts`)**: Canvas rendering and `hitTestAt` clip strictly to `[0, plotWidth) x [0, plotHeight)` derived from `timeScale().width()` / `timeScale().height()`, leaving Right Price Scale and Bottom Time Scale native interactions unobstructed.

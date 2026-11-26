@@ -91,7 +91,23 @@ describe("drawing geometry and domain math (Phase 4 Part 2)", () => {
     // Exact bar
     expect(timeToX(1700000000, timeScale, bars1h, 3600)).toBe(100);
     // 25% between 1h bars (15m offset = +900s) -> logical 0.25 -> x = 110
-    expect(timeToX(1700000900, timeScale, bars1h, 3600)).toBe(110);
+    const betweenX = timeToX(1700000900, timeScale, bars1h, 3600);
+    expect(betweenX).toBe(110);
+    // Exact round-trip timeToX -> xToTime -> timeToX even when coordinateToTime snaps to nearest bar
+    const roundTrippedTime = xToTime(betweenX!, timeScale, bars1h, 3600);
+    expect(roundTrippedTime).toBe(1700000900);
+    expect(timeToX(roundTrippedTime!, timeScale, bars1h, 3600)).toBe(110);
+
+    // Larger bar gap (e.g. weekend gap of 72h = 259200s): midpoint interpolates cleanly
+    const gapBars = [
+      makeBar(1700000000, 5000, 5010, 4995, 5005),
+      makeBar(1700259200, 5005, 5015, 5000, 5012),
+    ];
+    const gapScale = makeFakeTimeScale(gapBars, 40, 100);
+    const gapMidX = timeToX(1700129600, gapScale, gapBars, 3600);
+    expect(gapMidX).toBe(120);
+    expect(xToTime(gapMidX!, gapScale, gapBars, 3600)).toBe(1700129600);
+
     // 2 bars into future margin (+7200s after last bar) -> logical 1 + 2 = 3 -> x = 220
     expect(timeToX(1700010800, timeScale, bars1h, 3600)).toBe(220);
     // Round-trip xToTime from future margin

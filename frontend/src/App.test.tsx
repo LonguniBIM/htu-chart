@@ -127,6 +127,7 @@ vi.mock("./api/wsClient", async (importOriginal) => {
 
 const appAttachPrimitiveMock = vi.fn();
 const appDetachPrimitiveMock = vi.fn();
+const appApplyOptionsMock = vi.fn();
 
 vi.mock("lightweight-charts", () => {
   const CandlestickSeries = Symbol("CandlestickSeries");
@@ -188,7 +189,7 @@ vi.mock("lightweight-charts", () => {
         unsubscribeClick: vi.fn(),
         setCrosshairPosition: vi.fn(),
         clearCrosshairPosition: vi.fn(),
-        applyOptions: vi.fn(),
+        applyOptions: appApplyOptionsMock,
         remove: vi.fn(),
         timeScale: () => timeScaleApi,
       };
@@ -3564,12 +3565,14 @@ describe("App bootstrap and R03 503 recovery (P1-R3-03, P1-R3-04, P2-005)", () =
       contract_id: "CON.F.US.MES.H26",
       root_symbol: "MES",
       timeframe: "5m",
-      start_time: 1000,
-      end_time: 1000,
-      count: 0,
+      start_time: 1700000000,
+      end_time: 1700000000,
+      count: 1,
       include_partial: true,
       quality: { is_complete: true, truncated: false, provider_gap: false, quarantined_count: 0 },
-      bars: [],
+      bars: [
+        { time: 1700000000, open: 5000, high: 5005, low: 4995, close: 5000, volume: 10, is_closed: true },
+      ],
     });
     logoutMock.mockResolvedValue({ authenticated: false });
 
@@ -3748,12 +3751,14 @@ describe("App bootstrap and R03 503 recovery (P1-R3-03, P1-R3-04, P2-005)", () =
       contract_id: "CON.F.US.MES.H26",
       root_symbol: "MES",
       timeframe: "5m",
-      start_time: 1000,
-      end_time: 1000,
-      count: 0,
+      start_time: 1700000000,
+      end_time: 1700000000,
+      count: 1,
       include_partial: true,
       quality: { is_complete: true, truncated: false, provider_gap: false, quarantined_count: 0 },
-      bars: [],
+      bars: [
+        { time: 1700000000, open: 5000, high: 5005, low: 4995, close: 5000, volume: 10, is_closed: true },
+      ],
     });
     fetchDrawingsMock.mockImplementation(async (symbol, params) => ({
       symbol,
@@ -3796,6 +3801,150 @@ describe("App bootstrap and R03 503 recovery (P1-R3-03, P1-R3-04, P2-005)", () =
     expect(document.querySelectorAll("[data-pane-id]")).toHaveLength(1);
     expect(appDetachPrimitiveMock).toHaveBeenCalledTimes(3);
     expect(useDrawingStore.getState().scopes[pane1ScopeKey]?.drawings).toEqual([persistedHline]);
+  });
+
+  it("cancels active drag synchronously on Delete shortcut while delete HTTP request is pending and never sends updateDrawing on pointerUp (P1-C03)", async () => {
+    /**
+     * Contract: Pressing Delete mid-drag while postDrawingCommand(action="delete") is still in-flight
+     * synchronously advances mutationEpoch, clears selection, restores handleScroll/handleScale, and
+     * blocks updateDrawing on pointerUp both before and after the deferred delete resolves.
+     * Defect caught: In-flight delete leaving active drag armed so pointerUp sends stale updateDrawing.
+     */
+    const persistedHline = {
+      id: "draw-del-mid",
+      revision: 1,
+      type: "hline" as const,
+      symbol: "MES" as const,
+      contract_id: "CON.F.US.MES.H26",
+      pane_id: "pane-1",
+      created_by: "user" as const,
+      source_bar_refs: [],
+      coordinates: { anchors: [{ role: "level", time: 1700000000, price: 5000 }] },
+      style: {},
+      metadata: {},
+      created_at_utc: 1700000000,
+      updated_at_utc: 1700000000,
+    };
+
+    fetchSessionMock.mockResolvedValue({
+      authenticated: true,
+      csrf_token: "csrf-token-del-mid",
+    });
+    fetchStatusMock.mockResolvedValue({
+      connected: true,
+      live: false,
+      feed_state: "LIVE",
+    });
+    listLayoutsMock.mockResolvedValue([SAMPLE_LAYOUT]);
+    fetchContractsMock.mockResolvedValue({
+      live: false,
+      contracts: {
+        MES: { selected: { id: "CON.F.US.MES.H26" }, error_type: null, error: null },
+      },
+    });
+    fetchBarsMock.mockResolvedValue({
+      provider: "topstepx",
+      live: false,
+      contract_id: "CON.F.US.MES.H26",
+      root_symbol: "MES",
+      timeframe: "5m",
+      start_time: 1700000000,
+      end_time: 1700000000,
+      count: 1,
+      include_partial: true,
+      quality: { is_complete: true, truncated: false, provider_gap: false, quarantined_count: 0 },
+      bars: [
+        { time: 1700000000, open: 5000, high: 5005, low: 4995, close: 5000, volume: 10, is_closed: true },
+      ],
+    });
+    fetchDrawingsMock.mockResolvedValue({
+      symbol: "MES",
+      contract_id: "CON.F.US.MES.H26",
+      pane_id: "pane-1",
+      instrument: { root_symbol: "MES", name: "MES", exchange: "CME", tick_size: 0.25, tick_value: 1.25, currency: "USD" },
+      scope_revision: 1,
+      can_undo: true,
+      can_redo: false,
+      drawings: [persistedHline],
+    });
+
+    let resolveDelete!: (res: DrawingCommandResponse) => void;
+    postDrawingCommandMock.mockImplementationOnce(
+      () =>
+        new Promise<DrawingCommandResponse>((resolve) => {
+          resolveDelete = resolve;
+        }),
+    );
+
+    render(<App />);
+    await act(async () => {
+      await flushMicrotasks();
+    });
+
+    const canvas = document.querySelector(".chart-pane__canvas") as HTMLElement;
+    vi.spyOn(canvas, "getBoundingClientRect").mockReturnValue({
+      left: 0,
+      top: 0,
+      right: 600,
+      bottom: 400,
+      width: 600,
+      height: 400,
+      x: 0,
+      y: 0,
+      toJSON: () => ({}),
+    });
+
+    appApplyOptionsMock.mockClear();
+    // Start dragging hline at price=5000 (y=(5050-5000)*4 = 200) -> move >= 5px
+    act(() => {
+      fireEvent.pointerDown(canvas, { clientX: 100, clientY: 200, button: 0, pointerType: "mouse", pointerId: 1 });
+      fireEvent.pointerMove(canvas, { clientX: 100, clientY: 160, button: 0, pointerType: "mouse", pointerId: 1 });
+    });
+    expect(appApplyOptionsMock).toHaveBeenCalledWith({ handleScroll: false, handleScale: false });
+
+    // Press Delete while drag is active (delete HTTP call stays pending)
+    act(() => {
+      fireEvent.keyDown(window, { key: "Delete" });
+    });
+
+    // Synchronous drag cancellation restores handleScroll/handleScale immediately before any async microtask
+    expect(appApplyOptionsMock).toHaveBeenCalledWith({ handleScroll: true, handleScale: true });
+
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(postDrawingCommandMock).toHaveBeenCalledTimes(1);
+    expect(postDrawingCommandMock).toHaveBeenCalledWith(
+      "MES",
+      expect.objectContaining({ action: "delete", drawing_id: "draw-del-mid" }),
+      expect.any(AbortSignal),
+    );
+
+    // Release pointer BEFORE deferred delete resolves -> zero updateDrawing calls
+    await act(async () => {
+      fireEvent.pointerUp(canvas, { clientX: 100, clientY: 160, button: 0, pointerType: "mouse", pointerId: 1 });
+      await flushMicrotasks();
+    });
+    expect(postDrawingCommandMock).toHaveBeenCalledTimes(1);
+
+    // Resolve deferred delete -> still zero updateDrawing calls
+    await act(async () => {
+      resolveDelete({
+        symbol: "MES",
+        contract_id: "CON.F.US.MES.H26",
+        pane_id: "pane-1",
+        instrument: { root_symbol: "MES", name: "MES", exchange: "CME", tick_size: 0.25, tick_value: 1.25, currency: "USD" },
+        scope_revision: 2,
+        can_undo: true,
+        can_redo: false,
+        deduplicated: false,
+        affected_ids: ["draw-del-mid"],
+        drawings: [],
+      });
+      await flushMicrotasks();
+    });
+    expect(postDrawingCommandMock).toHaveBeenCalledTimes(1);
   });
 });
 
