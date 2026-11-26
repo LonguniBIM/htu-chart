@@ -602,10 +602,10 @@ export class DrawingsOverlayPrimitive implements ISeriesPrimitive<Time> {
     let nextDraft: ProjectedDrawingGeometry | null = null;
     if (this._draft !== null) {
       const draftMetadata: Record<string, unknown> = {};
-      if (this._draft.fvgPreset !== undefined) {
+      if (this._draft.tool === "fvg_box" && this._draft.fvgPreset !== undefined) {
         draftMetadata.direction = this._draft.fvgPreset;
       }
-      if (this._draft.extendRight !== undefined) {
+      if (this._draft.tool === "order_block" && this._draft.extendRight !== undefined) {
         draftMetadata.extend_right = this._draft.extendRight;
       }
       const draftRecord: DrawingRecord = {

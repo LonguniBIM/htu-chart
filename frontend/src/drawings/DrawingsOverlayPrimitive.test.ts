@@ -304,4 +304,93 @@ describe("DrawingsOverlayPrimitive (Phase 4 Part 2)", () => {
     primitive.detached();
     expect(primitive.priceAxisViews()).toEqual([]);
   });
+
+  it("renders a single hline with exact single stroke() call and keeps fvg_box draft bounded when obExtendRight is not applied", () => {
+    /**
+     * Contract:
+     * 1. A single hline drawing invokes context.moveTo(0, expectedY), lineTo(plotWidth, expectedY),
+     *    and context.stroke() exactly once.
+     * 2. An fvg_box draft without extendRight stays bounded to [start.x, end.x] rather than extending
+     *    to plotWidth (whereas an order_block draft with extendRight=true extends to plotWidth).
+     * Defect caught: Missing hline stroke() call or obExtendRight leaking onto fvg_box draft preview.
+     */
+    const bars = [makeBar(1700000000, 5000), makeBar(1700000300, 5010)];
+    const { chart, series } = makeChartSeriesMocks(bars);
+
+    const hlineOnly: DrawingRecord = {
+      id: "hl-solo",
+      revision: 1,
+      type: "hline",
+      symbol: "MES",
+      contract_id: "CON.F.US.MES.H26",
+      pane_id: "pane-1",
+      created_by: "user",
+      source_bar_refs: [],
+      coordinates: { anchors: [{ role: "level", time: 1700000000, price: 5005 }] },
+      style: {},
+      metadata: {},
+      created_at_utc: 1700000000,
+      updated_at_utc: 1700000000,
+    };
+
+    const hlinePrimitive = new DrawingsOverlayPrimitive();
+    hlinePrimitive.attached({
+      chart,
+      series,
+      requestUpdate: vi.fn(),
+      horzScaleBehavior: {} as never,
+    });
+    hlinePrimitive.setViewportSize(850, 470);
+    hlinePrimitive.setData({
+      drawings: [hlineOnly],
+      selectedDrawingId: null,
+      draft: null,
+      bars,
+      timeframeSec: 300,
+      instrumentSpec: INSTRUMENT_SPECS.MES,
+    });
+
+    const hlineCanvas = makeFakeCanvasContext();
+    hlinePrimitive.paneViews()[0]!.renderer()!.draw({
+      useMediaCoordinateSpace: (cb: (scope: { context: CanvasRenderingContext2D; mediaSize: { width: number; height: number } }) => void) => {
+        cb({ context: hlineCanvas.ctx, mediaSize: { width: 900, height: 500 } });
+      },
+    } as never);
+
+    expect(hlineCanvas.lineSegments).toEqual([{ x1: 0, y1: 180, x2: 850, y2: 180 }]);
+    expect(hlineCanvas.ctx.stroke).toHaveBeenCalledTimes(1);
+
+    // fvg_box draft (no extendRight) stays bounded to 50px width (100..150), not 750px
+    const fvgDraftPrimitive = new DrawingsOverlayPrimitive();
+    fvgDraftPrimitive.attached({
+      chart,
+      series,
+      requestUpdate: vi.fn(),
+      horzScaleBehavior: {} as never,
+    });
+    fvgDraftPrimitive.setViewportSize(850, 470);
+    fvgDraftPrimitive.setData({
+      drawings: [],
+      selectedDrawingId: null,
+      draft: {
+        tool: "fvg_box",
+        anchors: [
+          { role: "start", time: 1700000000, price: 5000 },
+          { role: "end", time: 1700000300, price: 5010 },
+        ],
+        fvgPreset: "auto",
+      },
+      bars,
+      timeframeSec: 300,
+      instrumentSpec: INSTRUMENT_SPECS.MES,
+    });
+    const fvgCanvas = makeFakeCanvasContext();
+    fvgDraftPrimitive.paneViews()[0]!.renderer()!.draw({
+      useMediaCoordinateSpace: (cb: (scope: { context: CanvasRenderingContext2D; mediaSize: { width: number; height: number } }) => void) => {
+        cb({ context: fvgCanvas.ctx, mediaSize: { width: 900, height: 500 } });
+      },
+    } as never);
+    expect(fvgCanvas.fillRects.some((r) => r[0] === 100 && r[2] === 50)).toBe(true);
+    expect(fvgCanvas.fillRects.some((r) => r[2] === 750)).toBe(false);
+  });
 });

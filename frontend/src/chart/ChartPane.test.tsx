@@ -2825,4 +2825,122 @@ describe("ChartPane (F06, P1-R3-01, P1-R3-02)", () => {
     const saved = useDrawingStore.getState().scopes[scopeKey]?.drawings[0];
     expect(saved?.coordinates.anchors.find((a) => a.role === "end")?.price).toBe(5020);
   });
+
+  it("keeps open 2-point draft active across axis clicks/drags and omits extend_right on fvg_box drafts when obExtendRight is true (P1-001, P1-002)", async () => {
+    /**
+     * Contract:
+     * 1. After click #1 opens a 2-point fvg_box draft inside the plot, clicking/dragging on the
+     *    Right Price Scale or Bottom Time Scale must NOT finalize the draft onto a clamped edge;
+     *    the draft remains open and only finalizes when click #2 lands inside the plot.
+     * 2. With obExtendRight=true, the fvg_box draft and persisted payload omit metadata.extend_right.
+     * Defect caught: Axis pointerup prematurely finalizing open 2-point drafts or obExtendRight leaking onto fvg_box.
+     */
+    const bars = [
+      { time: 1700000000, open: 5000, high: 5012, low: 4996, close: 5005, volume: 25, is_closed: true },
+      { time: 1700000300, open: 5005, high: 5020, low: 5002, close: 5015, volume: 30, is_closed: true },
+    ];
+    fetchBarsMock.mockResolvedValue(makeBarsResponse("CON.F.US.MES.H26", bars));
+    postDrawingCommandMock.mockResolvedValue({
+      symbol: "MES",
+      contract_id: "CON.F.US.MES.H26",
+      pane_id: "pane-1",
+      instrument: { root_symbol: "MES", name: "MES", exchange: "CME", tick_size: 0.25, tick_value: 1.25, currency: "USD" },
+      scope_revision: 1,
+      can_undo: true,
+      can_redo: false,
+      deduplicated: false,
+      affected_ids: ["fvg-new"],
+      drawings: [],
+    });
+
+    const coordinator = new PaneFetchCoordinator();
+    const fakeWs = createFakeWsClient();
+    const pane: PaneConfig = {
+      pane_id: "pane-1",
+      root_symbol: "MES",
+      timeframe: "5m",
+      live_mode: false,
+      playback_mode: "live",
+    };
+
+    render(
+      <ChartPane
+        pane={pane}
+        contractId="CON.F.US.MES.H26"
+        activeFeedLive={false}
+        wsClient={fakeWs.client}
+        coordinator={coordinator}
+      />,
+    );
+
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    const canvas = document.querySelector(".chart-pane__canvas") as HTMLElement;
+    vi.spyOn(canvas, "getBoundingClientRect").mockReturnValue({
+      left: 0,
+      top: 0,
+      right: 600,
+      bottom: 400,
+      width: 600,
+      height: 400,
+      x: 0,
+      y: 0,
+      toJSON: () => ({}),
+    });
+
+    const attachedPrimitive = attachPrimitiveMock.mock.calls[0]![0] as {
+      getRenderSnapshot: () => {
+        projectedDraft: { drawing: { type: string; metadata: Record<string, unknown> }; anchors: Array<{ x: number; price: number }> } | null;
+      };
+    };
+
+    useDrawingStore.getState().setObExtendRight(true);
+    useDrawingStore.getState().setActiveTool("fvg_box");
+
+    // Click #1 inside plot (< 5px pointerup) opens fvg_box draft without extendRight
+    act(() => {
+      fireEvent.pointerDown(canvas, { clientX: 100, clientY: 200, button: 0, pointerType: "mouse", pointerId: 1 });
+      fireEvent.pointerUp(canvas, { clientX: 100, clientY: 200, button: 0, pointerType: "mouse", pointerId: 1 });
+    });
+    expect(attachedPrimitive.getRenderSnapshot().projectedDraft?.drawing.type).toBe("fvg_box");
+    expect(attachedPrimitive.getRenderSnapshot().projectedDraft?.drawing.metadata.extend_right).toBeUndefined();
+
+    // Pointer gestures on Right Price Scale (565, 200) and Bottom Time Scale (200, 385) must NOT finalize draft
+    await act(async () => {
+      fireEvent.pointerDown(canvas, { clientX: 565, clientY: 200, button: 0, pointerType: "mouse", pointerId: 2 });
+      fireEvent.pointerMove(canvas, { clientX: 580, clientY: 160, button: 0, pointerType: "mouse", pointerId: 2 });
+      fireEvent.pointerUp(canvas, { clientX: 580, clientY: 160, button: 0, pointerType: "mouse", pointerId: 2 });
+      fireEvent.pointerDown(canvas, { clientX: 200, clientY: 385, button: 0, pointerType: "mouse", pointerId: 3 });
+      fireEvent.pointerMove(canvas, { clientX: 240, clientY: 390, button: 0, pointerType: "mouse", pointerId: 3 });
+      fireEvent.pointerUp(canvas, { clientX: 240, clientY: 390, button: 0, pointerType: "mouse", pointerId: 3 });
+      await Promise.resolve();
+    });
+    expect(postDrawingCommandMock).not.toHaveBeenCalled();
+
+    // Draft is still open and previews on subsequent in-plot pointermove
+    act(() => {
+      fireEvent.pointerMove(canvas, { clientX: 130, clientY: 160, button: 0, pointerType: "mouse", pointerId: 4 });
+    });
+    expect(attachedPrimitive.getRenderSnapshot().projectedDraft?.anchors[1]).toMatchObject({
+      x: 130,
+      price: 5010,
+    });
+
+    // Click #2 inside plot finalizes fvg_box cleanly without extend_right
+    await act(async () => {
+      fireEvent.pointerDown(canvas, { clientX: 130, clientY: 160, button: 0, pointerType: "mouse", pointerId: 4 });
+      fireEvent.pointerUp(canvas, { clientX: 130, clientY: 160, button: 0, pointerType: "mouse", pointerId: 4 });
+      await Promise.resolve();
+    });
+    expect(postDrawingCommandMock).toHaveBeenCalledTimes(1);
+    const createdCmd = postDrawingCommandMock.mock.calls[0]![1];
+    if (createdCmd.action === "create") {
+      expect(createdCmd.drawing.type).toBe("fvg_box");
+      expect(createdCmd.drawing.metadata?.extend_right).toBeUndefined();
+      expect(createdCmd.drawing.metadata?.direction).toBe("bullish");
+    }
+  });
 });
