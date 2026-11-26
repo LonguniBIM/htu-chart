@@ -526,4 +526,170 @@ describe("Backtest Store, Overlay Primitive, Panel, and ReplayControlBar", () =>
     expect(authSpy).toHaveBeenCalledWith(401, expect.stringContaining("Authentication required"));
     expect(ApiError).toBeDefined();
   });
+
+  it("halts strategy retry storm on HTTP 500 and recovers via manual Retry (P1-001)", async () => {
+    /**
+     * Contract: When GET /api/backtest/strategies fails with HTTP 500, BacktestPanel calls
+     * fetch once (no 0ms infinite loop), sets strategiesAttempted=true, and recovers on Retry click.
+     * Defect caught: Unbounded useEffect retry storm when strategies endpoint returns 500/503 or [].
+     */
+    const strategiesResp: BacktestStrategiesResponse = {
+      strategies: [
+        {
+          strategy_id: "ict_fvg_sweep",
+          strategy_version: "1.0.0",
+          name: "ICT FVG + Liquidity Sweep",
+          description: "ICT sample",
+          default_params: {},
+          param_schema: {},
+        },
+      ],
+      count: 1,
+    };
+    fetchMock
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ detail: "Backtest unavailable" }), {
+          status: 500,
+          headers: { "Content-Type": "application/json" },
+        }),
+      )
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify(strategiesResp), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        }),
+      );
+
+    useBacktestStore.getState().togglePanel();
+    render(
+      <BacktestPanel
+        activeTarget={{
+          paneId: "pane-1",
+          contractId: "CON.F.US.MES.H26",
+          rootSymbol: "MES",
+          timeframe: "5m",
+          liveMode: false,
+        }}
+      />,
+    );
+
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(useBacktestStore.getState().strategiesAttempted).toBe(true);
+    expect(screen.getByRole("button", { name: "Retry loading strategies" })).toBeTruthy();
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Retry loading strategies" }));
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(useBacktestStore.getState().strategies).toHaveLength(1);
+  });
+
+  it("aborts in-flight submit on clearResult/selectJob and refreshes terminal state on cancel 409 (P1-002, P2-005)", async () => {
+    /**
+     * Contract: clearResult() and selectJob() abort in-flight POST /api/backtest and clear submitting,
+     * and cancelActiveJob() refreshes GET /api/backtest/{id} on HTTP 409 Conflict to unlock UI.
+     * Defect caught: Stranded submitting=true or wedged RUNNING state after 409 conflict.
+     */
+    const payload: BacktestSubmitRequest = {
+      contract_id: "CON.F.US.MES.H26",
+      root_symbol: "MES",
+      timeframe: "5m",
+      live_mode: false,
+      start_time: 1700000000,
+      end_time: 1700002700,
+    };
+
+    let capturedSignal: AbortSignal | undefined;
+    let resolvePendingSubmit!: (resp: Response) => void;
+    fetchMock.mockImplementationOnce(
+      (_url, init) =>
+        new Promise<Response>((resolve) => {
+          capturedSignal = init?.signal ?? undefined;
+          resolvePendingSubmit = resolve;
+        }),
+    );
+
+    const p1 = useBacktestStore.getState().runBacktest(payload);
+    expect(useBacktestStore.getState().submitting).toBe(true);
+    useBacktestStore.getState().clearResult();
+    expect(capturedSignal?.aborted).toBe(true);
+    expect(useBacktestStore.getState().submitting).toBe(false);
+    resolvePendingSubmit(
+      new Response(JSON.stringify(makeJobSummary("late-job", "QUEUED")), { status: 202 }),
+    );
+    await p1;
+    expect(useBacktestStore.getState().activeJob).toBeNull();
+
+    // selectJob during pending submit clears submitting and loads selected job
+    let resolveSecondSubmit!: (resp: Response) => void;
+    const completedDetail: BacktestJobDetail = {
+      ...makeJobSummary("selected-job", "COMPLETED"),
+      result: makeSampleResult(),
+    };
+    fetchMock
+      .mockImplementationOnce(
+        () =>
+          new Promise<Response>((resolve) => {
+            resolveSecondSubmit = resolve;
+          }),
+      )
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify(completedDetail), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        }),
+      );
+
+    const p2 = useBacktestStore.getState().runBacktest(payload);
+    expect(useBacktestStore.getState().submitting).toBe(true);
+    await act(async () => {
+      await useBacktestStore.getState().selectJob("selected-job");
+    });
+    expect(useBacktestStore.getState().submitting).toBe(false);
+    expect(useBacktestStore.getState().activeJob?.job_id).toBe("selected-job");
+    resolveSecondSubmit(
+      new Response(JSON.stringify(makeJobSummary("late-2", "QUEUED")), { status: 202 }),
+    );
+    await p2;
+
+    // cancelActiveJob on HTTP 409 refreshes terminal COMPLETED job
+    const runningDetail: BacktestJobDetail = {
+      ...makeJobSummary("race-job", "RUNNING"),
+      result: null,
+    };
+    const finishedDetail: BacktestJobDetail = {
+      ...makeJobSummary("race-job", "COMPLETED"),
+      result: makeSampleResult(),
+    };
+    useBacktestStore.setState({ activeJob: runningDetail, polling: true });
+    fetchMock
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ detail: "Cannot cancel COMPLETED job" }), {
+          status: 409,
+          headers: { "Content-Type": "application/json" },
+        }),
+      )
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify(finishedDetail), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        }),
+      );
+
+    await act(async () => {
+      await useBacktestStore.getState().cancelActiveJob();
+    });
+    expect(useBacktestStore.getState().polling).toBe(false);
+    expect(useBacktestStore.getState().submitting).toBe(false);
+    expect(useBacktestStore.getState().activeJob?.status).toBe("COMPLETED");
+  });
 });

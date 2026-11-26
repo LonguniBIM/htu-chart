@@ -125,17 +125,22 @@ def test_resolve_frontend_dist_dir_returns_none_when_missing(tmp_path: Path) -> 
 
 
 def test_ops_kit_enforces_sec003_loopback_tailscale_and_single_worker() -> None:
-    """Contract: Dockerfile, docker-compose.yml, .env.example, and SETUP.md contain zero
-    wildcard all-interface binds and enforce single-worker APP_BIND_HOST deployment.
-    Defect caught: Regression to wildcard bind or multi-worker Uvicorn config.
+    """Contract: Dockerfile.dockerignore, Dockerfile, docker-compose.yml, .env.example,
+    and SETUP.md enforce build-context isolation, zero wildcard binds, IPv6 HEALTHCHECK
+    bracketing, named volume permissions, and single-worker app.main execution.
+    Defect caught: Host .venv/node_modules clobbering container layers, ./data UID mismatch,
+    wildcard bind, or comment-only worker check.
     """
+    dockerignore = (REPO_ROOT / "Dockerfile.dockerignore").read_text(encoding="utf-8")
     dockerfile = (REPO_ROOT / "Dockerfile").read_text(encoding="utf-8")
     compose = (REPO_ROOT / "docker-compose.yml").read_text(encoding="utf-8")
     env_example = (REPO_ROOT / ".env.example").read_text(encoding="utf-8")
     setup_md = (REPO_ROOT / "SETUP.md").read_text(encoding="utf-8")
+    main_py = (REPO_ROOT / "backend" / "app" / "main.py").read_text(encoding="utf-8")
 
     wildcard_ipv4 = ".".join(["0", "0", "0", "0"])
     for name, content in (
+        ("Dockerfile.dockerignore", dockerignore),
         ("Dockerfile", dockerfile),
         ("docker-compose.yml", compose),
         (".env.example", env_example),
@@ -143,15 +148,35 @@ def test_ops_kit_enforces_sec003_loopback_tailscale_and_single_worker() -> None:
     ):
         assert wildcard_ipv4 not in content, f"{name} must never reference wildcard {wildcard_ipv4}"
 
+    # Dockerfile.dockerignore isolates host secrets/caches while preserving lightweight-charts/dist
+    for pattern in ("**/.venv", "**/node_modules", "**/.env*", "**/data"):
+        assert pattern in dockerignore
+    assert "lightweight-charts/dist" not in dockerignore
+
+    # Dockerfile uses narrow explicit COPYs after dependency installs (never full directory clobber)
+    assert "COPY lightweight-charts/ " not in dockerfile
+    assert "COPY topstep-chart-app/frontend/ " not in dockerfile
+    assert "COPY topstep-chart-app/backend/ " not in dockerfile
+    assert "COPY lightweight-charts/dist/ /build/lightweight-charts/dist/" in dockerfile
+    assert (
+        "COPY topstep-chart-app/frontend/src/ /build/topstep-chart-app/frontend/src/"
+        in dockerfile
+    )
+    assert "uv sync --frozen --no-dev --no-install-project" in dockerfile
+    assert "COPY topstep-chart-app/backend/app/ /app/backend/app/" in dockerfile
     assert "APP_BIND_HOST=127.0.0.1" in dockerfile
     assert "HEALTHCHECK" in dockerfile
+    assert "url_host = f'[{host}]'" in dockerfile
     assert "/api/health" in dockerfile
-    assert "app.main" in dockerfile
-    assert "--workers 1" in dockerfile
+    assert 'CMD [".venv/bin/python", "-m", "app.main"]' in dockerfile
+    assert re.search(r"uvicorn\.run\([\s\S]*workers=1", main_py)
 
     assert "network_mode: host" in compose
     assert "topstep-chart-app/Dockerfile" in compose
     assert re.search(r"env_file:\s*\n\s*-\s*\.env", compose)
+    assert "./data:/app/data" not in compose
+    assert "topstep_data:/app/data" in compose
+    assert re.search(r"(?m)^volumes:\s*\n\s*topstep_data:", compose)
 
     assert "APP_BIND_HOST=127.0.0.1" in env_example
     assert "BACKTEST_ENABLED=true" in env_example
@@ -160,6 +185,9 @@ def test_ops_kit_enforces_sec003_loopback_tailscale_and_single_worker() -> None:
 
     assert "Tailscale" in setup_md
     assert "APP_BIND_HOST" in setup_md
+    assert "APP_ALLOWED_HOSTS" in setup_md
+    assert "topstep_data" in setup_md
+    assert "10001:10001" in setup_md
     assert "--workers 1" in setup_md
     assert "APP_COOKIE_SECURE=true" in setup_md
     assert "BACKTEST_ENABLED=false" in setup_md

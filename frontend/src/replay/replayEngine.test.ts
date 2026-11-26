@@ -23,6 +23,7 @@ import {
   stepReplayBack,
   stepReplayForward,
 } from "./replayEngine";
+import { useReplayStore } from "./replayStore";
 
 function makeBars(count: number, startTime = 1700000000, baseClose = 5000): OhlcvBar[] {
   const bars: OhlcvBar[] = [];
@@ -42,79 +43,139 @@ function makeBars(count: number, startTime = 1700000000, baseClose = 5000): Ohlc
 }
 
 describe("replayEngine deterministic F08 causality & CME P&L", () => {
-  it("deterministically rewinds across CHECKPOINT_INTERVAL=25 boundaries and prunes future actions", () => {
+  it("deterministically rewinds across CHECKPOINT_INTERVAL=25 boundaries (20 -> 50 -> 46 -> 35) and prunes future actions", () => {
     /**
-     * Contract: Stepping forward from cursorIndex=20 to 40 with open/close paper trades and
-     * stepping back across checkpoint boundaries reproduces identical state to an uninterrupted
-     * forward run and prunes actions beyond the rewound cursor.
-     * Defect caught: Non-deterministic checkpoint restoration, off-by-one bar replay, or leaked future actions.
+     * Contract: Stepping forward from startIndex=20 to cursorIndex=50 crosses barIndex=45 (20 + 25),
+     * records a checkpoint at barIndex=45, rewinds 50 -> 46 (using cp=45) and 46 -> 35 (dropping cp=45
+     * and restoring from cp=20), and matches fresh forward runs bit-for-bit.
+     * Defect caught: Untested checkpoint boundary (P1-004), off-by-one bar replay, or leaked future actions.
      */
     expect(CHECKPOINT_INTERVAL).toBe(25);
     const bars = makeBars(60);
 
-    // Uninterrupted forward reference from 20 -> 39
-    let ref = createReplaySession(bars, "MES", 20);
-    ref = stepReplayForward(ref); // 21
-    ref = openPaperPosition(ref, {
+    const buildForwardTo = (targetCursor: number) => {
+      let s = createReplaySession(bars, "MES", 20);
+      if (targetCursor >= 22) {
+        while (s.cursorIndex < 22) s = stepReplayForward(s);
+        s = openPaperPosition(s, {
+          direction: "LONG",
+          quantity: 2,
+          stopLoss: 4990,
+          takeProfit: 5050,
+        });
+      }
+      if (targetCursor >= 35) {
+        while (s.cursorIndex < 30) s = stepReplayForward(s);
+        s = flattenPaperPosition(s);
+        while (s.cursorIndex < 32) s = stepReplayForward(s);
+        s = openPaperPosition(s, {
+          direction: "SHORT",
+          quantity: 1,
+          stopLoss: 5030,
+          takeProfit: 4980,
+        });
+      }
+      if (targetCursor >= 45) {
+        while (s.cursorIndex < 45) s = stepReplayForward(s);
+        // Action right on the checkpoint bar 45
+        s = flattenPaperPosition(s);
+      }
+      if (targetCursor >= 48) {
+        while (s.cursorIndex < 48) s = stepReplayForward(s);
+        s = openPaperPosition(s, {
+          direction: "LONG",
+          quantity: 1,
+          stopLoss: 4995,
+          takeProfit: 5060,
+        });
+      }
+      while (s.cursorIndex < targetCursor) {
+        s = stepReplayForward(s);
+      }
+      return s;
+    };
+
+    const refAt35 = buildForwardTo(35);
+    const refAt46 = buildForwardTo(46);
+    let session = buildForwardTo(50);
+
+    expect(session.cursorIndex).toBe(50);
+    expect(session.checkpoints.some((cp) => cp.barIndex === 45)).toBe(true);
+
+    // Rewind 50 -> 46 (uses cp=45 + replays action on bar 45 -> steps to 46)
+    while (session.cursorIndex > 46) {
+      session = stepReplayBack(session);
+    }
+    expect(session.cursorIndex).toBe(46);
+    expect(session.openPosition).toEqual(refAt46.openPosition);
+    expect(session.closedTrades).toEqual(refAt46.closedTrades);
+    expect(session.realizedPnlDollars).toBe(refAt46.realizedPnlDollars);
+    expect(session.actions).toEqual(refAt46.actions);
+    expect(session.nextSeq).toBe(refAt46.nextSeq);
+    expect(session.nextTradeNum).toBe(refAt46.nextTradeNum);
+
+    // Rewind 46 -> 35 across checkpoint 45 (drops cp=45 and restores from cp=20)
+    while (session.cursorIndex > 35) {
+      session = stepReplayBack(session);
+    }
+    expect(session.cursorIndex).toBe(35);
+    expect(session.checkpoints.some((cp) => cp.barIndex === 45)).toBe(false);
+    expect(session.openPosition).toEqual(refAt35.openPosition);
+    expect(session.closedTrades).toEqual(refAt35.closedTrades);
+    expect(session.realizedPnlDollars).toBe(refAt35.realizedPnlDollars);
+    expect(session.actions).toEqual(refAt35.actions);
+    expect(session.nextSeq).toBe(refAt35.nextSeq);
+    expect(session.nextTradeNum).toBe(refAt35.nextTradeNum);
+  });
+
+  it("preserves replay prefix immutability when trailing provisional bar mutates and new bar arrives (P2-003)", () => {
+    /**
+     * Contract: registerPaneBars refuses to overwrite already-visited/loaded bars in an active
+     * replay session when a trailing provisional bar's OHLC mutates alongside a new bar arrival,
+     * preserving F08 rewind determinism and identical P&L.
+     * Defect caught: Mutating trailing provisional bar close causing stepBack() validation failure or P&L drift.
+     */
+    useReplayStore.getState().reset();
+    const initialBars: OhlcvBar[] = [
+      { time: 1700000000, open: 5000, high: 5001, low: 4999, close: 5000, volume: 10, is_closed: true },
+      { time: 1700000300, open: 5000, high: 5002, low: 4999.5, close: 5001, volume: 12, is_closed: false },
+    ];
+    const target = {
+      paneId: "pane-1",
+      contractId: "CON.F.US.MES.H26",
+      rootSymbol: "MES" as const,
+      timeframe: "5m" as const,
+      liveMode: false,
+    };
+
+    useReplayStore.getState().startReplayAtBar(target, initialBars, 0);
+    useReplayStore.getState().stepForward(); // bar 1 (close=5001)
+    useReplayStore.getState().openPaperTrade({
       direction: "LONG",
-      quantity: 2,
-      stopLoss: 4990,
-      takeProfit: 5050,
-    });
-    for (let i = 21; i < 25; i += 1) {
-      ref = stepReplayForward(ref);
-    }
-    // At bar 25 (checkpoint boundary): flatten and open another trade at 28
-    expect(ref.cursorIndex).toBe(25);
-    ref = flattenPaperPosition(ref);
-    for (let i = 25; i < 28; i += 1) {
-      ref = stepReplayForward(ref);
-    }
-    ref = openPaperPosition(ref, {
-      direction: "SHORT",
       quantity: 1,
-      stopLoss: 5030,
-      takeProfit: 4980,
+      stopLoss: 4998,
+      takeProfit: 5005,
     });
-    for (let i = 28; i < 39; i += 1) {
-      ref = stepReplayForward(ref);
-    }
-    expect(ref.cursorIndex).toBe(39);
 
-    // Now advance to 40, open/close an extra future trade at 40, then stepBack(-1) to 39
-    let rewound = stepReplayForward(ref); // 40
-    rewound = flattenPaperPosition(rewound);
-    expect(rewound.cursorIndex).toBe(40);
-    expect(rewound.closedTrades).toHaveLength(2);
+    // Mutate trailing provisional bar close to 4997 (below SL!) AND append bar 2
+    const mutatedIncoming: OhlcvBar[] = [
+      initialBars[0]!,
+      { time: 1700000300, open: 5000, high: 5002, low: 4996, close: 4997, volume: 20, is_closed: true },
+      { time: 1700000600, open: 4997, high: 5003, low: 4996.5, close: 5002, volume: 15, is_closed: false },
+    ];
+    useReplayStore.getState().registerPaneBars("pane-1", mutatedIncoming, target);
 
-    rewound = stepReplayBack(rewound); // back to 39
-    expect(rewound.cursorIndex).toBe(ref.cursorIndex);
-    expect(rewound.openPosition).toEqual(ref.openPosition);
-    expect(rewound.closedTrades).toEqual(ref.closedTrades);
-    expect(rewound.realizedPnlDollars).toBe(ref.realizedPnlDollars);
-    expect(rewound.actions).toEqual(ref.actions);
+    // Original session bar[1] must remain immutable at close=5001
+    expect(useReplayStore.getState().session?.bars[1]?.close).toBe(5001);
 
-    // Step all the way back across bar 25 checkpoint to bar 24
-    let refAt24 = createReplaySession(bars, "MES", 20);
-    refAt24 = stepReplayForward(refAt24); // 21
-    refAt24 = openPaperPosition(refAt24, {
-      direction: "LONG",
-      quantity: 2,
-      stopLoss: 4990,
-      takeProfit: 5050,
-    });
-    for (let i = 21; i < 24; i += 1) {
-      refAt24 = stepReplayForward(refAt24);
-    }
-
-    while (rewound.cursorIndex > 24) {
-      rewound = stepReplayBack(rewound);
-    }
-    expect(rewound.cursorIndex).toBe(24);
-    expect(rewound.openPosition).toEqual(refAt24.openPosition);
-    expect(rewound.closedTrades).toEqual(refAt24.closedTrades);
-    expect(rewound.realizedPnlDollars).toBe(refAt24.realizedPnlDollars);
-    expect(rewound.actions).toEqual(refAt24.actions);
+    // Step back to 0 must succeed cleanly with zero error
+    useReplayStore.getState().stepBack();
+    const afterBack = useReplayStore.getState().session;
+    expect(useReplayStore.getState().error).toBeNull();
+    expect(afterBack?.cursorIndex).toBe(0);
+    expect(afterBack?.openPosition).toBeNull();
+    expect(afterBack?.realizedPnlDollars).toBe(0);
+    useReplayStore.getState().reset();
   });
 
   it("enforces conservative F08 SL-first tie-breaking with ambiguousFill and gap-aware fills", () => {

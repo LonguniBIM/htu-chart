@@ -3496,8 +3496,56 @@ describe("ChartPane (F06, P1-R3-01, P1-R3-02)", () => {
             { time: 1700000000, position: "belowBar", color: "#22c55e", shape: "arrowUp", text: "M1" },
             { time: 1700000600, position: "aboveBar", color: "#ef4444", shape: "arrowDown", text: "M2" },
           ],
-          trade_lines: [],
-          zones: [],
+          trade_lines: [
+            {
+              trade_id: "T_PAST",
+              direction: "LONG",
+              entry_time: 1700000000,
+              entry_price: 5000,
+              exit_time: 1700000000,
+              exit_price: 5001,
+              pnl_dollars: 5,
+              pnl_ticks: 4,
+              color: "#22c55e",
+              ambiguous_fill: false,
+            },
+            {
+              trade_id: "T_FUTURE",
+              direction: "SHORT",
+              entry_time: 1700000300,
+              entry_price: 5002,
+              exit_time: 1700000600,
+              exit_price: 5004,
+              pnl_dollars: -10,
+              pnl_ticks: -8,
+              color: "#ef4444",
+              ambiguous_fill: false,
+            },
+          ],
+          zones: [
+            {
+              kind: "fvg",
+              direction: "bullish",
+              start_time: 1700000000,
+              end_time: 1700000000,
+              detected_at_time: 1700000000,
+              top: 5002,
+              bottom: 4999,
+              midpoint: 5000.5,
+              label: "Past FVG",
+            },
+            {
+              kind: "order_block",
+              direction: "bearish",
+              start_time: 1700000300,
+              end_time: 1700000600,
+              detected_at_time: 1700000600,
+              top: 5006,
+              bottom: 5003,
+              midpoint: null,
+              label: "Future OB",
+            },
+          ],
           indicators: [
             {
               id: "ema_20",
@@ -3545,6 +3593,20 @@ describe("ChartPane (F06, P1-R3-01, P1-R3-02)", () => {
 
     expect(setMarkersMock.mock.calls.at(-1)?.[0]).toHaveLength(2);
     expect(lineSetData.mock.calls.at(-1)?.[0]).toHaveLength(2);
+    const btPrimitive = attachPrimitiveMock.mock.calls[1]![0] as {
+      getRenderSnapshot: () => {
+        projectedZones: Array<{ zone: { label: string } }>;
+        projectedTradeLines: Array<{ line: { trade_id: string } }>;
+      };
+    };
+    expect(btPrimitive.getRenderSnapshot().projectedZones.map((z) => z.zone.label)).toEqual([
+      "Past FVG",
+      "Future OB",
+    ]);
+    expect(btPrimitive.getRenderSnapshot().projectedTradeLines.map((l) => l.line.trade_id)).toEqual([
+      "T_PAST",
+      "T_FUTURE",
+    ]);
 
     // Arm click-to-start replay and click bar at 1700000000
     act(() => {
@@ -3557,10 +3619,25 @@ describe("ChartPane (F06, P1-R3-01, P1-R3-02)", () => {
     expect(replayVisible.map((b) => b.time)).toEqual([1700000000]);
     expect(setMarkersMock.mock.calls.at(-1)?.[0]).toHaveLength(1);
     expect(lineSetData.mock.calls.at(-1)?.[0]).toHaveLength(1);
+    expect(btPrimitive.getRenderSnapshot().projectedZones.map((z) => z.zone.label)).toEqual([
+      "Past FVG",
+    ]);
+    expect(btPrimitive.getRenderSnapshot().projectedTradeLines.map((l) => l.line.trade_id)).toEqual([
+      "T_PAST",
+    ]);
 
-    // Live WS bar past cursor must NOT call candleUpdate
+    // Live WS bar at === cursorTime AND past cursorTime must NOT call candleUpdate
     candleUpdate.mockClear();
     act(() => {
+      fakeWs.emitBarUpdate({
+        type: "bar_update",
+        contract_id: "CON.F.US.MES.H26",
+        live_mode: false,
+        timeframe: "5m",
+        is_recovered_historical: false,
+        recovery_tag: null,
+        bar: makeBar(1700000000, 5009, false),
+      });
       fakeWs.emitBarUpdate({
         type: "bar_update",
         contract_id: "CON.F.US.MES.H26",
@@ -3581,5 +3658,99 @@ describe("ChartPane (F06, P1-R3-01, P1-R3-02)", () => {
     expect(restored.map((b) => b.time)).toEqual([
       1700000000, 1700000300, 1700000600, 1700000900,
     ]);
+  });
+
+  it("stops playback setInterval and exits replay cleanly when switching timeframe on active replay pane (P2-004)", async () => {
+    /**
+     * Contract: Switching symbol or timeframe on a pane with active Replay playback stops the
+     * playback interval and clears the replay session so timers never run on stale bars.
+     * Defect caught: Orphaned replay playback timer continuing after pane symbol/timeframe switch.
+     */
+    vi.useFakeTimers();
+    try {
+      const bars = [
+        makeBar(1700000000, 5000),
+        makeBar(1700000300, 5002),
+        makeBar(1700000600, 5004),
+        makeBar(1700000900, 5006),
+      ];
+      fetchBarsMock.mockResolvedValue(makeBarsResponse("CON.F.US.MES.H26", bars));
+
+      const coordinator = new PaneFetchCoordinator();
+      const fakeWs = createFakeWsClient();
+      const pane5m: PaneConfig = {
+        pane_id: "pane-1",
+        root_symbol: "MES",
+        timeframe: "5m",
+        live_mode: false,
+        playback_mode: "live",
+      };
+
+      const { rerender } = render(
+        <ChartPane
+          pane={pane5m}
+          contractId="CON.F.US.MES.H26"
+          activeFeedLive={false}
+          wsClient={fakeWs.client}
+          coordinator={coordinator}
+        />,
+      );
+
+      await act(async () => {
+        await Promise.resolve();
+        await Promise.resolve();
+      });
+
+      act(() => {
+        useReplayStore.getState().startReplayAtBar(
+          {
+            paneId: "pane-1",
+            contractId: "CON.F.US.MES.H26",
+            rootSymbol: "MES",
+            timeframe: "5m",
+            liveMode: false,
+          },
+          bars,
+          0,
+        );
+        useReplayStore.getState().play();
+      });
+      expect(useReplayStore.getState().isPlaying).toBe(true);
+      expect(useReplayStore.getState().session?.cursorIndex).toBe(0);
+
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(1000);
+      });
+      expect(useReplayStore.getState().session?.cursorIndex).toBe(1);
+
+      // Switch timeframe 5m -> 15m on same pane_id
+      const pane15m: PaneConfig = { ...pane5m, timeframe: "15m" };
+      rerender(
+        <ChartPane
+          pane={pane15m}
+          contractId="CON.F.US.MES.H26"
+          activeFeedLive={false}
+          wsClient={fakeWs.client}
+          coordinator={coordinator}
+        />,
+      );
+
+      await act(async () => {
+        await Promise.resolve();
+        await Promise.resolve();
+      });
+
+      expect(useReplayStore.getState().isPlaying).toBe(false);
+      expect(useReplayStore.getState().session).toBeNull();
+      expect(useReplayStore.getState().target).toBeNull();
+
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(3000);
+      });
+      expect(useReplayStore.getState().isPlaying).toBe(false);
+      expect(useReplayStore.getState().session).toBeNull();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

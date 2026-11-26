@@ -79,16 +79,34 @@ APP_SESSION_SECRET=<random-secret>
 ```
 
 > **Security Rule (`SEC-003`)**: Never bind to an unspecified wildcard address. Always bind explicitly to `127.0.0.1` or your Tailscale `100.x.y.z` IP.
+>
+> **Docker `HEALTHCHECK` & `HostOriginMiddleware` Note**: Always include your `APP_BIND_HOST` literal (e.g., `100.64.12.34`, `127.0.0.1`, or `[::1]`) in `APP_ALLOWED_HOSTS` alongside any MagicDNS hostname (`my-mini-pc.tailnet-name.ts.net`), because the container `HEALTHCHECK` probes `http://${APP_BIND_HOST}:${APP_PORT}/api/health`.
 
 ---
 
 ## 3. Running 24/7 with Docker Compose
 
-Build and start from `topstep-chart-app/` (the Compose build context automatically uses the parent workspace `..` so `lightweight-charts/` and `topstep-chart-app/` are both included):
+Build and start from `topstep-chart-app/` (the Compose build context automatically uses the parent workspace `..` so `lightweight-charts/` and `topstep-chart-app/` are both included, while `Dockerfile.dockerignore` keeps host `.venv`, `node_modules`, `.env*`, and `data/` out of build layers):
 
 ```bash
 cd topstep-chart-app
 docker compose up -d --build
+```
+
+`docker-compose.yml` mounts the persistent named volume `topstep_data:/app/data` so Parquet/SQLite storage automatically inherits container user `appuser` (`10001:10001`) ownership without host permission errors.
+
+Inspect or back up `topstep_data`:
+
+```bash
+docker volume inspect topstep-chart-app_topstep_data
+docker run --rm -v topstep-chart-app_topstep_data:/data -v "$PWD":/backup alpine tar czf /backup/topstep-data-backup.tgz -C /data .
+```
+
+If you prefer a host bind mount (`./data:/app/data`) on Linux, pre-create and chown it to UID/GID `10001:10001` before starting Compose:
+
+```bash
+mkdir -p ./data
+sudo chown -R 10001:10001 ./data
 ```
 
 Check health and logs:

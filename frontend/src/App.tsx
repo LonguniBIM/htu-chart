@@ -882,6 +882,7 @@ export function App() {
 
   const handleLayoutChange = useCallback(
     (nextLayoutId: string) => {
+      useReplayStore.getState().exitReplay();
       useLayoutStore.getState().selectLayout(nextLayoutId);
       const picked = useLayoutStore.getState().activeLayout;
       activeLayoutRef.current = picked;

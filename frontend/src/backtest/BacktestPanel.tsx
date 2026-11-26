@@ -41,6 +41,7 @@ export function BacktestPanel({ activeTarget }: BacktestPanelProps) {
   const isOpen = useBacktestStore((s) => s.isOpen);
   const strategies = useBacktestStore((s) => s.strategies);
   const strategiesLoading = useBacktestStore((s) => s.strategiesLoading);
+  const strategiesAttempted = useBacktestStore((s) => s.strategiesAttempted);
   const activeJob = useBacktestStore((s) => s.activeJob);
   const submitting = useBacktestStore((s) => s.submitting);
   const polling = useBacktestStore((s) => s.polling);
@@ -79,10 +80,10 @@ export function BacktestPanel({ activeTarget }: BacktestPanelProps) {
   const [includeVwap, setIncludeVwap] = useState<boolean>(true);
 
   useEffect(() => {
-    if (isOpen && strategies.length === 0 && !strategiesLoading) {
+    if (isOpen && !strategiesAttempted && !strategiesLoading) {
       void loadStrategies();
     }
-  }, [isOpen, loadStrategies, strategies.length, strategiesLoading]);
+  }, [isOpen, loadStrategies, strategiesAttempted, strategiesLoading]);
 
   const targetKey =
     activeTarget !== null
@@ -179,21 +180,33 @@ export function BacktestPanel({ activeTarget }: BacktestPanelProps) {
       <form className="backtest-drawer__form" onSubmit={handleSubmit}>
         <label className="backtest-field">
           <span>Strategy</span>
-          <select
-            aria-label="Backtest strategy"
-            value={strategyId}
-            onChange={(e) => setStrategyId(e.target.value)}
-          >
-            {strategies.length > 0 ? (
-              strategies.map((st) => (
-                <option key={st.strategy_id} value={st.strategy_id}>
-                  {st.name}
-                </option>
-              ))
-            ) : (
-              <option value="ict_fvg_sweep">ICT FVG + Liquidity Sweep</option>
+          <div className="layout-picker__row">
+            <select
+              aria-label="Backtest strategy"
+              value={strategyId}
+              onChange={(e) => setStrategyId(e.target.value)}
+            >
+              {strategies.length > 0 ? (
+                strategies.map((st) => (
+                  <option key={st.strategy_id} value={st.strategy_id}>
+                    {st.name}
+                  </option>
+                ))
+              ) : (
+                <option value="ict_fvg_sweep">ICT FVG + Liquidity Sweep</option>
+              )}
+            </select>
+            {strategies.length === 0 && !strategiesLoading && (
+              <button
+                type="button"
+                className="terminal-button"
+                aria-label="Retry loading strategies"
+                onClick={() => void loadStrategies()}
+              >
+                Retry
+              </button>
             )}
-          </select>
+          </div>
         </label>
 
         <div className="backtest-grid-2">

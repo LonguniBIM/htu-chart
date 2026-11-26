@@ -1,0 +1,24 @@
+# BuildKit per-Dockerfile ignore for parent workspace context (`context: ..`)
+**/.git
+**/.venv
+**/venv
+**/node_modules
+topstep-chart-app/frontend/dist
+**/.vite
+**/__pycache__
+**/.pytest_cache
+**/.ruff_cache
+**/.mypy_cache
+**/.env*
+!**/.env.example
+**/*.key
+**/*.pem
+**/*.db
+**/*.db-*
+**/data
+topstep-chart-app/harness
+topstep-chart-app/docs
+topstep-chart-app/backend/tests
+**/.agents
+**/.references
+**/.codex-runtime

@@ -26,6 +26,7 @@ export interface BacktestStoreState {
   isOpen: boolean;
   strategies: BacktestStrategyInfo[];
   strategiesLoading: boolean;
+  strategiesAttempted: boolean;
   activeJob: BacktestJobDetail | null;
   jobs: BacktestJobSummary[];
   submitting: boolean;
@@ -126,6 +127,7 @@ export const useBacktestStore = create<BacktestStoreState>((set, get) => {
     isOpen: false,
     strategies: [],
     strategiesLoading: false,
+    strategiesAttempted: false,
     activeJob: null,
     jobs: [],
     submitting: false,
@@ -160,6 +162,7 @@ export const useBacktestStore = create<BacktestStoreState>((set, get) => {
         set({
           strategies: res.strategies,
           strategiesLoading: false,
+          strategiesAttempted: true,
         });
       } catch (err: unknown) {
         if (controller.signal.aborted || isAbortError(err)) {
@@ -168,7 +171,10 @@ export const useBacktestStore = create<BacktestStoreState>((set, get) => {
         if (requestEpoch !== get().sessionEpoch) {
           return;
         }
-        set({ strategiesLoading: false });
+        set({
+          strategiesLoading: false,
+          strategiesAttempted: true,
+        });
         if (handlePossibleAuthError(err, requestEpoch)) {
           return;
         }
@@ -341,6 +347,9 @@ export const useBacktestStore = create<BacktestStoreState>((set, get) => {
           requestEpoch !== get().sessionEpoch ||
           myGen !== pollGeneration
         ) {
+          if (requestEpoch === get().sessionEpoch && myGen === pollGeneration) {
+            set({ submitting: false, polling: false });
+          }
           return null;
         }
         set({ submitting: false, polling: false });
@@ -384,7 +393,39 @@ export const useBacktestStore = create<BacktestStoreState>((set, get) => {
         if (controller.signal.aborted || isAbortError(err) || requestEpoch !== get().sessionEpoch) {
           return;
         }
-        set({ polling: false });
+        set({ polling: false, submitting: false });
+        if (err instanceof ApiError && err.status === 409) {
+          try {
+            const refreshed = await getBacktestJob(currentJob.job_id, controller.signal);
+            if (controller.signal.aborted || requestEpoch !== get().sessionEpoch) {
+              return;
+            }
+            set((state) => ({
+              polling: false,
+              submitting: false,
+              activeJob: refreshed,
+              jobs: upsertJobSummary(state.jobs, refreshed),
+              error: refreshed.error,
+            }));
+          } catch (refreshErr: unknown) {
+            if (
+              controller.signal.aborted ||
+              isAbortError(refreshErr) ||
+              requestEpoch !== get().sessionEpoch
+            ) {
+              return;
+            }
+            if (!handlePossibleAuthError(refreshErr, requestEpoch)) {
+              set({
+                error:
+                  refreshErr instanceof Error
+                    ? refreshErr.message
+                    : "Failed to refresh backtest job after 409 conflict",
+              });
+            }
+          }
+          return;
+        }
         if (handlePossibleAuthError(err, requestEpoch)) {
           return;
         }
@@ -401,9 +442,11 @@ export const useBacktestStore = create<BacktestStoreState>((set, get) => {
     selectJob: async (jobId) => {
       abortActivePoll();
       activeActionController?.abort();
+      activeActionController = null;
       const controller = new AbortController();
       activeActionController = controller;
       const requestEpoch = get().sessionEpoch;
+      set({ submitting: false, polling: false, error: null });
       try {
         const detail = await getBacktestJob(jobId, controller.signal);
         if (controller.signal.aborted || requestEpoch !== get().sessionEpoch) {
@@ -412,6 +455,7 @@ export const useBacktestStore = create<BacktestStoreState>((set, get) => {
         set((state) => ({
           activeJob: detail,
           jobs: upsertJobSummary(state.jobs, detail),
+          submitting: false,
           polling: false,
           error: detail.error,
         }));
@@ -438,8 +482,11 @@ export const useBacktestStore = create<BacktestStoreState>((set, get) => {
 
     clearResult: () => {
       abortActivePoll();
+      activeActionController?.abort();
+      activeActionController = null;
       set({
         activeJob: null,
+        submitting: false,
         polling: false,
         error: null,
       });
@@ -451,6 +498,7 @@ export const useBacktestStore = create<BacktestStoreState>((set, get) => {
         isOpen: false,
         strategies: [],
         strategiesLoading: false,
+        strategiesAttempted: false,
         activeJob: null,
         jobs: [],
         submitting: false,

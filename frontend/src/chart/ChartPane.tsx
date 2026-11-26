@@ -330,6 +330,19 @@ export function ChartPane({
   const resolvedContractIdRef = useRef<string>(resolvedContractIdForScope);
   resolvedContractIdRef.current = resolvedContractIdForScope;
 
+  const currentReplayTarget = useMemo(
+    () => ({
+      paneId: pane.pane_id,
+      contractId: resolvedContractIdForScope,
+      rootSymbol: pane.root_symbol,
+      timeframe: pane.timeframe,
+      liveMode: pane.live_mode,
+    }),
+    [pane.live_mode, pane.pane_id, pane.root_symbol, pane.timeframe, resolvedContractIdForScope],
+  );
+  const currentReplayTargetRef = useRef(currentReplayTarget);
+  currentReplayTargetRef.current = currentReplayTarget;
+
   const replayTarget = useReplayStore((s) => s.target);
   const replaySession = useReplayStore((s) => s.session);
   const isReplayActiveOnPane =
@@ -470,10 +483,11 @@ export function ChartPane({
     }
     latestFullBarRef.current = bar;
     lastFullBarTimeRef.current = bar.time;
-    useReplayStore.getState().registerPaneBars(paneIdRef.current, nextFullBars);
+    useReplayStore
+      .getState()
+      .registerPaneBars(paneIdRef.current, nextFullBars, currentReplayTargetRef.current);
 
-    const activeCursorTime = replayCursorTimeRef.current;
-    if (activeCursorTime !== null && bar.time > activeCursorTime) {
+    if (replayCursorTimeRef.current !== null) {
       return;
     }
 
@@ -1371,7 +1385,9 @@ export function ChartPane({
       barCloseByTimeRef.current.clear();
       latestBarRef.current = null;
       lastBarTimeRef.current = null;
-      useReplayStore.getState().registerPaneBars(pane.pane_id, []);
+      useReplayStore
+        .getState()
+        .registerPaneBars(pane.pane_id, [], currentReplayTargetRef.current);
       setBarsQuality(null);
       if (legendRef.current !== null) {
         legendRef.current.textContent = formatLegendText(pane.root_symbol, pane.timeframe, null);
@@ -1392,7 +1408,9 @@ export function ChartPane({
       lastFullBarTimeRef.current = null;
       barsRef.current = [];
       barCloseByTimeRef.current.clear();
-      useReplayStore.getState().registerPaneBars(pane.pane_id, []);
+      useReplayStore
+        .getState()
+        .registerPaneBars(pane.pane_id, [], currentReplayTargetRef.current);
       setBarsQuality(null);
       if (legendRef.current !== null) {
         legendRef.current.textContent = formatLegendText(pane.root_symbol, pane.timeframe, null);
@@ -1430,7 +1448,9 @@ export function ChartPane({
         fullBarsRef.current = mergedBars;
         latestFullBarRef.current = mergedBars[mergedBars.length - 1] ?? null;
         lastFullBarTimeRef.current = latestFullBarRef.current?.time ?? null;
-        useReplayStore.getState().registerPaneBars(pane.pane_id, mergedBars);
+        useReplayStore
+          .getState()
+          .registerPaneBars(pane.pane_id, mergedBars, currentReplayTargetRef.current);
 
         const activeCursorTime = replayCursorTimeRef.current;
         const visibleBars =
@@ -1495,7 +1515,9 @@ export function ChartPane({
           barCloseByTimeRef.current.clear();
           latestBarRef.current = null;
           lastBarTimeRef.current = null;
-          useReplayStore.getState().registerPaneBars(pane.pane_id, []);
+          useReplayStore
+            .getState()
+            .registerPaneBars(pane.pane_id, [], currentReplayTargetRef.current);
           if (legendRef.current !== null) {
             legendRef.current.textContent = formatLegendText(pane.root_symbol, pane.timeframe, null);
           }
@@ -1552,21 +1574,27 @@ export function ChartPane({
   ]);
 
   useEffect(() => {
+    useReplayStore.getState().syncPaneTarget(currentReplayTarget);
+  }, [currentReplayTarget]);
+
+  useEffect(() => {
     const id = pane.pane_id;
     return () => {
       useReplayStore.getState().unregisterPaneBars(id);
     };
   }, [pane.pane_id]);
 
+  const replaySessionBars = isReplayActiveOnPane && replaySession !== null ? replaySession.bars : null;
+
   useEffect(() => {
-    const isReplayNow = replayCursorTime !== null;
+    const isReplayNow = replayCursorTime !== null && replaySessionBars !== null;
     if (!isReplayNow && !wasReplayActiveRef.current) {
       return;
     }
     wasReplayActiveRef.current = isReplayNow;
     const visibleBars =
-      replayCursorTime !== null
-        ? filterBarsByReplayCursor(fullBarsRef.current, replayCursorTime)
+      isReplayNow
+        ? filterBarsByReplayCursor(replaySessionBars, replayCursorTime)
         : [...fullBarsRef.current];
     candleSeriesRef.current?.setData(visibleBars.map(toCandleDatum));
     volumeSeriesRef.current?.setData(visibleBars.map(toVolumeDatum));
@@ -1587,7 +1615,7 @@ export function ChartPane({
       );
     }
     syncOverlayPrimitive();
-  }, [pane.root_symbol, pane.timeframe, replayCursorTime, syncOverlayPrimitive]);
+  }, [pane.root_symbol, pane.timeframe, replayCursorTime, replaySessionBars, syncOverlayPrimitive]);
 
   useEffect(() => {
     const btPrimitive = backtestPrimitiveRef.current;

@@ -32,7 +32,12 @@ export interface ReplayStoreState {
   togglePanel: () => void;
   armPickStart: () => void;
   cancelPickStart: () => void;
-  registerPaneBars: (paneId: string, bars: readonly OhlcvBar[]) => void;
+  registerPaneBars: (
+    paneId: string,
+    bars: readonly OhlcvBar[],
+    targetMeta?: ReplayTarget,
+  ) => void;
+  syncPaneTarget: (target: ReplayTarget) => void;
   unregisterPaneBars: (paneId: string) => void;
   startReplayAtBar: (
     target: ReplayTarget,
@@ -63,6 +68,28 @@ function clearPlaybackTimer(): void {
 
 function playbackIntervalMs(speed: ReplaySpeed): number {
   return Math.max(100, Math.round(1000 / speed));
+}
+
+function targetsEqual(a: ReplayTarget, b: ReplayTarget): boolean {
+  return (
+    a.paneId === b.paneId &&
+    a.contractId.trim().toUpperCase() === b.contractId.trim().toUpperCase() &&
+    a.rootSymbol === b.rootSymbol &&
+    a.timeframe === b.timeframe &&
+    a.liveMode === b.liveMode
+  );
+}
+
+function barsEqual(a: OhlcvBar, b: OhlcvBar): boolean {
+  return (
+    a.time === b.time &&
+    a.open === b.open &&
+    a.high === b.high &&
+    a.low === b.low &&
+    a.close === b.close &&
+    a.volume === b.volume &&
+    a.is_closed === b.is_closed
+  );
 }
 
 function findStartBarIndex(bars: readonly OhlcvBar[], clickTime: number): number {
@@ -146,34 +173,76 @@ export const useReplayStore = create<ReplayStoreState>((set, get) => {
       set({ pickStartArmed: false });
     },
 
-    registerPaneBars: (paneId, bars) => {
-      const copied = [...bars];
+    registerPaneBars: (paneId, bars, targetMeta) => {
+      const copied = bars.map((bar) => ({ ...bar }));
       set((state) => {
         const nextBarsByPane = {
           ...state.barsByPane,
           [paneId]: copied,
         };
-        if (
-          state.session !== null &&
-          state.target?.paneId === paneId &&
-          copied.length > state.session.bars.length &&
-          state.session.cursorIndex < copied.length
-        ) {
-          const prefixMatches = state.session.bars.every(
-            (bar, idx) => copied[idx]?.time === bar.time,
-          );
-          if (prefixMatches) {
+        if (state.session !== null && state.target !== null && state.target.paneId === paneId) {
+          if (targetMeta !== undefined && !targetsEqual(state.target, targetMeta)) {
+            clearPlaybackTimer();
             return {
               barsByPane: nextBarsByPane,
-              session: {
-                ...state.session,
-                bars: copied,
-              },
+              isPlaying: false,
+              pickStartArmed: false,
+              target: null,
+              session: null,
+              error: null,
             };
+          }
+          const sessionBars = state.session.bars;
+          if (
+            copied.length > sessionBars.length &&
+            state.session.cursorIndex < copied.length
+          ) {
+            const prefixMatches = sessionBars.every((bar, idx) => {
+              const incoming = copied[idx];
+              return incoming !== undefined && barsEqual(incoming, bar);
+            });
+            const lastSessionBar = sessionBars[sessionBars.length - 1];
+            if (prefixMatches && lastSessionBar !== undefined) {
+              let prevTime = lastSessionBar.time;
+              const appended: OhlcvBar[] = [];
+              for (const candidate of copied.slice(sessionBars.length)) {
+                if (candidate.time > prevTime) {
+                  appended.push(candidate);
+                  prevTime = candidate.time;
+                }
+              }
+              if (appended.length > 0) {
+                return {
+                  barsByPane: nextBarsByPane,
+                  session: {
+                    ...state.session,
+                    bars: [...sessionBars, ...appended],
+                  },
+                };
+              }
+            }
           }
         }
         return { barsByPane: nextBarsByPane };
       });
+    },
+
+    syncPaneTarget: (target) => {
+      const state = get();
+      if (
+        state.target !== null &&
+        state.target.paneId === target.paneId &&
+        !targetsEqual(state.target, target)
+      ) {
+        clearPlaybackTimer();
+        set({
+          isPlaying: false,
+          pickStartArmed: false,
+          target: null,
+          session: null,
+          error: null,
+        });
+      }
     },
 
     unregisterPaneBars: (paneId) => {
@@ -278,12 +347,19 @@ export const useReplayStore = create<ReplayStoreState>((set, get) => {
         return;
       }
       clearPlaybackTimer();
-      const nextSession = stepReplayBack(state.session);
-      set({
-        session: nextSession,
-        isPlaying: false,
-        error: null,
-      });
+      try {
+        const nextSession = stepReplayBack(state.session);
+        set({
+          session: nextSession,
+          isPlaying: false,
+          error: null,
+        });
+      } catch (err: unknown) {
+        set({
+          isPlaying: false,
+          error: err instanceof Error ? err.message : "Failed to step replay back",
+        });
+      }
     },
 
     openPaperTrade: (input) => {
