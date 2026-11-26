@@ -3063,3 +3063,347 @@ def test_short_limit_expiry_and_last_allowed_bar_fills_long_short() -> None:
     assert r_short_last.trades[0].entry_price == 100.0
     assert r_short_last.trades[0].entry_time == short_last_bars[2].time
     assert r_short_last.trades[0].exit_reason == "take_profit"
+
+
+async def test_post_check_metadata_saturation_bounds_daemon_io(tmp_path: Path) -> None:
+    """Contract: Post-check _read_parquet_stored_root shares the 4-op daemon I/O cap.
+
+    Defect caught: Unbounded thread spawns when post-read metadata check blocks inside _run_locked.
+    """
+    import app.services.backtest_service as bs_mod
+
+    orig_read_meta = bs_mod._read_parquet_stored_root
+    gate = threading.Event()
+    count_lock = threading.Lock()
+    calls_by_path: dict[Path, int] = {}
+    post_entered = {"n": 0}
+    max_post = {"n": 0}
+
+    def _post_blocking_meta(path: Path) -> str | None:
+        with count_lock:
+            calls_by_path[path] = calls_by_path.get(path, 0) + 1
+            call_num = calls_by_path[path]
+        if call_num == 1:
+            return orig_read_meta(path)
+        with count_lock:
+            post_entered["n"] += 1
+            max_post["n"] = max(max_post["n"], post_entered["n"])
+        gate.wait(timeout=15.0)
+        return orig_read_meta(path)
+
+    bs_mod._read_parquet_stored_root = _post_blocking_meta
+    try:
+        async with _async_client(
+            tmp_path,
+            backtest_max_queue_depth=16,
+            backtest_timeout_sec=0.35,
+            worker_fn=worker_hang_or_fast,
+        ) as (client, app):
+            csrf = await _login(client)
+            svc = app.state.backtest_service
+            store = app.state.parquet_store
+            t0 = int(datetime(2025, 10, 10, 14, 0, tzinfo=UTC).timestamp())
+            sample_bars = _ict_long_setup_bars(t0, 300)
+
+            for idx in range(8):
+                key = StorageDatasetKey("topstepx", False, f"CON.F.US.MES.POST{idx}", "5m")
+                await store.upsert_bars(key, sample_bars, root_symbol="MES")
+
+            job_ids: list[str] = []
+            for idx in range(8):
+                r = await client.post(
+                    "/api/backtest",
+                    headers={"X-CSRF-Token": csrf},
+                    json={
+                        "contract_id": f"CON.F.US.MES.POST{idx}",
+                        "root_symbol": "MES",
+                        "timeframe": "5m",
+                        "start_time": t0,
+                        "end_time": t0 + 3600,
+                    },
+                )
+                assert r.status_code == 202
+                job_ids.append(r.json()["job_id"])
+
+            statuses: list[dict[str, Any]] = []
+            for _ in range(160):
+                assert svc.active_daemon_io_ops <= 4
+                statuses = [
+                    (await client.get(f"/api/backtest/{jid}")).json() for jid in job_ids
+                ]
+                if all(st["status"] in {"TIMED_OUT", "FAILED"} for st in statuses):
+                    break
+                await asyncio.sleep(0.05)
+
+            assert max_post["n"] <= 4
+            assert post_entered["n"] == 4
+            assert svc.active_daemon_io_ops == 4
+            assert [st["status"] for st in statuses[:4]] == ["TIMED_OUT"] * 4
+            assert [st["status"] for st in statuses[4:]] == ["FAILED"] * 4
+            assert all("saturated" in str(st["error"]).lower() for st in statuses[4:])
+
+            gate.set()
+            for _ in range(100):
+                if svc.active_daemon_io_ops == 0:
+                    break
+                await asyncio.sleep(0.02)
+            assert svc.active_daemon_io_ops == 0
+
+            app.state.settings.backtest_timeout_sec = 5.0
+            r_ok = await client.post(
+                "/api/backtest",
+                headers={"X-CSRF-Token": csrf},
+                json={
+                    "contract_id": "CON.F.US.MES.CLEAN",
+                    "root_symbol": "MES",
+                    "timeframe": "5m",
+                    "start_time": t0,
+                    "end_time": t0 + 3600,
+                },
+            )
+            j_ok = r_ok.json()["job_id"]
+            st_ok: dict[str, Any] = {}
+            for _ in range(100):
+                st_ok = (await client.get(f"/api/backtest/{j_ok}")).json()
+                if st_ok["status"] == "COMPLETED":
+                    break
+                await asyncio.sleep(0.05)
+            assert st_ok["status"] == "COMPLETED"
+    finally:
+        gate.set()
+        bs_mod._read_parquet_stored_root = orig_read_meta
+
+
+async def test_default_executor_isolation_on_stuck_read_bars_sync(tmp_path: Path) -> None:
+    """Contract: Stuck _read_bars_sync threads never starve asyncio's default executor.
+
+    Defect caught: Calling asyncio.to_thread inside _load_closed_bars stalling live I/O/SQLite.
+    """
+    loop = asyncio.get_running_loop()
+    orig_executor = getattr(loop, "_default_executor", None)
+    tiny_pool = ThreadPoolExecutor(max_workers=1)
+    loop.set_default_executor(tiny_pool)
+    barrier = threading.Event()
+    t0 = int(datetime(2025, 10, 10, 14, 0, tzinfo=UTC).timestamp())
+    stuck_ids = {f"CON.F.US.MES.ISO{idx}" for idx in range(4)}
+
+    try:
+        async with _async_client(
+            tmp_path,
+            backtest_max_queue_depth=10,
+            backtest_timeout_sec=0.35,
+            worker_fn=worker_hang_or_fast,
+        ) as (client, app):
+            csrf = await _login(client)
+            svc = app.state.backtest_service
+            store = app.state.parquet_store
+            sample_bars = _ict_long_setup_bars(t0, 300)
+
+            for idx in range(5):
+                key = StorageDatasetKey("topstepx", False, f"CON.F.US.MES.ISO{idx}", "5m")
+                await store.upsert_bars(key, sample_bars, root_symbol="MES")
+
+            orig_sync = store._read_bars_sync
+
+            def _blocking_sync(
+                target: Path,
+                key: StorageDatasetKey,
+                **kwargs: Any,
+            ) -> list[OHLCVBar]:
+                if key.contract_id in stuck_ids:
+                    barrier.wait(timeout=15.0)
+                return orig_sync(target, key, **kwargs)
+
+            store._read_bars_sync = _blocking_sync
+
+            stuck_jobs: list[str] = []
+            for idx in range(4):
+                r = await client.post(
+                    "/api/backtest",
+                    headers={"X-CSRF-Token": csrf},
+                    json={
+                        "contract_id": f"CON.F.US.MES.ISO{idx}",
+                        "root_symbol": "MES",
+                        "timeframe": "5m",
+                        "start_time": t0,
+                        "end_time": t0 + 3600,
+                    },
+                )
+                assert r.status_code == 202
+                stuck_jobs.append(r.json()["job_id"])
+
+            sts: list[dict[str, Any]] = []
+            for _ in range(160):
+                sts = [(await client.get(f"/api/backtest/{jid}")).json() for jid in stuck_jobs]
+                if all(st["status"] == "TIMED_OUT" for st in sts):
+                    break
+                await asyncio.sleep(0.05)
+
+            assert [st["status"] for st in sts] == ["TIMED_OUT"] * 4
+            assert svc.active_daemon_io_ops == 4
+            assert not barrier.is_set()
+
+            # (a) 5th dataset read fails fast due to _io_sem saturation.
+            r5 = await client.post(
+                "/api/backtest",
+                headers={"X-CSRF-Token": csrf},
+                json={
+                    "contract_id": "CON.F.US.MES.ISO4",
+                    "root_symbol": "MES",
+                    "timeframe": "5m",
+                    "start_time": t0,
+                    "end_time": t0 + 3600,
+                },
+            )
+            assert r5.status_code == 202
+            j5 = r5.json()["job_id"]
+            st5: dict[str, Any] = {}
+            for _ in range(60):
+                st5 = (await client.get(f"/api/backtest/{j5}")).json()
+                if st5["status"] in {"FAILED", "COMPLETED", "TIMED_OUT"}:
+                    break
+                await asyncio.sleep(0.02)
+            assert st5["status"] == "FAILED"
+            assert "saturated" in str(st5["error"]).lower()
+            assert svc.active_daemon_io_ops == 4
+
+            # (b) Default executor remains responsive for SQLite & live Parquet upserts.
+            summary = await asyncio.wait_for(
+                app.state.sqlite_store.get_quality_summary(),
+                timeout=1.5,
+            )
+            assert isinstance(summary, dict)
+            live_key = StorageDatasetKey("topstepx", False, "CON.F.US.MES.LIVE", "5m")
+            upsert_res = await asyncio.wait_for(
+                store.upsert_bars(live_key, sample_bars, root_symbol="MES"),
+                timeout=1.5,
+            )
+            assert upsert_res.written_rows == len(sample_bars)
+
+            barrier.set()
+            for _ in range(100):
+                if svc.active_daemon_io_ops == 0:
+                    break
+                await asyncio.sleep(0.02)
+            assert svc.active_daemon_io_ops == 0
+    finally:
+        barrier.set()
+        loop.set_default_executor(
+            orig_executor if orig_executor is not None else ThreadPoolExecutor()
+        )
+        tiny_pool.shutdown(wait=True)
+
+
+async def test_coverage_toctou_concurrent_backfill_fails_direct_and_resample(
+    tmp_path: Path,
+) -> None:
+    """Contract: Post-read coverage re-check rejects concurrent CORRUPTED backfill races.
+
+    Defect caught: Backfill writing valid Parquet + CORRUPTED coverage after pre-check passes.
+    """
+    t0 = int(datetime(2025, 10, 10, 14, 0, tzinfo=UTC).timestamp())
+    five_min_bars = _ict_long_setup_bars(t0, 300)
+    one_min_bars = [
+        _bar(b.time + m * 60, b.open, b.high, b.low, b.close, b.volume / 5.0)
+        for b in five_min_bars
+        for m in range(5)
+    ]
+
+    async with _async_client(tmp_path, worker_fn=worker_hang_or_fast) as (client, app):
+        csrf = await _login(client)
+        store = app.state.parquet_store
+        sqlite_store = app.state.sqlite_store
+        orig_run_locked = store._run_locked
+
+        entered_dir = asyncio.Event()
+        release_dir = asyncio.Event()
+        entered_res = asyncio.Event()
+        release_res = asyncio.Event()
+        seen_dir = {"done": False}
+        seen_res = {"done": False}
+
+        async def _intercept_run_locked(key: StorageDatasetKey, work: Any) -> Any:
+            if key.contract_id == "CON.F.US.MES.COVDIR" and not seen_dir["done"]:
+                seen_dir["done"] = True
+                entered_dir.set()
+                await release_dir.wait()
+            elif (
+                key.contract_id == "CON.F.US.MES.COVRES"
+                and key.timeframe == "1m"
+                and not seen_res["done"]
+            ):
+                seen_res["done"] = True
+                entered_res.set()
+                await release_res.wait()
+            return await orig_run_locked(key, work)
+
+        store._run_locked = _intercept_run_locked
+        try:
+            # 1) Direct path race: pre-check passes -> concurrent backfill -> post-check fails.
+            dir_key = StorageDatasetKey("topstepx", False, "CON.F.US.MES.COVDIR", "5m")
+            r_dir = await client.post(
+                "/api/backtest",
+                headers={"X-CSRF-Token": csrf},
+                json={
+                    "contract_id": "CON.F.US.MES.COVDIR",
+                    "root_symbol": "MES",
+                    "timeframe": "5m",
+                    "start_time": t0,
+                    "end_time": t0 + 3600,
+                },
+            )
+            assert r_dir.status_code == 202
+            dir_id = r_dir.json()["job_id"]
+
+            await asyncio.wait_for(entered_dir.wait(), timeout=5.0)
+            await store.upsert_bars(dir_key, five_min_bars, root_symbol="MES")
+            await sqlite_store.record_coverage(
+                dir_key, t0, t0 + 3600, status="CORRUPTED", quarantined_count=1
+            )
+            release_dir.set()
+
+            st_dir: dict[str, Any] = {}
+            for _ in range(100):
+                st_dir = (await client.get(f"/api/backtest/{dir_id}")).json()
+                if st_dir["status"] in {"FAILED", "COMPLETED", "TIMED_OUT", "CANCELLED"}:
+                    break
+                await asyncio.sleep(0.05)
+            assert st_dir["status"] == "FAILED"
+            assert "defective coverage" in str(st_dir["error"]).lower()
+
+            # 2) Resample path race: pre-check passes -> concurrent 1m backfill -> post-check fails.
+            res_1m_key = StorageDatasetKey("topstepx", False, "CON.F.US.MES.COVRES", "1m")
+            r_res = await client.post(
+                "/api/backtest",
+                headers={"X-CSRF-Token": csrf},
+                json={
+                    "contract_id": "CON.F.US.MES.COVRES",
+                    "root_symbol": "MES",
+                    "timeframe": "5m",
+                    "resample_from": "1m",
+                    "start_time": t0,
+                    "end_time": t0 + 3600,
+                },
+            )
+            assert r_res.status_code == 202
+            res_id = r_res.json()["job_id"]
+
+            await asyncio.wait_for(entered_res.wait(), timeout=5.0)
+            await store.upsert_bars(res_1m_key, one_min_bars, root_symbol="MES")
+            await sqlite_store.record_coverage(
+                res_1m_key, t0, t0 + 3600, status="CORRUPTED", quarantined_count=1
+            )
+            release_res.set()
+
+            st_res: dict[str, Any] = {}
+            for _ in range(100):
+                st_res = (await client.get(f"/api/backtest/{res_id}")).json()
+                if st_res["status"] in {"FAILED", "COMPLETED", "TIMED_OUT", "CANCELLED"}:
+                    break
+                await asyncio.sleep(0.05)
+            assert st_res["status"] == "FAILED"
+            assert "defective coverage" in str(st_res["error"]).lower()
+        finally:
+            release_dir.set()
+            release_res.set()
+            store._run_locked = orig_run_locked

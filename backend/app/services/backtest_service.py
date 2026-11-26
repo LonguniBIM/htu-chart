@@ -30,7 +30,7 @@ from app.engine.ohlcv import OHLCVBar, validate_query_timestamp
 from app.engine.session_calendar import bucket_bounds, bucket_open_utc, normalize_timeframe
 from app.engine.strategies import create_strategy
 from app.security import redact_secrets
-from app.storage.parquet_store import ParquetStore, validate_resample_path
+from app.storage.parquet_store import ParquetStore, ResampleResult, validate_resample_path
 from app.storage.sqlite_store import QualityIssueInput, SqliteStore
 
 logger = logging.getLogger("topstep_chart.backtest_service")
@@ -403,20 +403,25 @@ class BacktestService:
         fut: asyncio.Future[T] = loop.create_future()
 
         def _runner() -> None:
+            ok = False
+            res: Any = None
+            err: BaseException | None = None
             try:
                 res = fn()
+                ok = True
             except BaseException as exc:
-                if not loop.is_closed():
-                    with contextlib.suppress(RuntimeError):
-                        loop.call_soon_threadsafe(_set_future_exception, fut, exc)
-            else:
-                if not loop.is_closed():
-                    with contextlib.suppress(RuntimeError):
-                        loop.call_soon_threadsafe(_set_future_result, fut, res)
+                err = exc
             finally:
                 with self._io_counter_lock:
                     self._active_daemon_io_ops -= 1
                 self._io_sem.release()
+
+            if not loop.is_closed():
+                with contextlib.suppress(RuntimeError):
+                    if ok:
+                        loop.call_soon_threadsafe(_set_future_result, fut, res)
+                    elif err is not None:
+                        loop.call_soon_threadsafe(_set_future_exception, fut, err)
 
         try:
             thread = threading.Thread(
@@ -783,15 +788,29 @@ class BacktestService:
             aligned_start = bucket_open_utc(job.start_time, job.timeframe)
             await self._ensure_no_defective_coverage(source_key, aligned_start, aligned_end)
             await self._ensure_no_defective_coverage(target_key, job.start_time, aligned_end)
-            resample_res = await self._parquet_store.resample_with_issues(
-                source_key,
-                job.timeframe,
-                start_ts=job.start_time,
-                end_ts=job.end_time,
-                include_provisional=False,
-                now_utc=self._clock(),
-                root_symbol=job.root_symbol,
-                limit=job.max_bars + 1,
+            _, target_tf = validate_resample_path(source_key.timeframe, job.timeframe)
+            validate_root_symbol(source_key.contract_id, job.root_symbol)
+            source_target = self._parquet_store.resolve_path(source_key)
+            eff_now = self._clock()
+
+            async def _locked_resample() -> ResampleResult:
+                return await self._run_bounded_daemon_io(
+                    lambda: self._parquet_store._resample_sync(
+                        source_target,
+                        source_key,
+                        target_tf,
+                        start_ts=job.start_time,
+                        end_ts=job.end_time,
+                        include_provisional=False,
+                        now_utc=eff_now,
+                        root_symbol=job.root_symbol,
+                        holiday_overrides=None,
+                        limit=job.max_bars + 1,
+                    )
+                )
+
+            resample_res = await self._parquet_store._run_locked(
+                source_key, _locked_resample
             )
             if resample_res.issues:
                 if self._sqlite_store is not None:
@@ -822,6 +841,8 @@ class BacktestService:
                     f"Resampling {job.resample_from}->{job.timeframe} encountered "
                     f"{len(resample_res.issues)} corrupted bar(s)"
                 )
+            await self._ensure_no_defective_coverage(source_key, aligned_start, aligned_end)
+            await self._ensure_no_defective_coverage(target_key, job.start_time, aligned_end)
             return resample_res.bars
 
         dataset_key = StorageDatasetKey(
@@ -856,7 +877,7 @@ class BacktestService:
                     post_root = _read_parquet_stored_root(target_path) if exists_now else None
                 return bars, post_root, exists_now
 
-            return await asyncio.to_thread(_read_and_inspect)
+            return await self._run_bounded_daemon_io(_read_and_inspect)
 
         bars, post_root, exists_now = await self._parquet_store._run_locked(
             dataset_key, _locked_work
@@ -876,6 +897,7 @@ class BacktestService:
                     job.root_symbol,
                     stored_root_symbol=meta["root_symbol"],
                 )
+        await self._ensure_no_defective_coverage(dataset_key, job.start_time, aligned_end)
         return bars
 
     async def _execute_job(self, job: BacktestJobRecord) -> None:
