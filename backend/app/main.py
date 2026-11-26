@@ -15,7 +15,14 @@ from fastapi import FastAPI, Request, status
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
-from app.api import routes_alerts, routes_drawings, routes_layout, routes_market, routes_status
+from app.api import (
+    routes_alerts,
+    routes_backtest,
+    routes_drawings,
+    routes_layout,
+    routes_market,
+    routes_status,
+)
 from app.config import Settings, load_settings
 from app.engine.alert_engine import AlertEngine
 from app.engine.bar_aggregator import BarAggregator
@@ -28,6 +35,7 @@ from app.security import (
     redact_secrets,
 )
 from app.services.alert_service import AlertService
+from app.services.backtest_service import BacktestService
 from app.services.command_service import CommandService
 from app.services.history_service import HistoryBackfillService
 from app.services.live_feed_service import LiveFeedService
@@ -84,6 +92,7 @@ def create_app(
     signalr_ws_factory: WsConnectFactory | None = None,
     clock: Callable[[], int] | None = None,
     telegram_http_client: httpx.AsyncClient | None = None,
+    backtest_worker_fn: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
 ) -> FastAPI:
     """Create and configure the FastAPI application instance."""
     resolved_settings = settings or load_settings()
@@ -176,6 +185,12 @@ def create_app(
             on_bar_signal=alert_service.handle_bar_signal,
             clock=clock,
         )
+        backtest_service = BacktestService(
+            resolved_settings,
+            parquet_store,
+            clock=clock,
+            worker_fn=backtest_worker_fn,
+        )
 
         app_instance.state.settings = resolved_settings
         app_instance.state.http_client = client
@@ -197,9 +212,11 @@ def create_app(
         app_instance.state.telegram_client = telegram_notifier
         app_instance.state.alert_service = alert_service
         app_instance.state.live_feed_service = live_feed_service
+        app_instance.state.backtest_service = backtest_service
 
         await alert_service.start()
         await live_feed_service.start()
+        await backtest_service.start()
 
         auth_task: asyncio.Task[None] | None = None
         has_creds = bool(
@@ -219,6 +236,7 @@ def create_app(
                 auth_task.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
                     await auth_task
+            await backtest_service.stop()
             await live_feed_service.stop()
             await alert_service.stop()
             await ws_broadcaster.close_all()
@@ -268,6 +286,7 @@ def create_app(
 
     application.include_router(routes_status.router)
     application.include_router(routes_alerts.router)
+    application.include_router(routes_backtest.router)
     application.include_router(routes_drawings.router)
     application.include_router(routes_layout.router)
     application.include_router(routes_market.router)

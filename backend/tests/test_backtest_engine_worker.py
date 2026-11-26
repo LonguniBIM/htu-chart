@@ -1,0 +1,1271 @@
+"""Value-first tests for Phase 5 backtest engine, ICT FVG+Sweep strategy, and R02 worker."""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import os
+import time
+from collections.abc import Mapping, Sequence
+from contextlib import asynccontextmanager
+from datetime import UTC, datetime
+from pathlib import Path
+from typing import Any
+from zoneinfo import ZoneInfo
+
+import httpx
+import pytest
+from argon2 import PasswordHasher
+
+from app.config import Settings
+from app.engine.backtester import run_backtest
+from app.engine.indicators import (
+    detect_fvg_zones,
+    detect_liquidity_sweeps,
+    detect_order_blocks,
+    ema,
+    rsi,
+    session_vwap,
+)
+from app.engine.instruments import INSTRUMENTS, InstrumentSpec, StorageDatasetKey
+from app.engine.ohlcv import OHLCVBar
+from app.engine.strategies import create_strategy, list_strategies
+from app.engine.strategies.ict_fvg_sweep import IctFvgSweepStrategy
+from app.engine.strategy_base import (
+    BaseStrategy,
+    CausalBarView,
+    IndicatorSeries,
+    StrategyContext,
+    StrategySignal,
+    StrategyStepOutput,
+    StrategyZone,
+)
+from app.main import create_app
+
+TEST_PASSWORD = "backtest-test-password-123"
+TEST_PASSWORD_HASH = PasswordHasher().hash(TEST_PASSWORD)
+NY_TZ = ZoneInfo("America/New_York")
+
+
+def _bar(
+    ts: int,
+    o: float,
+    h: float,
+    low: float,
+    c: float,
+    v: float = 100.0,
+    *,
+    is_closed: bool = True,
+) -> OHLCVBar:
+    return OHLCVBar(
+        time=ts,
+        open=o,
+        high=h,
+        low=low,
+        close=c,
+        volume=v,
+        is_closed=is_closed,
+    )
+
+
+def _ict_long_setup_bars(start_ts: int = 1_760_000_000, step: int = 300) -> list[OHLCVBar]:
+    """Construct deterministic 12-bar series with a bullish SSL sweep + bullish FVG at bar 7."""
+    # Bars 0..4: range low at 100.00 (bar 2)
+    # Bar 5: bullish SSL sweep (low=99.50 < 100.00, close=100.50 > 100.00)
+    # Bar 6: mid expansion (high=101.25)
+    # Bar 7: displacement up leaving FVG between bar 5 high (100.75) and bar 7 low (101.50)
+    # Bars 8..11: follow-through upward reaching TP
+    specs = [
+        (101.00, 101.50, 100.50, 101.00),  # 0
+        (101.00, 101.25, 100.25, 100.50),  # 1
+        (100.50, 101.00, 100.00, 100.50),  # 2: prior swing low = 100.00
+        (100.50, 101.25, 100.25, 101.00),  # 3
+        (101.00, 101.25, 100.25, 100.75),  # 4
+        (100.75, 100.75, 99.50, 100.50),   # 5: SSL sweep (low=99.50 < 100.00, close=100.50)
+        (100.50, 102.00, 100.50, 101.75),  # 6: impulse candle
+        (101.75, 103.00, 101.50, 102.75),  # 7: bullish FVG confirmed (101.50 > 100.75)
+        (102.75, 103.50, 102.50, 103.25),  # 8: market entry at open=102.75
+        (103.25, 106.00, 103.00, 105.75),  # 9
+        (105.75, 111.00, 105.50, 110.50),  # 10: hits TP
+        (110.50, 111.50, 110.00, 111.00),  # 11
+    ]
+    return [
+        _bar(start_ts + idx * step, o, h, low, c, 100.0 + idx * 10.0)
+        for idx, (o, h, low, c) in enumerate(specs)
+    ]
+
+
+# Top-level picklable worker stubs for Windows `spawn` ProcessPoolExecutor tests.
+def worker_slow_success(payload: dict[str, Any]) -> dict[str, Any]:
+    """Simulate CPU-bound backtest taking ~0.6s in isolated worker process."""
+    time.sleep(0.6)
+    return {
+        "strategy_id": payload["strategy_id"],
+        "strategy_version": "1.0.0",
+        "contract_id": payload["contract_id"],
+        "root_symbol": payload["root_symbol"],
+        "timeframe": payload["timeframe"],
+        "live_mode": payload["live_mode"],
+        "params": payload["params"],
+        "instrument": {
+            "root_symbol": payload["root_symbol"],
+            "tick_size": 0.25,
+            "tick_value": 1.25,
+        },
+        "bar_count": len(payload["bars"]),
+        "start_time": payload["bars"][0][0] if payload["bars"] else None,
+        "end_time": payload["bars"][-1][0] if payload["bars"] else None,
+        "excluded_provisional_count": 0,
+        "trades": [],
+        "markers": [],
+        "trade_lines": [],
+        "zones": [],
+        "indicators": [],
+        "summary": {
+            "net_profit_dollars": 0.0,
+            "gross_profit_dollars": 0.0,
+            "gross_loss_dollars": 0.0,
+            "win_rate_pct": 0.0,
+            "profit_factor": None,
+            "max_drawdown_dollars": 0.0,
+            "total_trades": 0,
+            "winning_trades": 0,
+            "losing_trades": 0,
+            "breakeven_trades": 0,
+            "ambiguous_fill_count": 0,
+            "equity_curve": [],
+        },
+        "worker_pid": os.getpid(),
+    }
+
+
+def worker_hang_or_fast(payload: dict[str, Any]) -> dict[str, Any]:
+    """Sleep long when strategy param max_wait_bars == 49, else finish immediately."""
+    if int(payload["params"].get("max_wait_bars", 5)) == 49:
+        time.sleep(15.0)
+    return {
+        "strategy_id": payload["strategy_id"],
+        "strategy_version": "1.0.0",
+        "contract_id": payload["contract_id"],
+        "root_symbol": payload["root_symbol"],
+        "timeframe": payload["timeframe"],
+        "live_mode": payload["live_mode"],
+        "params": payload["params"],
+        "instrument": {
+            "root_symbol": payload["root_symbol"],
+            "tick_size": 0.25,
+            "tick_value": 1.25,
+        },
+        "bar_count": len(payload["bars"]),
+        "start_time": None,
+        "end_time": None,
+        "excluded_provisional_count": 0,
+        "trades": [],
+        "markers": [],
+        "trade_lines": [],
+        "zones": [],
+        "indicators": [],
+        "summary": {
+            "net_profit_dollars": 0.0,
+            "gross_profit_dollars": 0.0,
+            "gross_loss_dollars": 0.0,
+            "win_rate_pct": 0.0,
+            "profit_factor": None,
+            "max_drawdown_dollars": 0.0,
+            "total_trades": 0,
+            "winning_trades": 0,
+            "losing_trades": 0,
+            "breakeven_trades": 0,
+            "ambiguous_fill_count": 0,
+            "equity_curve": [],
+        },
+        "worker_pid": os.getpid(),
+    }
+
+
+def worker_oversized_payload(_payload: dict[str, Any]) -> dict[str, Any]:
+    """Return a huge payload to test backtest_max_result_bytes enforcement."""
+    return {
+        "strategy_id": "ict_fvg_sweep",
+        "summary": {"total_trades": 0},
+        "blob": "X" * 10_000,
+    }
+
+
+def worker_crash_once_or_ok(payload: dict[str, Any]) -> dict[str, Any]:
+    """Hard-exit worker process when max_wait_bars == 48 to test BrokenProcessPool respawn."""
+    if int(payload["params"].get("max_wait_bars", 5)) == 48:
+        os._exit(1)
+    return worker_hang_or_fast(payload)
+
+
+# Test-only causal strategy stubs for exact F08 fill/SL-TP/intrabar contract tests.
+class _LookaheadProbingStrategy(BaseStrategy):
+    strategy_id = "_test_lookahead_probe"
+    strategy_version = "1.0.0"
+    name = "Lookahead Probe"
+    description = "Attempts to index bar_index + 1 to verify CausalBarView barrier."
+
+    @classmethod
+    def default_params(cls) -> dict[str, Any]:
+        return {}
+
+    @classmethod
+    def validate_params(cls, params: Mapping[str, Any] | None = None) -> dict[str, Any]:
+        return dict(params or {})
+
+    def on_bar(self, ctx: StrategyContext) -> StrategyStepOutput:
+        _ = ctx.bars[ctx.bar_index + 1]
+        return StrategyStepOutput()
+
+    def compute_indicators(
+        self, bars: Sequence[OHLCVBar], instrument: InstrumentSpec
+    ) -> list[IndicatorSeries]:
+        return []
+
+
+class _SingleSignalStrategy(BaseStrategy):
+    strategy_id = "_test_single_signal"
+    strategy_version = "1.0.0"
+    name = "Single Signal"
+    description = "Emits one deterministic signal on a target bar index."
+
+    @classmethod
+    def default_params(cls) -> dict[str, Any]:
+        return {
+            "signal_index": 0,
+            "direction": "LONG",
+            "order_type": "market",
+            "limit_price": None,
+            "stop_loss": 99.0,
+            "take_profit": 102.0,
+            "quantity": 1,
+            "max_wait_bars": 5,
+        }
+
+    @classmethod
+    def validate_params(cls, params: Mapping[str, Any] | None = None) -> dict[str, Any]:
+        merged = cls.default_params()
+        if params:
+            merged.update(params)
+        return merged
+
+    def on_bar(self, ctx: StrategyContext) -> StrategyStepOutput:
+        if ctx.bar_index != int(self.params["signal_index"]):
+            return StrategyStepOutput()
+        return StrategyStepOutput(
+            signal=StrategySignal(
+                direction=self.params["direction"],
+                signal_bar_index=ctx.bar_index,
+                signal_time=ctx.bars[ctx.bar_index].time,
+                order_type=self.params["order_type"],
+                limit_price=self.params["limit_price"],
+                stop_loss=float(self.params["stop_loss"]),
+                take_profit=float(self.params["take_profit"]),
+                quantity=int(self.params["quantity"]),
+                max_wait_bars=int(self.params["max_wait_bars"]),
+                reason="Test signal",
+            )
+        )
+
+    def compute_indicators(
+        self, bars: Sequence[OHLCVBar], instrument: InstrumentSpec
+    ) -> list[IndicatorSeries]:
+        return []
+
+
+class _MultiSignalScriptStrategy(BaseStrategy):
+    strategy_id = "_test_multi_signal"
+    strategy_version = "1.0.0"
+    name = "Multi Signal"
+    description = "Emits scripted signals at specified bar indices."
+
+    @classmethod
+    def default_params(cls) -> dict[str, Any]:
+        return {"scripts": {}}
+
+    @classmethod
+    def validate_params(cls, params: Mapping[str, Any] | None = None) -> dict[str, Any]:
+        return {"scripts": dict((params or {}).get("scripts", {}))}
+
+    def on_bar(self, ctx: StrategyContext) -> StrategyStepOutput:
+        spec = self.params["scripts"].get(ctx.bar_index)
+        if spec is None or ctx.has_open_position or ctx.has_pending_order:
+            return StrategyStepOutput()
+        return StrategyStepOutput(
+            signal=StrategySignal(
+                direction=spec["direction"],
+                signal_bar_index=ctx.bar_index,
+                signal_time=ctx.bars[ctx.bar_index].time,
+                order_type="market",
+                stop_loss=float(spec["stop_loss"]),
+                take_profit=float(spec["take_profit"]),
+                quantity=int(spec.get("quantity", 1)),
+                reason=spec.get("reason", "Scripted"),
+            )
+        )
+
+    def compute_indicators(
+        self, bars: Sequence[OHLCVBar], instrument: InstrumentSpec
+    ) -> list[IndicatorSeries]:
+        return []
+
+
+class _FutureZoneLeakStrategy(BaseStrategy):
+    strategy_id = "_test_zone_leak"
+    strategy_version = "1.0.0"
+    name = "Zone Leak"
+    description = "Emits a zone with detected_at_time in the future."
+
+    @classmethod
+    def default_params(cls) -> dict[str, Any]:
+        return {}
+
+    @classmethod
+    def validate_params(cls, params: Mapping[str, Any] | None = None) -> dict[str, Any]:
+        return {}
+
+    def on_bar(self, ctx: StrategyContext) -> StrategyStepOutput:
+        bar = ctx.bars[ctx.bar_index]
+        return StrategyStepOutput(
+            zones=(
+                StrategyZone(
+                    kind="fvg",
+                    direction="bullish",
+                    start_time=bar.time,
+                    end_time=bar.time,
+                    detected_at_time=bar.time + 60,
+                    top=bar.high,
+                    bottom=bar.low,
+                ),
+            )
+        )
+
+    def compute_indicators(
+        self, bars: Sequence[OHLCVBar], instrument: InstrumentSpec
+    ) -> list[IndicatorSeries]:
+        return []
+
+
+@asynccontextmanager
+async def _async_client(
+    tmp_path: Path,
+    *,
+    backtest_enabled: bool = True,
+    backtest_max_queue_depth: int = 3,
+    backtest_max_bars: int = 50000,
+    backtest_max_date_range_days: int = 365,
+    backtest_timeout_sec: float = 30.0,
+    backtest_max_result_bytes: int = 5_000_000,
+    worker_fn: Any = None,
+):
+    settings = Settings(
+        app_password_hash=TEST_PASSWORD_HASH,
+        data_dir=tmp_path / "data",
+        signalr_enabled=False,
+        backtest_enabled=backtest_enabled,
+        backtest_max_queue_depth=backtest_max_queue_depth,
+        backtest_max_bars=backtest_max_bars,
+        backtest_max_date_range_days=backtest_max_date_range_days,
+        backtest_timeout_sec=backtest_timeout_sec,
+        backtest_max_result_bytes=backtest_max_result_bytes,
+    )
+    upstream = httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda _r: httpx.Response(404, json={}))
+    )
+    tg_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda _r: httpx.Response(200, json={"ok": True}))
+    )
+    app = create_app(
+        settings=settings,
+        http_client=upstream,
+        telegram_http_client=tg_client,
+        backtest_worker_fn=worker_fn,
+    )
+    try:
+        async with app.router.lifespan_context(app):
+            asgi = httpx.ASGITransport(app=app, client=("127.0.0.1", 54321))
+            async with httpx.AsyncClient(
+                transport=asgi,
+                base_url="http://127.0.0.1:8000",
+            ) as client:
+                yield client, app
+    finally:
+        await tg_client.aclose()
+        await upstream.aclose()
+
+
+async def _login(client: httpx.AsyncClient) -> str:
+    resp = await client.post("/api/auth/login", json={"password": TEST_PASSWORD})
+    assert resp.status_code == 200
+    return str(resp.json()["csrf_token"])
+
+
+def test_causal_bar_view_blocks_future_access_and_clamps_slices() -> None:
+    """Contract: CausalBarView physically blocks indexing bars >= visible_count and clamps slices.
+
+    Defect caught: Strategy accessing bars[i + 1] or slicing future candles during on_bar().
+    """
+    bars = _ict_long_setup_bars()
+    view = CausalBarView(bars, 4)
+
+    assert len(view) == 4
+    assert view[0] == bars[0]
+    assert view[3] == bars[3]
+    assert view[-1] == bars[3]
+    assert view[-4] == bars[0]
+    assert list(view[1:100]) == bars[1:4]
+    assert list(view[4:10]) == []
+    assert list(view) == bars[:4]
+
+    with pytest.raises(IndexError):
+        _ = view[4]
+    with pytest.raises(IndexError):
+        _ = view[-5]
+
+    with pytest.raises(IndexError):
+        run_backtest(
+            bars,
+            contract_id="CON.F.US.MES.Z26",
+            timeframe="5m",
+            strategy=_LookaheadProbingStrategy(),
+        )
+
+
+def test_ict_strategy_prefix_invariance_and_causality_guard() -> None:
+    """Contract: Mutating bars after index k never alters zones, signals, or indicators <= k.
+
+    Defect caught: Future data leakage (F08) in IctFvgSweepStrategy, zones, or indicators.
+    """
+    base_bars = _ict_long_setup_bars()
+    k = 7
+    mutated_bars = list(base_bars[: k + 1]) + [
+        _bar(base_bars[k].time + 300 * j, 50.0, 200.0, 10.0, 150.0, 9999.0)
+        for j in range(1, 6)
+    ]
+
+    res_base = run_backtest(
+        base_bars,
+        contract_id="CON.F.US.MES.Z26",
+        timeframe="5m",
+        strategy_id="ict_fvg_sweep",
+        params={"swing_lookback": 5, "ema_period": 3},
+    )
+    res_mutated = run_backtest(
+        mutated_bars,
+        contract_id="CON.F.US.MES.Z26",
+        timeframe="5m",
+        strategy_id="ict_fvg_sweep",
+        params={"swing_lookback": 5, "ema_period": 3},
+    )
+
+    cutoff_time = base_bars[k].time
+    zones_base = [z.to_dict() for z in res_base.zones if z.detected_at_time <= cutoff_time]
+    zones_mut = [z.to_dict() for z in res_mutated.zones if z.detected_at_time <= cutoff_time]
+    assert len(zones_base) >= 2
+    assert zones_base == zones_mut
+    assert all(z["detected_at_time"] <= cutoff_time for z in zones_base)
+
+    # First entry order triggered at bar[7] close must fill identically at bar[8].open.
+    assert len(res_base.trades) >= 1
+    assert len(res_mutated.trades) >= 1
+    assert res_base.trades[0].signal_time == base_bars[7].time
+    assert res_mutated.trades[0].signal_time == base_bars[7].time
+    assert res_base.trades[0].entry_time == base_bars[8].time
+    assert res_base.trades[0].entry_price == base_bars[8].open
+
+    for s_base, s_mut in zip(res_base.indicators, res_mutated.indicators, strict=True):
+        pts_base = [p.to_dict() for p in s_base.points if p.time <= cutoff_time]
+        pts_mut = [p.to_dict() for p in s_mut.points if p.time <= cutoff_time]
+        assert pts_base == pts_mut
+
+    with pytest.raises(ValueError, match="Causality violation"):
+        run_backtest(
+            base_bars[:3],
+            contract_id="CON.F.US.MES.Z26",
+            timeframe="5m",
+            strategy=_FutureZoneLeakStrategy(),
+        )
+
+
+def test_market_signal_fills_at_next_bar_open_never_signal_bar_close() -> None:
+    """Contract: Signal at bar[i] close fills strictly at bar[i+1].open and bar[i+1].time.
+
+    Defect caught: Look-ahead fill at bar[i].close instead of bar[i+1].open (F08).
+    """
+    t0 = 1_760_000_000
+    bars = [
+        _bar(t0, 100.0, 101.0, 99.5, 100.5),         # i=0: signal emitted at close=100.5
+        _bar(t0 + 300, 101.25, 101.5, 100.75, 101.0), # i=1: must fill at open=101.25
+        _bar(t0 + 600, 101.0, 102.5, 100.75, 102.25), # i=2: hits TP=102.0
+    ]
+    strat = _SingleSignalStrategy(
+        {
+            "signal_index": 0,
+            "direction": "LONG",
+            "order_type": "market",
+            "stop_loss": 99.0,
+            "take_profit": 102.0,
+        }
+    )
+    res = run_backtest(
+        bars,
+        contract_id="CON.F.US.MES.Z26",
+        timeframe="5m",
+        strategy=strat,
+    )
+    assert len(res.trades) == 1
+    trade = res.trades[0]
+    assert trade.signal_time == bars[0].time
+    assert trade.entry_time == bars[1].time
+    assert trade.entry_price == bars[1].open
+    assert trade.entry_price != bars[0].close
+    assert trade.exit_time == bars[2].time
+    assert trade.exit_price == 102.0
+    assert trade.exit_reason == "take_profit"
+
+
+def test_both_hit_sl_tp_resolves_conservatively_sl_first_and_intrabar_limit_rule() -> None:
+    """Contract: Both-hit resolves SL-first (ambiguous_fill=True); intrabar limit skips same-bar TP.
+
+    Defect caught: Optimistic TP-first tie-breaking or omitting ambiguous_fill counters (F08).
+    """
+    t0 = 1_760_000_000
+    # 1) LONG both-hit on bar 2 + SHORT both-hit on bar 4 -> both resolve SL-first.
+    bars = [
+        _bar(t0, 100.0, 101.0, 99.5, 100.5),         # 0: emit LONG
+        _bar(t0 + 300, 100.5, 101.0, 100.0, 100.75),  # 1: fill LONG @ 100.5
+        _bar(t0 + 600, 100.75, 104.0, 98.0, 101.0),   # 2: hits BOTH SL=99.0 & TP=103.0; emit SHORT
+        _bar(t0 + 900, 101.0, 101.5, 100.5, 101.0),   # 3: fill SHORT @ 101.0
+        _bar(t0 + 1200, 101.0, 104.0, 97.0, 100.0),  # 4: hits BOTH SL=103.0 & TP=98.0
+    ]
+    strat = _MultiSignalScriptStrategy(
+        {
+            "scripts": {
+                0: {"direction": "LONG", "stop_loss": 99.0, "take_profit": 103.0},
+                2: {"direction": "SHORT", "stop_loss": 103.0, "take_profit": 98.0},
+            }
+        }
+    )
+    res = run_backtest(
+        bars,
+        contract_id="CON.F.US.MES.Z26",
+        timeframe="5m",
+        strategy=strat,
+    )
+    assert len(res.trades) == 2
+    assert res.trades[0].exit_reason == "stop_loss"
+    assert res.trades[0].exit_price == 99.0
+    assert res.trades[0].ambiguous_fill is True
+    assert res.trades[1].exit_reason == "stop_loss"
+    assert res.trades[1].exit_price == 103.0
+    assert res.trades[1].ambiguous_fill is True
+    assert res.summary["ambiguous_fill_count"] == 2
+
+    # 2) Intrabar limit fill: bar[1] dips to 100.0 then rallies past TP=102.0 -> no bar[1] TP exit.
+    limit_bars = [
+        _bar(t0, 101.0, 101.5, 100.5, 101.0),         # 0: emit LONG limit @ 100.0
+        _bar(t0 + 300, 101.0, 102.5, 99.75, 101.5),   # 1: intrabar fill @ 100.0; TP touched
+        _bar(t0 + 600, 101.5, 102.25, 101.0, 102.0),  # 2: TP=102.0 validly hit on bar[2]
+    ]
+    limit_strat = _SingleSignalStrategy(
+        {
+            "signal_index": 0,
+            "direction": "LONG",
+            "order_type": "limit",
+            "limit_price": 100.0,
+            "stop_loss": 99.0,
+            "take_profit": 102.0,
+        }
+    )
+    limit_res = run_backtest(
+        limit_bars,
+        contract_id="CON.F.US.MES.Z26",
+        timeframe="5m",
+        strategy=limit_strat,
+    )
+    assert len(limit_res.trades) == 1
+    assert limit_res.trades[0].entry_time == limit_bars[1].time
+    assert limit_res.trades[0].entry_price == 100.0
+    assert limit_res.trades[0].exit_time == limit_bars[2].time
+    assert limit_res.trades[0].exit_reason == "take_profit"
+    assert limit_res.trades[0].ambiguous_fill is False
+
+
+def test_cme_decimal_pnl_across_all_instruments_and_summary_metrics() -> None:
+    """Contract: Exact Decimal tick/dollar P&L across MES, MNQ, MYM, MGC and summary metrics.
+
+    Defect caught: Binary float drift (MGC 0.10) or wrong profit_factor / drawdown / marker order.
+    """
+    t0 = 1_760_000_000
+
+    # Hand-calculated multi-trade test on MGC (tick_size=0.10, tick_value=$1.00):
+    # Trade 1 (qty=2): entry=1850.0, exit=1850.3 (+3 ticks * $1.00 * 2 = +$6.00)
+    # Trade 2 (qty=3): entry=1850.4, exit=1850.0 (-4 ticks * $1.00 * 3 = -$12.00) -> DD = $12.00
+    # Trade 3 (qty=1): entry=1850.2, exit=1851.2 (+10 ticks * $1.00 * 1 = +$10.00)
+    # Net = +6 - 12 + 10 = +4.00; Gross profit = 16.00; Gross loss = 12.00; PF = 16/12 = 4/3
+    mgc_bars = [
+        _bar(t0 + 0 * 60, 1850.0, 1850.2, 1849.8, 1850.0),
+        _bar(t0 + 1 * 60, 1850.0, 1850.4, 1849.9, 1850.3),  # T1 entry=1850.0, TP=1850.3
+        _bar(t0 + 2 * 60, 1850.3, 1850.5, 1850.2, 1850.4),
+        _bar(t0 + 3 * 60, 1850.4, 1850.5, 1849.9, 1850.0),  # T2 entry=1850.4, SL=1850.0
+        _bar(t0 + 4 * 60, 1850.0, 1850.3, 1849.9, 1850.2),
+        _bar(t0 + 5 * 60, 1850.2, 1851.3, 1850.1, 1851.2),  # T3 entry=1850.2, TP=1851.2
+    ]
+    mgc_strat = _MultiSignalScriptStrategy(
+        {
+            "scripts": {
+                0: {"direction": "LONG", "stop_loss": 1849.5, "take_profit": 1850.3, "quantity": 2},
+                2: {"direction": "LONG", "stop_loss": 1850.0, "take_profit": 1851.0, "quantity": 3},
+                4: {"direction": "LONG", "stop_loss": 1849.5, "take_profit": 1851.2, "quantity": 1},
+            }
+        }
+    )
+    mgc_res = run_backtest(
+        mgc_bars,
+        contract_id="CON.F.US.MGC.Z26",
+        timeframe="1m",
+        strategy=mgc_strat,
+    )
+    assert len(mgc_res.trades) == 3
+    assert mgc_res.trades[0].pnl_ticks == 3.0
+    assert mgc_res.trades[0].pnl_dollars == 6.0
+    assert mgc_res.trades[1].pnl_ticks == -4.0
+    assert mgc_res.trades[1].pnl_dollars == -12.0
+    assert mgc_res.trades[2].pnl_ticks == 10.0
+    assert mgc_res.trades[2].pnl_dollars == 10.0
+
+    summary = mgc_res.summary
+    assert summary["net_profit_dollars"] == 4.0
+    assert summary["gross_profit_dollars"] == 16.0
+    assert summary["gross_loss_dollars"] == 12.0
+    assert summary["max_drawdown_dollars"] == 12.0
+    assert summary["profit_factor"] == pytest.approx(16.0 / 12.0)
+    assert summary["total_trades"] == 3
+    assert summary["winning_trades"] == 2
+    assert summary["losing_trades"] == 1
+    assert summary["win_rate_pct"] == pytest.approx(200.0 / 3.0)
+
+    # Markers strictly ascending by time (entry before exit on same bar).
+    marker_times = [m["time"] for m in mgc_res.markers]
+    assert marker_times == sorted(marker_times)
+    assert len(mgc_res.trade_lines) == 3
+    assert mgc_res.trade_lines[0]["color"] == "#22c55e"
+    assert mgc_res.trade_lines[1]["color"] == "#ef4444"
+
+    # Verify MES, MNQ, MYM exact tick math and profit_factor=None when zero losses.
+    expected_cases = [
+        ("CON.F.US.MES.Z26", 5000.0, 5001.0, 2, 4.0, 10.0),   # 4 ticks * $1.25 * 2 = $10.00
+        ("CON.F.US.MNQ.Z26", 20000.0, 20001.0, 3, 4.0, 6.0),  # 4 ticks * $0.50 * 3 = $6.00
+        ("CON.F.US.MYM.Z26", 40000.0, 40005.0, 2, 5.0, 5.0),  # 5 ticks * $0.50 * 2 = $5.00
+    ]
+    for cid, entry_px, tp_px, qty, exp_ticks, exp_dollars in expected_cases:
+        sym_bars = [
+            _bar(t0, entry_px, entry_px + 1.0, entry_px - 1.0, entry_px),
+            _bar(t0 + 60, entry_px, tp_px + 1.0, entry_px - 0.5, tp_px),
+        ]
+        sym_res = run_backtest(
+            sym_bars,
+            contract_id=cid,
+            timeframe="1m",
+            strategy=_SingleSignalStrategy(
+                {
+                    "signal_index": 0,
+                    "direction": "LONG",
+                    "order_type": "market",
+                    "stop_loss": entry_px - 5.0,
+                    "take_profit": tp_px,
+                    "quantity": qty,
+                }
+            ),
+        )
+        assert sym_res.trades[0].pnl_ticks == exp_ticks
+        assert sym_res.trades[0].pnl_dollars == exp_dollars
+        assert sym_res.summary["profit_factor"] is None
+
+
+def test_provisional_bars_excluded_and_invalid_timestamps_rejected() -> None:
+    """Contract: Provisional bars (is_closed=False) excluded by default; non-monotonic times fail.
+
+    Defect caught: Open candle leaking into closed-bar backtest or unsorted bars breaking causality.
+    """
+    t0 = 1_760_000_000
+    bars = [
+        _bar(t0, 100.0, 101.0, 99.0, 100.5, is_closed=True),
+        _bar(t0 + 60, 100.5, 102.0, 100.0, 101.5, is_closed=True),
+        _bar(t0 + 120, 101.5, 105.0, 95.0, 104.0, is_closed=False),
+    ]
+    res = run_backtest(
+        bars,
+        contract_id="CON.F.US.MES.Z26",
+        timeframe="1m",
+        strategy=_SingleSignalStrategy(
+            {
+                "signal_index": 0,
+                "direction": "LONG",
+                "order_type": "market",
+                "stop_loss": 98.0,
+                "take_profit": 103.0,
+            }
+        ),
+    )
+    assert res.bar_count == 2
+    assert res.excluded_provisional_count == 1
+    # Exits at bar[1].close via end_of_data because bar[2] provisional was excluded.
+    assert res.trades[0].exit_time == bars[1].time
+    assert res.trades[0].exit_reason == "end_of_data"
+
+    with pytest.raises(ValueError, match="strictly increasing"):
+        run_backtest(
+            [_bar(t0 + 60, 100.0, 101.0, 99.0, 100.5), _bar(t0 + 60, 100.0, 101.0, 99.0, 100.5)],
+            contract_id="CON.F.US.MES.Z26",
+            timeframe="1m",
+        )
+
+
+def test_session_vwap_resets_at_1800_et_not_0000_utc() -> None:
+    """Contract: session_vwap resets strictly at 18:00 America/New_York, never at 00:00 UTC.
+
+    Defect caught: Naive UTC midnight VWAP reset splitting overnight CME Globex sessions (R05).
+    """
+    # Winter EST (UTC-5): 18:00 ET == 23:00 UTC.
+    # Jan 14 23:30 UTC (18:30 ET) and Jan 15 00:15 UTC (19:15 ET) belong to the SAME Globex session.
+    # Jan 15 23:00 UTC (18:00 ET) starts the NEXT Globex session.
+    t_same_1 = int(datetime(2026, 1, 14, 23, 30, tzinfo=UTC).timestamp())
+    t_same_2 = int(datetime(2026, 1, 15, 0, 15, tzinfo=UTC).timestamp())
+    t_next_sess = int(datetime(2026, 1, 15, 23, 0, tzinfo=UTC).timestamp())
+
+    bars = [
+        _bar(t_same_1, 100.0, 100.0, 100.0, 100.0, v=10.0),
+        _bar(t_same_2, 110.0, 110.0, 110.0, 110.0, v=30.0),
+        _bar(t_next_sess, 200.0, 200.0, 200.0, 200.0, v=0.0),
+    ]
+    vwap_pts = session_vwap(bars)
+    assert len(vwap_pts) == 3
+    assert vwap_pts[0] == (t_same_1, 100.0)
+    # Cumulative across 00:00 UTC: (100*10 + 110*30) / 40 = 4300 / 40 = 107.5 (NOT 110.0).
+    assert vwap_pts[1] == (t_same_2, 107.5)
+    # Reset at 18:00 ET even with zero volume -> falls back to finite typical_price = 200.0.
+    assert vwap_pts[2] == (t_next_sess, 200.0)
+
+
+def test_indicators_and_strategy_param_validation() -> None:
+    """Contract: EMA, RSI, FVG, OB, Sweep match hand-calculated values; invalid params fail.
+
+    Defect caught: Off-by-one indicator windows or accepting invalid/bool/NaN strategy params.
+    """
+    t0 = 1_760_000_000
+    closes = [10.0, 11.0, 12.0, 13.0, 14.0]
+    bars = [_bar(t0 + i * 60, c, c, c, c) for i, c in enumerate(closes)]
+
+    ema_pts = ema(bars, 3)
+    # SMA(10,11,12)=11.0; k=0.5 -> next=13*0.5+11*0.5=12.0 -> next=14*0.5+12*0.5=13.0
+    assert ema_pts == [(t0 + 120, 11.0), (t0 + 180, 12.0), (t0 + 240, 13.0)]
+
+    rsi_pts = rsi(bars, 3)
+    assert all(val == 100.0 for _, val in rsi_pts)
+
+    flat_bars = [_bar(t0 + i * 60, 100.0, 100.0, 100.0, 100.0) for i in range(5)]
+    assert rsi(flat_bars, 3)[-1][1] == 50.0
+
+    # FVG, OB, and Sweep on setup bars
+    setup_bars = _ict_long_setup_bars()
+    fvgs = detect_fvg_zones(setup_bars, min_gap_ticks=1.0, tick_size=0.25)
+    assert any(z.direction == "bullish" and z.detected_at_time == setup_bars[7].time for z in fvgs)
+    sweeps = detect_liquidity_sweeps(setup_bars, swing_lookback=5)
+    assert any(
+        s.direction == "bullish" and s.detected_at_time == setup_bars[5].time for s in sweeps
+    )
+
+    ob_bars = [
+        _bar(t0 + 0 * 60, 101.0, 101.5, 100.5, 101.0),
+        _bar(t0 + 1 * 60, 101.0, 101.5, 100.5, 100.75),  # bearish candle
+        _bar(t0 + 2 * 60, 100.75, 101.25, 100.25, 100.5), # last bearish candle
+        _bar(t0 + 3 * 60, 100.5, 103.0, 100.5, 102.75),   # displacement > prior 3 high (101.5)
+    ]
+    obs = detect_order_blocks(ob_bars, lookback=3)
+    assert len(obs) == 1
+    assert obs[0].direction == "bullish"
+    assert obs[0].start_time == ob_bars[2].time
+    assert obs[0].detected_at_time == ob_bars[3].time
+
+    # Static registry & parameter validation
+    reg_list = list_strategies()
+    assert [s["strategy_id"] for s in reg_list] == ["ict_fvg_sweep"]
+    strat = create_strategy("ict_fvg_sweep", {"entry_mode": "fvg_ce", "quantity": 2})
+    assert isinstance(strat, IctFvgSweepStrategy)
+
+    for bad_params in (
+        {"unknown_key": 1},
+        {"quantity": True},
+        {"quantity": 0},
+        {"risk_reward": float("nan")},
+        {"risk_reward": 0.1},
+        {"entry_mode": "invalid"},
+        {"include_vwap": "true"},
+    ):
+        with pytest.raises(ValueError):
+            IctFvgSweepStrategy.validate_params(bad_params)
+
+    with pytest.raises(ValueError):
+        create_strategy("non_existent_strategy")
+
+
+async def test_backtest_routes_require_session_and_csrf(tmp_path: Path) -> None:
+    """Contract: All /api/backtest routes enforce require_session (401) and require_csrf (403).
+
+    Defect caught: Unauthenticated callers or CSRF-less mutations hitting backtest endpoints (F01).
+    """
+    async with _async_client(tmp_path) as (client, _app):
+        assert (await client.get("/api/backtest/strategies")).status_code == 401
+        assert (await client.get("/api/backtest")).status_code == 401
+        assert (await client.get("/api/backtest/nonexistent")).status_code == 401
+        assert (
+            await client.post(
+                "/api/backtest",
+                json={
+                    "contract_id": "CON.F.US.MES.Z26",
+                    "timeframe": "5m",
+                    "start_time": 1_760_000_000,
+                    "end_time": 1_760_003_600,
+                },
+            )
+        ).status_code == 401
+        assert (await client.delete("/api/backtest/nonexistent")).status_code == 401
+
+        csrf = await _login(client)
+        assert (await client.get("/api/backtest/strategies")).status_code == 200
+        assert (await client.get("/api/backtest")).status_code == 200
+
+        post_no_csrf = await client.post(
+            "/api/backtest",
+            json={
+                "contract_id": "CON.F.US.MES.Z26",
+                "timeframe": "5m",
+                "start_time": 1_760_000_000,
+                "end_time": 1_760_003_600,
+            },
+        )
+        assert post_no_csrf.status_code == 403
+
+        del_bad_csrf = await client.delete(
+            "/api/backtest/nonexistent",
+            headers={"X-CSRF-Token": "wrong-csrf"},
+        )
+        assert del_bad_csrf.status_code == 403
+
+        del_missing = await client.delete(
+            "/api/backtest/nonexistent",
+            headers={"X-CSRF-Token": csrf},
+        )
+        assert del_missing.status_code == 404
+
+
+async def test_worker_subprocess_isolation_keeps_health_fast(tmp_path: Path) -> None:
+    """Contract: Long worker backtest runs in a separate process and never blocks /api/health.
+
+    Defect caught: CPU-bound backtest starving FastAPI event loop / SignalR heartbeats (R02).
+    """
+    async with _async_client(tmp_path, worker_fn=worker_slow_success) as (client, app):
+        csrf = await _login(client)
+        t0 = 1_760_000_000
+        key = StorageDatasetKey("topstepx", False, "CON.F.US.MES.Z26", "5m")
+        await app.state.parquet_store.upsert_bars(key, _ict_long_setup_bars(t0, 300))
+
+        submit_resp = await client.post(
+            "/api/backtest",
+            headers={"X-CSRF-Token": csrf},
+            json={
+                "contract_id": "CON.F.US.MES.Z26",
+                "timeframe": "5m",
+                "start_time": t0,
+                "end_time": t0 + 5000,
+            },
+        )
+        assert submit_resp.status_code == 202
+        job_id = submit_resp.json()["job_id"]
+
+        # Wait until RUNNING and probe /api/health concurrently.
+        for _ in range(50):
+            cur = (await client.get(f"/api/backtest/{job_id}")).json()
+            if cur["status"] == "RUNNING":
+                break
+            await asyncio.sleep(0.02)
+
+        t_start = time.monotonic()
+        health_resp = await client.get("/api/health")
+        elapsed = time.monotonic() - t_start
+        assert health_resp.status_code == 200
+        assert elapsed < 0.5
+
+        detail: dict[str, Any] = {}
+        for _ in range(100):
+            detail = (await client.get(f"/api/backtest/{job_id}")).json()
+            if detail["status"] == "COMPLETED":
+                break
+            await asyncio.sleep(0.05)
+
+        assert detail["status"] == "COMPLETED"
+        assert detail["result"]["worker_pid"] != os.getpid()
+
+
+async def test_timeout_and_cancel_kill_worker_and_respawn_cleanly(tmp_path: Path) -> None:
+    """Contract: Timeout and DELETE cancel kill worker process tree, respawn pool, enforce 409.
+
+    Defect caught: Stuck/orphaned worker blocking queued jobs or overwriting TIMED_OUT/CANCELLED.
+    """
+    async with _async_client(
+        tmp_path,
+        backtest_timeout_sec=2.0,
+        worker_fn=worker_hang_or_fast,
+    ) as (client, _app):
+        csrf = await _login(client)
+        t0 = 1_760_000_000
+
+        # 1) Timeout kills worker and respawns cleanly for next job.
+        timeout_resp = await client.post(
+            "/api/backtest",
+            headers={"X-CSRF-Token": csrf},
+            json={
+                "contract_id": "CON.F.US.MES.Z26",
+                "timeframe": "5m",
+                "start_time": t0,
+                "end_time": t0 + 3600,
+                "params": {"max_wait_bars": 49},
+            },
+        )
+        assert timeout_resp.status_code == 202
+        timeout_id = timeout_resp.json()["job_id"]
+
+        timed_out_detail: dict[str, Any] = {}
+        for _ in range(120):
+            timed_out_detail = (await client.get(f"/api/backtest/{timeout_id}")).json()
+            if timed_out_detail["status"] == "TIMED_OUT":
+                break
+            await asyncio.sleep(0.05)
+        assert timed_out_detail["status"] == "TIMED_OUT"
+
+        # 409 Conflict when trying to cancel already TIMED_OUT job.
+        del_timed_out = await client.delete(
+            f"/api/backtest/{timeout_id}",
+            headers={"X-CSRF-Token": csrf},
+        )
+        assert del_timed_out.status_code == 409
+
+        # Subsequent normal job succeeds on respawned pool.
+        ok_after_timeout = await client.post(
+            "/api/backtest",
+            headers={"X-CSRF-Token": csrf},
+            json={
+                "contract_id": "CON.F.US.MES.Z26",
+                "timeframe": "5m",
+                "start_time": t0,
+                "end_time": t0 + 3600,
+                "params": {"max_wait_bars": 5},
+            },
+        )
+        assert ok_after_timeout.status_code == 202
+        ok_id = ok_after_timeout.json()["job_id"]
+        cur: dict[str, Any] = {}
+        for _ in range(120):
+            cur = (await client.get(f"/api/backtest/{ok_id}")).json()
+            if cur["status"] == "COMPLETED":
+                break
+            await asyncio.sleep(0.05)
+        assert cur["status"] == "COMPLETED"
+        assert (
+            await client.delete(f"/api/backtest/{ok_id}", headers={"X-CSRF-Token": csrf})
+        ).status_code == 409
+
+    # 2) Cancel RUNNING job + cancel QUEUED job + verify subsequent job runs cleanly.
+    async with _async_client(
+        tmp_path / "cancel",
+        backtest_timeout_sec=30.0,
+        worker_fn=worker_hang_or_fast,
+    ) as (client, _app):
+        csrf = await _login(client)
+        t0 = 1_760_000_000
+
+        hang_resp = await client.post(
+            "/api/backtest",
+            headers={"X-CSRF-Token": csrf},
+            json={
+                "contract_id": "CON.F.US.MES.Z26",
+                "timeframe": "5m",
+                "start_time": t0,
+                "end_time": t0 + 3600,
+                "params": {"max_wait_bars": 49},
+            },
+        )
+        hang_id = hang_resp.json()["job_id"]
+        for _ in range(80):
+            if (await client.get(f"/api/backtest/{hang_id}")).json()["status"] == "RUNNING":
+                break
+            await asyncio.sleep(0.02)
+
+        queued_resp = await client.post(
+            "/api/backtest",
+            headers={"X-CSRF-Token": csrf},
+            json={
+                "contract_id": "CON.F.US.MES.Z26",
+                "timeframe": "5m",
+                "start_time": t0,
+                "end_time": t0 + 3600,
+                "params": {"max_wait_bars": 5},
+            },
+        )
+        queued_id = queued_resp.json()["job_id"]
+        assert (await client.get(f"/api/backtest/{queued_id}")).json()["status"] == "QUEUED"
+
+        # Cancel QUEUED job first.
+        del_q = await client.delete(
+            f"/api/backtest/{queued_id}",
+            headers={"X-CSRF-Token": csrf},
+        )
+        assert del_q.status_code == 200
+        assert del_q.json()["status"] == "CANCELLED"
+
+        # Cancel RUNNING job -> kills worker & respawns.
+        del_r = await client.delete(
+            f"/api/backtest/{hang_id}",
+            headers={"X-CSRF-Token": csrf},
+        )
+        assert del_r.status_code == 200
+        assert del_r.json()["status"] == "CANCELLED"
+
+        # Idempotent DELETE on CANCELLED returns 200.
+        del_again = await client.delete(
+            f"/api/backtest/{hang_id}",
+            headers={"X-CSRF-Token": csrf},
+        )
+        assert del_again.status_code == 200
+        assert del_again.json()["status"] == "CANCELLED"
+
+        # New job runs on respawned pool.
+        after_cancel = await client.post(
+            "/api/backtest",
+            headers={"X-CSRF-Token": csrf},
+            json={
+                "contract_id": "CON.F.US.MES.Z26",
+                "timeframe": "5m",
+                "start_time": t0,
+                "end_time": t0 + 3600,
+                "params": {"max_wait_bars": 5},
+            },
+        )
+        assert after_cancel.status_code == 202
+        after_id = after_cancel.json()["job_id"]
+        for _ in range(80):
+            st = (await client.get(f"/api/backtest/{after_id}")).json()
+            if st["status"] == "COMPLETED":
+                break
+            await asyncio.sleep(0.05)
+        assert st["status"] == "COMPLETED"
+        assert (await client.get(f"/api/backtest/{hang_id}")).json()["status"] == "CANCELLED"
+
+
+async def test_admission_limits_kill_switch_crash_recovery_and_result_cap(tmp_path: Path) -> None:
+    """Contract: BACKTEST_ENABLED=false returns 503; queue overflow 429; size cap & crash fail.
+
+    Defect caught: Unbounded queue memory, bypassed kill-switch, or unrecovered worker pool (R02).
+    """
+    # 1) Kill-switch disabled -> 503
+    async with _async_client(tmp_path / "disabled", backtest_enabled=False) as (client, _app):
+        csrf = await _login(client)
+        r = await client.post(
+            "/api/backtest",
+            headers={"X-CSRF-Token": csrf},
+            json={
+                "contract_id": "CON.F.US.MES.Z26",
+                "timeframe": "5m",
+                "start_time": 1_760_000_000,
+                "end_time": 1_760_003_600,
+            },
+        )
+        assert r.status_code == 503
+        status_json = (await client.get("/api/status")).json()
+        assert status_json["backtest"]["enabled"] is False
+
+    # 2) Queue depth limit -> 429
+    async with _async_client(
+        tmp_path / "queue",
+        backtest_max_queue_depth=2,
+        worker_fn=worker_hang_or_fast,
+    ) as (client, _app):
+        csrf = await _login(client)
+        t0 = 1_760_000_000
+        r_run = await client.post(
+            "/api/backtest",
+            headers={"X-CSRF-Token": csrf},
+            json={
+                "contract_id": "CON.F.US.MES.Z26",
+                "timeframe": "5m",
+                "start_time": t0,
+                "end_time": t0 + 3600,
+                "params": {"max_wait_bars": 49},
+            },
+        )
+        assert r_run.status_code == 202
+        running_id = r_run.json()["job_id"]
+        for _ in range(50):
+            if (await client.get(f"/api/backtest/{running_id}")).json()["status"] == "RUNNING":
+                break
+            await asyncio.sleep(0.02)
+
+        base_req = {
+            "contract_id": "CON.F.US.MES.Z26",
+            "timeframe": "5m",
+            "start_time": t0,
+            "end_time": t0 + 3600,
+        }
+        q1 = await client.post("/api/backtest", headers={"X-CSRF-Token": csrf}, json=base_req)
+        q2 = await client.post("/api/backtest", headers={"X-CSRF-Token": csrf}, json=base_req)
+        q3 = await client.post("/api/backtest", headers={"X-CSRF-Token": csrf}, json=base_req)
+        assert q1.status_code == 202
+        assert q2.status_code == 202
+        assert q3.status_code == 429
+
+        status_snap = (await client.get("/api/status")).json()["backtest"]
+        assert status_snap == {
+            "enabled": True,
+            "running_job_id": running_id,
+            "queue_depth": 2,
+            "max_queue_depth": 2,
+        }
+
+        await client.delete(f"/api/backtest/{running_id}", headers={"X-CSRF-Token": csrf})
+
+    # 3) Oversized result cap -> FAILED
+    async with _async_client(
+        tmp_path / "sizecap",
+        backtest_max_result_bytes=1024,
+        worker_fn=worker_oversized_payload,
+    ) as (client, _app):
+        csrf = await _login(client)
+        r = await client.post(
+            "/api/backtest",
+            headers={"X-CSRF-Token": csrf},
+            json={
+                "contract_id": "CON.F.US.MES.Z26",
+                "timeframe": "5m",
+                "start_time": 1_760_000_000,
+                "end_time": 1_760_003_600,
+            },
+        )
+        jid = r.json()["job_id"]
+        for _ in range(80):
+            st = (await client.get(f"/api/backtest/{jid}")).json()
+            if st["status"] == "FAILED":
+                break
+            await asyncio.sleep(0.05)
+        assert st["status"] == "FAILED"
+        assert "exceeds cap" in st["error"]
+
+    # 4) Worker process crash -> FAILED and clean respawn
+    async with _async_client(
+        tmp_path / "crash",
+        worker_fn=worker_crash_once_or_ok,
+    ) as (client, _app):
+        csrf = await _login(client)
+        r_crash = await client.post(
+            "/api/backtest",
+            headers={"X-CSRF-Token": csrf},
+            json={
+                "contract_id": "CON.F.US.MES.Z26",
+                "timeframe": "5m",
+                "start_time": 1_760_000_000,
+                "end_time": 1_760_003_600,
+                "params": {"max_wait_bars": 48},
+            },
+        )
+        crash_id = r_crash.json()["job_id"]
+        for _ in range(80):
+            st_c = (await client.get(f"/api/backtest/{crash_id}")).json()
+            if st_c["status"] == "FAILED":
+                break
+            await asyncio.sleep(0.05)
+        assert st_c["status"] == "FAILED"
+
+        r_ok = await client.post(
+            "/api/backtest",
+            headers={"X-CSRF-Token": csrf},
+            json={
+                "contract_id": "CON.F.US.MES.Z26",
+                "timeframe": "5m",
+                "start_time": 1_760_000_000,
+                "end_time": 1_760_003_600,
+                "params": {"max_wait_bars": 5},
+            },
+        )
+        ok_id = r_ok.json()["job_id"]
+        for _ in range(80):
+            st_ok = (await client.get(f"/api/backtest/{ok_id}")).json()
+            if st_ok["status"] == "COMPLETED":
+                break
+            await asyncio.sleep(0.05)
+        assert st_ok["status"] == "COMPLETED"
+
+
+async def test_end_to_end_parquet_resample_backtest_api(tmp_path: Path) -> None:
+    """Contract: Real worker runs ICT FVG+Sweep on ParquetStore resampled 1m->5m closed bars.
+
+    Defect caught: Serialization breakage across spawn worker or leaking provisional bars.
+    """
+    async with _async_client(tmp_path) as (client, app):
+        csrf = await _login(client)
+
+        # Build 1m bars aligned to a CME 5m boundary in the past (2025-10-10T14:00:00Z = 10:00 ET).
+        t_open = int(datetime(2025, 10, 10, 14, 0, tzinfo=UTC).timestamp())
+        five_min_bars = _ict_long_setup_bars(t_open, 300)
+        one_min_bars: list[OHLCVBar] = []
+        for idx, b5 in enumerate(five_min_bars):
+            is_last_provisional = idx == len(five_min_bars) - 1
+            for m in range(5):
+                bar_ts = b5.time + m * 60
+                o = b5.open if m == 0 else b5.close
+                c = b5.close if m == 4 else b5.close
+                h = b5.high if m == 2 else max(o, c)
+                low = b5.low if m == 1 else min(o, c)
+                one_min_bars.append(
+                    _bar(bar_ts, o, h, low, c, b5.volume / 5.0, is_closed=not is_last_provisional)
+                )
+
+        m1_key = StorageDatasetKey("topstepx", False, "CON.F.US.MES.Z26", "1m")
+        await app.state.parquet_store.upsert_bars(m1_key, one_min_bars)
+
+        submit = await client.post(
+            "/api/backtest",
+            headers={"X-CSRF-Token": csrf},
+            json={
+                "contract_id": "CON.F.US.MES.Z26",
+                "timeframe": "5m",
+                "resample_from": "1m",
+                "start_time": t_open,
+                "end_time": t_open + len(five_min_bars) * 300,
+                "strategy_id": "ict_fvg_sweep",
+                "params": {"swing_lookback": 5, "ema_period": 3},
+            },
+        )
+        assert submit.status_code == 202
+        job_id = submit.json()["job_id"]
+
+        detail: dict[str, Any] = {}
+        for _ in range(120):
+            detail = (await client.get(f"/api/backtest/{job_id}")).json()
+            if detail["status"] == "COMPLETED":
+                break
+            await asyncio.sleep(0.05)
+
+        assert detail["status"] == "COMPLETED"
+        result = detail["result"]
+        assert result["bar_count"] == len(five_min_bars) - 1
+        assert result["strategy_id"] == "ict_fvg_sweep"
+        assert result["instrument"]["tick_size"] == INSTRUMENTS["MES"].tick_size
+        assert len(result["trades"]) >= 1
+        assert len(result["markers"]) == len(result["trades"]) * 2
+        assert len(result["trade_lines"]) == len(result["trades"])
+        assert len(result["zones"]) >= 2
+        assert [ind["id"] for ind in result["indicators"]] == ["ema_3", "session_vwap"]
+        # Strict JSON compliance (zero NaN/Inf)
+        encoded = json.dumps(result, allow_nan=False, separators=(",", ":"))
+        assert len(encoded.encode("utf-8")) == detail["result_bytes"]

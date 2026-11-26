@@ -203,6 +203,14 @@ class Settings(BaseSettings):
     alert_scanner_enabled: bool = True
     alert_dispatcher_enabled: bool = True
 
+    backtest_enabled: bool = True
+    backtest_max_queue_depth: int = Field(default=3, ge=1, le=16)
+    backtest_max_bars: int = Field(default=50000, ge=10, le=500000)
+    backtest_max_date_range_days: int = Field(default=365, ge=1, le=3650)
+    backtest_timeout_sec: float = Field(default=30.0, gt=0.0, le=600.0)
+    backtest_max_result_bytes: int = Field(default=5_000_000, ge=1024, le=50_000_000)
+    backtest_max_jobs_retained: int = Field(default=64, ge=1, le=500)
+
     data_dir: Path = Path("data")
 
     @field_validator("app_env", mode="before")
