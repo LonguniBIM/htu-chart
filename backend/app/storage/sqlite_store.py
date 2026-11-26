@@ -8,7 +8,7 @@ import re
 import sqlite3
 import threading
 import uuid
-from collections.abc import Collection, Mapping, Sequence
+from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -25,6 +25,13 @@ _MAX_ALERT_ERROR_CHARS = 512
 _SQLITE_INT64_MIN = -(2**63)
 _SQLITE_INT64_MAX = 2**63 - 1
 _LAYOUT_ID_RE = re.compile(r"^[A-Za-z0-9._-]{1,80}$")
+_DRAWING_ID_RE = re.compile(r"^[A-Za-z0-9._-]{1,80}$")
+_PANE_ID_RE = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
+_IDEMPOTENCY_KEY_RE = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
+_VALID_DRAWING_ACTORS = frozenset({"user", "agent"})
+MAX_DRAWINGS_PER_SCOPE = 500
+MAX_UNDO_HISTORY = 100
+MAX_IDEMPOTENCY_ENTRIES_PER_SCOPE = 500
 DEFAULT_LAYOUT_ID = "layout-4-future"
 DEFAULT_LAYOUT_NAME = "4 Future"
 DEFAULT_LAYOUT_TEMPLATE_ID = "4-grid-2x2"
@@ -175,6 +182,116 @@ class LayoutRecord:
     is_default: bool
     created_at_utc: int
     updated_at_utc: int
+
+
+class DrawingStoreError(Exception):
+    """Base domain error raised by SQLite drawing command persistence."""
+
+
+class RevisionConflictError(DrawingStoreError):
+    """Raised when expected_revision does not match persisted scope_revision."""
+
+    def __init__(self, current_revision: int, expected_revision: int) -> None:
+        self.current_revision = current_revision
+        self.expected_revision = expected_revision
+        super().__init__(
+            f"Drawing scope revision conflict: expected {expected_revision}, "
+            f"current is {current_revision}"
+        )
+
+
+class IdempotencyConflictError(DrawingStoreError):
+    """Raised when an idempotency_key is reused with a different request fingerprint."""
+
+    def __init__(self, idempotency_key: str) -> None:
+        self.idempotency_key = idempotency_key
+        super().__init__(
+            f"Idempotency key {idempotency_key!r} already exists with a different payload"
+        )
+
+
+class NothingToUndoError(DrawingStoreError):
+    """Raised when undo is requested with no available undo history entry."""
+
+
+class NothingToRedoError(DrawingStoreError):
+    """Raised when redo is requested with no available redo history entry."""
+
+
+class DrawingConflictError(DrawingStoreError):
+    """Raised when creating a drawing with an ID that already exists in scope."""
+
+    def __init__(self, drawing_id: str) -> None:
+        self.drawing_id = drawing_id
+        super().__init__(f"Drawing {drawing_id!r} already exists in scope")
+
+
+class DrawingNotFoundError(DrawingStoreError):
+    """Raised when updating or deleting a drawing ID absent from scope."""
+
+    def __init__(self, drawing_id: str) -> None:
+        self.drawing_id = drawing_id
+        super().__init__(f"Drawing {drawing_id!r} not found in scope")
+
+
+class ScopeLimitError(DrawingStoreError):
+    """Raised when a scope would exceed MAX_DRAWINGS_PER_SCOPE."""
+
+    def __init__(self, limit: int, resulting_count: int) -> None:
+        self.limit = limit
+        self.resulting_count = resulting_count
+        super().__init__(
+            f"Drawing scope limit exceeded ({resulting_count} > {limit})"
+        )
+
+
+@dataclass(frozen=True)
+class DrawingRecord:
+    """Persisted domain-coordinate drawing object."""
+
+    id: str
+    revision: int
+    type: str
+    symbol: str
+    contract_id: str | None
+    pane_id: str | None
+    created_by: Literal["user", "agent"]
+    source_bar_refs: list[int]
+    coordinates: dict[str, Any]
+    style: dict[str, Any]
+    metadata: dict[str, Any]
+    created_at_utc: int
+    updated_at_utc: int
+
+
+@dataclass(frozen=True)
+class DrawingScopeSnapshot:
+    """Current persisted drawing state and undo/redo availability for a scope."""
+
+    symbol: str
+    contract_id: str | None
+    pane_id: str | None
+    scope_revision: int
+    can_undo: bool
+    can_redo: bool
+    drawings: list[DrawingRecord]
+
+
+@dataclass(frozen=True)
+class DrawingCommandExecutionResult:
+    """Outcome of executing a drawing command, undo, or redo in SQLite."""
+
+    symbol: str
+    contract_id: str | None
+    pane_id: str | None
+    scope_revision: int
+    command_type: str
+    can_undo: bool
+    can_redo: bool
+    deduplicated: bool
+    changed: bool
+    affected_ids: list[str]
+    drawings: list[DrawingRecord]
 
 
 def _subtract_interval(
@@ -353,6 +470,62 @@ class SqliteStore:
 
             CREATE INDEX IF NOT EXISTS idx_layouts_default_created
                 ON layouts (is_default DESC, created_at_utc ASC, id ASC);
+
+            CREATE TABLE IF NOT EXISTS drawing_scopes (
+                symbol TEXT NOT NULL,
+                contract_id TEXT NOT NULL,
+                pane_id TEXT NOT NULL,
+                scope_revision INTEGER NOT NULL DEFAULT 0,
+                undo_cursor INTEGER NOT NULL DEFAULT 0,
+                max_seq INTEGER NOT NULL DEFAULT 0,
+                updated_at_utc INTEGER NOT NULL,
+                PRIMARY KEY (symbol, contract_id, pane_id)
+            );
+
+            CREATE TABLE IF NOT EXISTS drawings (
+                symbol TEXT NOT NULL,
+                contract_id TEXT NOT NULL,
+                pane_id TEXT NOT NULL,
+                id TEXT NOT NULL,
+                revision INTEGER NOT NULL,
+                drawing_type TEXT NOT NULL,
+                created_by TEXT NOT NULL CHECK (created_by IN ('user', 'agent')),
+                source_bar_refs_json TEXT NOT NULL,
+                coordinates_json TEXT NOT NULL,
+                style_json TEXT NOT NULL,
+                metadata_json TEXT NOT NULL,
+                created_at_utc INTEGER NOT NULL,
+                updated_at_utc INTEGER NOT NULL,
+                PRIMARY KEY (symbol, contract_id, pane_id, id)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_drawings_scope_created
+                ON drawings (symbol, contract_id, pane_id, created_at_utc ASC, id ASC);
+
+            CREATE TABLE IF NOT EXISTS drawing_history (
+                symbol TEXT NOT NULL,
+                contract_id TEXT NOT NULL,
+                pane_id TEXT NOT NULL,
+                seq INTEGER NOT NULL,
+                command_type TEXT NOT NULL,
+                actor TEXT NOT NULL CHECK (actor IN ('user', 'agent')),
+                before_json TEXT NOT NULL,
+                after_json TEXT NOT NULL,
+                created_at_utc INTEGER NOT NULL,
+                PRIMARY KEY (symbol, contract_id, pane_id, seq)
+            );
+
+            CREATE TABLE IF NOT EXISTS drawing_idempotency (
+                symbol TEXT NOT NULL,
+                contract_id TEXT NOT NULL,
+                pane_id TEXT NOT NULL,
+                idempotency_key TEXT NOT NULL,
+                request_fingerprint TEXT NOT NULL,
+                applied_revision INTEGER NOT NULL,
+                response_json TEXT NOT NULL,
+                created_at_utc INTEGER NOT NULL,
+                PRIMARY KEY (symbol, contract_id, pane_id, idempotency_key)
+            );
             """
         )
         conn.commit()
@@ -2003,3 +2176,945 @@ class SqliteStore:
     async def delete_layout(self, layout_id: str) -> bool:
         """Delete a layout, promoting oldest remaining if default; guard last layout."""
         return await asyncio.to_thread(self._delete_layout_sync, layout_id)
+
+    @staticmethod
+    def _normalize_drawing_scope_params(
+        symbol: str,
+        contract_id: str | None,
+        pane_id: str | None,
+    ) -> tuple[str, str, str]:
+        clean_symbol = _validate_non_empty_str(symbol, "symbol").upper()
+        contract_scope = (
+            contract_id.strip().upper()
+            if isinstance(contract_id, str) and contract_id.strip()
+            else ""
+        )
+        pane_scope = (
+            pane_id.strip()
+            if isinstance(pane_id, str) and pane_id.strip()
+            else ""
+        )
+        return clean_symbol, contract_scope, pane_scope
+
+    @staticmethod
+    def _validate_drawing_id_value(drawing_id: str) -> str:
+        if not isinstance(drawing_id, str):
+            raise ValueError("drawing_id must be a string")
+        cleaned = drawing_id.strip()
+        if not cleaned or cleaned in {".", ".."} or not _DRAWING_ID_RE.fullmatch(cleaned):
+            raise ValueError(f"Invalid drawing_id: {drawing_id!r}")
+        return cleaned
+
+    @staticmethod
+    def _validate_idempotency_key_value(idempotency_key: str | None) -> str | None:
+        if idempotency_key is None:
+            return None
+        if not isinstance(idempotency_key, str) or not _IDEMPOTENCY_KEY_RE.fullmatch(
+            idempotency_key
+        ):
+            raise ValueError(f"Invalid idempotency_key: {idempotency_key!r}")
+        return idempotency_key
+
+    @staticmethod
+    def _row_to_drawing_record(row: sqlite3.Row) -> DrawingRecord:
+        contract_raw = str(row["contract_id"])
+        pane_raw = str(row["pane_id"])
+        actor_raw = str(row["created_by"])
+        actor: Literal["user", "agent"] = "agent" if actor_raw == "agent" else "user"
+        return DrawingRecord(
+            id=str(row["id"]),
+            revision=int(row["revision"]),
+            type=str(row["drawing_type"]),
+            symbol=str(row["symbol"]),
+            contract_id=contract_raw if contract_raw else None,
+            pane_id=pane_raw if pane_raw else None,
+            created_by=actor,
+            source_bar_refs=[int(x) for x in json.loads(str(row["source_bar_refs_json"]))],
+            coordinates=dict(json.loads(str(row["coordinates_json"]))),
+            style=dict(json.loads(str(row["style_json"]))),
+            metadata=dict(json.loads(str(row["metadata_json"]))),
+            created_at_utc=int(row["created_at_utc"]),
+            updated_at_utc=int(row["updated_at_utc"]),
+        )
+
+    @staticmethod
+    def _drawing_record_to_dict(record: DrawingRecord) -> dict[str, Any]:
+        return {
+            "id": record.id,
+            "revision": record.revision,
+            "type": record.type,
+            "symbol": record.symbol,
+            "contract_id": record.contract_id,
+            "pane_id": record.pane_id,
+            "created_by": record.created_by,
+            "source_bar_refs": list(record.source_bar_refs),
+            "coordinates": dict(record.coordinates),
+            "style": dict(record.style),
+            "metadata": dict(record.metadata),
+            "created_at_utc": record.created_at_utc,
+            "updated_at_utc": record.updated_at_utc,
+        }
+
+    @staticmethod
+    def _dict_to_drawing_record(data: Mapping[str, Any]) -> DrawingRecord:
+        actor_raw = str(data["created_by"])
+        actor: Literal["user", "agent"] = "agent" if actor_raw == "agent" else "user"
+        return DrawingRecord(
+            id=str(data["id"]),
+            revision=int(data["revision"]),
+            type=str(data["type"]),
+            symbol=str(data["symbol"]),
+            contract_id=str(data["contract_id"]) if data.get("contract_id") else None,
+            pane_id=str(data["pane_id"]) if data.get("pane_id") else None,
+            created_by=actor,
+            source_bar_refs=[int(x) for x in data["source_bar_refs"]],
+            coordinates=dict(data["coordinates"]),
+            style=dict(data["style"]),
+            metadata=dict(data["metadata"]),
+            created_at_utc=int(data["created_at_utc"]),
+            updated_at_utc=int(data["updated_at_utc"]),
+        )
+
+    @staticmethod
+    def _read_scope_meta_locked(
+        conn: sqlite3.Connection,
+        scope_params: tuple[str, str, str],
+    ) -> tuple[int, int, int]:
+        row = conn.execute(
+            """
+            SELECT scope_revision, undo_cursor, max_seq
+            FROM drawing_scopes
+            WHERE symbol = ? AND contract_id = ? AND pane_id = ?
+            """,
+            scope_params,
+        ).fetchone()
+        if row is None:
+            return 0, 0, 0
+        return int(row["scope_revision"]), int(row["undo_cursor"]), int(row["max_seq"])
+
+    @staticmethod
+    def _has_undo_row_locked(
+        conn: sqlite3.Connection,
+        scope_params: tuple[str, str, str],
+        undo_cursor: int,
+    ) -> bool:
+        if undo_cursor <= 0:
+            return False
+        row = conn.execute(
+            """
+            SELECT 1 FROM drawing_history
+            WHERE symbol = ? AND contract_id = ? AND pane_id = ? AND seq = ?
+            LIMIT 1
+            """,
+            (*scope_params, undo_cursor),
+        ).fetchone()
+        return row is not None
+
+    @staticmethod
+    def _has_redo_row_locked(
+        conn: sqlite3.Connection,
+        scope_params: tuple[str, str, str],
+        undo_cursor: int,
+        max_seq: int,
+    ) -> bool:
+        if undo_cursor >= max_seq:
+            return False
+        row = conn.execute(
+            """
+            SELECT 1 FROM drawing_history
+            WHERE symbol = ? AND contract_id = ? AND pane_id = ? AND seq > ?
+            LIMIT 1
+            """,
+            (*scope_params, undo_cursor),
+        ).fetchone()
+        return row is not None
+
+    def _list_scope_drawings_locked(
+        self,
+        conn: sqlite3.Connection,
+        scope_params: tuple[str, str, str],
+    ) -> list[DrawingRecord]:
+        rows = conn.execute(
+            """
+            SELECT symbol, contract_id, pane_id, id, revision, drawing_type,
+                   created_by, source_bar_refs_json, coordinates_json,
+                   style_json, metadata_json, created_at_utc, updated_at_utc
+            FROM drawings
+            WHERE symbol = ? AND contract_id = ? AND pane_id = ?
+            ORDER BY created_at_utc ASC, id ASC
+            """,
+            scope_params,
+        ).fetchall()
+        return [self._row_to_drawing_record(row) for row in rows]
+
+    def _check_idempotency_locked(
+        self,
+        conn: sqlite3.Connection,
+        scope_params: tuple[str, str, str],
+        idempotency_key: str | None,
+        request_fingerprint: str,
+    ) -> DrawingCommandExecutionResult | None:
+        if idempotency_key is None:
+            return None
+        row = conn.execute(
+            """
+            SELECT request_fingerprint, response_json
+            FROM drawing_idempotency
+            WHERE symbol = ? AND contract_id = ? AND pane_id = ? AND idempotency_key = ?
+            """,
+            (*scope_params, idempotency_key),
+        ).fetchone()
+        if row is None:
+            return None
+        if str(row["request_fingerprint"]) != request_fingerprint:
+            raise IdempotencyConflictError(idempotency_key)
+        stored = json.loads(str(row["response_json"]))
+        return DrawingCommandExecutionResult(
+            symbol=str(stored["symbol"]),
+            contract_id=str(stored["contract_id"]) if stored.get("contract_id") else None,
+            pane_id=str(stored["pane_id"]) if stored.get("pane_id") else None,
+            scope_revision=int(stored["scope_revision"]),
+            command_type=str(stored["command_type"]),
+            can_undo=bool(stored["can_undo"]),
+            can_redo=bool(stored["can_redo"]),
+            deduplicated=True,
+            changed=False,
+            affected_ids=[str(x) for x in stored["affected_ids"]],
+            drawings=[self._dict_to_drawing_record(d) for d in stored["drawings"]],
+        )
+
+    def _store_idempotency_locked(
+        self,
+        conn: sqlite3.Connection,
+        scope_params: tuple[str, str, str],
+        idempotency_key: str | None,
+        request_fingerprint: str,
+        result: DrawingCommandExecutionResult,
+        now_ts: int,
+    ) -> None:
+        if idempotency_key is None:
+            return
+        payload = {
+            "symbol": result.symbol,
+            "contract_id": result.contract_id,
+            "pane_id": result.pane_id,
+            "scope_revision": result.scope_revision,
+            "command_type": result.command_type,
+            "can_undo": result.can_undo,
+            "can_redo": result.can_redo,
+            "affected_ids": list(result.affected_ids),
+            "drawings": [self._drawing_record_to_dict(d) for d in result.drawings],
+        }
+        conn.execute(
+            """
+            INSERT INTO drawing_idempotency (
+                symbol, contract_id, pane_id, idempotency_key,
+                request_fingerprint, applied_revision, response_json, created_at_utc
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                *scope_params,
+                idempotency_key,
+                request_fingerprint,
+                result.scope_revision,
+                json.dumps(payload, allow_nan=False, separators=(",", ":")),
+                now_ts,
+            ),
+        )
+        conn.execute(
+            """
+            DELETE FROM drawing_idempotency
+            WHERE symbol = ? AND contract_id = ? AND pane_id = ?
+              AND rowid NOT IN (
+                  SELECT rowid FROM drawing_idempotency
+                  WHERE symbol = ? AND contract_id = ? AND pane_id = ?
+                  ORDER BY rowid DESC
+                  LIMIT ?
+              )
+            """,
+            (*scope_params, *scope_params, MAX_IDEMPOTENCY_ENTRIES_PER_SCOPE),
+        )
+
+    @staticmethod
+    def _upsert_drawing_locked(
+        conn: sqlite3.Connection,
+        scope_params: tuple[str, str, str],
+        obj: Mapping[str, Any],
+    ) -> None:
+        conn.execute(
+            """
+            INSERT INTO drawings (
+                symbol, contract_id, pane_id, id, revision, drawing_type,
+                created_by, source_bar_refs_json, coordinates_json,
+                style_json, metadata_json, created_at_utc, updated_at_utc
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT (symbol, contract_id, pane_id, id) DO UPDATE SET
+                revision = excluded.revision,
+                drawing_type = excluded.drawing_type,
+                created_by = excluded.created_by,
+                source_bar_refs_json = excluded.source_bar_refs_json,
+                coordinates_json = excluded.coordinates_json,
+                style_json = excluded.style_json,
+                metadata_json = excluded.metadata_json,
+                created_at_utc = excluded.created_at_utc,
+                updated_at_utc = excluded.updated_at_utc
+            """,
+            (
+                *scope_params,
+                str(obj["id"]),
+                int(obj["revision"]),
+                str(obj["type"]),
+                str(obj["created_by"]),
+                json.dumps(obj["source_bar_refs"], allow_nan=False, separators=(",", ":")),
+                json.dumps(obj["coordinates"], allow_nan=False, separators=(",", ":")),
+                json.dumps(obj["style"], allow_nan=False, separators=(",", ":")),
+                json.dumps(obj["metadata"], allow_nan=False, separators=(",", ":")),
+                int(obj["created_at_utc"]),
+                int(obj["updated_at_utc"]),
+            ),
+        )
+
+    @staticmethod
+    def _upsert_scope_meta_locked(
+        conn: sqlite3.Connection,
+        scope_params: tuple[str, str, str],
+        scope_revision: int,
+        undo_cursor: int,
+        max_seq: int,
+        now_ts: int,
+    ) -> None:
+        conn.execute(
+            """
+            INSERT INTO drawing_scopes (
+                symbol, contract_id, pane_id, scope_revision,
+                undo_cursor, max_seq, updated_at_utc
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT (symbol, contract_id, pane_id) DO UPDATE SET
+                scope_revision = excluded.scope_revision,
+                undo_cursor = excluded.undo_cursor,
+                max_seq = excluded.max_seq,
+                updated_at_utc = excluded.updated_at_utc
+            """,
+            (*scope_params, scope_revision, undo_cursor, max_seq, now_ts),
+        )
+
+    def _list_drawings_scope_sync(
+        self,
+        symbol: str,
+        *,
+        contract_id: str | None = None,
+        pane_id: str | None = None,
+    ) -> DrawingScopeSnapshot:
+        scope_params = self._normalize_drawing_scope_params(symbol, contract_id, pane_id)
+        clean_symbol, contract_scope, pane_scope = scope_params
+        with self._lock:
+            conn = self._ensure_conn_locked()
+            scope_rev, undo_cursor, max_seq = self._read_scope_meta_locked(conn, scope_params)
+            can_undo = self._has_undo_row_locked(conn, scope_params, undo_cursor)
+            can_redo = self._has_redo_row_locked(conn, scope_params, undo_cursor, max_seq)
+            drawings = self._list_scope_drawings_locked(conn, scope_params)
+        return DrawingScopeSnapshot(
+            symbol=clean_symbol,
+            contract_id=contract_scope or None,
+            pane_id=pane_scope or None,
+            scope_revision=scope_rev,
+            can_undo=can_undo,
+            can_redo=can_redo,
+            drawings=drawings,
+        )
+
+    async def list_drawings_scope(
+        self,
+        symbol: str,
+        *,
+        contract_id: str | None = None,
+        pane_id: str | None = None,
+    ) -> DrawingScopeSnapshot:
+        """Return persisted drawings and scope revision metadata for a target scope."""
+        return await asyncio.to_thread(
+            self._list_drawings_scope_sync,
+            symbol,
+            contract_id=contract_id,
+            pane_id=pane_id,
+        )
+
+    def _execute_drawing_command_sync(
+        self,
+        *,
+        symbol: str,
+        contract_id: str | None,
+        pane_id: str | None,
+        expected_revision: int,
+        command_type: str,
+        actor: Literal["user", "agent"],
+        operations: Sequence[Mapping[str, Any]],
+        request_fingerprint: str,
+        idempotency_key: str | None = None,
+        merge_validator: Callable[[str, Mapping[str, Any], Mapping[str, Any]], dict[str, Any]]
+        | None = None,
+    ) -> DrawingCommandExecutionResult:
+        scope_params = self._normalize_drawing_scope_params(symbol, contract_id, pane_id)
+        clean_symbol, contract_scope, pane_scope = scope_params
+        safe_expected = _validate_sqlite_int64(expected_revision, "expected_revision")
+        if safe_expected < 0:
+            raise ValueError("expected_revision must be >= 0")
+        if actor not in _VALID_DRAWING_ACTORS:
+            raise ValueError(f"Invalid actor: {actor!r}")
+        clean_idem = self._validate_idempotency_key_value(idempotency_key)
+        clean_fp = _validate_non_empty_str(request_fingerprint, "request_fingerprint")
+        now_ts = self._now_utc()
+
+        with self._lock:
+            conn = self._ensure_conn_locked()
+            try:
+                self._begin_tx(conn)
+                cached = self._check_idempotency_locked(conn, scope_params, clean_idem, clean_fp)
+                if cached is not None:
+                    conn.rollback()
+                    return cached
+
+                current_rev, undo_cursor, max_seq = self._read_scope_meta_locked(
+                    conn, scope_params
+                )
+                if safe_expected != current_rev:
+                    raise RevisionConflictError(current_rev, safe_expected)
+
+                existing_records = self._list_scope_drawings_locked(conn, scope_params)
+                current_map: dict[str, dict[str, Any]] = {
+                    rec.id: self._drawing_record_to_dict(rec) for rec in existing_records
+                }
+
+                if command_type == "clear":
+                    if not current_map:
+                        result = DrawingCommandExecutionResult(
+                            symbol=clean_symbol,
+                            contract_id=contract_scope or None,
+                            pane_id=pane_scope or None,
+                            scope_revision=current_rev,
+                            command_type="clear",
+                            can_undo=self._has_undo_row_locked(conn, scope_params, undo_cursor),
+                            can_redo=self._has_redo_row_locked(
+                                conn, scope_params, undo_cursor, max_seq
+                            ),
+                            deduplicated=False,
+                            changed=False,
+                            affected_ids=[],
+                            drawings=[],
+                        )
+                        self._store_idempotency_locked(
+                            conn, scope_params, clean_idem, clean_fp, result, now_ts
+                        )
+                        conn.commit()
+                        return result
+
+                    before_snapshots = [current_map[did] for did in current_map]
+                    after_snapshots: list[dict[str, Any]] = []
+                    affected_ids = list(current_map.keys())
+                    new_rev = current_rev + 1
+                    new_seq = undo_cursor + 1
+                    conn.execute(
+                        """
+                        DELETE FROM drawings
+                        WHERE symbol = ? AND contract_id = ? AND pane_id = ?
+                        """,
+                        scope_params,
+                    )
+                else:
+                    if not operations:
+                        raise ValueError("Drawing command requires at least one operation")
+                    new_rev = current_rev + 1
+                    new_seq = undo_cursor + 1
+                    working_map: dict[str, dict[str, Any]] = dict(current_map)
+                    touched_ids: list[str] = []
+                    seen_touched: set[str] = set()
+
+                    def _mark_touched(target_id: str) -> None:
+                        if target_id not in seen_touched:
+                            seen_touched.add(target_id)
+                            touched_ids.append(target_id)
+
+                    for op in operations:
+                        action = str(op["action"])
+                        if action == "create":
+                            spec = op["drawing"]
+                            did = self._validate_drawing_id_value(str(spec["id"]))
+                            if did in working_map:
+                                raise DrawingConflictError(did)
+                            obj_actor = spec.get("created_by") or actor
+                            if obj_actor not in _VALID_DRAWING_ACTORS:
+                                raise ValueError(f"Invalid created_by: {obj_actor!r}")
+                            working_map[did] = {
+                                "id": did,
+                                "revision": new_rev,
+                                "type": str(spec["type"]),
+                                "symbol": clean_symbol,
+                                "contract_id": contract_scope or None,
+                                "pane_id": pane_scope or None,
+                                "created_by": obj_actor,
+                                "source_bar_refs": [int(x) for x in spec["source_bar_refs"]],
+                                "coordinates": dict(spec["coordinates"]),
+                                "style": dict(spec["style"]),
+                                "metadata": dict(spec["metadata"]),
+                                "created_at_utc": now_ts,
+                                "updated_at_utc": now_ts,
+                            }
+                            _mark_touched(did)
+                        elif action == "update":
+                            did = self._validate_drawing_id_value(str(op["drawing_id"]))
+                            if did not in working_map:
+                                raise DrawingNotFoundError(did)
+                            prev_obj = working_map[did]
+                            patch = op["drawing"]
+                            if merge_validator is not None:
+                                merged_spec = merge_validator(did, prev_obj, patch)
+                            else:
+                                merged_spec = {
+                                    "type": patch.get("type", prev_obj["type"]),
+                                    "coordinates": patch.get(
+                                        "coordinates", prev_obj["coordinates"]
+                                    ),
+                                    "source_bar_refs": patch.get(
+                                        "source_bar_refs", prev_obj["source_bar_refs"]
+                                    ),
+                                    "style": patch.get("style", prev_obj["style"]),
+                                    "metadata": patch.get("metadata", prev_obj["metadata"]),
+                                }
+                            working_map[did] = {
+                                "id": did,
+                                "revision": new_rev,
+                                "type": str(merged_spec["type"]),
+                                "symbol": clean_symbol,
+                                "contract_id": contract_scope or None,
+                                "pane_id": pane_scope or None,
+                                "created_by": prev_obj["created_by"],
+                                "source_bar_refs": [int(x) for x in merged_spec["source_bar_refs"]],
+                                "coordinates": dict(merged_spec["coordinates"]),
+                                "style": dict(merged_spec["style"]),
+                                "metadata": dict(merged_spec["metadata"]),
+                                "created_at_utc": int(prev_obj["created_at_utc"]),
+                                "updated_at_utc": now_ts,
+                            }
+                            _mark_touched(did)
+                        elif action == "delete":
+                            did = self._validate_drawing_id_value(str(op["drawing_id"]))
+                            if did not in working_map:
+                                raise DrawingNotFoundError(did)
+                            del working_map[did]
+                            _mark_touched(did)
+                        else:
+                            raise ValueError(f"Unsupported drawing operation action: {action!r}")
+
+                    if len(working_map) > MAX_DRAWINGS_PER_SCOPE:
+                        raise ScopeLimitError(MAX_DRAWINGS_PER_SCOPE, len(working_map))
+
+                    before_snapshots = [
+                        current_map[did] for did in touched_ids if did in current_map
+                    ]
+                    after_snapshots = [
+                        working_map[did] for did in touched_ids if did in working_map
+                    ]
+                    affected_ids = touched_ids
+
+                    for did in touched_ids:
+                        if did in current_map and did not in working_map:
+                            conn.execute(
+                                """
+                                DELETE FROM drawings
+                                WHERE symbol = ? AND contract_id = ? AND pane_id = ? AND id = ?
+                                """,
+                                (*scope_params, did),
+                            )
+                        elif did in working_map:
+                            self._upsert_drawing_locked(conn, scope_params, working_map[did])
+
+                conn.execute(
+                    """
+                    DELETE FROM drawing_history
+                    WHERE symbol = ? AND contract_id = ? AND pane_id = ? AND seq > ?
+                    """,
+                    (*scope_params, undo_cursor),
+                )
+                conn.execute(
+                    """
+                    INSERT INTO drawing_history (
+                        symbol, contract_id, pane_id, seq, command_type,
+                        actor, before_json, after_json, created_at_utc
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        *scope_params,
+                        new_seq,
+                        command_type,
+                        actor,
+                        json.dumps(before_snapshots, allow_nan=False, separators=(",", ":")),
+                        json.dumps(after_snapshots, allow_nan=False, separators=(",", ":")),
+                        now_ts,
+                    ),
+                )
+                if new_seq > MAX_UNDO_HISTORY:
+                    min_keep_seq = new_seq - MAX_UNDO_HISTORY + 1
+                    conn.execute(
+                        """
+                        DELETE FROM drawing_history
+                        WHERE symbol = ? AND contract_id = ? AND pane_id = ? AND seq < ?
+                        """,
+                        (*scope_params, min_keep_seq),
+                    )
+                self._upsert_scope_meta_locked(
+                    conn, scope_params, new_rev, new_seq, new_seq, now_ts
+                )
+                final_drawings = self._list_scope_drawings_locked(conn, scope_params)
+                result = DrawingCommandExecutionResult(
+                    symbol=clean_symbol,
+                    contract_id=contract_scope or None,
+                    pane_id=pane_scope or None,
+                    scope_revision=new_rev,
+                    command_type=command_type,
+                    can_undo=True,
+                    can_redo=False,
+                    deduplicated=False,
+                    changed=True,
+                    affected_ids=affected_ids,
+                    drawings=final_drawings,
+                )
+                self._store_idempotency_locked(
+                    conn, scope_params, clean_idem, clean_fp, result, now_ts
+                )
+                conn.commit()
+                return result
+            except BaseException:
+                if conn.in_transaction:
+                    conn.rollback()
+                raise
+
+    async def execute_drawing_command(
+        self,
+        *,
+        symbol: str,
+        contract_id: str | None,
+        pane_id: str | None,
+        expected_revision: int,
+        command_type: str,
+        actor: Literal["user", "agent"],
+        operations: Sequence[Mapping[str, Any]],
+        request_fingerprint: str,
+        idempotency_key: str | None = None,
+        merge_validator: Callable[[str, Mapping[str, Any], Mapping[str, Any]], dict[str, Any]]
+        | None = None,
+    ) -> DrawingCommandExecutionResult:
+        """Atomically execute a drawing command with idempotency, OCC, and Undo history."""
+        return await asyncio.to_thread(
+            self._execute_drawing_command_sync,
+            symbol=symbol,
+            contract_id=contract_id,
+            pane_id=pane_id,
+            expected_revision=expected_revision,
+            command_type=command_type,
+            actor=actor,
+            operations=operations,
+            request_fingerprint=request_fingerprint,
+            idempotency_key=idempotency_key,
+            merge_validator=merge_validator,
+        )
+
+    def _undo_drawing_command_sync(
+        self,
+        *,
+        symbol: str,
+        contract_id: str | None,
+        pane_id: str | None,
+        expected_revision: int,
+        actor: Literal["user", "agent"],
+        request_fingerprint: str,
+        idempotency_key: str | None = None,
+    ) -> DrawingCommandExecutionResult:
+        scope_params = self._normalize_drawing_scope_params(symbol, contract_id, pane_id)
+        clean_symbol, contract_scope, pane_scope = scope_params
+        safe_expected = _validate_sqlite_int64(expected_revision, "expected_revision")
+        if safe_expected < 0:
+            raise ValueError("expected_revision must be >= 0")
+        if actor not in _VALID_DRAWING_ACTORS:
+            raise ValueError(f"Invalid actor: {actor!r}")
+        clean_idem = self._validate_idempotency_key_value(idempotency_key)
+        clean_fp = _validate_non_empty_str(request_fingerprint, "request_fingerprint")
+        now_ts = self._now_utc()
+
+        with self._lock:
+            conn = self._ensure_conn_locked()
+            try:
+                self._begin_tx(conn)
+                cached = self._check_idempotency_locked(conn, scope_params, clean_idem, clean_fp)
+                if cached is not None:
+                    conn.rollback()
+                    return cached
+
+                current_rev, undo_cursor, max_seq = self._read_scope_meta_locked(
+                    conn, scope_params
+                )
+                if safe_expected != current_rev:
+                    raise RevisionConflictError(current_rev, safe_expected)
+
+                if undo_cursor <= 0:
+                    raise NothingToUndoError("Nothing to undo in this drawing scope")
+                history_row = conn.execute(
+                    """
+                    SELECT before_json, after_json
+                    FROM drawing_history
+                    WHERE symbol = ? AND contract_id = ? AND pane_id = ? AND seq = ?
+                    """,
+                    (*scope_params, undo_cursor),
+                ).fetchone()
+                if history_row is None:
+                    raise NothingToUndoError("Nothing to undo in this drawing scope")
+
+                before_objs: list[dict[str, Any]] = json.loads(str(history_row["before_json"]))
+                after_objs: list[dict[str, Any]] = json.loads(str(history_row["after_json"]))
+                before_by_id = {str(obj["id"]): obj for obj in before_objs}
+                after_by_id = {str(obj["id"]): obj for obj in after_objs}
+
+                existing_count_row = conn.execute(
+                    """
+                    SELECT COUNT(*) AS cnt FROM drawings
+                    WHERE symbol = ? AND contract_id = ? AND pane_id = ?
+                    """,
+                    scope_params,
+                ).fetchone()
+                existing_count = int(existing_count_row["cnt"]) if existing_count_row else 0
+                deletes_count = sum(1 for oid in after_by_id if oid not in before_by_id)
+                inserts_count = sum(1 for oid in before_by_id if oid not in after_by_id)
+                projected_count = existing_count - deletes_count + inserts_count
+                if projected_count > MAX_DRAWINGS_PER_SCOPE:
+                    raise ScopeLimitError(MAX_DRAWINGS_PER_SCOPE, projected_count)
+
+                new_rev = current_rev + 1
+                for oid in after_by_id:
+                    if oid not in before_by_id:
+                        conn.execute(
+                            """
+                            DELETE FROM drawings
+                            WHERE symbol = ? AND contract_id = ? AND pane_id = ? AND id = ?
+                            """,
+                            (*scope_params, oid),
+                        )
+                for obj in before_objs:
+                    restored = dict(obj)
+                    restored["revision"] = new_rev
+                    restored["updated_at_utc"] = now_ts
+                    self._upsert_drawing_locked(conn, scope_params, restored)
+
+                prev_row = conn.execute(
+                    """
+                    SELECT MAX(seq) AS prev_seq
+                    FROM drawing_history
+                    WHERE symbol = ? AND contract_id = ? AND pane_id = ? AND seq < ?
+                    """,
+                    (*scope_params, undo_cursor),
+                ).fetchone()
+                new_cursor = (
+                    int(prev_row["prev_seq"])
+                    if prev_row is not None and prev_row["prev_seq"] is not None
+                    else 0
+                )
+                self._upsert_scope_meta_locked(
+                    conn, scope_params, new_rev, new_cursor, max_seq, now_ts
+                )
+                affected_ids = list(
+                    dict.fromkeys(
+                        [
+                            *(str(o["id"]) for o in before_objs),
+                            *(str(o["id"]) for o in after_objs),
+                        ]
+                    )
+                )
+                final_drawings = self._list_scope_drawings_locked(conn, scope_params)
+                result = DrawingCommandExecutionResult(
+                    symbol=clean_symbol,
+                    contract_id=contract_scope or None,
+                    pane_id=pane_scope or None,
+                    scope_revision=new_rev,
+                    command_type="undo",
+                    can_undo=self._has_undo_row_locked(conn, scope_params, new_cursor),
+                    can_redo=self._has_redo_row_locked(conn, scope_params, new_cursor, max_seq),
+                    deduplicated=False,
+                    changed=True,
+                    affected_ids=affected_ids,
+                    drawings=final_drawings,
+                )
+                self._store_idempotency_locked(
+                    conn, scope_params, clean_idem, clean_fp, result, now_ts
+                )
+                conn.commit()
+                return result
+            except BaseException:
+                if conn.in_transaction:
+                    conn.rollback()
+                raise
+
+    async def undo_drawing_command(
+        self,
+        *,
+        symbol: str,
+        contract_id: str | None,
+        pane_id: str | None,
+        expected_revision: int,
+        actor: Literal["user", "agent"],
+        request_fingerprint: str,
+        idempotency_key: str | None = None,
+    ) -> DrawingCommandExecutionResult:
+        """Atomically undo the latest drawing command in scope with OCC and idempotency."""
+        return await asyncio.to_thread(
+            self._undo_drawing_command_sync,
+            symbol=symbol,
+            contract_id=contract_id,
+            pane_id=pane_id,
+            expected_revision=expected_revision,
+            actor=actor,
+            request_fingerprint=request_fingerprint,
+            idempotency_key=idempotency_key,
+        )
+
+    def _redo_drawing_command_sync(
+        self,
+        *,
+        symbol: str,
+        contract_id: str | None,
+        pane_id: str | None,
+        expected_revision: int,
+        actor: Literal["user", "agent"],
+        request_fingerprint: str,
+        idempotency_key: str | None = None,
+    ) -> DrawingCommandExecutionResult:
+        scope_params = self._normalize_drawing_scope_params(symbol, contract_id, pane_id)
+        clean_symbol, contract_scope, pane_scope = scope_params
+        safe_expected = _validate_sqlite_int64(expected_revision, "expected_revision")
+        if safe_expected < 0:
+            raise ValueError("expected_revision must be >= 0")
+        if actor not in _VALID_DRAWING_ACTORS:
+            raise ValueError(f"Invalid actor: {actor!r}")
+        clean_idem = self._validate_idempotency_key_value(idempotency_key)
+        clean_fp = _validate_non_empty_str(request_fingerprint, "request_fingerprint")
+        now_ts = self._now_utc()
+
+        with self._lock:
+            conn = self._ensure_conn_locked()
+            try:
+                self._begin_tx(conn)
+                cached = self._check_idempotency_locked(conn, scope_params, clean_idem, clean_fp)
+                if cached is not None:
+                    conn.rollback()
+                    return cached
+
+                current_rev, undo_cursor, max_seq = self._read_scope_meta_locked(
+                    conn, scope_params
+                )
+                if safe_expected != current_rev:
+                    raise RevisionConflictError(current_rev, safe_expected)
+
+                if undo_cursor >= max_seq:
+                    raise NothingToRedoError("Nothing to redo in this drawing scope")
+                history_row = conn.execute(
+                    """
+                    SELECT seq, before_json, after_json
+                    FROM drawing_history
+                    WHERE symbol = ? AND contract_id = ? AND pane_id = ? AND seq > ?
+                    ORDER BY seq ASC
+                    LIMIT 1
+                    """,
+                    (*scope_params, undo_cursor),
+                ).fetchone()
+                if history_row is None:
+                    raise NothingToRedoError("Nothing to redo in this drawing scope")
+
+                target_seq = int(history_row["seq"])
+                before_objs: list[dict[str, Any]] = json.loads(str(history_row["before_json"]))
+                after_objs: list[dict[str, Any]] = json.loads(str(history_row["after_json"]))
+                before_by_id = {str(obj["id"]): obj for obj in before_objs}
+                after_by_id = {str(obj["id"]): obj for obj in after_objs}
+
+                existing_count_row = conn.execute(
+                    """
+                    SELECT COUNT(*) AS cnt FROM drawings
+                    WHERE symbol = ? AND contract_id = ? AND pane_id = ?
+                    """,
+                    scope_params,
+                ).fetchone()
+                existing_count = int(existing_count_row["cnt"]) if existing_count_row else 0
+                deletes_count = sum(1 for oid in before_by_id if oid not in after_by_id)
+                inserts_count = sum(1 for oid in after_by_id if oid not in before_by_id)
+                projected_count = existing_count - deletes_count + inserts_count
+                if projected_count > MAX_DRAWINGS_PER_SCOPE:
+                    raise ScopeLimitError(MAX_DRAWINGS_PER_SCOPE, projected_count)
+
+                new_rev = current_rev + 1
+                for oid in before_by_id:
+                    if oid not in after_by_id:
+                        conn.execute(
+                            """
+                            DELETE FROM drawings
+                            WHERE symbol = ? AND contract_id = ? AND pane_id = ? AND id = ?
+                            """,
+                            (*scope_params, oid),
+                        )
+                for obj in after_objs:
+                    reapplied = dict(obj)
+                    reapplied["revision"] = new_rev
+                    reapplied["updated_at_utc"] = now_ts
+                    self._upsert_drawing_locked(conn, scope_params, reapplied)
+
+                self._upsert_scope_meta_locked(
+                    conn, scope_params, new_rev, target_seq, max_seq, now_ts
+                )
+                affected_ids = list(
+                    dict.fromkeys(
+                        [
+                            *(str(o["id"]) for o in before_objs),
+                            *(str(o["id"]) for o in after_objs),
+                        ]
+                    )
+                )
+                final_drawings = self._list_scope_drawings_locked(conn, scope_params)
+                result = DrawingCommandExecutionResult(
+                    symbol=clean_symbol,
+                    contract_id=contract_scope or None,
+                    pane_id=pane_scope or None,
+                    scope_revision=new_rev,
+                    command_type="redo",
+                    can_undo=True,
+                    can_redo=self._has_redo_row_locked(conn, scope_params, target_seq, max_seq),
+                    deduplicated=False,
+                    changed=True,
+                    affected_ids=affected_ids,
+                    drawings=final_drawings,
+                )
+                self._store_idempotency_locked(
+                    conn, scope_params, clean_idem, clean_fp, result, now_ts
+                )
+                conn.commit()
+                return result
+            except BaseException:
+                if conn.in_transaction:
+                    conn.rollback()
+                raise
+
+    async def redo_drawing_command(
+        self,
+        *,
+        symbol: str,
+        contract_id: str | None,
+        pane_id: str | None,
+        expected_revision: int,
+        actor: Literal["user", "agent"],
+        request_fingerprint: str,
+        idempotency_key: str | None = None,
+    ) -> DrawingCommandExecutionResult:
+        """Atomically redo the next undone drawing command in scope with OCC and idempotency."""
+        return await asyncio.to_thread(
+            self._redo_drawing_command_sync,
+            symbol=symbol,
+            contract_id=contract_id,
+            pane_id=pane_id,
+            expected_revision=expected_revision,
+            actor=actor,
+            request_fingerprint=request_fingerprint,
+            idempotency_key=idempotency_key,
+        )

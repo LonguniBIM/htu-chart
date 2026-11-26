@@ -470,9 +470,7 @@ class WsBroadcaster:
             if not session.queue.enqueue(payload):
                 self._schedule_slow_disconnect(session, "resync_required: queue overflow")
 
-    def publish_feed_status(self, status_payload: dict[str, Any]) -> None:
-        """Broadcast feed telemetry status non-blockingly to all connected clients."""
-        payload = {"type": "feed_status", **status_payload}
+    def _broadcast_all(self, payload: dict[str, Any]) -> None:
         for session in list(self._clients.values()):
             if not self._is_session_valid(session):
                 self._schedule_slow_disconnect(
@@ -485,6 +483,10 @@ class WsBroadcaster:
             if not session.queue.enqueue(payload):
                 self._schedule_slow_disconnect(session, "resync_required: queue overflow")
 
+    def publish_feed_status(self, status_payload: dict[str, Any]) -> None:
+        """Broadcast feed telemetry status non-blockingly to all connected clients."""
+        self._broadcast_all({"type": "feed_status", **status_payload})
+
     def publish_resync_required(
         self,
         reason: str,
@@ -492,22 +494,18 @@ class WsBroadcaster:
         contract_id: str | None = None,
     ) -> None:
         """Notify connected clients that a resync/backfill refresh is required."""
-        payload: dict[str, Any] = {
-            "type": "resync_required",
-            "reason": reason,
-            "contract_id": contract_id,
-        }
-        for session in list(self._clients.values()):
-            if not self._is_session_valid(session):
-                self._schedule_slow_disconnect(
-                    session,
-                    "Session expired or revoked",
-                    code=1008,
-                    count_as_slow=False,
-                )
-                continue
-            if not session.queue.enqueue(payload):
-                self._schedule_slow_disconnect(session, "resync_required: queue overflow")
+        self._broadcast_all(
+            {
+                "type": "resync_required",
+                "reason": reason,
+                "contract_id": contract_id,
+            }
+        )
+
+    def publish_drawings_update(self, payload: dict[str, Any]) -> None:
+        """Broadcast a drawings_update snapshot non-blockingly to all connected clients."""
+        clean_payload = {k: v for k, v in payload.items() if k != "type"}
+        self._broadcast_all({"type": "drawings_update", **clean_payload})
 
     async def close_all(self) -> None:
         """Cleanly disconnect all clients and await background teardown tasks."""

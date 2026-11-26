@@ -15,7 +15,7 @@ from fastapi import FastAPI, Request, status
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
-from app.api import routes_alerts, routes_layout, routes_market, routes_status
+from app.api import routes_alerts, routes_drawings, routes_layout, routes_market, routes_status
 from app.config import Settings, load_settings
 from app.engine.alert_engine import AlertEngine
 from app.engine.bar_aggregator import BarAggregator
@@ -28,6 +28,7 @@ from app.security import (
     redact_secrets,
 )
 from app.services.alert_service import AlertService
+from app.services.command_service import CommandService
 from app.services.history_service import HistoryBackfillService
 from app.services.live_feed_service import LiveFeedService
 from app.services.ws_broadcaster import WsBroadcaster
@@ -143,6 +144,7 @@ def create_app(
             supported_timeframes=bar_aggregator.timeframes,
             max_clients=resolved_settings.ws_max_clients,
         )
+        command_service = CommandService(sqlite_store, broadcaster=ws_broadcaster)
         signalr_hub = SignalRMarketHub(
             resolved_settings,
             auth_service=auth_service,
@@ -189,6 +191,7 @@ def create_app(
         app_instance.state.login_guard = login_guard
         app_instance.state.bar_aggregator = bar_aggregator
         app_instance.state.ws_broadcaster = ws_broadcaster
+        app_instance.state.command_service = command_service
         app_instance.state.signalr_hub = signalr_hub
         app_instance.state.alert_engine = alert_engine
         app_instance.state.telegram_client = telegram_notifier
@@ -265,6 +268,7 @@ def create_app(
 
     application.include_router(routes_status.router)
     application.include_router(routes_alerts.router)
+    application.include_router(routes_drawings.router)
     application.include_router(routes_layout.router)
     application.include_router(routes_market.router)
     application.include_router(routes_market.ws_router)
