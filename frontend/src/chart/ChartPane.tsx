@@ -185,6 +185,41 @@ export function ChartPane({
   const hasLoadedTargetKeyRef = useRef<string>("");
   const snapshotRetryCountRef = useRef<number>(0);
   const retryCancelRef = useRef<(() => void) | null>(null);
+  const suppressRangeEchoRef = useRef(false);
+  const suppressRangeRafRef = useRef<number | null>(null);
+
+  const cancelPendingRangeSuppressionRaf = useCallback(() => {
+    if (suppressRangeRafRef.current !== null) {
+      if (typeof cancelAnimationFrame === "function") {
+        cancelAnimationFrame(suppressRangeRafRef.current);
+      }
+      suppressRangeRafRef.current = null;
+    }
+  }, []);
+
+  const runProgrammaticVisibleRange = useCallback(
+    (apply: () => void) => {
+      cancelPendingRangeSuppressionRaf();
+      suppressRangeEchoRef.current = true;
+      try {
+        apply();
+      } catch {
+        suppressRangeEchoRef.current = false;
+        return;
+      }
+      if (suppressRangeEchoRef.current) {
+        if (typeof requestAnimationFrame === "function") {
+          suppressRangeRafRef.current = requestAnimationFrame(() => {
+            suppressRangeRafRef.current = null;
+            suppressRangeEchoRef.current = false;
+          });
+        } else {
+          suppressRangeEchoRef.current = false;
+        }
+      }
+    },
+    [cancelPendingRangeSuppressionRaf],
+  );
 
   const [loadStatus, setLoadStatus] = useState<string>("idle");
   const [barsQuality, setBarsQuality] = useState<BarsQuality | null>(null);
@@ -336,6 +371,11 @@ export function ChartPane({
 
     const timeScale = chart.timeScale();
     const handleVisibleTimeRangeChange = (range: IRange<Time> | null) => {
+      if (suppressRangeEchoRef.current) {
+        suppressRangeEchoRef.current = false;
+        cancelPendingRangeSuppressionRaf();
+        return;
+      }
       if (
         range !== null &&
         typeof range.from === "number" &&
@@ -363,6 +403,8 @@ export function ChartPane({
     resizeObserver.observe(container);
 
     return () => {
+      cancelPendingRangeSuppressionRaf();
+      suppressRangeEchoRef.current = false;
       resizeObserver.disconnect();
       chart.unsubscribeCrosshairMove(handleCrosshair);
       chart.unsubscribeClick(handleClick);
@@ -376,7 +418,7 @@ export function ChartPane({
       latestBarRef.current = null;
       lastBarTimeRef.current = null;
     };
-  }, []);
+  }, [cancelPendingRangeSuppressionRaf]);
 
   useEffect(() => {
     if (syncController === undefined) {
@@ -421,11 +463,9 @@ export function ChartPane({
         if (chart === null) {
           return;
         }
-        try {
+        runProgrammaticVisibleRange(() => {
           chart.timeScale().setVisibleRange(range);
-        } catch {
-          // Ignore when chart has insufficient data for visible range
-        }
+        });
       },
       centerOnTime: (time) => {
         const chart = chartRef.current;
@@ -452,18 +492,16 @@ export function ChartPane({
           halfSpan = computeFallbackHalfSpan(barsRef.current);
         }
         const center = Number(time);
-        try {
+        runProgrammaticVisibleRange(() => {
           chart.timeScale().setVisibleRange({
             from: (center - halfSpan) as UTCTimestamp,
             to: (center + halfSpan) as UTCTimestamp,
           });
-        } catch {
-          // Ignore when chart has no data
-        }
+        });
       },
     };
     return syncController.registerPane(handle);
-  }, [pane.pane_id, syncController]);
+  }, [pane.pane_id, runProgrammaticVisibleRange, syncController]);
 
   useEffect(() => {
     const resolvedContractId = contractId?.trim() ?? "";

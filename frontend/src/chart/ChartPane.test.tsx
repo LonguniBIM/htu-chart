@@ -1565,4 +1565,300 @@ describe("ChartPane (F06, P1-R3-01, P1-R3-02)", () => {
     visibleRangeHandlers[0]!({ from: 900, to: 1200 });
     expect(peerHandle.applyVisibleTimeRange).toHaveBeenCalledWith({ from: 900, to: 1200 });
   });
+
+  it("suppresses async next-frame visibleTimeRangeChange echo after applyVisibleTimeRange without blocking subsequent user pan/zoom (P1-001)", async () => {
+    /**
+     * Contract: When applyVisibleTimeRange invokes setVisibleRange and the chart asynchronously
+     * emits subscribeVisibleTimeRangeChange on the next animation frame (e.g. timeframe-adjusted
+     * range), ChartPane suppresses the echo so it never bounces back to the source pane, while
+     * subsequent user pan/zoom events still propagate.
+     * Defect caught: Lightweight Charts v5 async InvalidateMask echo bypassing LayoutSyncController's synchronous guard.
+     */
+    let nextId = 1;
+    const rafCallbacks = new Map<number, FrameRequestCallback>();
+    const rafMock = vi.fn((cb: FrameRequestCallback) => {
+      const id = nextId++;
+      rafCallbacks.set(id, cb);
+      return id;
+    });
+    const cafMock = vi.fn((id: number) => {
+      rafCallbacks.delete(id);
+    });
+    vi.stubGlobal("requestAnimationFrame", rafMock);
+    vi.stubGlobal("cancelAnimationFrame", cafMock);
+
+    const initialFetch = createDeferred<BarsResponse>();
+    fetchBarsMock.mockReturnValueOnce(initialFetch.promise);
+
+    const coordinator = new PaneFetchCoordinator();
+    const fakeWs = createFakeWsClient();
+    const syncController = new LayoutSyncController({
+      symbol: false,
+      interval: false,
+      crosshair: false,
+      time: false,
+      dateRange: true,
+    });
+    const sourcePane = {
+      paneId: "pane-2",
+      applyCrosshairTime: vi.fn(),
+      applyVisibleTimeRange: vi.fn(),
+      centerOnTime: vi.fn(),
+    };
+    syncController.registerPane(sourcePane);
+
+    const pane: PaneConfig = {
+      pane_id: "pane-1",
+      root_symbol: "MES",
+      timeframe: "5m",
+      live_mode: false,
+      playback_mode: "live",
+    };
+
+    render(
+      <ChartPane
+        pane={pane}
+        contractId="CON.F.US.MES.H26"
+        activeFeedLive={false}
+        wsClient={fakeWs.client}
+        coordinator={coordinator}
+        syncController={syncController}
+      />,
+    );
+
+    await act(async () => {
+      initialFetch.resolve(
+        makeBarsResponse("CON.F.US.MES.H26", [makeBar(1000, 5000), makeBar(1600, 5025)]),
+      );
+      await initialFetch.promise;
+    });
+
+    setVisibleRangeMock.mockImplementationOnce((range) => {
+      requestAnimationFrame(() => {
+        for (const handler of visibleRangeHandlers) {
+          handler({ from: range.from - 60, to: range.to + 60 });
+        }
+      });
+    });
+
+    syncController.onVisibleTimeRangeChange("pane-2", {
+      from: 1000 as never,
+      to: 1600 as never,
+    });
+    expect(setVisibleRangeMock).toHaveBeenCalledWith({ from: 1000, to: 1600 });
+    expect(sourcePane.applyVisibleTimeRange).not.toHaveBeenCalled();
+
+    const frameEntries = Array.from(rafCallbacks.entries());
+    rafCallbacks.clear();
+    for (const [, cb] of frameEntries) {
+      cb(16);
+    }
+
+    expect(sourcePane.applyVisibleTimeRange).not.toHaveBeenCalled();
+    expect(cafMock).toHaveBeenCalledTimes(1);
+
+    // Subsequent user pan/zoom propagates normally
+    visibleRangeHandlers[0]!({ from: 1100, to: 1500 });
+    expect(sourcePane.applyVisibleTimeRange).toHaveBeenCalledTimes(1);
+    expect(sourcePane.applyVisibleTimeRange).toHaveBeenCalledWith({ from: 1100, to: 1500 });
+  });
+
+  it("suppresses async next-frame visibleTimeRangeChange after centerOnTime when both time and dateRange sync are enabled (P1-001)", async () => {
+    /**
+     * Contract: When both time and dateRange sync are enabled, an async next-frame
+     * visibleTimeRangeChange emitted after centerOnTime is suppressed and does not trigger
+     * a dateRange broadcast back to sourcePane.
+     * Defect caught: centerOnTime triggering an async dateRange feedback broadcast after activeTimeSource clears.
+     */
+    let nextId = 1;
+    const rafCallbacks = new Map<number, FrameRequestCallback>();
+    vi.stubGlobal(
+      "requestAnimationFrame",
+      vi.fn((cb: FrameRequestCallback) => {
+        const id = nextId++;
+        rafCallbacks.set(id, cb);
+        return id;
+      }),
+    );
+    vi.stubGlobal(
+      "cancelAnimationFrame",
+      vi.fn((id: number) => {
+        rafCallbacks.delete(id);
+      }),
+    );
+
+    const initialFetch = createDeferred<BarsResponse>();
+    fetchBarsMock.mockReturnValueOnce(initialFetch.promise);
+
+    const coordinator = new PaneFetchCoordinator();
+    const fakeWs = createFakeWsClient();
+    const syncController = new LayoutSyncController({
+      symbol: false,
+      interval: false,
+      crosshair: false,
+      time: true,
+      dateRange: true,
+    });
+    const sourcePane = {
+      paneId: "pane-2",
+      applyCrosshairTime: vi.fn(),
+      applyVisibleTimeRange: vi.fn(),
+      centerOnTime: vi.fn(),
+    };
+    syncController.registerPane(sourcePane);
+
+    const pane: PaneConfig = {
+      pane_id: "pane-1",
+      root_symbol: "MES",
+      timeframe: "5m",
+      live_mode: false,
+      playback_mode: "live",
+    };
+
+    render(
+      <ChartPane
+        pane={pane}
+        contractId="CON.F.US.MES.H26"
+        activeFeedLive={false}
+        wsClient={fakeWs.client}
+        coordinator={coordinator}
+        syncController={syncController}
+      />,
+    );
+
+    await act(async () => {
+      initialFetch.resolve(
+        makeBarsResponse("CON.F.US.MES.H26", [
+          makeBar(1000, 5000),
+          makeBar(1300, 5012),
+          makeBar(1600, 5025),
+        ]),
+      );
+      await initialFetch.promise;
+    });
+
+    setVisibleRangeMock.mockImplementationOnce((range) => {
+      requestAnimationFrame(() => {
+        for (const handler of visibleRangeHandlers) {
+          handler(range);
+        }
+      });
+    });
+
+    syncController.onTimeClick("pane-2", 1300 as never);
+    expect(setVisibleRangeMock).toHaveBeenCalledWith({ from: 1000, to: 1600 });
+
+    const frameEntries = Array.from(rafCallbacks.entries());
+    rafCallbacks.clear();
+    for (const [, cb] of frameEntries) {
+      cb(16);
+    }
+
+    expect(sourcePane.applyVisibleTimeRange).not.toHaveBeenCalled();
+
+    // Subsequent user pan/zoom propagates normally
+    visibleRangeHandlers[0]!({ from: 1050, to: 1550 });
+    expect(sourcePane.applyVisibleTimeRange).toHaveBeenCalledTimes(1);
+    expect(sourcePane.applyVisibleTimeRange).toHaveBeenCalledWith({ from: 1050, to: 1550 });
+  });
+
+  it("resets echo suppression on the next animation frame when setVisibleRange is a no-op and cancels pending rAF on unmount (P1-001)", async () => {
+    /**
+     * Contract: When setVisibleRange fires no visibleTimeRangeChange callback (e.g. identical
+     * range no-op), the scheduled animation frame resets suppression so subsequent user pan/zoom
+     * propagates, and unmounting cancels any pending suppression rAF.
+     * Defect caught: Stuck suppressRangeEchoRef swallowing future user pan/zoom after a no-op range update.
+     */
+    let nextId = 1;
+    const rafCallbacks = new Map<number, FrameRequestCallback>();
+    const cafMock = vi.fn((id: number) => {
+      rafCallbacks.delete(id);
+    });
+    vi.stubGlobal(
+      "requestAnimationFrame",
+      vi.fn((cb: FrameRequestCallback) => {
+        const id = nextId++;
+        rafCallbacks.set(id, cb);
+        return id;
+      }),
+    );
+    vi.stubGlobal("cancelAnimationFrame", cafMock);
+
+    const initialFetch = createDeferred<BarsResponse>();
+    fetchBarsMock.mockReturnValueOnce(initialFetch.promise);
+
+    const coordinator = new PaneFetchCoordinator();
+    const fakeWs = createFakeWsClient();
+    const syncController = new LayoutSyncController({
+      symbol: false,
+      interval: false,
+      crosshair: false,
+      time: false,
+      dateRange: true,
+    });
+    const sourcePane = {
+      paneId: "pane-2",
+      applyCrosshairTime: vi.fn(),
+      applyVisibleTimeRange: vi.fn(),
+      centerOnTime: vi.fn(),
+    };
+    syncController.registerPane(sourcePane);
+
+    const pane: PaneConfig = {
+      pane_id: "pane-1",
+      root_symbol: "MES",
+      timeframe: "5m",
+      live_mode: false,
+      playback_mode: "live",
+    };
+
+    const { unmount } = render(
+      <ChartPane
+        pane={pane}
+        contractId="CON.F.US.MES.H26"
+        activeFeedLive={false}
+        wsClient={fakeWs.client}
+        coordinator={coordinator}
+        syncController={syncController}
+      />,
+    );
+
+    await act(async () => {
+      initialFetch.resolve(
+        makeBarsResponse("CON.F.US.MES.H26", [makeBar(1000, 5000), makeBar(1600, 5025)]),
+      );
+      await initialFetch.promise;
+    });
+
+    // No-op setVisibleRange: no visibleRangeHandlers callback fired
+    syncController.onVisibleTimeRangeChange("pane-2", {
+      from: 1000 as never,
+      to: 1600 as never,
+    });
+    expect(setVisibleRangeMock).toHaveBeenCalledTimes(1);
+    expect(rafCallbacks.size).toBe(1);
+
+    // Flush the next animation frame -> clears suppression
+    const frameEntries = Array.from(rafCallbacks.entries());
+    rafCallbacks.clear();
+    for (const [, cb] of frameEntries) {
+      cb(16);
+    }
+    expect(rafCallbacks.size).toBe(0);
+
+    // Subsequent user pan/zoom now propagates
+    visibleRangeHandlers[0]!({ from: 1200, to: 1500 });
+    expect(sourcePane.applyVisibleTimeRange).toHaveBeenCalledTimes(1);
+    expect(sourcePane.applyVisibleTimeRange).toHaveBeenCalledWith({ from: 1200, to: 1500 });
+
+    // Pending rAF from another no-op update is cancelled cleanly on unmount
+    syncController.onVisibleTimeRangeChange("pane-2", {
+      from: 1000 as never,
+      to: 1600 as never,
+    });
+    expect(rafCallbacks.size).toBe(1);
+    unmount();
+    expect(cafMock).toHaveBeenCalledTimes(1);
+    expect(rafCallbacks.size).toBe(0);
+  });
 });
