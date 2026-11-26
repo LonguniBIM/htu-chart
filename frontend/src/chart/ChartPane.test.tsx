@@ -15,7 +15,7 @@ import type {
   WsResyncRequiredMessage,
   WsSubscribedMessage,
 } from "../api/types";
-import type { MarketWsClient } from "../api/wsClient";
+import type { MarketWsClient, WsConnectionState } from "../api/wsClient";
 import { LayoutSyncController } from "../layout/syncController";
 import { buildDrawingScopeKey, useDrawingStore } from "../store/drawingStore";
 import { ChartPane } from "./ChartPane";
@@ -220,6 +220,7 @@ function createFakeWsClient() {
   const barListeners = new Set<(msg: WsBarUpdateMessage) => void>();
   const resyncListeners = new Set<(msg: WsResyncRequiredMessage) => void>();
   const subscribedListeners = new Set<(msg: WsSubscribedMessage) => void>();
+  const connectionStateListeners = new Set<(state: WsConnectionState) => void>();
   const subscribe = vi.fn<(contractId: string, timeframe: Timeframe) => () => void>(
     () => vi.fn(),
   );
@@ -244,6 +245,12 @@ function createFakeWsClient() {
         subscribedListeners.delete(listener);
       };
     },
+    onConnectionState: (listener: (state: WsConnectionState) => void) => {
+      connectionStateListeners.add(listener);
+      return () => {
+        connectionStateListeners.delete(listener);
+      };
+    },
   };
 
   return {
@@ -262,6 +269,11 @@ function createFakeWsClient() {
     emitResyncRequired: (msg: WsResyncRequiredMessage) => {
       for (const listener of resyncListeners) {
         listener(msg);
+      }
+    },
+    emitConnectionState: (state: WsConnectionState) => {
+      for (const listener of connectionStateListeners) {
+        listener(state);
       }
     },
   };
@@ -3144,5 +3156,243 @@ describe("ChartPane (F06, P1-R3-01, P1-R3-02)", () => {
         },
       },
     });
+  });
+
+  it("keeps suppressTimeClickRef armed across mid-gesture WS revision and Escape cancellations, then syncs on fresh empty click (P1-002)", async () => {
+    /**
+     * Contract: When pointerdown hits a drawing (< 5px deadzone) and a concurrent WS revision bump
+     * or Escape cancellation clears dragRef/selection before pointerup + Lightweight Charts click,
+     * the trailing click must NOT trigger Time-sync centerOnTime; a subsequent empty-plot click DOES sync.
+     * Defect caught: Mid-gesture cancellation resetting suppressTimeClickRef prematurely and causing unintended Time sync jump.
+     */
+    const bars = [
+      { time: 1700000000, open: 5000, high: 5012, low: 4996, close: 5005, volume: 25, is_closed: true },
+      { time: 1700000300, open: 5005, high: 5020, low: 5002, close: 5015, volume: 30, is_closed: true },
+    ];
+    const hlineDrawing = {
+      id: "hl-time-suppress",
+      revision: 1,
+      type: "hline" as const,
+      symbol: "MES" as const,
+      contract_id: "CON.F.US.MES.H26",
+      pane_id: "pane-1",
+      created_by: "user" as const,
+      source_bar_refs: [],
+      coordinates: { anchors: [{ role: "level", time: 1700000000, price: 5000 }] },
+      style: {},
+      metadata: {},
+      created_at_utc: 1700000000,
+      updated_at_utc: 1700000000,
+    };
+
+    fetchBarsMock.mockResolvedValue(makeBarsResponse("CON.F.US.MES.H26", bars));
+    fetchDrawingsMock.mockResolvedValue({
+      symbol: "MES",
+      contract_id: "CON.F.US.MES.H26",
+      pane_id: "pane-1",
+      instrument: { root_symbol: "MES", name: "MES", exchange: "CME", tick_size: 0.25, tick_value: 1.25, currency: "USD" },
+      scope_revision: 1,
+      can_undo: false,
+      can_redo: false,
+      drawings: [hlineDrawing],
+    });
+
+    const syncController = new LayoutSyncController({
+      symbol: false,
+      interval: false,
+      crosshair: false,
+      time: true,
+      dateRange: false,
+    });
+    const peerCenterOnTime = vi.fn();
+    syncController.registerPane({
+      paneId: "pane-peer",
+      applyCrosshairTime: vi.fn(),
+      applyVisibleTimeRange: vi.fn(),
+      centerOnTime: peerCenterOnTime,
+    });
+    const onTimeClickSpy = vi.spyOn(syncController, "onTimeClick");
+
+    const coordinator = new PaneFetchCoordinator();
+    const fakeWs = createFakeWsClient();
+    const pane: PaneConfig = {
+      pane_id: "pane-1",
+      root_symbol: "MES",
+      timeframe: "5m",
+      live_mode: false,
+      playback_mode: "live",
+    };
+
+    render(
+      <ChartPane
+        pane={pane}
+        contractId="CON.F.US.MES.H26"
+        activeFeedLive={false}
+        wsClient={fakeWs.client}
+        coordinator={coordinator}
+        syncController={syncController}
+      />,
+    );
+
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    const canvas = document.querySelector(".chart-pane__canvas") as HTMLElement;
+    vi.spyOn(canvas, "getBoundingClientRect").mockReturnValue({
+      left: 0,
+      top: 0,
+      right: 600,
+      bottom: 400,
+      width: 600,
+      height: 400,
+      x: 0,
+      y: 0,
+      toJSON: () => ({}),
+    });
+
+    // Case A: pointerdown hits hline (y=200), < 5px move, WS bumps revision 1 -> 2 mid-gesture
+    act(() => {
+      fireEvent.pointerDown(canvas, { clientX: 160, clientY: 200, button: 0, pointerType: "mouse", pointerId: 1 });
+      fireEvent.pointerMove(canvas, { clientX: 161, clientY: 201, button: 0, pointerType: "mouse", pointerId: 1 });
+      useDrawingStore.getState().applyWsDrawingsUpdate({
+        type: "drawings_update",
+        symbol: "MES",
+        contract_id: "CON.F.US.MES.H26",
+        pane_id: "pane-1",
+        scope_revision: 2,
+        command_type: "update",
+        can_undo: true,
+        can_redo: false,
+        drawings: [{ ...hlineDrawing, revision: 2 }],
+      });
+      fireEvent.pointerUp(canvas, { clientX: 161, clientY: 201, button: 0, pointerType: "mouse", pointerId: 1 });
+      for (const handler of clickHandlers) {
+        handler({ time: 1700000000 });
+      }
+    });
+    expect(onTimeClickSpy).not.toHaveBeenCalled();
+    expect(peerCenterOnTime).not.toHaveBeenCalled();
+
+    // Case B: pointerdown hits hline again, simulated Escape clears selection mid-gesture (< 5px) before pointerup + click
+    const scopeTarget = { symbol: "MES" as const, contractId: "CON.F.US.MES.H26", paneId: "pane-1" };
+    act(() => {
+      fireEvent.pointerDown(canvas, { clientX: 160, clientY: 200, button: 0, pointerType: "mouse", pointerId: 2 });
+      useDrawingStore.getState().setSelectedDrawing(scopeTarget, null);
+      fireEvent.pointerUp(canvas, { clientX: 160, clientY: 200, button: 0, pointerType: "mouse", pointerId: 2 });
+      for (const handler of clickHandlers) {
+        handler({ time: 1700000000 });
+      }
+    });
+    expect(onTimeClickSpy).not.toHaveBeenCalled();
+    expect(peerCenterOnTime).not.toHaveBeenCalled();
+
+    // Fresh empty-plot click (y=60 misses hline at y=200) resets suppressTimeClickRef and triggers Time sync
+    act(() => {
+      fireEvent.pointerDown(canvas, { clientX: 160, clientY: 60, button: 0, pointerType: "mouse", pointerId: 3 });
+      fireEvent.pointerUp(canvas, { clientX: 160, clientY: 60, button: 0, pointerType: "mouse", pointerId: 3 });
+      for (const handler of clickHandlers) {
+        handler({ time: 1700000000 });
+      }
+    });
+    expect(onTimeClickSpy).toHaveBeenCalledTimes(1);
+    expect(onTimeClickSpy).toHaveBeenCalledWith("pane-1", 1700000000);
+    expect(peerCenterOnTime).toHaveBeenCalledTimes(1);
+    expect(peerCenterOnTime).toHaveBeenCalledWith(1700000000);
+  });
+
+  it("re-syncs drawing scope when /ws/market transitions to connected even on historical-only 3m panes (P2-INIT-001)", async () => {
+    /**
+     * Contract: Historical-only panes (e.g. 3m, !canSubscribeWs) do not receive subscribed ACKs,
+     * so ChartPane subscribes to wsClient.onConnectionState and re-runs loadScope() when WS enters
+     * 'connected', closing any pre-handshake drawings_update race.
+     * Defect caught: Stale drawings on 3m panes when another client/agent mutates before WS handshake completes.
+     */
+    const bars = [
+      { time: 1700000000, open: 5000, high: 5012, low: 4996, close: 5005, volume: 25, is_closed: true },
+    ];
+    fetchBarsMock.mockResolvedValue({
+      ...makeBarsResponse("CON.F.US.MES.H26", bars),
+      timeframe: "3m",
+    });
+    fetchDrawingsMock
+      .mockResolvedValueOnce({
+        symbol: "MES",
+        contract_id: "CON.F.US.MES.H26",
+        pane_id: "pane-3m",
+        instrument: { root_symbol: "MES", name: "MES", exchange: "CME", tick_size: 0.25, tick_value: 1.25, currency: "USD" },
+        scope_revision: 1,
+        can_undo: false,
+        can_redo: false,
+        drawings: [],
+      })
+      .mockResolvedValueOnce({
+        symbol: "MES",
+        contract_id: "CON.F.US.MES.H26",
+        pane_id: "pane-3m",
+        instrument: { root_symbol: "MES", name: "MES", exchange: "CME", tick_size: 0.25, tick_value: 1.25, currency: "USD" },
+        scope_revision: 2,
+        can_undo: true,
+        can_redo: false,
+        drawings: [
+          {
+            id: "hl-missed-handshake",
+            revision: 1,
+            type: "hline",
+            symbol: "MES",
+            contract_id: "CON.F.US.MES.H26",
+            pane_id: "pane-3m",
+            created_by: "agent",
+            source_bar_refs: [],
+            coordinates: { anchors: [{ role: "level", time: 1700000000, price: 5002 }] },
+            style: {},
+            metadata: {},
+            created_at_utc: 1700000000,
+            updated_at_utc: 1700000000,
+          },
+        ],
+      });
+
+    const coordinator = new PaneFetchCoordinator();
+    const fakeWs = createFakeWsClient();
+    const pane: PaneConfig = {
+      pane_id: "pane-3m",
+      root_symbol: "MES",
+      timeframe: "3m",
+      live_mode: false,
+      playback_mode: "live",
+    };
+
+    render(
+      <ChartPane
+        pane={pane}
+        contractId="CON.F.US.MES.H26"
+        activeFeedLive={false}
+        wsClient={fakeWs.client}
+        coordinator={coordinator}
+      />,
+    );
+
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    const scopeKey = buildDrawingScopeKey("MES", "CON.F.US.MES.H26", "pane-3m");
+    expect(fetchDrawingsMock).toHaveBeenCalledTimes(1);
+    expect(useDrawingStore.getState().scopes[scopeKey]?.scopeRevision).toBe(1);
+
+    await act(async () => {
+      fakeWs.emitConnectionState("connected");
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(fetchDrawingsMock).toHaveBeenCalledTimes(2);
+    expect(useDrawingStore.getState().scopes[scopeKey]?.scopeRevision).toBe(2);
+    expect(useDrawingStore.getState().scopes[scopeKey]?.drawings.map((d) => d.id)).toEqual([
+      "hl-missed-handshake",
+    ]);
   });
 });

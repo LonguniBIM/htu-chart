@@ -995,7 +995,6 @@ export function ChartPane({
         !sameDrawingRevision
       ) {
         dragRef.current = null;
-        suppressTimeClickRef.current = false;
         restoreChartInteraction();
         syncOverlayPrimitive(null);
       }
@@ -1076,7 +1075,6 @@ export function ChartPane({
       placementStartPxRef.current = null;
       draftGestureStartedInPlotRef.current = false;
       draftPlacementPointerIdRef.current = null;
-      suppressTimeClickRef.current = false;
       setDraftState(null);
       syncOverlayPrimitive(null);
       chartRef.current?.applyOptions({ handleScroll: true, handleScale: true });
@@ -1116,6 +1114,21 @@ export function ChartPane({
       paneId: pane.pane_id,
     });
   }, [pane.pane_id, pane.root_symbol, resyncNonce, resolvedContractIdForScope]);
+
+  useEffect(() => {
+    if (!resolvedContractIdForScope || typeof wsClient.onConnectionState !== "function") {
+      return;
+    }
+    return wsClient.onConnectionState((state) => {
+      if (state === "connected") {
+        void useDrawingStore.getState().loadScope({
+          symbol: pane.root_symbol,
+          contractId: resolvedContractIdForScope,
+          paneId: pane.pane_id,
+        });
+      }
+    });
+  }, [pane.pane_id, pane.root_symbol, resolvedContractIdForScope, wsClient]);
 
   useEffect(() => {
     if (syncController === undefined) {

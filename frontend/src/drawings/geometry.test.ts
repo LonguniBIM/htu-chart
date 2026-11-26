@@ -21,7 +21,12 @@ function makeBar(time: number, open: number, high: number, low: number, close: n
   return { time, open, high, low, close, volume: 100, is_closed: true };
 }
 
-function makeFakeTimeScale(bars: readonly OhlcvBar[], pxPerBar = 10, originX = 100): TimeScaleCoordinateApi {
+function makeFakeTimeScale(
+  bars: readonly OhlcvBar[],
+  pxPerBar = 10,
+  originX = 100,
+  snapMode: "continuous" | "round" | "ceil" | "floor" = "continuous",
+): TimeScaleCoordinateApi {
   const indexByTime = new Map<number, number>();
   bars.forEach((b, i) => indexByTime.set(b.time, i));
   return {
@@ -38,7 +43,19 @@ function makeFakeTimeScale(bars: readonly OhlcvBar[], pxPerBar = 10, originX = 1
       return null;
     },
     logicalToCoordinate: (logical) => (originX + Number(logical) * pxPerBar) as Coordinate,
-    coordinateToLogical: (x) => ((x - originX) / pxPerBar) as Logical,
+    coordinateToLogical: (x) => {
+      const raw = (x - originX) / pxPerBar;
+      if (snapMode === "round") {
+        return Math.round(raw) as Logical;
+      }
+      if (snapMode === "ceil") {
+        return Math.ceil(raw) as Logical;
+      }
+      if (snapMode === "floor") {
+        return Math.floor(raw) as Logical;
+      }
+      return raw as Logical;
+    },
   };
 }
 
@@ -112,6 +129,18 @@ describe("drawing geometry and domain math (Phase 4 Part 2)", () => {
     expect(timeToX(1700010800, timeScale, bars1h, 3600)).toBe(220);
     // Round-trip xToTime from future margin
     expect(xToTime(220, timeScale, bars1h, 3600)).toBe(1700010800);
+
+    // Lightweight Charts v5 snapped integer coordinateToLogical (round/ceil/floor) still recovers continuous fractional time
+    for (const snapMode of ["round", "ceil", "floor"] as const) {
+      const snappedScale = makeFakeTimeScale(bars1h, 40, 100, snapMode);
+      expect(timeToX(1700000900, snappedScale, bars1h, 3600)).toBe(110);
+      expect(xToTime(110, snappedScale, bars1h, 3600)).toBe(1700000900);
+      expect(timeToX(1700000900, snappedScale, bars1h, 3600)).toBe(110);
+
+      // Fractional future whitespace (logical 3.25 => x = 230 => 1700011700)
+      expect(xToTime(230, snappedScale, bars1h, 3600)).toBe(1700011700);
+      expect(timeToX(1700011700, snappedScale, bars1h, 3600)).toBe(230);
+    }
   });
 
   it("computes exact 50% FVG midpoint, Position R:R/ticks/$ metrics, and Measure metrics", () => {

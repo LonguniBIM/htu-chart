@@ -217,40 +217,94 @@ export function xToTime(
   if (typeof timeScale.coordinateToLogical === "function" && bars.length > 0) {
     const logical = timeScale.coordinateToLogical(x);
     if (logical !== null && Number.isFinite(logical)) {
-      const numLogical = Number(logical);
-      const lastIdx = bars.length - 1;
-      const nearestIdx = Math.round(numLogical);
-      if (
-        nearestIdx >= 0 &&
-        nearestIdx <= lastIdx &&
-        Math.abs(numLogical - nearestIdx) <= 1e-6
-      ) {
-        return Math.max(MIN_DRAWING_TIMESTAMP_SEC, Math.round(bars[nearestIdx]!.time));
-      }
-      let resolvedTime: number;
-      if (numLogical < 0) {
-        const leftStep =
-          timeframeSec > 0
-            ? timeframeSec
-            : bars.length >= 2
-              ? Math.max(1, bars[1]!.time - bars[0]!.time)
-              : 60;
-        resolvedTime = bars[0]!.time + numLogical * leftStep;
-      } else if (numLogical > lastIdx) {
-        const rightStep =
-          timeframeSec > 0
-            ? timeframeSec
-            : bars.length >= 2
-              ? Math.max(1, bars[lastIdx]!.time - bars[lastIdx - 1]!.time)
-              : 60;
-        resolvedTime = bars[lastIdx]!.time + (numLogical - lastIdx) * rightStep;
+      const rawLogical = Number(logical);
+      let continuousLogical: number | null = null;
+      if (Math.abs(rawLogical - Math.round(rawLogical)) > 1e-6) {
+        continuousLogical = rawLogical;
       } else {
-        const leftIdx = Math.floor(numLogical);
-        const frac = numLogical - leftIdx;
-        resolvedTime =
-          bars[leftIdx]!.time + frac * (bars[leftIdx + 1]!.time - bars[leftIdx]!.time);
+        const k = Math.round(rawLogical);
+        if (typeof timeScale.logicalToCoordinate === "function") {
+          const kCoord = timeScale.logicalToCoordinate(k as Logical);
+          if (kCoord !== null && Number.isFinite(kCoord)) {
+            const kx = Number(kCoord);
+            const dx = x - kx;
+            if (Math.abs(dx) <= 1e-6) {
+              continuousLogical = k;
+            } else {
+              const nextCoord = timeScale.logicalToCoordinate((k + 1) as Logical);
+              const prevCoord = timeScale.logicalToCoordinate((k - 1) as Logical);
+              const nextSpacing =
+                nextCoord !== null && Number.isFinite(nextCoord) && Number(nextCoord) > kx
+                  ? Number(nextCoord) - kx
+                  : 0;
+              const prevSpacing =
+                prevCoord !== null && Number.isFinite(prevCoord) && kx > Number(prevCoord)
+                  ? kx - Number(prevCoord)
+                  : 0;
+              const barSpacing =
+                dx > 0
+                  ? nextSpacing > 0
+                    ? nextSpacing
+                    : prevSpacing
+                  : prevSpacing > 0
+                    ? prevSpacing
+                    : nextSpacing;
+              continuousLogical = barSpacing > 0 ? k + dx / barSpacing : k;
+            }
+          } else if (
+            k >= 0 &&
+            k < bars.length &&
+            typeof timeScale.timeToCoordinate === "function"
+          ) {
+            const barCoord = timeScale.timeToCoordinate(bars[k]!.time as Time);
+            if (
+              barCoord !== null &&
+              Number.isFinite(barCoord) &&
+              Math.abs(Number(barCoord) - x) <= 0.5
+            ) {
+              return Math.max(MIN_DRAWING_TIMESTAMP_SEC, Math.round(bars[k]!.time));
+            }
+          }
+        } else {
+          continuousLogical = k;
+        }
       }
-      return Math.max(MIN_DRAWING_TIMESTAMP_SEC, Math.round(resolvedTime));
+
+      if (continuousLogical !== null) {
+        const lastIdx = bars.length - 1;
+        const nearestIdx = Math.round(continuousLogical);
+        if (
+          nearestIdx >= 0 &&
+          nearestIdx <= lastIdx &&
+          Math.abs(continuousLogical - nearestIdx) <= 1e-6
+        ) {
+          return Math.max(MIN_DRAWING_TIMESTAMP_SEC, Math.round(bars[nearestIdx]!.time));
+        }
+        let resolvedTime: number;
+        if (continuousLogical < 0) {
+          const leftStep =
+            timeframeSec > 0
+              ? timeframeSec
+              : bars.length >= 2
+                ? Math.max(1, bars[1]!.time - bars[0]!.time)
+                : 60;
+          resolvedTime = bars[0]!.time + continuousLogical * leftStep;
+        } else if (continuousLogical > lastIdx) {
+          const rightStep =
+            timeframeSec > 0
+              ? timeframeSec
+              : bars.length >= 2
+                ? Math.max(1, bars[lastIdx]!.time - bars[lastIdx - 1]!.time)
+                : 60;
+          resolvedTime = bars[lastIdx]!.time + (continuousLogical - lastIdx) * rightStep;
+        } else {
+          const leftIdx = Math.floor(continuousLogical);
+          const frac = continuousLogical - leftIdx;
+          resolvedTime =
+            bars[leftIdx]!.time + frac * (bars[leftIdx + 1]!.time - bars[leftIdx]!.time);
+        }
+        return Math.max(MIN_DRAWING_TIMESTAMP_SEC, Math.round(resolvedTime));
+      }
     }
   }
   if (typeof timeScale.coordinateToTime === "function") {

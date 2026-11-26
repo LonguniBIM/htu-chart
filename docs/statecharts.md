@@ -169,7 +169,7 @@ stateDiagram-v2
 ```mermaid
 stateDiagram-v2
     [*] --> UNINITIALIZED: "New scope (symbol, contractId, paneId)"
-    UNINITIALIZED --> LOADING: "loadScope() on target ready or resyncNonce"
+    UNINITIALIZED --> LOADING: "loadScope() on target ready, resyncNonce, or wsClient.onConnectionState('connected')"
     UNINITIALIZED --> READY: "wsClient.onDrawingsUpdate arrives first"
     LOADING --> READY: "GET 200 (preserves newer local scopeRevision)"
     LOADING --> LOGIN_GATE: "401/403 on matching sessionEpoch -> onAuthError"
