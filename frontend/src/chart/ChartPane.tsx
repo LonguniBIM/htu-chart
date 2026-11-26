@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState, type CSSProperties } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties } from "react";
 import {
   CandlestickSeries,
   ColorType,
@@ -27,7 +27,27 @@ import {
   type Timeframe,
 } from "../api/types";
 import type { MarketWsClient } from "../api/wsClient";
+import { DrawingsOverlayPrimitive } from "../drawings/DrawingsOverlayPrimitive";
+import {
+  MIN_DRAWING_TIMESTAMP_SEC,
+  TIMEFRAME_SECONDS,
+  clampPositionAnchors,
+  snapPriceToTick,
+  snapToNearestOhlc,
+  xToTime,
+} from "../drawings/geometry";
+import {
+  INSTRUMENT_SPECS,
+  type DrawingAnchor,
+  type DrawingDraft,
+  type DrawingRecord,
+} from "../drawings/types";
 import type { ChartPaneSyncHandle, LayoutSyncController } from "../layout/syncController";
+import {
+  buildDrawingScopeKey,
+  useDrawingStore,
+  type DrawingScopeTarget,
+} from "../store/drawingStore";
 import {
   PaneFetchCoordinator,
   appendBoundedWsBar,
@@ -187,6 +207,20 @@ export function ChartPane({
   const retryCancelRef = useRef<(() => void) | null>(null);
   const suppressRangeEchoRef = useRef(false);
   const suppressRangeRafRef = useRef<number | null>(null);
+  const primitiveRef = useRef<DrawingsOverlayPrimitive | null>(null);
+  const suppressTimeClickRef = useRef(false);
+  const draftRef = useRef<DrawingDraft | null>(null);
+  const placementStartPxRef = useRef<{ px: number; py: number } | null>(null);
+  const dragRef = useRef<{
+    drawingId: string;
+    originalDrawing: DrawingRecord;
+    anchorRole: string | null;
+    startTime: number;
+    startPrice: number;
+    currentAnchors: DrawingAnchor[];
+    hasMoved: boolean;
+  } | null>(null);
+  const [draftState, setDraftState] = useState<DrawingDraft | null>(null);
 
   const cancelPendingRangeSuppressionRaf = useCallback(() => {
     if (suppressRangeRafRef.current !== null) {
@@ -246,6 +280,75 @@ export function ChartPane({
   const onAuthErrorRef = useRef(onAuthError);
   onAuthErrorRef.current = onAuthError;
 
+  const resolvedContractIdForScope = contractId?.trim() ? contractId.trim().toUpperCase() : "";
+  const drawingScope: DrawingScopeTarget | null = resolvedContractIdForScope
+    ? {
+        symbol: pane.root_symbol,
+        contractId: resolvedContractIdForScope,
+        paneId: pane.pane_id,
+      }
+    : null;
+  const drawingScopeKey =
+    drawingScope !== null
+      ? buildDrawingScopeKey(drawingScope.symbol, drawingScope.contractId, drawingScope.paneId)
+      : "";
+
+  const activeTool = useDrawingStore((s) => s.activeTool);
+  const scopeDrawingState = useDrawingStore((s) =>
+    drawingScopeKey ? s.scopes[drawingScopeKey] : undefined,
+  );
+  const selectedDrawingId = useDrawingStore((s) =>
+    drawingScopeKey ? (s.selectedByScope[drawingScopeKey] ?? null) : null,
+  );
+  const persistedDrawings = useMemo(
+    () => scopeDrawingState?.drawings ?? [],
+    [scopeDrawingState?.drawings],
+  );
+
+  const drawingScopeRef = useRef<DrawingScopeTarget | null>(drawingScope);
+  drawingScopeRef.current = drawingScope;
+  const persistedDrawingsRef = useRef<readonly DrawingRecord[]>(persistedDrawings);
+  persistedDrawingsRef.current = persistedDrawings;
+  const selectedDrawingIdRef = useRef<string | null>(selectedDrawingId);
+  selectedDrawingIdRef.current = selectedDrawingId;
+
+  const syncOverlayPrimitive = useCallback((nextDraft?: DrawingDraft | null) => {
+    const primitive = primitiveRef.current;
+    if (primitive === null) {
+      return;
+    }
+    const activeDrag = dragRef.current;
+    const overrideDrawing =
+      activeDrag !== null
+        ? {
+            ...activeDrag.originalDrawing,
+            coordinates: { anchors: activeDrag.currentAnchors },
+          }
+        : null;
+    const scope = drawingScopeRef.current;
+    const storeState = useDrawingStore.getState();
+    const scopeKey =
+      scope !== null
+        ? buildDrawingScopeKey(scope.symbol, scope.contractId, scope.paneId)
+        : "";
+    const drawings = scopeKey
+      ? (storeState.scopes[scopeKey]?.drawings ?? persistedDrawingsRef.current)
+      : persistedDrawingsRef.current;
+    const selectedId = scopeKey
+      ? (storeState.selectedByScope[scopeKey] ?? null)
+      : selectedDrawingIdRef.current;
+
+    primitive.setData({
+      drawings,
+      selectedDrawingId: selectedId,
+      draft: nextDraft !== undefined ? nextDraft : draftRef.current,
+      overrideDrawing,
+      bars: barsRef.current,
+      timeframeSec: TIMEFRAME_SECONDS[timeframeRef.current],
+      instrumentSpec: INSTRUMENT_SPECS[symbolRef.current],
+    });
+  }, []);
+
   const applyLiveBarUpdate = useCallback((bar: OhlcvBar) => {
     if (lastBarTimeRef.current !== null && bar.time < lastBarTimeRef.current) {
       return;
@@ -272,6 +375,7 @@ export function ChartPane({
     }
     latestBarRef.current = bar;
     lastBarTimeRef.current = bar.time;
+    syncOverlayPrimitive();
     if (legendRef.current !== null) {
       legendRef.current.textContent = formatLegendText(
         symbolRef.current,
@@ -279,7 +383,7 @@ export function ChartPane({
         bar,
       );
     }
-  }, []);
+  }, [syncOverlayPrimitive]);
 
   useEffect(() => {
     const container = containerRef.current;
@@ -331,6 +435,13 @@ export function ChartPane({
     candleSeriesRef.current = candleSeries;
     volumeSeriesRef.current = volumeSeries;
 
+    const primitive = new DrawingsOverlayPrimitive();
+    primitive.setViewportWidth(Math.max(container.clientWidth, 240));
+    primitiveRef.current = primitive;
+    if (typeof candleSeries.attachPrimitive === "function") {
+      candleSeries.attachPrimitive(primitive);
+    }
+
     const handleCrosshair = (param: MouseEventParams<Time>) => {
       const legendEl = legendRef.current;
       if (legendEl !== null) {
@@ -363,11 +474,357 @@ export function ChartPane({
     chart.subscribeCrosshairMove(handleCrosshair);
 
     const handleClick = (param: MouseEventParams<Time>) => {
+      if (
+        suppressTimeClickRef.current ||
+        useDrawingStore.getState().activeTool !== "cursor" ||
+        dragRef.current !== null ||
+        draftRef.current !== null
+      ) {
+        suppressTimeClickRef.current = false;
+        return;
+      }
       if (typeof param.time === "number") {
         syncControllerRef.current?.onTimeClick(paneIdRef.current, param.time as UTCTimestamp);
       }
     };
     chart.subscribeClick(handleClick);
+
+    const resolveChartPoint = (
+      clientX: number,
+      clientY: number,
+    ): { px: number; py: number; time: number; price: number } | null => {
+      const rect = container.getBoundingClientRect();
+      const px = clientX - rect.left;
+      const py = clientY - rect.top;
+      if (!Number.isFinite(px) || !Number.isFinite(py)) {
+        return null;
+      }
+      if (typeof candleSeries.coordinateToPrice !== "function") {
+        return null;
+      }
+      const rawPrice = candleSeries.coordinateToPrice(py);
+      if (rawPrice === null || !Number.isFinite(rawPrice) || rawPrice <= 0) {
+        return null;
+      }
+      const tfSec = TIMEFRAME_SECONDS[timeframeRef.current];
+      const rawTime = xToTime(px, chart.timeScale(), barsRef.current, tfSec);
+      if (rawTime === null) {
+        return null;
+      }
+      const tickSize = INSTRUMENT_SPECS[symbolRef.current].tickSize;
+      const snapped = useDrawingStore.getState().magnetEnabled
+        ? snapToNearestOhlc(rawTime, Number(rawPrice), barsRef.current, tickSize)
+        : {
+            time: Math.max(MIN_DRAWING_TIMESTAMP_SEC, Math.round(rawTime)),
+            price: snapPriceToTick(Number(rawPrice), tickSize),
+          };
+      return {
+        px,
+        py,
+        time: Math.max(MIN_DRAWING_TIMESTAMP_SEC, Math.round(snapped.time)),
+        price: Math.max(tickSize, snapped.price),
+      };
+    };
+
+    const finalizeTwoPointTool = (
+      scope: DrawingScopeTarget,
+      draft: DrawingDraft,
+      endPoint: { time: number; price: number },
+    ) => {
+      const start = draft.anchors[0]!;
+      let endTime = endPoint.time;
+      const endPrice = endPoint.price;
+      const tfSec = TIMEFRAME_SECONDS[timeframeRef.current];
+      if (draft.tool === "ray" && start.time === endTime && start.price === endPrice) {
+        endTime = start.time + Math.max(1, tfSec);
+      }
+      const metadata: Record<string, unknown> = {};
+      if (draft.tool === "fvg_box" && draft.fvgPreset !== undefined && draft.fvgPreset !== "auto") {
+        metadata.direction = draft.fvgPreset;
+      }
+      if (draft.tool === "order_block") {
+        metadata.extend_right = draft.extendRight ?? true;
+        metadata.label = "OB";
+      }
+      draftRef.current = null;
+      placementStartPxRef.current = null;
+      setDraftState(null);
+      useDrawingStore.getState().setActiveTool("cursor");
+      void useDrawingStore.getState().createDrawing(scope, {
+        type: draft.tool,
+        coordinates: {
+          anchors: [
+            { role: "start", time: start.time, price: start.price },
+            { role: "end", time: endTime, price: endPrice },
+          ],
+        },
+        ...(Object.keys(metadata).length > 0 ? { metadata } : {}),
+      });
+    };
+
+    const restoreChartInteraction = () => {
+      chart.applyOptions({ handleScroll: true, handleScale: true });
+    };
+
+    const releasePointerSafely = (pointerId: number) => {
+      try {
+        if (typeof container.releasePointerCapture === "function") {
+          container.releasePointerCapture(pointerId);
+        }
+      } catch {
+        // Ignore jsdom / synthetic pointer events without active capture
+      }
+    };
+
+    const handlePointerDown = (event: PointerEvent) => {
+      if (event.pointerType === "mouse" && event.button !== 0) {
+        return;
+      }
+      const scope = drawingScopeRef.current;
+      if (scope === null) {
+        return;
+      }
+      const pt = resolveChartPoint(event.clientX, event.clientY);
+      const storeState = useDrawingStore.getState();
+      const tool = storeState.activeTool;
+      const scopeKey = buildDrawingScopeKey(scope.symbol, scope.contractId, scope.paneId);
+      const liveDrawings = storeState.scopes[scopeKey]?.drawings ?? persistedDrawingsRef.current;
+      const liveSelectedId = storeState.selectedByScope[scopeKey] ?? null;
+
+      if (tool === "cursor") {
+        const rect = container.getBoundingClientRect();
+        const px = event.clientX - rect.left;
+        const py = event.clientY - rect.top;
+        const hit = primitive.hitTestAt(px, py);
+        if (hit === null) {
+          if (liveSelectedId !== null) {
+            storeState.setSelectedDrawing(scope, null);
+          }
+          return;
+        }
+        suppressTimeClickRef.current = true;
+        storeState.setSelectedDrawing(scope, hit.drawingId);
+        const targetDrawing = liveDrawings.find((d) => d.id === hit.drawingId);
+        if (targetDrawing === undefined || pt === null) {
+          return;
+        }
+        dragRef.current = {
+          drawingId: targetDrawing.id,
+          originalDrawing: targetDrawing,
+          anchorRole: hit.anchorRole,
+          startTime: pt.time,
+          startPrice: pt.price,
+          currentAnchors: targetDrawing.coordinates.anchors.map((a) => ({ ...a })),
+          hasMoved: false,
+        };
+        chart.applyOptions({ handleScroll: false, handleScale: false });
+        try {
+          if (typeof container.setPointerCapture === "function") {
+            container.setPointerCapture(event.pointerId);
+          }
+        } catch {
+          // Ignore jsdom / synthetic pointer events without active capture
+        }
+        return;
+      }
+
+      if (pt === null) {
+        return;
+      }
+      suppressTimeClickRef.current = true;
+      const tickSize = INSTRUMENT_SPECS[symbolRef.current].tickSize;
+      const tfSec = TIMEFRAME_SECONDS[timeframeRef.current];
+
+      if (tool === "hline") {
+        storeState.setActiveTool("cursor");
+        void storeState.createDrawing(scope, {
+          type: "hline",
+          coordinates: {
+            anchors: [{ role: "level", time: pt.time, price: pt.price }],
+          },
+        });
+        return;
+      }
+
+      if (tool === "long_position" || tool === "short_position") {
+        const widthTime = Math.max(tfSec * 5, 60);
+        const rawAnchors: DrawingAnchor[] =
+          tool === "long_position"
+            ? [
+                { role: "entry", time: pt.time, price: pt.price },
+                { role: "target", time: pt.time + widthTime, price: pt.price + tickSize * 20 },
+                {
+                  role: "stop",
+                  time: pt.time + widthTime,
+                  price: Math.max(tickSize, pt.price - tickSize * 10),
+                },
+              ]
+            : [
+                { role: "entry", time: pt.time, price: pt.price },
+                {
+                  role: "target",
+                  time: pt.time + widthTime,
+                  price: Math.max(tickSize, pt.price - tickSize * 20),
+                },
+                { role: "stop", time: pt.time + widthTime, price: pt.price + tickSize * 10 },
+              ];
+        const clampedAnchors = clampPositionAnchors(tool, rawAnchors, "entry", tickSize);
+        storeState.setActiveTool("cursor");
+        void storeState.createDrawing(scope, {
+          type: tool,
+          coordinates: { anchors: clampedAnchors },
+        });
+        return;
+      }
+
+      if (draftRef.current === null) {
+        const nextDraft: DrawingDraft = {
+          tool,
+          anchors: [
+            { role: "start", time: pt.time, price: pt.price },
+            { role: "end", time: pt.time, price: pt.price },
+          ],
+          fvgPreset: storeState.fvgPreset,
+          extendRight: storeState.obExtendRight,
+        };
+        draftRef.current = nextDraft;
+        placementStartPxRef.current = { px: pt.px, py: pt.py };
+        setDraftState(nextDraft);
+        syncOverlayPrimitive(nextDraft);
+        chart.applyOptions({ handleScroll: false, handleScale: false });
+        try {
+          if (typeof container.setPointerCapture === "function") {
+            container.setPointerCapture(event.pointerId);
+          }
+        } catch {
+          // Ignore jsdom / synthetic pointer events without active capture
+        }
+      } else {
+        finalizeTwoPointTool(scope, draftRef.current, pt);
+      }
+    };
+
+    const handlePointerMove = (event: PointerEvent) => {
+      const activeDrag = dragRef.current;
+      if (activeDrag !== null) {
+        const pt = resolveChartPoint(event.clientX, event.clientY);
+        if (pt === null) {
+          return;
+        }
+        const tickSize = INSTRUMENT_SPECS[symbolRef.current].tickSize;
+        const tfSec = TIMEFRAME_SECONDS[timeframeRef.current];
+        let nextAnchors: DrawingAnchor[];
+
+        if (activeDrag.anchorRole !== null) {
+          nextAnchors = activeDrag.originalDrawing.coordinates.anchors.map((a) =>
+            a.role === activeDrag.anchorRole
+              ? { ...a, time: pt.time, price: pt.price }
+              : { ...a },
+          );
+        } else {
+          const deltaTime = pt.time - activeDrag.startTime;
+          const deltaPrice = pt.price - activeDrag.startPrice;
+          nextAnchors = activeDrag.originalDrawing.coordinates.anchors.map((a) => ({
+            ...a,
+            time: Math.max(MIN_DRAWING_TIMESTAMP_SEC, Math.round(a.time + deltaTime)),
+            price: Math.max(tickSize, snapPriceToTick(a.price + deltaPrice, tickSize)),
+          }));
+        }
+
+        if (
+          activeDrag.originalDrawing.type === "long_position" ||
+          activeDrag.originalDrawing.type === "short_position"
+        ) {
+          const movedRole =
+            activeDrag.anchorRole === "entry" ||
+            activeDrag.anchorRole === "target" ||
+            activeDrag.anchorRole === "stop"
+              ? activeDrag.anchorRole
+              : "body";
+          nextAnchors = clampPositionAnchors(
+            activeDrag.originalDrawing.type,
+            nextAnchors,
+            movedRole,
+            tickSize,
+          );
+        } else if (activeDrag.originalDrawing.type === "ray" && nextAnchors.length >= 2) {
+          const start = nextAnchors[0]!;
+          const end = nextAnchors[1]!;
+          if (start.time === end.time && start.price === end.price) {
+            nextAnchors[1] = { ...end, time: start.time + Math.max(1, tfSec) };
+          }
+        }
+
+        activeDrag.currentAnchors = nextAnchors;
+        activeDrag.hasMoved = true;
+        syncOverlayPrimitive();
+        return;
+      }
+
+      if (draftRef.current !== null) {
+        const pt = resolveChartPoint(event.clientX, event.clientY);
+        if (pt === null) {
+          return;
+        }
+        const updatedDraft: DrawingDraft = {
+          ...draftRef.current,
+          anchors: [draftRef.current.anchors[0]!, { role: "end", time: pt.time, price: pt.price }],
+        };
+        draftRef.current = updatedDraft;
+        setDraftState(updatedDraft);
+        syncOverlayPrimitive(updatedDraft);
+      }
+    };
+
+    const handlePointerUp = (event: PointerEvent) => {
+      restoreChartInteraction();
+      releasePointerSafely(event.pointerId);
+
+      const finishedDrag = dragRef.current;
+      if (finishedDrag !== null) {
+        dragRef.current = null;
+        syncOverlayPrimitive();
+        if (finishedDrag.hasMoved && drawingScopeRef.current !== null) {
+          void useDrawingStore
+            .getState()
+            .updateDrawing(drawingScopeRef.current, finishedDrag.drawingId, {
+              coordinates: { anchors: finishedDrag.currentAnchors },
+            });
+        }
+        return;
+      }
+
+      if (draftRef.current !== null && placementStartPxRef.current !== null) {
+        const rect = container.getBoundingClientRect();
+        const px = event.clientX - rect.left;
+        const py = event.clientY - rect.top;
+        const dist = Math.hypot(
+          px - placementStartPxRef.current.px,
+          py - placementStartPxRef.current.py,
+        );
+        if (dist >= 5 && drawingScopeRef.current !== null) {
+          const pt = resolveChartPoint(event.clientX, event.clientY);
+          if (pt !== null) {
+            finalizeTwoPointTool(drawingScopeRef.current, draftRef.current, pt);
+          }
+        }
+      }
+    };
+
+    const handlePointerCancel = (event: PointerEvent) => {
+      restoreChartInteraction();
+      releasePointerSafely(event.pointerId);
+      dragRef.current = null;
+      draftRef.current = null;
+      placementStartPxRef.current = null;
+      setDraftState(null);
+      syncOverlayPrimitive(null);
+    };
+
+    container.addEventListener("pointerdown", handlePointerDown);
+    container.addEventListener("pointermove", handlePointerMove);
+    container.addEventListener("pointerup", handlePointerUp);
+    container.addEventListener("pointercancel", handlePointerCancel);
 
     const timeScale = chart.timeScale();
     const handleVisibleTimeRangeChange = (range: IRange<Time> | null) => {
@@ -397,6 +854,7 @@ export function ChartPane({
       const nextWidth = Math.floor(entry.contentRect.width);
       const nextHeight = Math.floor(entry.contentRect.height);
       if (nextWidth > 0 && nextHeight > 0) {
+        primitive.setViewportWidth(nextWidth);
         chart.applyOptions({ width: nextWidth, height: nextHeight });
       }
     });
@@ -405,10 +863,23 @@ export function ChartPane({
     return () => {
       cancelPendingRangeSuppressionRaf();
       suppressRangeEchoRef.current = false;
+      suppressTimeClickRef.current = false;
+      dragRef.current = null;
+      draftRef.current = null;
+      placementStartPxRef.current = null;
+      restoreChartInteraction();
+      container.removeEventListener("pointerdown", handlePointerDown);
+      container.removeEventListener("pointermove", handlePointerMove);
+      container.removeEventListener("pointerup", handlePointerUp);
+      container.removeEventListener("pointercancel", handlePointerCancel);
       resizeObserver.disconnect();
       chart.unsubscribeCrosshairMove(handleCrosshair);
       chart.unsubscribeClick(handleClick);
       timeScale.unsubscribeVisibleTimeRangeChange(handleVisibleTimeRangeChange);
+      if (typeof candleSeries.detachPrimitive === "function") {
+        candleSeries.detachPrimitive(primitive);
+      }
+      primitiveRef.current = null;
       chart.remove();
       chartRef.current = null;
       candleSeriesRef.current = null;
@@ -418,7 +889,38 @@ export function ChartPane({
       latestBarRef.current = null;
       lastBarTimeRef.current = null;
     };
-  }, [cancelPendingRangeSuppressionRaf]);
+  }, [cancelPendingRangeSuppressionRaf, syncOverlayPrimitive]);
+
+  useEffect(() => {
+    if (activeTool === "cursor" && draftRef.current !== null) {
+      draftRef.current = null;
+      placementStartPxRef.current = null;
+      setDraftState(null);
+      chartRef.current?.applyOptions({ handleScroll: true, handleScale: true });
+    }
+  }, [activeTool]);
+
+  useEffect(() => {
+    syncOverlayPrimitive(draftState);
+  }, [
+    draftState,
+    pane.root_symbol,
+    pane.timeframe,
+    persistedDrawings,
+    selectedDrawingId,
+    syncOverlayPrimitive,
+  ]);
+
+  useEffect(() => {
+    if (!resolvedContractIdForScope) {
+      return;
+    }
+    void useDrawingStore.getState().loadScope({
+      symbol: pane.root_symbol,
+      contractId: resolvedContractIdForScope,
+      paneId: pane.pane_id,
+    });
+  }, [pane.pane_id, pane.root_symbol, resyncNonce, resolvedContractIdForScope]);
 
   useEffect(() => {
     if (syncController === undefined) {
@@ -582,6 +1084,7 @@ export function ChartPane({
         candleSeriesRef.current?.setData(candles);
         volumeSeriesRef.current?.setData(volumes);
         barsRef.current = mergedBars;
+        syncOverlayPrimitive();
         const closeMap = new Map<number, number>();
         for (const bar of mergedBars) {
           closeMap.set(bar.time, bar.close);
@@ -681,6 +1184,7 @@ export function ChartPane({
     pane.root_symbol,
     pane.timeframe,
     resyncNonce,
+    syncOverlayPrimitive,
   ]);
 
   const isModeMismatch = activeFeedLive !== null && pane.live_mode !== activeFeedLive;

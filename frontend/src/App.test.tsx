@@ -5,12 +5,16 @@ import { ApiError } from "./api/client";
 import type {
   BarsResponse,
   ContractsResponse,
+  DrawingCommandRequest,
+  DrawingCommandResponse,
+  DrawingScopeResponse,
   LayoutPayload,
   LayoutRecord,
   RootSymbol,
   StatusResponse,
   Timeframe,
   WsBarUpdateMessage,
+  WsDrawingsUpdateMessage,
   WsErrorMessage,
   WsFeedStatusMessage,
   WsResyncRequiredMessage,
@@ -18,6 +22,7 @@ import type {
 } from "./api/types";
 import type { WsConnectionState } from "./api/wsClient";
 import { App } from "./App";
+import { buildDrawingScopeKey, useDrawingStore } from "./store/drawingStore";
 import { useLayoutStore } from "./store/layoutStore";
 
 const mockWsConnect = vi.fn();
@@ -33,6 +38,7 @@ let barUpdateListeners = new Set<(msg: WsBarUpdateMessage) => void>();
 let resyncListeners = new Set<(msg: WsResyncRequiredMessage) => void>();
 let errorListeners = new Set<(msg: WsErrorMessage) => void>();
 let subscribedListeners = new Set<(msg: WsSubscribedMessage) => void>();
+let drawingsUpdateListeners = new Set<(msg: WsDrawingsUpdateMessage) => void>();
 let sessionExpiredListeners = new Set<(reason: string) => void>();
 let useRealWsClient = false;
 
@@ -99,6 +105,13 @@ vi.mock("./api/wsClient", async (importOriginal) => {
       subscribedListeners.add(listener);
       return () => {
         subscribedListeners.delete(listener);
+      };
+    }
+
+    onDrawingsUpdate(listener: (msg: WsDrawingsUpdateMessage) => void) {
+      drawingsUpdateListeners.add(listener);
+      return () => {
+        drawingsUpdateListeners.delete(listener);
       };
     }
 
@@ -173,6 +186,23 @@ const fetchContractsMock = vi.fn<
 const fetchBarsMock = vi.fn<
   (params: { contract_id: string; timeframe: Timeframe }, signal?: AbortSignal) => Promise<BarsResponse>
 >();
+const fetchDrawingsMock = vi.fn<
+  (
+    symbol: RootSymbol,
+    params?: { contract_id?: string | null; pane_id?: string | null },
+    signal?: AbortSignal,
+  ) => Promise<DrawingScopeResponse>
+>();
+const postDrawingCommandMock = vi.fn<
+  (
+    symbol: RootSymbol,
+    command: DrawingCommandRequest,
+    signal?: AbortSignal,
+  ) => Promise<DrawingCommandResponse>
+>();
+const undoDrawingCommandMock = vi.fn();
+const redoDrawingCommandMock = vi.fn();
+const clearDrawingsMock = vi.fn();
 
 vi.mock("./api/client", async (importOriginal) => {
   const actual = await importOriginal<typeof import("./api/client")>();
@@ -202,6 +232,22 @@ vi.mock("./api/client", async (importOriginal) => {
       params: { contract_id: string; timeframe: Timeframe },
       signal?: AbortSignal,
     ) => fetchBarsMock(params, signal),
+    fetchDrawings: (
+      symbol: RootSymbol,
+      params?: { contract_id?: string | null; pane_id?: string | null },
+      signal?: AbortSignal,
+    ) => fetchDrawingsMock(symbol, params, signal),
+    postDrawingCommand: (
+      symbol: RootSymbol,
+      command: DrawingCommandRequest,
+      signal?: AbortSignal,
+    ) => postDrawingCommandMock(symbol, command, signal),
+    undoDrawingCommand: (symbol: RootSymbol, request: unknown, signal?: AbortSignal) =>
+      undoDrawingCommandMock(symbol, request, signal),
+    redoDrawingCommand: (symbol: RootSymbol, request: unknown, signal?: AbortSignal) =>
+      redoDrawingCommandMock(symbol, request, signal),
+    clearDrawings: (symbol: RootSymbol, params: unknown, signal?: AbortSignal) =>
+      clearDrawingsMock(symbol, params, signal),
   };
 });
 
@@ -255,15 +301,40 @@ describe("App bootstrap and R03 503 recovery (P1-R3-03, P1-R3-04, P2-005)", () =
     deleteLayoutMock.mockReset();
     fetchContractsMock.mockReset();
     fetchBarsMock.mockReset();
+    fetchDrawingsMock.mockReset();
+    postDrawingCommandMock.mockReset();
+    undoDrawingCommandMock.mockReset();
+    redoDrawingCommandMock.mockReset();
+    clearDrawingsMock.mockReset();
+    fetchDrawingsMock.mockResolvedValue({
+      symbol: "MES",
+      contract_id: "CON.F.US.MES.H26",
+      pane_id: "pane-1",
+      instrument: {
+        root_symbol: "MES",
+        name: "Micro E-mini S&P 500",
+        exchange: "CME",
+        tick_size: 0.25,
+        tick_value: 1.25,
+        currency: "USD",
+      },
+      scope_revision: 0,
+      can_undo: false,
+      can_redo: false,
+      drawings: [],
+    });
     clearCsrfTokenMock.mockReset();
     useLayoutStore.getState().setAuthErrorHandler(null);
     useLayoutStore.getState().reset();
+    useDrawingStore.getState().setAuthErrorHandler(null);
+    useDrawingStore.getState().reset();
     feedStatusListeners = new Set();
     connectionStateListeners = new Set();
     barUpdateListeners = new Set();
     resyncListeners = new Set();
     errorListeners = new Set();
     subscribedListeners = new Set();
+    drawingsUpdateListeners = new Set();
     sessionExpiredListeners = new Set();
     useRealWsClient = false;
     vi.stubGlobal("ResizeObserver", MockResizeObserver);
@@ -274,6 +345,8 @@ describe("App bootstrap and R03 503 recovery (P1-R3-03, P1-R3-04, P2-005)", () =
     cleanup();
     useLayoutStore.getState().setAuthErrorHandler(null);
     useLayoutStore.getState().reset();
+    useDrawingStore.getState().setAuthErrorHandler(null);
+    useDrawingStore.getState().reset();
     vi.unstubAllGlobals();
   });
 
@@ -3421,6 +3494,171 @@ describe("App bootstrap and R03 503 recovery (P1-R3-03, P1-R3-04, P2-005)", () =
     expect(screen.getByText("CON.F.US.MES.SIM")).toBeTruthy();
     expect(screen.queryByRole("button", { name: /retry contracts/i })).toBeNull();
     expect(fetchContractsMock).toHaveBeenCalledTimes(callsAfterExhaustion + 2);
+  });
+
+  it("wires DrawingToolbar, WS drawings_update, keyboard shortcuts (ignored in inputs), and Logout store reset (Phase 4 Part 2)", async () => {
+    /**
+     * Contract: Authenticated App mounts DrawingToolbar inside .terminal-body, routes WS
+     * drawings_update frames into useDrawingStore, triggers Undo/Redo/Delete/Escape shortcuts
+     * globally while ignoring editable form inputs, and resets useDrawingStore on Logout.
+     * Defect caught: Dead keyboard shortcuts, shortcut firing while typing in inputs, or stale drawings surviving Logout.
+     */
+    fetchSessionMock.mockResolvedValue({
+      authenticated: true,
+      csrf_token: "csrf-token-p4",
+    });
+    fetchStatusMock.mockResolvedValue({
+      connected: true,
+      live: false,
+      feed_state: "LIVE",
+    });
+    listLayoutsMock.mockResolvedValue([SAMPLE_LAYOUT]);
+    fetchContractsMock.mockResolvedValue({
+      live: false,
+      contracts: {
+        MES: { selected: { id: "CON.F.US.MES.H26" }, error_type: null, error: null },
+      },
+    });
+    fetchBarsMock.mockResolvedValue({
+      provider: "topstepx",
+      live: false,
+      contract_id: "CON.F.US.MES.H26",
+      root_symbol: "MES",
+      timeframe: "5m",
+      start_time: 1000,
+      end_time: 1000,
+      count: 0,
+      include_partial: true,
+      quality: { is_complete: true, truncated: false, provider_gap: false, quarantined_count: 0 },
+      bars: [],
+    });
+    logoutMock.mockResolvedValue({ authenticated: false });
+
+    const scope = { symbol: "MES" as const, contractId: "CON.F.US.MES.H26", paneId: "pane-1" };
+    const scopeKey = buildDrawingScopeKey("MES", "CON.F.US.MES.H26", "pane-1");
+
+    render(<App />);
+    await act(async () => {
+      await flushMicrotasks();
+    });
+
+    expect(document.querySelector(".terminal-body")).not.toBeNull();
+    expect(screen.getByRole("complementary", { name: "Drawing toolbar" })).toBeTruthy();
+
+    // WS drawings_update hydrates scope
+    const wsDrawing = {
+      id: "draw-ws-1",
+      revision: 1,
+      type: "hline" as const,
+      symbol: "MES" as const,
+      contract_id: "CON.F.US.MES.H26",
+      pane_id: "pane-1",
+      created_by: "agent" as const,
+      source_bar_refs: [],
+      coordinates: { anchors: [{ role: "level", time: 1700000000, price: 5000 }] },
+      style: {},
+      metadata: {},
+      created_at_utc: 1700000000,
+      updated_at_utc: 1700000000,
+    };
+    act(() => {
+      for (const listener of drawingsUpdateListeners) {
+        listener({
+          type: "drawings_update",
+          symbol: "MES",
+          contract_id: "CON.F.US.MES.H26",
+          pane_id: "pane-1",
+          scope_revision: 2,
+          command_type: "create",
+          can_undo: true,
+          can_redo: true,
+          drawings: [wsDrawing],
+        });
+      }
+    });
+    expect(useDrawingStore.getState().scopes[scopeKey]?.scopeRevision).toBe(2);
+    expect(useDrawingStore.getState().scopes[scopeKey]?.drawings).toEqual([wsDrawing]);
+
+    // Escape resets activeTool to cursor
+    fireEvent.click(screen.getByRole("button", { name: "Trendline tool" }));
+    expect(useDrawingStore.getState().activeTool).toBe("trendline");
+    fireEvent.keyDown(window, { key: "Escape" });
+    expect(useDrawingStore.getState().activeTool).toBe("cursor");
+
+    // Editable target (<select>) must suppress Delete/Ctrl+Z shortcuts
+    const symbolSelect = screen.getByLabelText("pane-1 symbol");
+    useDrawingStore.getState().setSelectedDrawing(scope, "draw-ws-1");
+    fireEvent.keyDown(symbolSelect, { key: "Delete" });
+    expect(postDrawingCommandMock).not.toHaveBeenCalled();
+
+    // Ctrl+Z -> undo, Ctrl+Shift+Z -> redo, Delete -> delete
+    undoDrawingCommandMock.mockResolvedValueOnce({
+      symbol: "MES",
+      contract_id: "CON.F.US.MES.H26",
+      pane_id: "pane-1",
+      instrument: { root_symbol: "MES", name: "MES", exchange: "CME", tick_size: 0.25, tick_value: 1.25, currency: "USD" },
+      scope_revision: 3,
+      can_undo: false,
+      can_redo: true,
+      deduplicated: false,
+      affected_ids: ["draw-ws-1"],
+      drawings: [],
+    });
+    redoDrawingCommandMock.mockResolvedValueOnce({
+      symbol: "MES",
+      contract_id: "CON.F.US.MES.H26",
+      pane_id: "pane-1",
+      instrument: { root_symbol: "MES", name: "MES", exchange: "CME", tick_size: 0.25, tick_value: 1.25, currency: "USD" },
+      scope_revision: 4,
+      can_undo: true,
+      can_redo: false,
+      deduplicated: false,
+      affected_ids: ["draw-ws-1"],
+      drawings: [wsDrawing],
+    });
+    postDrawingCommandMock.mockResolvedValueOnce({
+      symbol: "MES",
+      contract_id: "CON.F.US.MES.H26",
+      pane_id: "pane-1",
+      instrument: { root_symbol: "MES", name: "MES", exchange: "CME", tick_size: 0.25, tick_value: 1.25, currency: "USD" },
+      scope_revision: 5,
+      can_undo: true,
+      can_redo: false,
+      deduplicated: false,
+      affected_ids: ["draw-ws-1"],
+      drawings: [],
+    });
+
+    await act(async () => {
+      fireEvent.keyDown(window, { key: "z", ctrlKey: true });
+      await flushMicrotasks();
+    });
+    expect(undoDrawingCommandMock).toHaveBeenCalledTimes(1);
+
+    await act(async () => {
+      fireEvent.keyDown(window, { key: "Z", ctrlKey: true, shiftKey: true });
+      await flushMicrotasks();
+    });
+    expect(redoDrawingCommandMock).toHaveBeenCalledTimes(1);
+
+    useDrawingStore.getState().setSelectedDrawing(scope, "draw-ws-1");
+    await act(async () => {
+      fireEvent.keyDown(window, { key: "Delete" });
+      await flushMicrotasks();
+    });
+    expect(postDrawingCommandMock).toHaveBeenCalledWith(
+      "MES",
+      expect.objectContaining({ action: "delete", drawing_id: "draw-ws-1" }),
+      expect.any(AbortSignal),
+    );
+
+    // Logout resets useDrawingStore
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Logout" }));
+      await flushMicrotasks();
+    });
+    expect(useDrawingStore.getState().scopes).toEqual({});
+    expect(useDrawingStore.getState().selectedByScope).toEqual({});
   });
 });
 

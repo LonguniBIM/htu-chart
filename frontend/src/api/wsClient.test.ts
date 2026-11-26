@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   LIVE_WS_TIMEFRAMES,
   isLiveWsTimeframe,
+  type WsDrawingsUpdateMessage,
   type WsResyncRequiredMessage,
   type WsSubscribedMessage,
 } from "./types";
@@ -682,5 +683,65 @@ describe("MarketWsClient (P1-04, P1-05, P2-003)", () => {
     expect(expiredListener).not.toHaveBeenCalled();
     expect(client.getConnectionState()).toBe("connected");
     expect(FakeWebSocket.instances).toHaveLength(4);
+  });
+
+  it("dispatches inbound drawings_update frames to onDrawingsUpdate and ignores stale sockets (Phase 4)", () => {
+    /**
+     * Contract: MarketWsClient.onDrawingsUpdate delivers { type: "drawings_update", ... }
+     * frames from the active socket while ignoring stale-socket frames and cleaning up on unsubscribe.
+     * Defect caught: Missing drawings_update WS routing or stale socket leaking old drawing state.
+     */
+    const client = new MarketWsClient(() => "ws://127.0.0.1:8000/ws/market");
+    const received: WsDrawingsUpdateMessage[] = [];
+    const unsubscribe = client.onDrawingsUpdate((msg) => {
+      received.push(msg);
+    });
+
+    client.connect();
+    const ws1 = FakeWebSocket.instances[0];
+    ws1?.emitOpen();
+
+    client.disconnect();
+    client.connect();
+    const ws2 = FakeWebSocket.instances[1];
+    ws2?.emitOpen();
+
+    const payload: WsDrawingsUpdateMessage = {
+      type: "drawings_update",
+      symbol: "MES",
+      contract_id: "CON.F.US.MES.H26",
+      pane_id: "pane-1",
+      scope_revision: 3,
+      command_type: "create",
+      can_undo: true,
+      can_redo: false,
+      drawings: [
+        {
+          id: "draw-1",
+          revision: 1,
+          type: "hline",
+          symbol: "MES",
+          contract_id: "CON.F.US.MES.H26",
+          pane_id: "pane-1",
+          created_by: "user",
+          source_bar_refs: [],
+          coordinates: { anchors: [{ role: "level", time: 1700000000, price: 5000 }] },
+          style: {},
+          metadata: {},
+          created_at_utc: 1700000000,
+          updated_at_utc: 1700000000,
+        },
+      ],
+    };
+
+    ws1?.emitMessage({ ...payload, scope_revision: 1 });
+    expect(received).toEqual([]);
+
+    ws2?.emitMessage(payload);
+    expect(received).toEqual([payload]);
+
+    unsubscribe();
+    ws2?.emitMessage({ ...payload, scope_revision: 4 });
+    expect(received).toHaveLength(1);
   });
 });

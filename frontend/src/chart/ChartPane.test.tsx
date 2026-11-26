@@ -4,8 +4,12 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ApiError, type FetchBarsParams } from "../api/client";
 import type {
   BarsResponse,
+  DrawingCommandRequest,
+  DrawingCommandResponse,
+  DrawingScopeResponse,
   OhlcvBar,
   PaneConfig,
+  RootSymbol,
   Timeframe,
   WsBarUpdateMessage,
   WsResyncRequiredMessage,
@@ -13,6 +17,7 @@ import type {
 } from "../api/types";
 import type { MarketWsClient } from "../api/wsClient";
 import { LayoutSyncController } from "../layout/syncController";
+import { buildDrawingScopeKey, useDrawingStore } from "../store/drawingStore";
 import { ChartPane } from "./ChartPane";
 import { PaneFetchCoordinator } from "./fetchGuard";
 
@@ -21,6 +26,15 @@ const candleUpdate = vi.fn();
 const volumeSetData = vi.fn();
 const volumeUpdate = vi.fn();
 const fitContentMock = vi.fn();
+const applyOptionsMock = vi.fn();
+const attachPrimitiveMock = vi.fn();
+const detachPrimitiveMock = vi.fn();
+const priceToCoordinateMock = vi.fn<(price: number) => number | null>((price) => (5050 - price) * 4);
+const coordinateToPriceMock = vi.fn<(y: number) => number | null>((y) => 5050 - y / 4);
+const timeToCoordinateMock = vi.fn<(time: number) => number | null>((time) => (time - 1700000000) / 10 + 100);
+const coordinateToTimeMock = vi.fn<(x: number) => number | null>(() => null);
+const logicalToCoordinateMock = vi.fn<(logical: number) => number | null>((logical) => 100 + logical * 30);
+const coordinateToLogicalMock = vi.fn<(x: number) => number | null>((x) => (x - 100) / 30);
 const setCrosshairPositionMock = vi.fn();
 const clearCrosshairPositionMock = vi.fn();
 const getVisibleRangeMock = vi.fn<() => { from: number; to: number } | null>(() => null);
@@ -37,39 +51,14 @@ vi.mock("lightweight-charts", () => {
     HistogramSeries,
     ColorType: { Solid: "solid" },
     CrosshairMode: { Normal: 0 },
-    createChart: vi.fn(() => ({
-      addSeries: vi.fn((seriesType: unknown) => {
-        if (seriesType === CandlestickSeries) {
-          return {
-            setData: candleSetData,
-            update: candleUpdate,
-            priceScale: () => ({ applyOptions: vi.fn() }),
-          };
-        }
-        return {
-          setData: volumeSetData,
-          update: volumeUpdate,
-          priceScale: () => ({ applyOptions: vi.fn() }),
-        };
-      }),
-      subscribeCrosshairMove: vi.fn((handler: (param: unknown) => void) => {
-        crosshairMoveHandlers.push(handler);
-      }),
-      unsubscribeCrosshairMove: vi.fn((handler: (param: unknown) => void) => {
-        crosshairMoveHandlers = crosshairMoveHandlers.filter((h) => h !== handler);
-      }),
-      subscribeClick: vi.fn((handler: (param: unknown) => void) => {
-        clickHandlers.push(handler);
-      }),
-      unsubscribeClick: vi.fn((handler: (param: unknown) => void) => {
-        clickHandlers = clickHandlers.filter((h) => h !== handler);
-      }),
-      setCrosshairPosition: setCrosshairPositionMock,
-      clearCrosshairPosition: clearCrosshairPositionMock,
-      applyOptions: vi.fn(),
-      remove: vi.fn(),
-      timeScale: () => ({
+    createChart: vi.fn(() => {
+      let candleSeriesApi: unknown;
+      const timeScaleApi = {
         fitContent: fitContentMock,
+        timeToCoordinate: timeToCoordinateMock,
+        coordinateToTime: coordinateToTimeMock,
+        logicalToCoordinate: logicalToCoordinateMock,
+        coordinateToLogical: coordinateToLogicalMock,
         subscribeVisibleTimeRangeChange: vi.fn(
           (handler: (range: { from: number; to: number } | null) => void) => {
             visibleRangeHandlers.push(handler);
@@ -82,13 +71,77 @@ vi.mock("lightweight-charts", () => {
         ),
         getVisibleRange: getVisibleRangeMock,
         setVisibleRange: setVisibleRangeMock,
-      }),
-    })),
+      };
+      const chartApi = {
+        addSeries: vi.fn((seriesType: unknown) => {
+          if (seriesType === CandlestickSeries) {
+            candleSeriesApi = {
+              setData: candleSetData,
+              update: candleUpdate,
+              attachPrimitive: vi.fn((primitive: { attached?: (param: unknown) => void }) => {
+                attachPrimitiveMock(primitive);
+                primitive.attached?.({
+                  chart: chartApi,
+                  series: candleSeriesApi,
+                  requestUpdate: vi.fn(),
+                  horzScaleBehavior: {},
+                });
+              }),
+              detachPrimitive: vi.fn((primitive: { detached?: () => void }) => {
+                detachPrimitiveMock(primitive);
+                primitive.detached?.();
+              }),
+              priceToCoordinate: priceToCoordinateMock,
+              coordinateToPrice: coordinateToPriceMock,
+              priceScale: () => ({ applyOptions: vi.fn() }),
+            };
+            return candleSeriesApi;
+          }
+          return {
+            setData: volumeSetData,
+            update: volumeUpdate,
+            priceScale: () => ({ applyOptions: vi.fn() }),
+          };
+        }),
+        subscribeCrosshairMove: vi.fn((handler: (param: unknown) => void) => {
+          crosshairMoveHandlers.push(handler);
+        }),
+        unsubscribeCrosshairMove: vi.fn((handler: (param: unknown) => void) => {
+          crosshairMoveHandlers = crosshairMoveHandlers.filter((h) => h !== handler);
+        }),
+        subscribeClick: vi.fn((handler: (param: unknown) => void) => {
+          clickHandlers.push(handler);
+        }),
+        unsubscribeClick: vi.fn((handler: (param: unknown) => void) => {
+          clickHandlers = clickHandlers.filter((h) => h !== handler);
+        }),
+        setCrosshairPosition: setCrosshairPositionMock,
+        clearCrosshairPosition: clearCrosshairPositionMock,
+        applyOptions: applyOptionsMock,
+        remove: vi.fn(),
+        timeScale: () => timeScaleApi,
+      };
+      return chartApi;
+    }),
   };
 });
 
 const fetchBarsMock = vi.fn<
   (params: FetchBarsParams, signal?: AbortSignal) => Promise<BarsResponse>
+>();
+const fetchDrawingsMock = vi.fn<
+  (
+    symbol: RootSymbol,
+    params?: { contract_id?: string | null; pane_id?: string | null },
+    signal?: AbortSignal,
+  ) => Promise<DrawingScopeResponse>
+>();
+const postDrawingCommandMock = vi.fn<
+  (
+    symbol: RootSymbol,
+    command: DrawingCommandRequest,
+    signal?: AbortSignal,
+  ) => Promise<DrawingCommandResponse>
 >();
 
 vi.mock("../api/client", async (importOriginal) => {
@@ -97,6 +150,16 @@ vi.mock("../api/client", async (importOriginal) => {
     ...actual,
     fetchBars: (params: FetchBarsParams, signal?: AbortSignal) =>
       fetchBarsMock(params, signal),
+    fetchDrawings: (
+      symbol: RootSymbol,
+      params?: { contract_id?: string | null; pane_id?: string | null },
+      signal?: AbortSignal,
+    ) => fetchDrawingsMock(symbol, params, signal),
+    postDrawingCommand: (
+      symbol: RootSymbol,
+      command: DrawingCommandRequest,
+      signal?: AbortSignal,
+    ) => postDrawingCommandMock(symbol, command, signal),
   };
 });
 
@@ -205,6 +268,27 @@ describe("ChartPane (F06, P1-R3-01, P1-R3-02)", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     fetchBarsMock.mockReset();
+    fetchDrawingsMock.mockReset();
+    postDrawingCommandMock.mockReset();
+    fetchDrawingsMock.mockResolvedValue({
+      symbol: "MES",
+      contract_id: "CON.F.US.MES.H26",
+      pane_id: "pane-1",
+      instrument: {
+        root_symbol: "MES",
+        name: "Micro E-mini S&P 500",
+        exchange: "CME",
+        tick_size: 0.25,
+        tick_value: 1.25,
+        currency: "USD",
+      },
+      scope_revision: 0,
+      can_undo: false,
+      can_redo: false,
+      drawings: [],
+    });
+    useDrawingStore.getState().setAuthErrorHandler(null);
+    useDrawingStore.getState().reset();
     crosshairMoveHandlers = [];
     clickHandlers = [];
     visibleRangeHandlers = [];
@@ -219,6 +303,7 @@ describe("ChartPane (F06, P1-R3-01, P1-R3-02)", () => {
   afterEach(() => {
     vi.useRealTimers();
     cleanup();
+    useDrawingStore.getState().reset();
     vi.unstubAllGlobals();
   });
 
@@ -1860,5 +1945,208 @@ describe("ChartPane (F06, P1-R3-01, P1-R3-02)", () => {
     unmount();
     expect(cafMock).toHaveBeenCalledTimes(1);
     expect(rafCallbacks.size).toBe(0);
+  });
+
+  it("hydrates drawings, attaches/detaches primitive, places drawings with Magnet & distinct ray, drags handles, and suppresses Time sync mid-draw (Phase 4 Part 2)", async () => {
+    /**
+     * Contract: ChartPane hydrates drawings on target ready and resyncNonce, attaches/detaches
+     * DrawingsOverlayPrimitive, supports pointer placement (hline, trendline, ray distinct anchors,
+     * Magnet OHLC snap), disables/restores handleScroll/handleScale on handle drag, persists domain
+     * (time, price) updates on pointerup, and suppresses syncController.onTimeClick while drawing.
+     * Defect caught: Chart scroll hijacking handle drags, raw pixels persisted, or Time sync jumping panes mid-draw.
+     */
+    const bars = [
+      { time: 1700000000, open: 5000, high: 5012, low: 4996, close: 5005, volume: 25, is_closed: true },
+      { time: 1700000300, open: 5005, high: 5020, low: 5002, close: 5015, volume: 30, is_closed: true },
+    ];
+    fetchBarsMock.mockResolvedValue(makeBarsResponse("CON.F.US.MES.H26", bars));
+    postDrawingCommandMock.mockImplementation(async (symbol, cmd) => {
+      const anchors =
+        cmd.action === "create"
+          ? cmd.drawing.coordinates.anchors
+          : cmd.action === "update" && cmd.drawing.coordinates !== undefined
+            ? cmd.drawing.coordinates.anchors
+            : [];
+      return {
+        symbol,
+        contract_id: "CON.F.US.MES.H26",
+        pane_id: "pane-1",
+        instrument: {
+          root_symbol: "MES",
+          name: "MES",
+          exchange: "CME",
+          tick_size: 0.25,
+          tick_value: 1.25,
+          currency: "USD",
+        },
+        scope_revision: cmd.expected_revision + 1,
+        can_undo: true,
+        can_redo: false,
+        deduplicated: false,
+        affected_ids: ["draw-created"],
+        drawings:
+          cmd.action === "create" || cmd.action === "update"
+            ? [
+                {
+                  id: "draw-created",
+                  revision: cmd.expected_revision + 1,
+                  type: "ray",
+                  symbol: "MES",
+                  contract_id: "CON.F.US.MES.H26",
+                  pane_id: "pane-1",
+                  created_by: "user",
+                  source_bar_refs: [],
+                  coordinates: { anchors },
+                  style: {},
+                  metadata: {},
+                  created_at_utc: 1700000000,
+                  updated_at_utc: 1700000000,
+                },
+              ]
+            : [],
+      };
+    });
+
+    const coordinator = new PaneFetchCoordinator();
+    const fakeWs = createFakeWsClient();
+    const syncController = new LayoutSyncController({
+      symbol: false,
+      interval: false,
+      crosshair: false,
+      time: true,
+      dateRange: false,
+    });
+    const otherPane = {
+      paneId: "pane-2",
+      applyCrosshairTime: vi.fn(),
+      applyVisibleTimeRange: vi.fn(),
+      centerOnTime: vi.fn(),
+    };
+    syncController.registerPane(otherPane);
+
+    const pane: PaneConfig = {
+      pane_id: "pane-1",
+      root_symbol: "MES",
+      timeframe: "5m",
+      live_mode: false,
+      playback_mode: "live",
+    };
+
+    const { unmount } = render(
+      <ChartPane
+        pane={pane}
+        contractId="CON.F.US.MES.H26"
+        activeFeedLive={false}
+        wsClient={fakeWs.client}
+        coordinator={coordinator}
+        syncController={syncController}
+      />,
+    );
+
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(attachPrimitiveMock).toHaveBeenCalledTimes(1);
+    expect(fetchDrawingsMock).toHaveBeenCalledWith(
+      "MES",
+      { contract_id: "CON.F.US.MES.H26", pane_id: "pane-1" },
+      expect.any(AbortSignal),
+    );
+
+    // Resync via subscribed ACK triggers drawings re-hydration
+    act(() => {
+      fakeWs.emitSubscribed({
+        type: "subscribed",
+        contract_id: "CON.F.US.MES.H26",
+        timeframe: "5m",
+      });
+    });
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(fetchDrawingsMock).toHaveBeenCalledTimes(2);
+
+    const canvas = document.querySelector(".chart-pane__canvas") as HTMLElement;
+    vi.spyOn(canvas, "getBoundingClientRect").mockReturnValue({
+      left: 0,
+      top: 0,
+      right: 600,
+      bottom: 400,
+      width: 600,
+      height: 400,
+      x: 0,
+      y: 0,
+      toJSON: () => ({}),
+    });
+
+    // Place a Ray with two clicks at identical point -> distinct end.time enforced + Time sync suppressed
+    useDrawingStore.getState().setActiveTool("ray");
+    useDrawingStore.getState().setMagnetEnabled(true);
+    await act(async () => {
+      fireEvent.pointerDown(canvas, { clientX: 100, clientY: 160, button: 0, pointerType: "mouse", pointerId: 1 });
+      fireEvent.pointerUp(canvas, { clientX: 100, clientY: 160, button: 0, pointerType: "mouse", pointerId: 1 });
+      fireEvent.pointerDown(canvas, { clientX: 100, clientY: 160, button: 0, pointerType: "mouse", pointerId: 1 });
+      fireEvent.pointerUp(canvas, { clientX: 100, clientY: 160, button: 0, pointerType: "mouse", pointerId: 1 });
+      clickHandlers[0]?.({ time: 1700000000 });
+      await Promise.resolve();
+    });
+
+    // Suppressed Time sync while placing drawing
+    expect(otherPane.centerOnTime).not.toHaveBeenCalled();
+    expect(postDrawingCommandMock).toHaveBeenCalledTimes(1);
+    const rayCreateCmd = postDrawingCommandMock.mock.calls[0]![1];
+    expect(rayCreateCmd.action).toBe("create");
+    if (rayCreateCmd.action === "create") {
+      // Magnet snapped y=160 (price=5010) to nearest OHLC high=5012 on bar 1700000000, and ray end.time !== start.time
+      expect(rayCreateCmd.drawing.type).toBe("ray");
+      expect(rayCreateCmd.drawing.coordinates.anchors[0]).toEqual({
+        role: "start",
+        time: 1700000000,
+        price: 5012,
+      });
+      expect(rayCreateCmd.drawing.coordinates.anchors[1]!.time).toBe(1700000300);
+    }
+
+    // Drag start anchor handle of the selected ray -> disables handleScroll/handleScale then restores on pointerup
+    useDrawingStore.getState().setMagnetEnabled(false);
+    const scopeKey = buildDrawingScopeKey("MES", "CON.F.US.MES.H26", "pane-1");
+    expect(useDrawingStore.getState().selectedByScope[scopeKey]).toBe("draw-created");
+
+    applyOptionsMock.mockClear();
+    // Start handle is at bar 0 (x=100) and price 5012 (y=(5050-5012)*4 = 152)
+    await act(async () => {
+      fireEvent.pointerDown(canvas, { clientX: 100, clientY: 152, button: 0, pointerType: "mouse", pointerId: 2 });
+      fireEvent.pointerMove(canvas, { clientX: 130, clientY: 180, button: 0, pointerType: "mouse", pointerId: 2 });
+      fireEvent.pointerUp(canvas, { clientX: 130, clientY: 180, button: 0, pointerType: "mouse", pointerId: 2 });
+      await Promise.resolve();
+    });
+
+    expect(applyOptionsMock).toHaveBeenCalledWith({ handleScroll: false, handleScale: false });
+    expect(applyOptionsMock).toHaveBeenCalledWith({ handleScroll: true, handleScale: true });
+    expect(postDrawingCommandMock).toHaveBeenCalledTimes(2);
+    const updateCmd = postDrawingCommandMock.mock.calls[1]![1];
+    expect(updateCmd.action).toBe("update");
+    if (updateCmd.action === "update") {
+      expect(updateCmd.drawing.coordinates?.anchors[0]?.time).toBe(1700000300);
+      expect(updateCmd.drawing.coordinates?.anchors[0]?.price).toBe(5005);
+    }
+
+    // pointercancel mid-drag restores handleScroll/handleScale without persisting update
+    applyOptionsMock.mockClear();
+    await act(async () => {
+      fireEvent.pointerDown(canvas, { clientX: 130, clientY: 180, button: 0, pointerType: "mouse", pointerId: 3 });
+      fireEvent.pointerMove(canvas, { clientX: 140, clientY: 190, button: 0, pointerType: "mouse", pointerId: 3 });
+      fireEvent.pointerCancel(canvas, { pointerId: 3 });
+      await Promise.resolve();
+    });
+    expect(applyOptionsMock).toHaveBeenCalledWith({ handleScroll: false, handleScale: false });
+    expect(applyOptionsMock).toHaveBeenCalledWith({ handleScroll: true, handleScale: true });
+    expect(postDrawingCommandMock).toHaveBeenCalledTimes(2);
+
+    unmount();
+    expect(detachPrimitiveMock).toHaveBeenCalledTimes(1);
   });
 });

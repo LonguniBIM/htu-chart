@@ -1,11 +1,16 @@
 import type {
   BarsResponse,
   ContractsResponse,
+  DrawingBatchOperation,
+  DrawingCommandRequest,
+  DrawingCommandResponse,
+  DrawingScopeResponse,
   LayoutPayload,
   LayoutRecord,
   RootSymbol,
   StatusResponse,
   Timeframe,
+  UndoRedoRequest,
 } from "./types";
 
 let inMemoryCsrfToken: string | null = null;
@@ -14,12 +19,27 @@ let authGeneration = 0;
 export class ApiError extends Error {
   readonly status: number;
   readonly detail: string;
+  readonly code?: string;
+  readonly detailObject?: Record<string, unknown>;
 
-  constructor(status: number, detail: string) {
+  constructor(
+    status: number,
+    detail: string,
+    options?: {
+      code?: string;
+      detailObject?: Record<string, unknown>;
+    },
+  ) {
     super(`API error ${status}: ${detail}`);
     this.name = "ApiError";
     this.status = status;
     this.detail = detail;
+    if (options?.code !== undefined) {
+      this.code = options.code;
+    }
+    if (options?.detailObject !== undefined) {
+      this.detailObject = options.detailObject;
+    }
   }
 }
 
@@ -63,17 +83,37 @@ async function apiRequest<T>(url: string, options: RequestOptions = {}): Promise
   const response = await fetch(url, init);
   if (!response.ok) {
     let detail = response.statusText || "Request failed";
+    let code: string | undefined;
+    let detailObject: Record<string, unknown> | undefined;
     try {
       const errJson = (await response.json()) as { detail?: unknown };
       if (typeof errJson.detail === "string") {
         detail = errJson.detail;
+      } else if (
+        errJson.detail !== null &&
+        typeof errJson.detail === "object" &&
+        !Array.isArray(errJson.detail)
+      ) {
+        const obj = errJson.detail as Record<string, unknown>;
+        detailObject = obj;
+        if (typeof obj.code === "string") {
+          code = obj.code;
+        }
+        if (typeof obj.message === "string") {
+          detail = obj.message;
+        } else {
+          detail = JSON.stringify(obj);
+        }
       } else if (errJson.detail !== undefined) {
         detail = JSON.stringify(errJson.detail);
       }
     } catch {
       // Ignore non-JSON error body
     }
-    throw new ApiError(response.status, detail);
+    throw new ApiError(response.status, detail, {
+      ...(code !== undefined ? { code } : {}),
+      ...(detailObject !== undefined ? { detailObject } : {}),
+    });
   }
 
   return (await response.json()) as T;
@@ -242,6 +282,192 @@ export async function deleteLayout(
   }
   return apiRequest<{ deleted: boolean; id: string }>(
     `/api/layouts/${encodeURIComponent(layoutId)}`,
+    opts,
+  );
+}
+
+function appendScopeQueryParams(
+  query: URLSearchParams,
+  params?: { contract_id?: string | null; pane_id?: string | null },
+): void {
+  const contractId = params?.contract_id?.trim();
+  if (contractId) {
+    query.set("contract_id", contractId);
+  }
+  const paneId = params?.pane_id?.trim();
+  if (paneId) {
+    query.set("pane_id", paneId);
+  }
+}
+
+function sanitizeBatchOperation(op: DrawingBatchOperation): Record<string, unknown> {
+  const base: Record<string, unknown> = { action: op.action };
+  if (op.created_by !== undefined) {
+    base.created_by = op.created_by;
+  }
+  if (op.action === "create") {
+    base.drawing = op.drawing;
+  } else if (op.action === "update") {
+    base.drawing_id = op.drawing_id;
+    base.drawing = op.drawing;
+  } else {
+    base.drawing_id = op.drawing_id;
+  }
+  return base;
+}
+
+function sanitizeDrawingCommand(command: DrawingCommandRequest): Record<string, unknown> {
+  const payload: Record<string, unknown> = {
+    action: command.action,
+    expected_revision: command.expected_revision,
+  };
+  if (command.idempotency_key !== undefined) {
+    payload.idempotency_key = command.idempotency_key;
+  }
+  if (command.contract_id !== undefined && command.contract_id !== null && command.contract_id.trim()) {
+    payload.contract_id = command.contract_id.trim();
+  }
+  if (command.pane_id !== undefined && command.pane_id !== null && command.pane_id.trim()) {
+    payload.pane_id = command.pane_id.trim();
+  }
+  if (command.created_by !== undefined) {
+    payload.created_by = command.created_by;
+  }
+
+  switch (command.action) {
+    case "create":
+      payload.drawing = command.drawing;
+      break;
+    case "update":
+      payload.drawing_id = command.drawing_id;
+      payload.drawing = command.drawing;
+      break;
+    case "delete":
+      payload.drawing_id = command.drawing_id;
+      break;
+    case "clear":
+      break;
+    case "batch":
+      payload.operations = command.operations.map(sanitizeBatchOperation);
+      break;
+  }
+  return payload;
+}
+
+export async function fetchDrawings(
+  symbol: RootSymbol,
+  params?: { contract_id?: string | null; pane_id?: string | null },
+  signal?: AbortSignal,
+): Promise<DrawingScopeResponse> {
+  const query = new URLSearchParams();
+  appendScopeQueryParams(query, params);
+  const qs = query.toString();
+  const url = qs
+    ? `/api/drawings/${encodeURIComponent(symbol)}?${qs}`
+    : `/api/drawings/${encodeURIComponent(symbol)}`;
+  const opts: RequestOptions = {};
+  if (signal !== undefined) {
+    opts.signal = signal;
+  }
+  return apiRequest<DrawingScopeResponse>(url, opts);
+}
+
+export async function postDrawingCommand(
+  symbol: RootSymbol,
+  command: DrawingCommandRequest,
+  signal?: AbortSignal,
+): Promise<DrawingCommandResponse> {
+  const opts: RequestOptions = {
+    method: "POST",
+    body: sanitizeDrawingCommand(command),
+  };
+  if (signal !== undefined) {
+    opts.signal = signal;
+  }
+  return apiRequest<DrawingCommandResponse>(
+    `/api/drawings/${encodeURIComponent(symbol)}`,
+    opts,
+  );
+}
+
+function sanitizeUndoRedoRequest(request: UndoRedoRequest): Record<string, unknown> {
+  const payload: Record<string, unknown> = {
+    expected_revision: request.expected_revision,
+  };
+  if (request.idempotency_key !== undefined) {
+    payload.idempotency_key = request.idempotency_key;
+  }
+  if (request.contract_id !== undefined && request.contract_id !== null && request.contract_id.trim()) {
+    payload.contract_id = request.contract_id.trim();
+  }
+  if (request.pane_id !== undefined && request.pane_id !== null && request.pane_id.trim()) {
+    payload.pane_id = request.pane_id.trim();
+  }
+  if (request.actor !== undefined) {
+    payload.actor = request.actor;
+  }
+  return payload;
+}
+
+export async function undoDrawingCommand(
+  symbol: RootSymbol,
+  request: UndoRedoRequest,
+  signal?: AbortSignal,
+): Promise<DrawingCommandResponse> {
+  const opts: RequestOptions = {
+    method: "POST",
+    body: sanitizeUndoRedoRequest(request),
+  };
+  if (signal !== undefined) {
+    opts.signal = signal;
+  }
+  return apiRequest<DrawingCommandResponse>(
+    `/api/drawings/${encodeURIComponent(symbol)}/undo`,
+    opts,
+  );
+}
+
+export async function redoDrawingCommand(
+  symbol: RootSymbol,
+  request: UndoRedoRequest,
+  signal?: AbortSignal,
+): Promise<DrawingCommandResponse> {
+  const opts: RequestOptions = {
+    method: "POST",
+    body: sanitizeUndoRedoRequest(request),
+  };
+  if (signal !== undefined) {
+    opts.signal = signal;
+  }
+  return apiRequest<DrawingCommandResponse>(
+    `/api/drawings/${encodeURIComponent(symbol)}/redo`,
+    opts,
+  );
+}
+
+export async function clearDrawings(
+  symbol: RootSymbol,
+  params: {
+    expected_revision: number;
+    idempotency_key?: string;
+    contract_id?: string | null;
+    pane_id?: string | null;
+  },
+  signal?: AbortSignal,
+): Promise<DrawingCommandResponse> {
+  const query = new URLSearchParams({
+    expected_revision: String(params.expected_revision),
+  });
+  if (params.idempotency_key !== undefined) {
+    query.set("idempotency_key", params.idempotency_key);
+  }
+  appendScopeQueryParams(query, params);
+  const opts: RequestOptions = { method: "DELETE" };
+  if (signal !== undefined) {
+    opts.signal = signal;
+  }
+  return apiRequest<DrawingCommandResponse>(
+    `/api/drawings/${encodeURIComponent(symbol)}?${query.toString()}`,
     opts,
   );
 }

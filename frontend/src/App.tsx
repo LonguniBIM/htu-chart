@@ -19,9 +19,15 @@ import type {
 } from "./api/types";
 import { MarketWsClient, type WsConnectionState } from "./api/wsClient";
 import { PaneFetchCoordinator } from "./chart/fetchGuard";
+import { DrawingToolbar } from "./drawings/DrawingToolbar";
 import { LayoutSyncController } from "./layout/syncController";
 import { TopToolbar } from "./layout/TopToolbar";
 import { WorkspaceGrid } from "./layout/WorkspaceGrid";
+import {
+  buildDrawingScopeKey,
+  useDrawingStore,
+  type DrawingScopeTarget,
+} from "./store/drawingStore";
 import { useLayoutStore } from "./store/layoutStore";
 
 type AuthStage = "checking" | "unauthenticated" | "authenticated";
@@ -159,6 +165,8 @@ export function App() {
       coordinator.dispose();
       useLayoutStore.getState().setAuthErrorHandler(null);
       useLayoutStore.getState().reset();
+      useDrawingStore.getState().setAuthErrorHandler(null);
+      useDrawingStore.getState().reset();
     };
   }, [abortAllLayoutControllers, abortAndClearController, coordinator, wsClient]);
 
@@ -185,6 +193,7 @@ export function App() {
       wsClient.disconnect();
       coordinator.dispose();
       useLayoutStore.getState().reset();
+      useDrawingStore.getState().reset();
       activeLayoutRef.current = null;
       prevActiveLayoutIdRef.current = null;
       setContracts({});
@@ -196,9 +205,11 @@ export function App() {
   );
 
   useEffect(() => {
-    useLayoutStore.getState().setAuthErrorHandler((status, message) => {
+    const authHandler = (status: number, message: string) => {
       invalidateSessionLocally(status === 403 ? message : null);
-    });
+    };
+    useLayoutStore.getState().setAuthErrorHandler(authHandler);
+    useDrawingStore.getState().setAuthErrorHandler(authHandler);
   }, [invalidateSessionLocally]);
 
   const fetchContractsForModes = useCallback(
@@ -492,6 +503,9 @@ export function App() {
     const removeErrorListener = wsClient.onError((msg) => {
       setLoadError(msg.detail || "WebSocket error");
     });
+    const removeDrawingsListener = wsClient.onDrawingsUpdate((msg) => {
+      useDrawingStore.getState().applyWsDrawingsUpdate(msg);
+    });
     const removeSessionExpiredListener = wsClient.onSessionExpired(() => {
       invalidateSessionLocally(null);
     });
@@ -499,6 +513,7 @@ export function App() {
       removeStateListener();
       removeStatusListener();
       removeErrorListener();
+      removeDrawingsListener();
       removeSessionExpiredListener();
     };
   }, [invalidateSessionLocally, retryUnresolvedContracts, wsClient]);
@@ -871,6 +886,101 @@ export function App() {
     [abortAllLayoutControllers, resolveMissingContractModes],
   );
 
+  const activeDrawingScope = useMemo<DrawingScopeTarget | null>(() => {
+    if (activeLayout === null || activeLayout.panes.length === 0) {
+      return null;
+    }
+    const targetPane =
+      activeLayout.panes.find((p) => p.pane_id === activePaneId) ?? activeLayout.panes[0];
+    if (targetPane === undefined) {
+      return null;
+    }
+    const cacheKey = `${targetPane.live_mode ? "live" : "sim"}:${targetPane.root_symbol}`;
+    const entry = contracts[cacheKey];
+    const resolvedContractId =
+      entry?.selected !== null && entry?.selected !== undefined
+        ? (entry.selected.id ?? entry.selected.contractId ?? null)
+        : null;
+    return {
+      symbol: targetPane.root_symbol,
+      contractId: resolvedContractId,
+      paneId: targetPane.pane_id,
+    };
+  }, [activeLayout, activePaneId, contracts]);
+
+  useEffect(() => {
+    if (authStage !== "authenticated") {
+      return;
+    }
+    const isEditableTarget = (target: EventTarget | null): boolean => {
+      if (!(target instanceof HTMLElement)) {
+        return false;
+      }
+      const tag = target.tagName;
+      if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT") {
+        return true;
+      }
+      return target.isContentEditable;
+    };
+
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (isEditableTarget(event.target)) {
+        return;
+      }
+      const store = useDrawingStore.getState();
+      const scope = activeDrawingScope;
+      const scopeKey =
+        scope !== null
+          ? buildDrawingScopeKey(scope.symbol, scope.contractId, scope.paneId)
+          : "";
+      const scopeState = scopeKey ? store.scopes[scopeKey] : undefined;
+      const selectedId = scopeKey ? (store.selectedByScope[scopeKey] ?? null) : null;
+      const hasReadyScope =
+        scope !== null && Boolean(scope.contractId && scope.contractId.trim().length > 0);
+
+      if (event.key === "Escape") {
+        if (store.activeTool !== "cursor") {
+          store.setActiveTool("cursor");
+        } else if (scope !== null && selectedId !== null) {
+          store.setSelectedDrawing(scope, null);
+        }
+        return;
+      }
+
+      if (event.key === "Delete" || event.key === "Backspace") {
+        if (hasReadyScope && scope !== null && selectedId !== null && !scopeState?.mutating) {
+          event.preventDefault();
+          void store.deleteDrawing(scope, selectedId);
+        }
+        return;
+      }
+
+      const mod = event.ctrlKey || event.metaKey;
+      if (!mod) {
+        return;
+      }
+      const keyLower = event.key.toLowerCase();
+      if (keyLower === "z" && !event.shiftKey) {
+        if (hasReadyScope && scope !== null && scopeState?.canUndo && !scopeState.mutating) {
+          event.preventDefault();
+          void store.undoScope(scope);
+        }
+        return;
+      }
+      if (keyLower === "y" || (keyLower === "z" && event.shiftKey)) {
+        if (hasReadyScope && scope !== null && scopeState?.canRedo && !scopeState.mutating) {
+          event.preventDefault();
+          void store.redoScope(scope);
+        }
+      }
+    };
+
+    window.addEventListener("keydown", handleKeyDown);
+    return () => {
+      window.removeEventListener("keydown", handleKeyDown);
+    };
+  }, [activeDrawingScope, authStage]);
+
   if (authStage === "checking") {
     return (
       <main className="login-gate">
@@ -917,19 +1027,22 @@ export function App() {
         onRetryContracts={() => void retryUnresolvedContracts({ resetAttempt: true })}
         onLogout={() => void handleLogout()}
       />
-      <WorkspaceGrid
-        layout={activeLayout}
-        activePaneId={activePaneId}
-        contracts={contracts}
-        activeFeedLive={statusData?.live ?? null}
-        wsClient={wsClient}
-        coordinator={coordinator}
-        syncController={syncController}
-        onSelectPane={handleSelectPane}
-        onSymbolChange={handlePaneSymbolChange}
-        onTimeframeChange={handlePaneTimeframeChange}
-        onAuthError={handlePaneAuthError}
-      />
+      <div className="terminal-body">
+        <DrawingToolbar activeScope={activeDrawingScope} />
+        <WorkspaceGrid
+          layout={activeLayout}
+          activePaneId={activePaneId}
+          contracts={contracts}
+          activeFeedLive={statusData?.live ?? null}
+          wsClient={wsClient}
+          coordinator={coordinator}
+          syncController={syncController}
+          onSelectPane={handleSelectPane}
+          onSymbolChange={handlePaneSymbolChange}
+          onTimeframeChange={handlePaneTimeframeChange}
+          onAuthError={handlePaneAuthError}
+        />
+      </div>
     </div>
   );
 }

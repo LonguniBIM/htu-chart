@@ -210,10 +210,161 @@ export interface WsPongMessage {
   type: "pong";
 }
 
+export type PersistedDrawingType =
+  | "trendline"
+  | "ray"
+  | "hline"
+  | "fvg_box"
+  | "order_block"
+  | "long_position"
+  | "short_position"
+  | "measure";
+
+export type DrawingActor = "user" | "agent";
+
+export interface DrawingAnchor {
+  role: string;
+  time: number;
+  price: number;
+}
+
+export interface DrawingCoordinates {
+  anchors: DrawingAnchor[];
+}
+
+export interface DrawingRecord {
+  id: string;
+  revision: number;
+  type: PersistedDrawingType;
+  symbol: RootSymbol;
+  contract_id: string | null;
+  pane_id: string | null;
+  created_by: DrawingActor;
+  source_bar_refs: number[];
+  coordinates: DrawingCoordinates;
+  style: Record<string, unknown>;
+  metadata: Record<string, unknown>;
+  created_at_utc: number;
+  updated_at_utc: number;
+}
+
+export interface DrawingInstrumentSpec {
+  root_symbol: RootSymbol;
+  name: string;
+  exchange: string;
+  tick_size: number;
+  tick_value: number;
+  currency: string;
+}
+
+export interface DrawingScopeResponse {
+  symbol: RootSymbol;
+  contract_id: string | null;
+  pane_id: string | null;
+  instrument: DrawingInstrumentSpec;
+  scope_revision: number;
+  can_undo: boolean;
+  can_redo: boolean;
+  drawings: DrawingRecord[];
+}
+
+export interface DrawingCommandResponse extends DrawingScopeResponse {
+  deduplicated: boolean;
+  affected_ids: string[];
+}
+
+export interface DrawingCreateInput {
+  id?: string;
+  type: PersistedDrawingType;
+  coordinates: DrawingCoordinates;
+  created_by?: DrawingActor;
+  source_bar_refs?: number[];
+  style?: Record<string, unknown>;
+  metadata?: Record<string, unknown>;
+}
+
+export interface DrawingUpdateInput {
+  id?: string;
+  type?: PersistedDrawingType;
+  coordinates?: DrawingCoordinates;
+  source_bar_refs?: number[];
+  style?: Record<string, unknown>;
+  metadata?: Record<string, unknown>;
+}
+
+export type DrawingBatchOperation =
+  | {
+      action: "create";
+      drawing: DrawingCreateInput;
+      created_by?: DrawingActor;
+    }
+  | {
+      action: "update";
+      drawing_id: string;
+      drawing: DrawingUpdateInput;
+      created_by?: DrawingActor;
+    }
+  | {
+      action: "delete";
+      drawing_id: string;
+      created_by?: DrawingActor;
+    };
+
+export interface DrawingCommandEnvelopeBase {
+  expected_revision: number;
+  idempotency_key?: string;
+  contract_id?: string | null;
+  pane_id?: string | null;
+  created_by?: DrawingActor;
+}
+
+export type DrawingCommandRequest =
+  | (DrawingCommandEnvelopeBase & {
+      action: "create";
+      drawing: DrawingCreateInput;
+    })
+  | (DrawingCommandEnvelopeBase & {
+      action: "update";
+      drawing_id: string;
+      drawing: DrawingUpdateInput;
+    })
+  | (DrawingCommandEnvelopeBase & {
+      action: "delete";
+      drawing_id: string;
+    })
+  | (DrawingCommandEnvelopeBase & {
+      action: "clear";
+    })
+  | (DrawingCommandEnvelopeBase & {
+      action: "batch";
+      operations: DrawingBatchOperation[];
+    });
+
+export interface UndoRedoRequest {
+  expected_revision: number;
+  idempotency_key?: string;
+  contract_id?: string | null;
+  pane_id?: string | null;
+  actor?: DrawingActor;
+}
+
+export interface WsDrawingsUpdateMessage {
+  type: "drawings_update";
+  symbol: RootSymbol;
+  contract_id: string | null;
+  pane_id: string | null;
+  scope_revision: number;
+  command_type: string;
+  can_undo: boolean;
+  can_redo: boolean;
+  drawings: DrawingRecord[];
+}
+
 export type WsInboundMessage =
   | WsBarUpdateMessage
   | WsFeedStatusMessage
   | WsResyncRequiredMessage
   | WsSubscribedMessage
+  | WsDrawingsUpdateMessage
   | WsErrorMessage
   | WsPongMessage;

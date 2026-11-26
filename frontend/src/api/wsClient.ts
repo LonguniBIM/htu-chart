@@ -1,6 +1,7 @@
 import type {
   Timeframe,
   WsBarUpdateMessage,
+  WsDrawingsUpdateMessage,
   WsErrorMessage,
   WsFeedStatusMessage,
   WsInboundMessage,
@@ -14,6 +15,7 @@ type BarUpdateListener = (message: WsBarUpdateMessage) => void;
 type FeedStatusListener = (message: WsFeedStatusMessage) => void;
 type ResyncRequiredListener = (message: WsResyncRequiredMessage) => void;
 type SubscribedListener = (message: WsSubscribedMessage) => void;
+type DrawingsUpdateListener = (message: WsDrawingsUpdateMessage) => void;
 type ErrorListener = (message: WsErrorMessage) => void;
 type ConnectionStateListener = (state: WsConnectionState) => void;
 type SessionExpiredListener = (reason: string) => void;
@@ -54,6 +56,7 @@ export class MarketWsClient {
   private readonly feedStatusListeners = new Set<FeedStatusListener>();
   private readonly resyncListeners = new Set<ResyncRequiredListener>();
   private readonly subscribedListeners = new Set<SubscribedListener>();
+  private readonly drawingsUpdateListeners = new Set<DrawingsUpdateListener>();
   private readonly errorListeners = new Set<ErrorListener>();
   private readonly connectionListeners = new Set<ConnectionStateListener>();
   private readonly sessionExpiredListeners = new Set<SessionExpiredListener>();
@@ -178,6 +181,13 @@ export class MarketWsClient {
     };
   }
 
+  onDrawingsUpdate(listener: DrawingsUpdateListener): () => void {
+    this.drawingsUpdateListeners.add(listener);
+    return () => {
+      this.drawingsUpdateListeners.delete(listener);
+    };
+  }
+
   onError(listener: ErrorListener): () => void {
     this.errorListeners.add(listener);
     return () => {
@@ -275,6 +285,10 @@ export class MarketWsClient {
         }
       } else if (parsed.type === "subscribed") {
         for (const listener of this.subscribedListeners) {
+          listener(parsed);
+        }
+      } else if (parsed.type === "drawings_update") {
+        for (const listener of this.drawingsUpdateListeners) {
           listener(parsed);
         }
       } else if (parsed.type === "error") {
