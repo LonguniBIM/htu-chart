@@ -10,6 +10,7 @@ import logging
 import multiprocessing
 import os
 import signal
+import threading
 import uuid
 from collections import deque
 from collections.abc import Callable, Mapping
@@ -26,7 +27,7 @@ from app.config import Settings
 from app.engine.backtester import run_backtest
 from app.engine.instruments import StorageDatasetKey, get_instrument_spec, validate_root_symbol
 from app.engine.ohlcv import OHLCVBar, validate_query_timestamp
-from app.engine.session_calendar import normalize_timeframe
+from app.engine.session_calendar import bucket_bounds, bucket_open_utc, normalize_timeframe
 from app.engine.strategies import create_strategy
 from app.security import redact_secrets
 from app.storage.parquet_store import ParquetStore, validate_resample_path
@@ -44,6 +45,38 @@ BacktestJobStatus = Literal[
 ]
 _TERMINAL_STATUSES = frozenset({"COMPLETED", "CANCELLED", "TIMED_OUT", "FAILED"})
 _ENVELOPE_FLAG = "__backtest_worker_envelope__"
+
+
+def _set_future_result[T](fut: asyncio.Future[T], res: T) -> None:
+    if not fut.done():
+        fut.set_result(res)
+
+
+def _set_future_exception[T](fut: asyncio.Future[T], exc: BaseException) -> None:
+    if not fut.done():
+        fut.set_exception(exc)
+
+
+async def _run_in_daemon_thread[T](fn: Callable[[], T]) -> T:
+    """Run blocking I/O or process-pool teardown in a dedicated daemon thread."""
+    loop = asyncio.get_running_loop()
+    fut: asyncio.Future[T] = loop.create_future()
+
+    def _runner() -> None:
+        try:
+            res = fn()
+        except BaseException as exc:
+            if not loop.is_closed():
+                with contextlib.suppress(RuntimeError):
+                    loop.call_soon_threadsafe(_set_future_exception, fut, exc)
+        else:
+            if not loop.is_closed():
+                with contextlib.suppress(RuntimeError):
+                    loop.call_soon_threadsafe(_set_future_result, fut, res)
+
+    thread = threading.Thread(target=_runner, daemon=True, name="backtest-daemon-op")
+    thread.start()
+    return await fut
 
 
 class BacktestServiceError(RuntimeError):
@@ -412,7 +445,7 @@ class BacktestService:
                 return
             if self._executor is None:
                 return
-            await asyncio.to_thread(self._terminate_and_reset_executor_sync)
+            await _run_in_daemon_thread(self._terminate_and_reset_executor_sync)
 
     def _queued_count(self) -> int:
         return sum(
@@ -460,7 +493,7 @@ class BacktestService:
                     job.error = "Cancelled on service shutdown"
             async with self._cleanup_lock:
                 if self._executor is not None:
-                    await asyncio.to_thread(self._terminate_and_reset_executor_sync)
+                    await _run_in_daemon_thread(self._terminate_and_reset_executor_sync)
                 active_task.cancel()
             with contextlib.suppress(TimeoutError, asyncio.CancelledError, Exception):
                 await asyncio.wait_for(active_task, timeout=2.0)
@@ -486,13 +519,19 @@ class BacktestService:
                 executor = self._executor
                 try:
                     await asyncio.wait_for(
-                        asyncio.to_thread(executor.shutdown, wait=True, cancel_futures=True),
+                        _run_in_daemon_thread(
+                            lambda: executor.shutdown(wait=True, cancel_futures=True)
+                        ),
                         timeout=3.0,
                     )
                     if self._executor is executor:
                         self._executor = None
                 except (TimeoutError, Exception):
-                    await asyncio.to_thread(self._terminate_and_reset_executor_sync)
+                    with contextlib.suppress(TimeoutError, Exception):
+                        await asyncio.wait_for(
+                            _run_in_daemon_thread(self._terminate_and_reset_executor_sync),
+                            timeout=3.0,
+                        )
 
     def submit_job(
         self,
@@ -636,7 +675,7 @@ class BacktestService:
         active_task = self._active_exec_task
         async with self._cleanup_lock:
             if self._executor is not None:
-                await asyncio.to_thread(self._terminate_and_reset_executor_sync)
+                await _run_in_daemon_thread(self._terminate_and_reset_executor_sync)
             if active_task is not None and not active_task.done():
                 active_task.cancel()
         self._prune_terminal_jobs()
@@ -651,7 +690,33 @@ class BacktestService:
             "max_queue_depth": self._settings.backtest_max_queue_depth,
         }
 
+    async def _ensure_no_defective_coverage(
+        self,
+        key: StorageDatasetKey,
+        start_ts: int,
+        end_ts: int,
+    ) -> None:
+        if self._sqlite_store is None:
+            return
+        intervals = await self._sqlite_store.get_coverage_intervals(key)
+        for iv in intervals:
+            if iv.start_ts < end_ts and iv.end_ts > start_ts and (
+                iv.status in {"CORRUPTED", "TRUNCATED", "PROVIDER_GAP"}
+                or iv.quarantined_count > 0
+                or iv.truncated
+                or iv.provider_gap
+            ):
+                raise ValueError(
+                    f"Dataset {key.contract_id} ({key.timeframe}) has defective coverage "
+                    f"[{iv.start_ts}, {iv.end_ts}) status={iv.status}"
+                )
+
     async def _load_closed_bars(self, job: BacktestJobRecord) -> list[OHLCVBar]:
+        _, aligned_end = bucket_bounds(
+            job.end_time,
+            job.timeframe,
+            root_symbol=job.root_symbol,
+        )
         if job.resample_from is not None:
             source_key = StorageDatasetKey(
                 "topstepx",
@@ -659,6 +724,15 @@ class BacktestService:
                 job.contract_id,
                 job.resample_from,
             )
+            target_key = StorageDatasetKey(
+                "topstepx",
+                job.live_mode,
+                job.contract_id,
+                job.timeframe,
+            )
+            aligned_start = bucket_open_utc(job.start_time, job.timeframe)
+            await self._ensure_no_defective_coverage(source_key, aligned_start, aligned_end)
+            await self._ensure_no_defective_coverage(target_key, job.start_time, aligned_end)
             resample_res = await self._parquet_store.resample_with_issues(
                 source_key,
                 job.timeframe,
@@ -670,12 +744,6 @@ class BacktestService:
                 limit=job.max_bars + 1,
             )
             if resample_res.issues:
-                target_key = StorageDatasetKey(
-                    "topstepx",
-                    job.live_mode,
-                    job.contract_id,
-                    job.timeframe,
-                )
                 if self._sqlite_store is not None:
                     await self._sqlite_store.record_quality_issues(
                         target_key,
@@ -712,8 +780,11 @@ class BacktestService:
             job.contract_id,
             job.timeframe,
         )
+        await self._ensure_no_defective_coverage(dataset_key, job.start_time, aligned_end)
         target_path = self._parquet_store.resolve_path(dataset_key)
-        stored_root = await asyncio.to_thread(_read_parquet_stored_root, target_path)
+        stored_root = await _run_in_daemon_thread(
+            lambda: _read_parquet_stored_root(target_path)
+        )
         validate_root_symbol(
             job.contract_id,
             job.root_symbol,
@@ -838,7 +909,12 @@ class BacktestService:
                 result_bytes = int(raw_output["result_bytes"])
             else:
                 result_dict = raw_output
-                result_bytes = await asyncio.to_thread(_measure_result_bytes, result_dict)
+                result_bytes = await _run_in_daemon_thread(
+                    lambda: _measure_result_bytes(result_dict)
+                )
+
+            if job.status != "RUNNING":
+                return
 
             if result_bytes > self._settings.backtest_max_result_bytes:
                 job.status = "FAILED"

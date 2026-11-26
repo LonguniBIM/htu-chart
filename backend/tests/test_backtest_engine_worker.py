@@ -11,6 +11,7 @@ import tempfile
 import threading
 import time
 from collections.abc import Mapping, Sequence
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from pathlib import Path
@@ -856,14 +857,25 @@ def test_indicators_and_strategy_param_validation() -> None:
     flat_bars = [_bar(t0 + i * 60, 100.0, 100.0, 100.0, 100.0) for i in range(5)]
     assert rsi(flat_bars, 3)[-1][1] == 50.0
 
-    # FVG, OB, and Sweep on setup bars
+    # FVG, OB, and Sweep on setup bars with exact independent value checks
     setup_bars = _ict_long_setup_bars()
     fvgs = detect_fvg_zones(setup_bars, min_gap_ticks=1.0, tick_size=0.25)
-    assert any(z.direction == "bullish" and z.detected_at_time == setup_bars[7].time for z in fvgs)
+    assert len(fvgs) == 4
+    assert fvgs[0].direction == "bullish"
+    assert fvgs[0].bottom == 100.75
+    assert fvgs[0].top == 101.50
+    assert fvgs[0].midpoint == 101.125
+    assert fvgs[0].start_time == setup_bars[5].time
+    assert fvgs[0].end_time == setup_bars[7].time
+    assert fvgs[0].detected_at_time == setup_bars[7].time
+
     sweeps = detect_liquidity_sweeps(setup_bars, swing_lookback=5)
-    assert any(
-        s.direction == "bullish" and s.detected_at_time == setup_bars[5].time for s in sweeps
-    )
+    assert len(sweeps) == 1
+    assert sweeps[0].direction == "bullish"
+    assert sweeps[0].level_price == 100.00
+    assert sweeps[0].level_time == setup_bars[2].time
+    assert sweeps[0].sweep_extreme == 99.50
+    assert sweeps[0].detected_at_time == setup_bars[5].time
 
     ob_bars = [
         _bar(t0 + 0 * 60, 101.0, 101.5, 100.5, 101.0),
@@ -874,7 +886,10 @@ def test_indicators_and_strategy_param_validation() -> None:
     obs = detect_order_blocks(ob_bars, lookback=3)
     assert len(obs) == 1
     assert obs[0].direction == "bullish"
+    assert obs[0].top == 101.25
+    assert obs[0].bottom == 100.25
     assert obs[0].start_time == ob_bars[2].time
+    assert obs[0].end_time == ob_bars[3].time
     assert obs[0].detected_at_time == ob_bars[3].time
 
     # Static registry & parameter validation
@@ -2149,3 +2164,328 @@ async def test_resample_issues_quarantine_and_fail_backtest(tmp_path: Path) -> N
         assert quality["quarantined_bars"] >= 1
         assert quality["corrupted_intervals"] >= 1
         assert await app.state.sqlite_store.is_interval_complete(m5_key, t0, t0 + 300) is False
+
+
+def test_session_vwap_large_volume_decimal_prevents_float64_overflow() -> None:
+    """Contract: Decimal accumulation keeps session_vwap exact and finite for 1e308 volumes.
+
+    Defect caught: Float64 overflow turning session_vwap into inf/nan across multiple bars.
+    """
+    t0 = int(datetime(2026, 1, 15, 15, 0, tzinfo=UTC).timestamp())
+    bars = [
+        _bar(t0, 100.0, 100.0, 100.0, 100.0, v=1e308),
+        _bar(t0 + 60, 100.0, 100.0, 100.0, 100.0, v=1e308),
+        _bar(t0 + 120, 100.0, 100.0, 100.0, 100.0, v=1e308),
+    ]
+    vwap_one = session_vwap(bars[:1])
+    vwap_two = session_vwap(bars[:2])
+    assert vwap_one == [(t0, 100.0)]
+    assert vwap_two == [(t0, 100.0), (t0 + 60, 100.0)]
+
+    bt_res = run_backtest(
+        bars,
+        contract_id="CON.F.US.MES.Z26",
+        timeframe="1m",
+        strategy_id="ict_fvg_sweep",
+        params={"ema_period": 2, "include_vwap": True},
+    )
+    payload = bt_res.to_dict()
+    encoded = json.dumps(payload, allow_nan=False)
+    assert "Infinity" not in encoded
+    assert "NaN" not in encoded
+
+
+def test_mgc_fvg_ce_decimal_midpoint_and_tp_snapping() -> None:
+    """Contract: FVG midpoint and fvg_ce TP snapping use Decimal without binary float drift.
+
+    Defect caught: (1850.1 + 1850.3)/2 drifting to 1850.1999999999998 on MGC limit fills.
+    """
+    t0 = 1_760_000_000
+    mgc_specs = [
+        (1850.2, 1850.3, 1850.1, 1850.2),   # 0
+        (1850.2, 1850.3, 1850.1, 1850.2),   # 1
+        (1850.2, 1850.3, 1850.05, 1850.2),  # 2: swing low = 1850.05
+        (1850.2, 1850.3, 1850.1, 1850.2),   # 3
+        (1850.2, 1850.3, 1850.1, 1850.1),   # 4
+        (1850.1, 1850.1, 1850.0, 1850.1),   # 5: SSL sweep=1850.0; close=1850.1 > 1850.05
+        (1850.1, 1850.4, 1850.1, 1850.35),  # 6
+        (1850.35, 1850.5, 1850.3, 1850.45), # 7: bullish FVG [1850.1, 1850.3], midpoint=1850.2
+        (1850.3, 1850.35, 1850.2, 1850.3),  # 8: touches limit=1850.2 exactly
+        (1850.3, 1850.45, 1850.25, 1850.4), # 9: hits TP=1850.4
+    ]
+    mgc_bars = [_bar(t0 + i * 60, o, h, low, c) for i, (o, h, low, c) in enumerate(mgc_specs)]
+    fvgs = detect_fvg_zones(mgc_bars[:8], min_gap_ticks=1.0, tick_size=0.10)
+    assert len(fvgs) == 1
+    assert fvgs[0].bottom == 1850.1
+    assert fvgs[0].top == 1850.3
+    assert fvgs[0].midpoint == 1850.2
+
+    res = run_backtest(
+        mgc_bars,
+        contract_id="CON.F.US.MGC.Z26",
+        timeframe="1m",
+        strategy_id="ict_fvg_sweep",
+        params={
+            "swing_lookback": 5,
+            "entry_mode": "fvg_ce",
+            "sl_buffer_ticks": 1.0,
+            "risk_reward": 0.5,
+            "min_fvg_ticks": 1.0,
+        },
+    )
+    assert len(res.trades) == 1
+    tr = res.trades[0]
+    assert tr.entry_price == 1850.2
+    assert tr.stop_loss == 1849.9
+    assert tr.take_profit == 1850.4
+    assert tr.exit_price == 1850.4
+    assert tr.exit_reason == "take_profit"
+
+
+async def test_fallback_json_sizing_cancel_race_preserves_cancelled(tmp_path: Path) -> None:
+    """Contract: Cancelling while fallback _measure_result_bytes awaits preserves CANCELLED.
+
+    Defect caught: Fallback JSON sizing completion overwriting CANCELLED with COMPLETED result.
+    """
+    import app.services.backtest_service as bs_mod
+
+    sizing_entered = threading.Event()
+    sizing_release = threading.Event()
+    orig_measure = bs_mod._measure_result_bytes
+
+    def _gated_measure(result_dict: dict[str, Any]) -> int:
+        sizing_entered.set()
+        sizing_release.wait(timeout=5.0)
+        return orig_measure(result_dict)
+
+    bs_mod._measure_result_bytes = _gated_measure
+    try:
+        async with _async_client(tmp_path, worker_fn=worker_hang_or_fast) as (client, app):
+            csrf = await _login(client)
+            t0 = 1_760_000_000
+            resp = await client.post(
+                "/api/backtest",
+                headers={"X-CSRF-Token": csrf},
+                json={
+                    "contract_id": "CON.F.US.MES.Z26",
+                    "timeframe": "5m",
+                    "start_time": t0,
+                    "end_time": t0 + 3600,
+                },
+            )
+            assert resp.status_code == 202
+            job_id = resp.json()["job_id"]
+
+            for _ in range(100):
+                if sizing_entered.is_set():
+                    break
+                await asyncio.sleep(0.02)
+            assert sizing_entered.is_set()
+
+            del_resp = await client.delete(
+                f"/api/backtest/{job_id}",
+                headers={"X-CSRF-Token": csrf},
+            )
+            assert del_resp.status_code == 200
+            assert del_resp.json()["status"] == "CANCELLED"
+
+            sizing_release.set()
+            await asyncio.sleep(0.15)
+            detail = (await client.get(f"/api/backtest/{job_id}")).json()
+            assert detail["status"] == "CANCELLED"
+            assert detail["result"] is None
+            assert app.state.backtest_service.get_job(job_id).result is None
+    finally:
+        sizing_release.set()
+        bs_mod._measure_result_bytes = orig_measure
+
+
+async def test_default_threadpool_saturation_does_not_hang_stop(tmp_path: Path) -> None:
+    """Contract: Saturated default ThreadPoolExecutor(max_workers=1) does not stall stop().
+
+    Defect caught: Using asyncio.to_thread for executor teardown deadlocking behind blocked I/O.
+    """
+    loop = asyncio.get_running_loop()
+    orig_executor = getattr(loop, "_default_executor", None)
+    tiny_pool = ThreadPoolExecutor(max_workers=1)
+    loop.set_default_executor(tiny_pool)
+    barrier = threading.Event()
+    blocked_entered = threading.Event()
+    t0 = 1_760_000_000
+
+    try:
+        async with _async_client(
+            tmp_path,
+            backtest_timeout_sec=1.5,
+            worker_fn=worker_hang_or_fast,
+        ) as (client, app):
+            csrf = await _login(client)
+            store = app.state.parquet_store
+            key_ok = StorageDatasetKey("topstepx", False, "CON.F.US.MES.POOL1", "5m")
+            key_sat = StorageDatasetKey("topstepx", False, "CON.F.US.MES.POOL2", "5m")
+            await store.upsert_bars(key_ok, _ict_long_setup_bars(t0, 300), root_symbol="MES")
+            await store.upsert_bars(key_sat, _ict_long_setup_bars(t0, 300), root_symbol="MES")
+
+            # 1) Warm up and create the ProcessPoolExecutor worker via Job 1.
+            r1 = await client.post(
+                "/api/backtest",
+                headers={"X-CSRF-Token": csrf},
+                json={
+                    "contract_id": "CON.F.US.MES.POOL1",
+                    "root_symbol": "MES",
+                    "timeframe": "5m",
+                    "start_time": t0,
+                    "end_time": t0 + 5000,
+                },
+            )
+            j1 = r1.json()["job_id"]
+            for _ in range(100):
+                if (await client.get(f"/api/backtest/{j1}")).json()["status"] == "COMPLETED":
+                    break
+                await asyncio.sleep(0.05)
+
+            # 2) Saturate the 1-thread default pool on Job 2's _read_bars_sync.
+            orig_sync = store._read_bars_sync
+
+            def _blocking_sync(
+                target: Path,
+                key: StorageDatasetKey,
+                **kwargs: Any,
+            ) -> list[OHLCVBar]:
+                if key.contract_id == "CON.F.US.MES.POOL2":
+                    blocked_entered.set()
+                    barrier.wait(timeout=15.0)
+                return orig_sync(target, key, **kwargs)
+
+            store._read_bars_sync = _blocking_sync
+            r2 = await client.post(
+                "/api/backtest",
+                headers={"X-CSRF-Token": csrf},
+                json={
+                    "contract_id": "CON.F.US.MES.POOL2",
+                    "root_symbol": "MES",
+                    "timeframe": "5m",
+                    "start_time": t0,
+                    "end_time": t0 + 5000,
+                },
+            )
+            j2 = r2.json()["job_id"]
+            for _ in range(100):
+                if blocked_entered.is_set():
+                    break
+                await asyncio.sleep(0.01)
+            assert blocked_entered.is_set()
+
+            st2: dict[str, Any] = {}
+            for _ in range(100):
+                st2 = (await client.get(f"/api/backtest/{j2}")).json()
+                if st2["status"] == "TIMED_OUT":
+                    break
+                await asyncio.sleep(0.05)
+            assert st2["status"] == "TIMED_OUT"
+
+            # 3) Call stop() BEFORE releasing barrier while default thread pool is saturated.
+            t_stop = time.monotonic()
+            await app.state.backtest_service.stop()
+            stop_elapsed = time.monotonic() - t_stop
+            assert stop_elapsed < 4.0
+            assert not barrier.is_set()
+    finally:
+        barrier.set()
+        loop.set_default_executor(
+            orig_executor if orig_executor is not None else ThreadPoolExecutor()
+        )
+        tiny_pool.shutdown(wait=True)
+
+
+async def test_preexisting_defective_coverage_fails_backtest(tmp_path: Path) -> None:
+    """Contract: Defective SQLite coverage fails overlapping direct/resampled backtests.
+
+    Defect caught: Executing backtests over ranges marked CORRUPTED/TRUNCATED/PROVIDER_GAP.
+    """
+    async with _async_client(tmp_path) as (client, app):
+        csrf = await _login(client)
+        t0 = int(datetime(2025, 10, 10, 14, 0, tzinfo=UTC).timestamp())
+        m1_key = StorageDatasetKey("topstepx", False, "CON.F.US.MES.Z26", "1m")
+        m5_key = StorageDatasetKey("topstepx", False, "CON.F.US.MES.Z26", "5m")
+
+        five_min_bars = _ict_long_setup_bars(t0, 300)
+        one_min_bars = [
+            _bar(b.time + m * 60, b.open, b.high, b.low, b.close, b.volume / 5.0)
+            for b in five_min_bars
+            for m in range(5)
+        ]
+        await app.state.parquet_store.upsert_bars(m5_key, five_min_bars)
+        await app.state.parquet_store.upsert_bars(m1_key, one_min_bars)
+
+        # Mark [t0, t0 + 300) on 5m as CORRUPTED and [t0 + 600, t0 + 900) on 1m as PROVIDER_GAP.
+        await app.state.sqlite_store.record_coverage(
+            m5_key, t0, t0 + 300, status="CORRUPTED", quarantined_count=1
+        )
+        await app.state.sqlite_store.record_coverage(
+            m1_key, t0 + 600, t0 + 900, status="PROVIDER_GAP", provider_gap=True
+        )
+        # Non-overlapping clean range [t0 + 1200, t0 + 3000) is COMPLETE.
+        await app.state.sqlite_store.record_coverage(
+            m5_key, t0 + 1200, t0 + 3000, status="COMPLETE"
+        )
+
+        # 1) Direct read_bars intersecting CORRUPTED 5m coverage -> FAILED
+        r_direct = await client.post(
+            "/api/backtest",
+            headers={"X-CSRF-Token": csrf},
+            json={
+                "contract_id": "CON.F.US.MES.Z26",
+                "timeframe": "5m",
+                "start_time": t0,
+                "end_time": t0 + 600,
+            },
+        )
+        jd = r_direct.json()["job_id"]
+        for _ in range(100):
+            std = (await client.get(f"/api/backtest/{jd}")).json()
+            if std["status"] == "FAILED":
+                break
+            await asyncio.sleep(0.05)
+        assert std["status"] == "FAILED"
+        assert "defective coverage" in std["error"].lower()
+
+        # 2) Resampled 1m->5m intersecting PROVIDER_GAP 1m coverage -> FAILED
+        r_res = await client.post(
+            "/api/backtest",
+            headers={"X-CSRF-Token": csrf},
+            json={
+                "contract_id": "CON.F.US.MES.Z26",
+                "timeframe": "5m",
+                "resample_from": "1m",
+                "start_time": t0 + 600,
+                "end_time": t0 + 1200,
+            },
+        )
+        jr = r_res.json()["job_id"]
+        for _ in range(100):
+            str_ = (await client.get(f"/api/backtest/{jr}")).json()
+            if str_["status"] == "FAILED":
+                break
+            await asyncio.sleep(0.05)
+        assert str_["status"] == "FAILED"
+        assert "defective coverage" in str_["error"].lower()
+
+        # 3) Non-overlapping clean range -> COMPLETED
+        r_clean = await client.post(
+            "/api/backtest",
+            headers={"X-CSRF-Token": csrf},
+            json={
+                "contract_id": "CON.F.US.MES.Z26",
+                "timeframe": "5m",
+                "start_time": t0 + 1200,
+                "end_time": t0 + 3000,
+            },
+        )
+        jc = r_clean.json()["job_id"]
+        for _ in range(100):
+            stc = (await client.get(f"/api/backtest/{jc}")).json()
+            if stc["status"] == "COMPLETED":
+                break
+            await asyncio.sleep(0.05)
+        assert stc["status"] == "COMPLETED"

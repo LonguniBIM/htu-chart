@@ -5,6 +5,7 @@ from __future__ import annotations
 import math
 from collections.abc import Sequence
 from dataclasses import dataclass
+from decimal import Decimal
 from typing import Any, Literal
 
 from app.engine.ohlcv import OHLCVBar
@@ -159,21 +160,27 @@ def session_vwap(bars: Sequence[OHLCVBar]) -> list[tuple[int, float]]:
 
     result: list[tuple[int, float]] = []
     current_session: int | None = None
-    cum_pv = 0.0
-    cum_vol = 0.0
+    cum_pv = Decimal("0")
+    cum_vol = Decimal("0")
+    three = Decimal("3")
+    zero = Decimal("0")
 
     for bar in bars:
         sess_open = vwap_session_open_utc(bar.time)
         if sess_open != current_session:
             current_session = sess_open
-            cum_pv = 0.0
-            cum_vol = 0.0
+            cum_pv = Decimal("0")
+            cum_vol = Decimal("0")
 
-        typical_price = (float(bar.high) + float(bar.low) + float(bar.close)) / 3.0
-        vol = float(bar.volume)
-        cum_pv += typical_price * vol
+        tp = (
+            Decimal(str(float(bar.high)))
+            + Decimal(str(float(bar.low)))
+            + Decimal(str(float(bar.close)))
+        ) / three
+        vol = Decimal(str(float(bar.volume)))
+        cum_pv += tp * vol
         cum_vol += vol
-        vwap_val = (cum_pv / cum_vol) if cum_vol > 0.0 else typical_price
+        vwap_val = float(cum_pv / cum_vol) if cum_vol > zero else float(tp)
         result.append((bar.time, vwap_val))
 
     return result
@@ -210,11 +217,12 @@ def detect_fvg_at_index(
     if right.low > left.high and (right.low - left.high) + 1e-12 >= min_gap:
         bottom = float(left.high)
         top = float(right.low)
+        midpoint = float((Decimal(str(bottom)) + Decimal(str(top))) / Decimal("2"))
         return FVGZone(
             direction="bullish",
             top=top,
             bottom=bottom,
-            midpoint=(top + bottom) / 2.0,
+            midpoint=midpoint,
             start_time=left.time,
             end_time=right.time,
             detected_at_time=right.time,
@@ -223,11 +231,12 @@ def detect_fvg_at_index(
     if right.high < left.low and (left.low - right.high) + 1e-12 >= min_gap:
         top = float(left.low)
         bottom = float(right.high)
+        midpoint = float((Decimal(str(bottom)) + Decimal(str(top))) / Decimal("2"))
         return FVGZone(
             direction="bearish",
             top=top,
             bottom=bottom,
-            midpoint=(top + bottom) / 2.0,
+            midpoint=midpoint,
             start_time=left.time,
             end_time=right.time,
             detected_at_time=right.time,
