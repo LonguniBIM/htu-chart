@@ -116,8 +116,10 @@ export function BacktestPanel({ activeTarget }: BacktestPanelProps) {
   }
 
   const canCancel =
-    activeJob !== null && (activeJob.status === "QUEUED" || activeJob.status === "RUNNING");
-  const isBusy = submitting || polling || canCancel;
+    activeJob !== null &&
+    (activeJob.status === "QUEUED" || activeJob.status === "RUNNING") &&
+    (polling || submitting);
+  const isBusy = submitting || polling;
   const result = activeJob?.status === "COMPLETED" ? activeJob.result : null;
   const summary = result?.summary ?? activeJob?.summary ?? null;
 

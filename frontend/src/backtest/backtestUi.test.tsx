@@ -2,7 +2,6 @@
 import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
 import type { ISeriesApi, SeriesType, Time } from "lightweight-charts";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { ApiError } from "../api/client";
 import type {
   BacktestJobDetail,
   BacktestJobSummary,
@@ -473,11 +472,38 @@ describe("Backtest Store, Overlay Primitive, Panel, and ReplayControlBar", () =>
       await Promise.resolve();
     });
 
-    // Submit backtest
+    // Submit backtest and verify serialized POST /api/backtest body
     await act(async () => {
       fireEvent.click(screen.getByRole("button", { name: "Run Backtest" }));
       await Promise.resolve();
       await Promise.resolve();
+    });
+
+    const postCall = fetchMock.mock.calls.find(
+      ([url, init]) => String(url) === "/api/backtest" && init?.method === "POST",
+    );
+    expect(postCall).toBeDefined();
+    const sentBody = JSON.parse(String(postCall![1]!.body)) as BacktestSubmitRequest;
+    expect(sentBody).toEqual({
+      contract_id: "CON.F.US.MES.H26",
+      root_symbol: "MES",
+      timeframe: "5m",
+      live_mode: false,
+      start_time: 1699999980,
+      end_time: 1700000580,
+      strategy_id: "ict_fvg_sweep",
+      params: {
+        swing_lookback: 5,
+        sweep_window_bars: 5,
+        min_fvg_ticks: 1,
+        risk_reward: 2,
+        sl_buffer_ticks: 1,
+        entry_mode: "market",
+        max_wait_bars: 5,
+        quantity: 1,
+        ema_period: 20,
+        include_vwap: true,
+      },
     });
 
     expect(screen.getByText("Net Profit")).toBeTruthy();
@@ -524,7 +550,6 @@ describe("Backtest Store, Overlay Primitive, Panel, and ReplayControlBar", () =>
     });
 
     expect(authSpy).toHaveBeenCalledWith(401, expect.stringContaining("Authentication required"));
-    expect(ApiError).toBeDefined();
   });
 
   it("halts strategy retry storm on HTTP 500 and recovers via manual Retry (P1-001)", async () => {
@@ -691,5 +716,139 @@ describe("Backtest Store, Overlay Primitive, Panel, and ReplayControlBar", () =>
     expect(useBacktestStore.getState().polling).toBe(false);
     expect(useBacktestStore.getState().submitting).toBe(false);
     expect(useBacktestStore.getState().activeJob?.status).toBe("COMPLETED");
+  });
+
+  it("terminalizes activeJob on 404 poll/cancel and keeps BacktestPanel unlocked after transient poll 500 (P2-002)", async () => {
+    /**
+     * Contract: HTTP 404 during pollOnce or cancelActiveJob (including 409 -> 404 refresh)
+     * terminalizes activeJob to FAILED, and transient HTTP 500 poll failure stops polling
+     * while leaving Run Backtest enabled and Clear visible/clickable (no UI wedge).
+     * Defect caught: Stranded QUEUED/RUNNING activeJob wedging Run Backtest and Clear buttons.
+     */
+    const payload: BacktestSubmitRequest = {
+      contract_id: "CON.F.US.MES.H26",
+      root_symbol: "MES",
+      timeframe: "5m",
+      live_mode: false,
+      start_time: 1700000000,
+      end_time: 1700002700,
+    };
+
+    // 1. pollOnce HTTP 404 terminalizes activeJob to FAILED
+    fetchMock
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify(makeJobSummary("missing-poll-job", "QUEUED")), {
+          status: 202,
+          headers: { "Content-Type": "application/json" },
+        }),
+      )
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ detail: "Job not found" }), {
+          status: 404,
+          headers: { "Content-Type": "application/json" },
+        }),
+      );
+
+    const poll404Promise = useBacktestStore.getState().runBacktest(payload);
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+      await vi.advanceTimersByTimeAsync(500);
+    });
+    await poll404Promise;
+    expect(useBacktestStore.getState().activeJob?.status).toBe("FAILED");
+    expect(useBacktestStore.getState().polling).toBe(false);
+
+    // 2. cancelActiveJob direct 404 and 409 -> 404 terminalize activeJob
+    useBacktestStore.setState({
+      activeJob: { ...makeJobSummary("direct-404-job", "RUNNING"), result: null },
+      polling: true,
+    });
+    fetchMock.mockResolvedValueOnce(
+      new Response(JSON.stringify({ detail: "Job gone" }), {
+        status: 404,
+        headers: { "Content-Type": "application/json" },
+      }),
+    );
+    await act(async () => {
+      await useBacktestStore.getState().cancelActiveJob();
+    });
+    expect(useBacktestStore.getState().activeJob?.status).toBe("FAILED");
+
+    useBacktestStore.setState({
+      activeJob: { ...makeJobSummary("conflict-404-job", "RUNNING"), result: null },
+      polling: true,
+    });
+    fetchMock
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ detail: "Conflict" }), {
+          status: 409,
+          headers: { "Content-Type": "application/json" },
+        }),
+      )
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ detail: "Evicted" }), {
+          status: 404,
+          headers: { "Content-Type": "application/json" },
+        }),
+      );
+    await act(async () => {
+      await useBacktestStore.getState().cancelActiveJob();
+    });
+    expect(useBacktestStore.getState().activeJob?.status).toBe("FAILED");
+
+    // 3. Transient poll HTTP 500 in BacktestPanel leaves Run Backtest enabled and Clear clickable
+    useBacktestStore.getState().reset();
+    fetchMock
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ strategies: [], count: 0 }), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        }),
+      )
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify(makeJobSummary("transient-500-job", "QUEUED")), {
+          status: 202,
+          headers: { "Content-Type": "application/json" },
+        }),
+      )
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ detail: "Temporary upstream error" }), {
+          status: 500,
+          headers: { "Content-Type": "application/json" },
+        }),
+      );
+
+    useBacktestStore.getState().togglePanel();
+    render(
+      <BacktestPanel
+        activeTarget={{
+          paneId: "pane-1",
+          contractId: "CON.F.US.MES.H26",
+          rootSymbol: "MES",
+          timeframe: "5m",
+          liveMode: false,
+        }}
+      />,
+    );
+
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Run Backtest" }));
+      await Promise.resolve();
+      await Promise.resolve();
+      await vi.advanceTimersByTimeAsync(500);
+    });
+
+    expect(useBacktestStore.getState().polling).toBe(false);
+    const runBtn = screen.getByRole("button", { name: "Run Backtest" }) as HTMLButtonElement;
+    expect(runBtn.disabled).toBe(false);
+    const clearBtn = screen.getByRole("button", { name: "Clear" });
+    fireEvent.click(clearBtn);
+    expect(useBacktestStore.getState().activeJob).toBeNull();
   });
 });

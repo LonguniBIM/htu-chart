@@ -114,6 +114,30 @@ function toJobDetail(summary: BacktestJobSummary): BacktestJobDetail {
   };
 }
 
+function terminalizeFailedJob(
+  state: BacktestStoreState,
+  jobId: string,
+  message: string,
+): Partial<BacktestStoreState> {
+  if (
+    state.activeJob !== null &&
+    state.activeJob.job_id === jobId &&
+    !TERMINAL_STATUSES.has(state.activeJob.status)
+  ) {
+    const failedJob: BacktestJobDetail = {
+      ...state.activeJob,
+      status: "FAILED",
+      error: message,
+      result: null,
+    };
+    return {
+      activeJob: failedJob,
+      jobs: upsertJobSummary(state.jobs, failedJob),
+    };
+  }
+  return {};
+}
+
 export const useBacktestStore = create<BacktestStoreState>((set, get) => {
   const handlePossibleAuthError = (err: unknown, requestEpoch: number): boolean => {
     if (isAuthStatusError(err) && requestEpoch === get().sessionEpoch) {
@@ -322,11 +346,20 @@ export const useBacktestStore = create<BacktestStoreState>((set, get) => {
                 return;
               }
               clearPollTimer();
-              set({ polling: false });
-              if (!handlePossibleAuthError(err, requestEpoch)) {
-                set({
-                  error: err instanceof Error ? err.message : "Failed to poll backtest job",
-                });
+              if (handlePossibleAuthError(err, requestEpoch)) {
+                set({ polling: false, submitting: false });
+              } else {
+                const message =
+                  err instanceof Error ? err.message : "Failed to poll backtest job";
+                const isNotFound = err instanceof ApiError && err.status === 404;
+                set((state) => ({
+                  polling: false,
+                  submitting: false,
+                  error: message,
+                  ...(isNotFound
+                    ? terminalizeFailedJob(state, submitted.job_id, message)
+                    : {}),
+                }));
               }
               finish(null);
             } finally {
@@ -416,12 +449,20 @@ export const useBacktestStore = create<BacktestStoreState>((set, get) => {
               return;
             }
             if (!handlePossibleAuthError(refreshErr, requestEpoch)) {
-              set({
-                error:
-                  refreshErr instanceof Error
-                    ? refreshErr.message
-                    : "Failed to refresh backtest job after 409 conflict",
-              });
+              const refreshMsg =
+                refreshErr instanceof Error
+                  ? refreshErr.message
+                  : "Failed to refresh backtest job after 409 conflict";
+              const isRefreshNotFound =
+                refreshErr instanceof ApiError && refreshErr.status === 404;
+              set((state) => ({
+                polling: false,
+                submitting: false,
+                error: refreshMsg,
+                ...(isRefreshNotFound
+                  ? terminalizeFailedJob(state, currentJob.job_id, refreshMsg)
+                  : {}),
+              }));
             }
           }
           return;
@@ -429,9 +470,16 @@ export const useBacktestStore = create<BacktestStoreState>((set, get) => {
         if (handlePossibleAuthError(err, requestEpoch)) {
           return;
         }
-        set({
-          error: err instanceof Error ? err.message : "Failed to cancel backtest job",
-        });
+        const message = err instanceof Error ? err.message : "Failed to cancel backtest job";
+        const isNotFound = err instanceof ApiError && err.status === 404;
+        set((state) => ({
+          polling: false,
+          submitting: false,
+          error: message,
+          ...(isNotFound
+            ? terminalizeFailedJob(state, currentJob.job_id, message)
+            : {}),
+        }));
       } finally {
         if (activeActionController === controller) {
           activeActionController = null;

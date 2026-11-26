@@ -3753,4 +3753,112 @@ describe("ChartPane (F06, P1-R3-01, P1-R3-02)", () => {
       vi.useRealTimers();
     }
   });
+
+  it("keeps frozen replay bars and OHLC legend during fetchBars snapshot resync and restores mutated bars after exitReplay (P1-001, P2-001)", async () => {
+    /**
+     * Contract: When Replay Mode is started on a provisional bar (close=5001, is_closed=false)
+     * and a subsequent fetchBars resync (triggered by WS subscribed/resync_required) returns a
+     * mutated close=4995 + newer bar, ChartPane continues rendering frozen replaySession.bars
+     * (close=5001) on candleSeries and legend until exitReplay(), after which fullBarsRef
+     * (close=4995 + newer bar) renders immediately.
+     * Defect caught: fetchBars.then() overwriting visible candleSeries/legend with mutable mergedBars during replay.
+     */
+    const initialBars: OhlcvBar[] = [
+      { time: 1700000000, open: 5000, high: 5002, low: 4999, close: 5000, volume: 10, is_closed: true },
+      { time: 1700000300, open: 5000, high: 5002, low: 4999.5, close: 5001, volume: 12, is_closed: false },
+    ];
+    const resyncedBars: OhlcvBar[] = [
+      initialBars[0]!,
+      { time: 1700000300, open: 5000, high: 5002, low: 4994, close: 4995, volume: 22, is_closed: true },
+      { time: 1700000600, open: 4995, high: 4998, low: 4994.5, close: 4997, volume: 18, is_closed: false },
+    ];
+    fetchBarsMock
+      .mockResolvedValueOnce(makeBarsResponse("CON.F.US.MES.H26", initialBars))
+      .mockResolvedValueOnce(makeBarsResponse("CON.F.US.MES.H26", resyncedBars));
+
+    const coordinator = new PaneFetchCoordinator();
+    const fakeWs = createFakeWsClient();
+    const pane: PaneConfig = {
+      pane_id: "pane-1",
+      root_symbol: "MES",
+      timeframe: "5m",
+      live_mode: false,
+      playback_mode: "live",
+    };
+
+    const { container } = render(
+      <ChartPane
+        pane={pane}
+        contractId="CON.F.US.MES.H26"
+        activeFeedLive={false}
+        wsClient={fakeWs.client}
+        coordinator={coordinator}
+      />,
+    );
+
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    // Start replay at bar index 1 (the provisional bar close=5001)
+    act(() => {
+      useReplayStore.getState().startReplayAtBar(
+        {
+          paneId: "pane-1",
+          contractId: "CON.F.US.MES.H26",
+          rootSymbol: "MES",
+          timeframe: "5m",
+          liveMode: false,
+        },
+        initialBars,
+        1,
+      );
+    });
+
+    const legendEl = container.querySelector(".chart-pane__legend");
+    expect(legendEl?.textContent).toContain("C 5001.00");
+
+    // Trigger fetchBars resync via WS subscribed + resync_required
+    fitContentMock.mockClear();
+    act(() => {
+      fakeWs.emitSubscribed({
+        type: "subscribed",
+        contract_id: "CON.F.US.MES.H26",
+        timeframe: "5m",
+      });
+    });
+
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(fetchBarsMock).toHaveBeenCalledTimes(2);
+    expect(fitContentMock).not.toHaveBeenCalled();
+
+    const duringReplayCandles = candleSetData.mock.calls.at(-1)?.[0] as Array<{
+      time: number;
+      close: number;
+    }>;
+    expect(duringReplayCandles).toHaveLength(2);
+    expect(duringReplayCandles[1]?.close).toBe(5001);
+    expect(legendEl?.textContent).toContain("C 5001.00");
+    expect(legendEl?.textContent).not.toContain("C 4995.00");
+
+    // Exiting replay must restore the resynced bars (close=4995 + newer bar close=4997)
+    act(() => {
+      useReplayStore.getState().exitReplay();
+    });
+    const afterExitCandles = candleSetData.mock.calls.at(-1)?.[0] as Array<{
+      time: number;
+      close: number;
+    }>;
+    expect(afterExitCandles.map((b) => ({ time: b.time, close: b.close }))).toEqual([
+      { time: 1700000000, close: 5000 },
+      { time: 1700000300, close: 4995 },
+      { time: 1700000600, close: 4997 },
+    ]);
+    expect(legendEl?.textContent).toContain("C 4997.00");
+  });
 });

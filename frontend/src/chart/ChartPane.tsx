@@ -1452,10 +1452,21 @@ export function ChartPane({
           .getState()
           .registerPaneBars(pane.pane_id, mergedBars, currentReplayTargetRef.current);
 
-        const activeCursorTime = replayCursorTimeRef.current;
+        const liveReplay = useReplayStore.getState();
+        const liveReplayMatchesPane =
+          liveReplay.session !== null &&
+          liveReplay.target !== null &&
+          liveReplay.target.paneId === pane.pane_id &&
+          liveReplay.target.contractId.trim().toUpperCase() === resolvedContractId.toUpperCase() &&
+          liveReplay.target.rootSymbol === pane.root_symbol &&
+          liveReplay.target.timeframe === pane.timeframe &&
+          liveReplay.target.liveMode === pane.live_mode;
+        const liveCursorTime = liveReplayMatchesPane
+          ? (liveReplay.session!.bars[liveReplay.session!.cursorIndex]?.time ?? null)
+          : null;
         const visibleBars =
-          activeCursorTime !== null
-            ? filterBarsByReplayCursor(mergedBars, activeCursorTime)
+          liveReplayMatchesPane && liveCursorTime !== null
+            ? filterBarsByReplayCursor(liveReplay.session!.bars, liveCursorTime)
             : mergedBars;
         const candles = visibleBars.map(toCandleDatum);
         const volumes = visibleBars.map(toVolumeDatum);
@@ -1486,7 +1497,7 @@ export function ChartPane({
             lastBar,
           );
         }
-        if (activeCursorTime === null) {
+        if (liveCursorTime === null) {
           chartRef.current?.timeScale().fitContent();
         }
         setBarsQuality(response.quality ?? null);
