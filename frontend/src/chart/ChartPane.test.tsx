@@ -2943,4 +2943,206 @@ describe("ChartPane (F06, P1-R3-01, P1-R3-02)", () => {
       expect(createdCmd.drawing.metadata?.direction).toBe("bullish");
     }
   });
+
+  it("isolates active drag and drag-to-place draft gestures by pointerId against secondary pointers (P1-C01)", async () => {
+    /**
+     * Contract:
+     * 1. While pointerId=1 is dragging an hline (>= 5px), secondary pointerId=2 pointerDown/Move/Up
+     *    on the Right Price Scale or plot must NOT commit, cancel, or restore chart handleScroll/handleScale;
+     *    pointerUp(pointerId=1) restores interaction and commits pointer 1's dragged price.
+     * 2. While pointerId=1 is mid-drag-to-place on an fvg_box draft, secondary pointerId=2
+     *    pointerDown/Move/Up must NOT prematurely finalize or cancel the draft until pointerId=1 releases.
+     * Defect caught: Secondary/stray pointer events clobbering captured drag/draft state or unlocking scroll/scale.
+     */
+    const bars = [
+      { time: 1700000000, open: 5000, high: 5012, low: 4996, close: 5005, volume: 25, is_closed: true },
+      { time: 1700000300, open: 5005, high: 5020, low: 5002, close: 5015, volume: 30, is_closed: true },
+    ];
+    const hlineDrawing = {
+      id: "hl-pointer-iso",
+      revision: 1,
+      type: "hline" as const,
+      symbol: "MES" as const,
+      contract_id: "CON.F.US.MES.H26",
+      pane_id: "pane-1",
+      created_by: "user" as const,
+      source_bar_refs: [],
+      coordinates: { anchors: [{ role: "level", time: 1700000000, price: 5000 }] },
+      style: {},
+      metadata: {},
+      created_at_utc: 1700000000,
+      updated_at_utc: 1700000000,
+    };
+
+    fetchBarsMock.mockResolvedValue(makeBarsResponse("CON.F.US.MES.H26", bars));
+    fetchDrawingsMock.mockResolvedValue({
+      symbol: "MES",
+      contract_id: "CON.F.US.MES.H26",
+      pane_id: "pane-1",
+      instrument: { root_symbol: "MES", name: "MES", exchange: "CME", tick_size: 0.25, tick_value: 1.25, currency: "USD" },
+      scope_revision: 1,
+      can_undo: false,
+      can_redo: false,
+      drawings: [hlineDrawing],
+    });
+    postDrawingCommandMock.mockResolvedValue({
+      symbol: "MES",
+      contract_id: "CON.F.US.MES.H26",
+      pane_id: "pane-1",
+      instrument: { root_symbol: "MES", name: "MES", exchange: "CME", tick_size: 0.25, tick_value: 1.25, currency: "USD" },
+      scope_revision: 2,
+      can_undo: true,
+      can_redo: false,
+      deduplicated: false,
+      affected_ids: ["hl-pointer-iso"],
+      drawings: [
+        {
+          ...hlineDrawing,
+          revision: 2,
+          coordinates: { anchors: [{ role: "level", time: 1700000000, price: 5005 }] },
+        },
+      ],
+    });
+
+    const coordinator = new PaneFetchCoordinator();
+    const fakeWs = createFakeWsClient();
+    const pane: PaneConfig = {
+      pane_id: "pane-1",
+      root_symbol: "MES",
+      timeframe: "5m",
+      live_mode: false,
+      playback_mode: "live",
+    };
+
+    render(
+      <ChartPane
+        pane={pane}
+        contractId="CON.F.US.MES.H26"
+        activeFeedLive={false}
+        wsClient={fakeWs.client}
+        coordinator={coordinator}
+      />,
+    );
+
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    const canvas = document.querySelector(".chart-pane__canvas") as HTMLElement;
+    vi.spyOn(canvas, "getBoundingClientRect").mockReturnValue({
+      left: 0,
+      top: 0,
+      right: 600,
+      bottom: 400,
+      width: 600,
+      height: 400,
+      x: 0,
+      y: 0,
+      toJSON: () => ({}),
+    });
+
+    const attachedPrimitive = attachPrimitiveMock.mock.calls[0]![0] as {
+      getRenderSnapshot: () => {
+        projectedDraft: { drawing: { type: string }; anchors: Array<{ x: number; price: number }> } | null;
+      };
+    };
+
+    // 1. Active hline drag with pointerId=1 (5000 -> y=200 moved to y=180 => price=5005)
+    applyOptionsMock.mockClear();
+    act(() => {
+      fireEvent.pointerDown(canvas, { clientX: 160, clientY: 200, button: 0, pointerType: "mouse", pointerId: 1 });
+      fireEvent.pointerMove(canvas, { clientX: 160, clientY: 180, button: 0, pointerType: "mouse", pointerId: 1 });
+    });
+    expect(applyOptionsMock).toHaveBeenCalledWith({ handleScroll: false, handleScale: false });
+
+    // Secondary pointerId=2 events (on Right Price Scale and inside plot) must be completely ignored
+    applyOptionsMock.mockClear();
+    await act(async () => {
+      fireEvent.pointerDown(canvas, { clientX: 565, clientY: 200, button: 0, pointerType: "touch", pointerId: 2 });
+      fireEvent.pointerMove(canvas, { clientX: 250, clientY: 120, button: 0, pointerType: "touch", pointerId: 2 });
+      fireEvent.pointerUp(canvas, { clientX: 250, clientY: 120, button: 0, pointerType: "touch", pointerId: 2 });
+      fireEvent.pointerCancel(canvas, { pointerType: "touch", pointerId: 2 });
+      await Promise.resolve();
+    });
+    expect(postDrawingCommandMock).not.toHaveBeenCalled();
+    expect(applyOptionsMock).not.toHaveBeenCalledWith({ handleScroll: true, handleScale: true });
+
+    // Matching pointerId=1 pointerUp restores scroll/scale and commits pointer 1's coordinates (price=5005)
+    await act(async () => {
+      fireEvent.pointerUp(canvas, { clientX: 160, clientY: 180, button: 0, pointerType: "mouse", pointerId: 1 });
+      await Promise.resolve();
+    });
+    expect(applyOptionsMock).toHaveBeenCalledWith({ handleScroll: true, handleScale: true });
+    expect(postDrawingCommandMock).toHaveBeenCalledTimes(1);
+    expect(postDrawingCommandMock.mock.calls[0]![1]).toMatchObject({
+      action: "update",
+      drawing_id: "hl-pointer-iso",
+      drawing: {
+        coordinates: {
+          anchors: [{ role: "level", price: 5005 }],
+        },
+      },
+    });
+
+    // 2. Active drag-to-place fvg_box draft with pointerId=1 ignores secondary pointerId=2
+    postDrawingCommandMock.mockClear();
+    postDrawingCommandMock.mockResolvedValueOnce({
+      symbol: "MES",
+      contract_id: "CON.F.US.MES.H26",
+      pane_id: "pane-1",
+      instrument: { root_symbol: "MES", name: "MES", exchange: "CME", tick_size: 0.25, tick_value: 1.25, currency: "USD" },
+      scope_revision: 3,
+      can_undo: true,
+      can_redo: false,
+      deduplicated: false,
+      affected_ids: ["fvg-pointer-iso"],
+      drawings: [],
+    });
+    useDrawingStore.getState().setActiveTool("fvg_box");
+    applyOptionsMock.mockClear();
+    act(() => {
+      fireEvent.pointerDown(canvas, { clientX: 100, clientY: 200, button: 0, pointerType: "mouse", pointerId: 1 });
+      fireEvent.pointerMove(canvas, { clientX: 130, clientY: 160, button: 0, pointerType: "mouse", pointerId: 1 });
+    });
+    expect(attachedPrimitive.getRenderSnapshot().projectedDraft?.anchors[1]).toMatchObject({
+      x: 130,
+      price: 5010,
+    });
+
+    await act(async () => {
+      fireEvent.pointerDown(canvas, { clientX: 220, clientY: 100, button: 0, pointerType: "touch", pointerId: 2 });
+      fireEvent.pointerMove(canvas, { clientX: 260, clientY: 90, button: 0, pointerType: "touch", pointerId: 2 });
+      fireEvent.pointerUp(canvas, { clientX: 260, clientY: 90, button: 0, pointerType: "touch", pointerId: 2 });
+      fireEvent.pointerCancel(canvas, { pointerType: "touch", pointerId: 2 });
+      await Promise.resolve();
+    });
+    expect(postDrawingCommandMock).not.toHaveBeenCalled();
+    expect(applyOptionsMock).not.toHaveBeenCalledWith({ handleScroll: true, handleScale: true });
+    // Secondary pointerMove did NOT overwrite draft's second anchor
+    expect(attachedPrimitive.getRenderSnapshot().projectedDraft?.anchors[1]).toMatchObject({
+      x: 130,
+      price: 5010,
+    });
+
+    // Releasing matching pointerId=1 finalizes the drag-to-place fvg_box at (130, 160) -> price=5010
+    await act(async () => {
+      fireEvent.pointerUp(canvas, { clientX: 130, clientY: 160, button: 0, pointerType: "mouse", pointerId: 1 });
+      await Promise.resolve();
+    });
+    expect(applyOptionsMock).toHaveBeenCalledWith({ handleScroll: true, handleScale: true });
+    expect(postDrawingCommandMock).toHaveBeenCalledTimes(1);
+    expect(postDrawingCommandMock.mock.calls[0]![1]).toMatchObject({
+      action: "create",
+      drawing: {
+        type: "fvg_box",
+        coordinates: {
+          anchors: [
+            { role: "start", time: 1700000000, price: 5000 },
+            { role: "end", time: 1700000300, price: 5010 },
+          ],
+        },
+      },
+    });
+  });
 });

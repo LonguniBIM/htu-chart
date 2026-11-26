@@ -226,7 +226,9 @@ export function ChartPane({
   const draftRef = useRef<DrawingDraft | null>(null);
   const placementStartPxRef = useRef<{ px: number; py: number } | null>(null);
   const draftGestureStartedInPlotRef = useRef(false);
+  const draftPlacementPointerIdRef = useRef<number | null>(null);
   const dragRef = useRef<{
+    pointerId: number;
     drawingId: string;
     scope: DrawingScopeTarget;
     scopeKey: string;
@@ -600,6 +602,7 @@ export function ChartPane({
       draftRef.current = null;
       placementStartPxRef.current = null;
       draftGestureStartedInPlotRef.current = false;
+      draftPlacementPointerIdRef.current = null;
       setDraftState(null);
       useDrawingStore.getState().setActiveTool("cursor");
       void useDrawingStore.getState().createDrawing(scope, {
@@ -630,6 +633,9 @@ export function ChartPane({
 
     const handlePointerDown = (event: PointerEvent) => {
       if (event.pointerType === "mouse" && event.button !== 0) {
+        return;
+      }
+      if (dragRef.current !== null || draftPlacementPointerIdRef.current !== null) {
         return;
       }
       const scope = drawingScopeRef.current;
@@ -675,6 +681,7 @@ export function ChartPane({
           return;
         }
         dragRef.current = {
+          pointerId: event.pointerId,
           drawingId: targetDrawing.id,
           scope,
           scopeKey,
@@ -761,6 +768,7 @@ export function ChartPane({
         draftRef.current = nextDraft;
         placementStartPxRef.current = { px: pt.px, py: pt.py };
         draftGestureStartedInPlotRef.current = true;
+        draftPlacementPointerIdRef.current = event.pointerId;
         setDraftState(nextDraft);
         syncOverlayPrimitive(nextDraft);
         chart.applyOptions({ handleScroll: false, handleScale: false });
@@ -779,6 +787,9 @@ export function ChartPane({
     const handlePointerMove = (event: PointerEvent) => {
       const activeDrag = dragRef.current;
       if (activeDrag !== null) {
+        if (event.pointerId !== activeDrag.pointerId) {
+          return;
+        }
         if (activeDrag.scopeKey !== drawingScopeKeyRef.current) {
           dragRef.current = null;
           restoreChartInteraction();
@@ -846,6 +857,12 @@ export function ChartPane({
       }
 
       if (draftRef.current !== null) {
+        if (
+          draftPlacementPointerIdRef.current !== null &&
+          event.pointerId !== draftPlacementPointerIdRef.current
+        ) {
+          return;
+        }
         const pt = resolveChartPoint(event.clientX, event.clientY, true);
         if (pt === null) {
           return;
@@ -861,14 +878,14 @@ export function ChartPane({
     };
 
     const handlePointerUp = (event: PointerEvent) => {
-      const wasDraftGesture = draftGestureStartedInPlotRef.current;
-      draftGestureStartedInPlotRef.current = false;
-      restoreChartInteraction();
-      releasePointerSafely(event.pointerId);
-
       const finishedDrag = dragRef.current;
       if (finishedDrag !== null) {
+        if (event.pointerId !== finishedDrag.pointerId) {
+          return;
+        }
         dragRef.current = null;
+        restoreChartInteraction();
+        releasePointerSafely(event.pointerId);
         syncOverlayPrimitive();
         const currentState = useDrawingStore.getState();
         const scopeState = currentState.scopes[finishedDrag.scopeKey];
@@ -899,6 +916,20 @@ export function ChartPane({
         return;
       }
 
+      if (
+        draftRef.current !== null &&
+        draftPlacementPointerIdRef.current !== null &&
+        event.pointerId !== draftPlacementPointerIdRef.current
+      ) {
+        return;
+      }
+
+      const wasDraftGesture = draftGestureStartedInPlotRef.current;
+      draftGestureStartedInPlotRef.current = false;
+      draftPlacementPointerIdRef.current = null;
+      restoreChartInteraction();
+      releasePointerSafely(event.pointerId);
+
       if (draftRef.current !== null && placementStartPxRef.current !== null && wasDraftGesture) {
         const rect = container.getBoundingClientRect();
         const px = event.clientX - rect.left;
@@ -917,12 +948,24 @@ export function ChartPane({
     };
 
     const handlePointerCancel = (event: PointerEvent) => {
+      if (dragRef.current !== null && event.pointerId !== dragRef.current.pointerId) {
+        return;
+      }
+      if (
+        dragRef.current === null &&
+        draftRef.current !== null &&
+        draftPlacementPointerIdRef.current !== null &&
+        event.pointerId !== draftPlacementPointerIdRef.current
+      ) {
+        return;
+      }
       restoreChartInteraction();
       releasePointerSafely(event.pointerId);
       dragRef.current = null;
       draftRef.current = null;
       placementStartPxRef.current = null;
       draftGestureStartedInPlotRef.current = false;
+      draftPlacementPointerIdRef.current = null;
       suppressTimeClickRef.current = false;
       setDraftState(null);
       syncOverlayPrimitive(null);
@@ -1002,6 +1045,7 @@ export function ChartPane({
       draftRef.current = null;
       placementStartPxRef.current = null;
       draftGestureStartedInPlotRef.current = false;
+      draftPlacementPointerIdRef.current = null;
       restoreChartInteraction();
       container.removeEventListener("pointerdown", handlePointerDown);
       container.removeEventListener("pointermove", handlePointerMove);
@@ -1031,6 +1075,7 @@ export function ChartPane({
       draftRef.current = null;
       placementStartPxRef.current = null;
       draftGestureStartedInPlotRef.current = false;
+      draftPlacementPointerIdRef.current = null;
       suppressTimeClickRef.current = false;
       setDraftState(null);
       syncOverlayPrimitive(null);
@@ -1043,6 +1088,7 @@ export function ChartPane({
     draftRef.current = null;
     placementStartPxRef.current = null;
     draftGestureStartedInPlotRef.current = false;
+    draftPlacementPointerIdRef.current = null;
     suppressTimeClickRef.current = false;
     setDraftState(null);
     syncOverlayPrimitive(null);
