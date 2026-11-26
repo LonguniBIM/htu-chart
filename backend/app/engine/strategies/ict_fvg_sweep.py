@@ -130,7 +130,12 @@ class IctFvgSweepStrategy(BaseStrategy):
             raw = params.get(key, default_val)
             if isinstance(raw, bool) or not isinstance(raw, (int, float)):
                 raise ValueError(f"Parameter '{key}' must be a number, got {raw!r}")
-            num = float(raw)
+            try:
+                num = float(raw)
+            except OverflowError as exc:
+                raise ValueError(
+                    f"Parameter '{key}' ({raw!r}) overflows finite float bounds"
+                ) from exc
             if not math.isfinite(num) or num < min_f or num > max_f:
                 raise ValueError(
                     f"Parameter '{key}' ({raw!r}) must be finite within [{min_f}, {max_f}]"

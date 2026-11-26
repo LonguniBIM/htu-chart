@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import ctypes
 import json
+import multiprocessing
 import os
 import tempfile
 import threading
@@ -218,6 +219,24 @@ def worker_hang_or_fast(payload: dict[str, Any]) -> dict[str, Any]:
         },
         "worker_pid": os.getpid(),
     }
+
+
+def _sleep_child_target() -> None:
+    time.sleep(30.0)
+
+
+def worker_spawns_child_and_sleeps(payload: dict[str, Any]) -> dict[str, Any]:
+    """Spawn a real child Python process, record both PIDs, and sleep for tree-kill tests."""
+    mp_ctx = multiprocessing.get_context("spawn")
+    child = mp_ctx.Process(target=_sleep_child_target)
+    child.start()
+    marker = Path(tempfile.gettempdir()) / f"topstep_tree_{payload['contract_id']}.json"
+    marker.write_text(
+        json.dumps({"worker_pid": os.getpid(), "child_pid": child.pid}),
+        encoding="utf-8",
+    )
+    time.sleep(30.0)
+    return {"child_pid": child.pid}
 
 
 def worker_oversized_payload(_payload: dict[str, Any]) -> dict[str, Any]:
@@ -477,7 +496,7 @@ def test_ict_strategy_prefix_invariance_and_causality_guard() -> None:
     Defect caught: Future data leakage (F08) in IctFvgSweepStrategy, zones, or indicators.
     """
     base_bars = _ict_long_setup_bars()
-    k = 7
+    k = 8
     mutated_bars = list(base_bars[: k + 1]) + [
         _bar(base_bars[k].time + 300 * j, 50.0, 200.0, 10.0, 150.0, 9999.0)
         for j in range(1, 6)
@@ -505,11 +524,28 @@ def test_ict_strategy_prefix_invariance_and_causality_guard() -> None:
     assert zones_base == zones_mut
     assert all(z["detected_at_time"] <= cutoff_time for z in zones_base)
 
-    # First entry order triggered at bar[7] close must fill identically at bar[8].open.
-    assert len(res_base.trades) >= 1
-    assert len(res_mutated.trades) >= 1
+    # Full entry attributes for trades initiated in prefix <= k must match identically.
+    def _entry_tuple(tr: Any) -> tuple[Any, ...]:
+        return (
+            tr.direction,
+            tr.signal_time,
+            tr.entry_time,
+            tr.entry_price,
+            tr.stop_loss,
+            tr.take_profit,
+            tr.quantity,
+            tr.reason,
+        )
+
+    prefix_trades_base = [
+        _entry_tuple(t) for t in res_base.trades if t.signal_time <= cutoff_time
+    ]
+    prefix_trades_mut = [
+        _entry_tuple(t) for t in res_mutated.trades if t.signal_time <= cutoff_time
+    ]
+    assert len(prefix_trades_base) == 1
+    assert prefix_trades_base == prefix_trades_mut
     assert res_base.trades[0].signal_time == base_bars[7].time
-    assert res_mutated.trades[0].signal_time == base_bars[7].time
     assert res_base.trades[0].entry_time == base_bars[8].time
     assert res_base.trades[0].entry_price == base_bars[8].open
 
@@ -852,6 +888,7 @@ def test_indicators_and_strategy_param_validation() -> None:
         {"quantity": True},
         {"quantity": 0},
         {"risk_reward": float("nan")},
+        {"risk_reward": 10**400},
         {"risk_reward": 0.1},
         {"entry_mode": "invalid"},
         {"include_vwap": "true"},
@@ -861,6 +898,28 @@ def test_indicators_and_strategy_param_validation() -> None:
 
     with pytest.raises(ValueError):
         create_strategy("non_existent_strategy")
+
+
+async def test_overflow_param_returns_400_without_queuing(tmp_path: Path) -> None:
+    """Contract: Huge integer parameter (10**400) returns HTTP 400 and never queues a job.
+
+    Defect caught: OverflowError on float(10**400) leaking as HTTP 500 on POST /api/backtest.
+    """
+    async with _async_client(tmp_path) as (client, _app):
+        csrf = await _login(client)
+        resp = await client.post(
+            "/api/backtest",
+            headers={"X-CSRF-Token": csrf},
+            json={
+                "contract_id": "CON.F.US.MES.Z26",
+                "timeframe": "5m",
+                "start_time": 1_760_000_000,
+                "end_time": 1_760_003_600,
+                "params": {"risk_reward": 10**400},
+            },
+        )
+        assert resp.status_code == 400
+        assert (await client.get("/api/backtest")).json()["count"] == 0
 
 
 async def test_backtest_routes_require_session_and_csrf(tmp_path: Path) -> None:
@@ -1830,3 +1889,263 @@ async def test_metadata_mismatch_max_bars_pruning_and_worker_pid_death(tmp_path:
             assert not _is_pid_alive(del_pid)
         finally:
             marker_del.unlink(missing_ok=True)
+
+
+async def test_real_read_bars_sync_barrier_timeout_unblocks_queue_and_stop(tmp_path: Path) -> None:
+    """Contract: Blocked _read_bars_sync times out Job A, unblocks Job B, and bounds stop().
+
+    Defect caught: ParquetStore._run_locked shield hanging asyncio.wait_for, dispatcher, or stop().
+    """
+    barrier = threading.Event()
+    slow_entered = threading.Event()
+    t0 = 1_760_000_000
+
+    try:
+        async with _async_client(
+            tmp_path,
+            backtest_timeout_sec=2.0,
+            worker_fn=worker_hang_or_fast,
+        ) as (client, app):
+            csrf = await _login(client)
+            store = app.state.parquet_store
+            key_slow = StorageDatasetKey("topstepx", False, "CON.F.US.MES.SLOWDS", "5m")
+            key_fast = StorageDatasetKey("topstepx", False, "CON.F.US.MES.FASTDS", "5m")
+            await store.upsert_bars(
+                key_slow, _ict_long_setup_bars(t0, 300), root_symbol="MES"
+            )
+            await store.upsert_bars(
+                key_fast, _ict_long_setup_bars(t0, 300), root_symbol="MES"
+            )
+
+            orig_sync = store._read_bars_sync
+
+            def _guarded_read_bars_sync(
+                target: Path,
+                key: StorageDatasetKey,
+                **kwargs: Any,
+            ) -> list[OHLCVBar]:
+                if key.contract_id == "CON.F.US.MES.SLOWDS":
+                    slow_entered.set()
+                    barrier.wait(timeout=15.0)
+                return orig_sync(target, key, **kwargs)
+
+            store._read_bars_sync = _guarded_read_bars_sync
+
+            ra = await client.post(
+                "/api/backtest",
+                headers={"X-CSRF-Token": csrf},
+                json={
+                    "contract_id": "CON.F.US.MES.SLOWDS",
+                    "root_symbol": "MES",
+                    "timeframe": "5m",
+                    "start_time": t0,
+                    "end_time": t0 + 5000,
+                },
+            )
+            assert ra.status_code == 202
+            job_a = ra.json()["job_id"]
+
+            for _ in range(100):
+                if slow_entered.is_set():
+                    break
+                await asyncio.sleep(0.01)
+            assert slow_entered.is_set()
+
+            rb = await client.post(
+                "/api/backtest",
+                headers={"X-CSRF-Token": csrf},
+                json={
+                    "contract_id": "CON.F.US.MES.FASTDS",
+                    "root_symbol": "MES",
+                    "timeframe": "5m",
+                    "start_time": t0,
+                    "end_time": t0 + 5000,
+                },
+            )
+            assert rb.status_code == 202
+            job_b = rb.json()["job_id"]
+
+            # Job A must time out BEFORE barrier is released.
+            st_a: dict[str, Any] = {}
+            for _ in range(100):
+                st_a = (await client.get(f"/api/backtest/{job_a}")).json()
+                if st_a["status"] == "TIMED_OUT":
+                    break
+                await asyncio.sleep(0.05)
+            assert st_a["status"] == "TIMED_OUT"
+            assert not barrier.is_set()
+
+            # Job B on dataset 2 must reach COMPLETED while dataset 1's thread is still blocked.
+            st_b: dict[str, Any] = {}
+            for _ in range(100):
+                st_b = (await client.get(f"/api/backtest/{job_b}")).json()
+                if st_b["status"] == "COMPLETED":
+                    break
+                await asyncio.sleep(0.05)
+            assert st_b["status"] == "COMPLETED"
+            assert not barrier.is_set()
+
+            # Verify stop() completes within bounded time even while Job A's thread is wedged.
+            t_stop_start = time.monotonic()
+            await app.state.backtest_service.stop()
+            stop_elapsed = time.monotonic() - t_stop_start
+            assert stop_elapsed < 4.0
+    finally:
+        barrier.set()
+
+
+async def test_child_process_tree_killed_on_timeout_and_cancel(tmp_path: Path) -> None:
+    """Contract: Timeout and DELETE cancel terminate both worker_pid and spawned child_pid.
+
+    Defect caught: Descendant processes surviving worker kill on timeout or cancellation.
+    """
+    from app.services.backtest_service import _terminate_pid_tree
+
+    async with _async_client(
+        tmp_path,
+        backtest_timeout_sec=2.0,
+        worker_fn=worker_spawns_child_and_sleeps,
+    ) as (client, _app):
+        csrf = await _login(client)
+        t0 = 1_760_000_000
+
+        # 1) Timeout kills both worker_pid and child_pid
+        cid_to = "CON.F.US.MES.TREE_TO"
+        marker_to = Path(tempfile.gettempdir()) / f"topstep_tree_{cid_to}.json"
+        marker_to.unlink(missing_ok=True)
+        pids_to: dict[str, int] = {}
+        try:
+            r_to = await client.post(
+                "/api/backtest",
+                headers={"X-CSRF-Token": csrf},
+                json={
+                    "contract_id": cid_to,
+                    "root_symbol": "MES",
+                    "timeframe": "5m",
+                    "start_time": t0,
+                    "end_time": t0 + 3600,
+                },
+            )
+            to_id = r_to.json()["job_id"]
+            for _ in range(120):
+                if marker_to.is_file():
+                    break
+                await asyncio.sleep(0.05)
+            assert marker_to.is_file()
+            pids_to = json.loads(marker_to.read_text(encoding="utf-8"))
+
+            for _ in range(120):
+                if (await client.get(f"/api/backtest/{to_id}")).json()["status"] == "TIMED_OUT":
+                    break
+                await asyncio.sleep(0.05)
+
+            for _ in range(40):
+                if not _is_pid_alive(pids_to["worker_pid"]) and not _is_pid_alive(
+                    pids_to["child_pid"]
+                ):
+                    break
+                await asyncio.sleep(0.05)
+            assert not _is_pid_alive(pids_to["worker_pid"])
+            assert not _is_pid_alive(pids_to["child_pid"])
+        finally:
+            if pids_to.get("child_pid"):
+                _terminate_pid_tree(pids_to["child_pid"])
+            if pids_to.get("worker_pid"):
+                _terminate_pid_tree(pids_to["worker_pid"])
+            marker_to.unlink(missing_ok=True)
+
+        # 2) DELETE cancel kills both worker_pid and child_pid
+        cid_del = "CON.F.US.MES.TREE_DEL"
+        marker_del = Path(tempfile.gettempdir()) / f"topstep_tree_{cid_del}.json"
+        marker_del.unlink(missing_ok=True)
+        pids_del: dict[str, int] = {}
+        try:
+            r_del = await client.post(
+                "/api/backtest",
+                headers={"X-CSRF-Token": csrf},
+                json={
+                    "contract_id": cid_del,
+                    "root_symbol": "MES",
+                    "timeframe": "5m",
+                    "start_time": t0,
+                    "end_time": t0 + 3600,
+                },
+            )
+            del_id = r_del.json()["job_id"]
+            for _ in range(120):
+                if marker_del.is_file():
+                    break
+                await asyncio.sleep(0.05)
+            assert marker_del.is_file()
+            pids_del = json.loads(marker_del.read_text(encoding="utf-8"))
+
+            resp_del = await client.delete(
+                f"/api/backtest/{del_id}",
+                headers={"X-CSRF-Token": csrf},
+            )
+            assert resp_del.status_code == 200
+            assert resp_del.json()["status"] == "CANCELLED"
+
+            for _ in range(40):
+                if not _is_pid_alive(pids_del["worker_pid"]) and not _is_pid_alive(
+                    pids_del["child_pid"]
+                ):
+                    break
+                await asyncio.sleep(0.05)
+            assert not _is_pid_alive(pids_del["worker_pid"])
+            assert not _is_pid_alive(pids_del["child_pid"])
+        finally:
+            if pids_del.get("child_pid"):
+                _terminate_pid_tree(pids_del["child_pid"])
+            if pids_del.get("worker_pid"):
+                _terminate_pid_tree(pids_del["worker_pid"])
+            marker_del.unlink(missing_ok=True)
+
+
+async def test_resample_issues_quarantine_and_fail_backtest(tmp_path: Path) -> None:
+    """Contract: Resample Float64 overflow quarantines issue in SQLite and fails backtest job.
+
+    Defect caught: Silently dropping corrupted resampled bars instead of quarantining (F04/R04).
+    """
+    async with _async_client(tmp_path) as (client, app):
+        csrf = await _login(client)
+        t0 = int(datetime(2025, 10, 10, 14, 0, tzinfo=UTC).timestamp())
+        m1_key = StorageDatasetKey("topstepx", False, "CON.F.US.MES.Z26", "1m")
+        m5_key = StorageDatasetKey("topstepx", False, "CON.F.US.MES.Z26", "5m")
+
+        # Seed valid 1m bars whose 5m volume sum overflows Float64 (1e308 + 1e308 -> inf).
+        overflow_bars = [
+            _bar(t0, 5000.0, 5001.0, 4999.0, 5000.5, v=1e308, is_closed=True),
+            _bar(t0 + 60, 5000.5, 5002.0, 5000.0, 5001.5, v=1e308, is_closed=True),
+        ]
+        await app.state.parquet_store.upsert_bars(m1_key, overflow_bars)
+        await app.state.sqlite_store.record_coverage(m5_key, t0, t0 + 300, status="COMPLETE")
+
+        resp = await client.post(
+            "/api/backtest",
+            headers={"X-CSRF-Token": csrf},
+            json={
+                "contract_id": "CON.F.US.MES.Z26",
+                "timeframe": "5m",
+                "resample_from": "1m",
+                "start_time": t0,
+                "end_time": t0 + 300,
+            },
+        )
+        assert resp.status_code == 202
+        job_id = resp.json()["job_id"]
+
+        st: dict[str, Any] = {}
+        for _ in range(100):
+            st = (await client.get(f"/api/backtest/{job_id}")).json()
+            if st["status"] == "FAILED":
+                break
+            await asyncio.sleep(0.05)
+
+        assert st["status"] == "FAILED"
+        assert "corrupted" in st["error"].lower()
+
+        quality = await app.state.sqlite_store.get_quality_summary()
+        assert quality["quarantined_bars"] >= 1
+        assert quality["corrupted_intervals"] >= 1
+        assert await app.state.sqlite_store.is_interval_complete(m5_key, t0, t0 + 300) is False

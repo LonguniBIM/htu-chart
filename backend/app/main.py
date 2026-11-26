@@ -188,6 +188,7 @@ def create_app(
         backtest_service = BacktestService(
             resolved_settings,
             parquet_store,
+            sqlite_store=sqlite_store,
             clock=clock,
             worker_fn=backtest_worker_fn,
         )

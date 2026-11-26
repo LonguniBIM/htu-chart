@@ -30,6 +30,7 @@ from app.engine.session_calendar import normalize_timeframe
 from app.engine.strategies import create_strategy
 from app.security import redact_secrets
 from app.storage.parquet_store import ParquetStore, validate_resample_path
+from app.storage.sqlite_store import QualityIssueInput, SqliteStore
 
 logger = logging.getLogger("topstep_chart.backtest_service")
 
@@ -325,11 +326,13 @@ class BacktestService:
         settings: Settings,
         parquet_store: ParquetStore,
         *,
+        sqlite_store: SqliteStore | None = None,
         clock: Callable[[], int] | None = None,
         worker_fn: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
     ) -> None:
         self._settings = settings
         self._parquet_store = parquet_store
+        self._sqlite_store = sqlite_store
         self._clock = clock or (lambda: int(datetime.now(UTC).timestamp()))
         self._worker_fn = worker_fn or execute_backtest_in_worker
         self._mp_context = multiprocessing.get_context("spawn")
@@ -341,9 +344,21 @@ class BacktestService:
         self._seq = 0
         self._running_job_id: str | None = None
         self._active_exec_task: asyncio.Task[None] | None = None
+        self._orphaned_load_tasks: set[asyncio.Task[Any]] = set()
         self._dispatcher_task: asyncio.Task[None] | None = None
         self._wakeup = asyncio.Event()
         self._running = False
+
+    def _track_orphaned_load_task(self, task: asyncio.Task[Any]) -> None:
+        self._orphaned_load_tasks.add(task)
+
+        def _on_done(done_task: asyncio.Task[Any]) -> None:
+            self._orphaned_load_tasks.discard(done_task)
+            if not done_task.cancelled():
+                with contextlib.suppress(BaseException):
+                    _ = done_task.exception()
+
+        task.add_done_callback(_on_done)
 
     def _redaction_secrets(self) -> tuple[str, ...]:
         return (
@@ -447,13 +462,21 @@ class BacktestService:
                 if self._executor is not None:
                     await asyncio.to_thread(self._terminate_and_reset_executor_sync)
                 active_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError, Exception):
-                await active_task
+            with contextlib.suppress(TimeoutError, asyncio.CancelledError, Exception):
+                await asyncio.wait_for(active_task, timeout=2.0)
 
         if self._dispatcher_task is not None and not self._dispatcher_task.done():
             self._dispatcher_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await self._dispatcher_task
+            with contextlib.suppress(TimeoutError, asyncio.CancelledError):
+                await asyncio.wait_for(self._dispatcher_task, timeout=2.0)
+
+        orphaned = [t for t in self._orphaned_load_tasks if not t.done()]
+        for task in orphaned:
+            task.cancel()
+        if orphaned:
+            with contextlib.suppress(Exception):
+                await asyncio.wait(orphaned, timeout=1.0)
+
         self._dispatcher_task = None
         self._active_exec_task = None
         self._running_job_id = None
@@ -636,7 +659,7 @@ class BacktestService:
                 job.contract_id,
                 job.resample_from,
             )
-            return await self._parquet_store.resample(
+            resample_res = await self._parquet_store.resample_with_issues(
                 source_key,
                 job.timeframe,
                 start_ts=job.start_time,
@@ -646,6 +669,42 @@ class BacktestService:
                 root_symbol=job.root_symbol,
                 limit=job.max_bars + 1,
             )
+            if resample_res.issues:
+                target_key = StorageDatasetKey(
+                    "topstepx",
+                    job.live_mode,
+                    job.contract_id,
+                    job.timeframe,
+                )
+                if self._sqlite_store is not None:
+                    await self._sqlite_store.record_quality_issues(
+                        target_key,
+                        [
+                            QualityIssueInput(
+                                bar_time=issue.bar_time,
+                                interval_start=issue.interval_start,
+                                interval_end=issue.interval_end,
+                                issue_code=issue.issue_code,
+                                detail=self._redact(issue.detail),
+                                raw_payload=self._redact(issue.raw_payload)[:2048],
+                            )
+                            for issue in resample_res.issues
+                        ],
+                        deduplicate=True,
+                    )
+                    for issue in resample_res.issues:
+                        await self._sqlite_store.record_coverage(
+                            target_key,
+                            issue.interval_start,
+                            issue.interval_end,
+                            status="CORRUPTED",
+                            quarantined_count=1,
+                        )
+                raise ValueError(
+                    f"Resampling {job.resample_from}->{job.timeframe} encountered "
+                    f"{len(resample_res.issues)} corrupted bar(s)"
+                )
+            return resample_res.bars
 
         dataset_key = StorageDatasetKey(
             "topstepx",
@@ -676,12 +735,23 @@ class BacktestService:
             return max(0.0, deadline - loop.time())
 
         try:
+            load_task = asyncio.create_task(
+                self._load_closed_bars(job),
+                name=f"backtest-load-{job.job_id[:8]}",
+            )
             try:
-                bars = await asyncio.wait_for(
-                    self._load_closed_bars(job),
+                done, _ = await asyncio.wait(
+                    {load_task},
                     timeout=_remaining_timeout(),
                 )
-            except TimeoutError:
+            except asyncio.CancelledError:
+                self._track_orphaned_load_task(load_task)
+                load_task.cancel()
+                raise
+
+            if load_task not in done:
+                self._track_orphaned_load_task(load_task)
+                load_task.cancel()
                 if job.status == "RUNNING":
                     job.status = "TIMED_OUT"
                     job.finished_at_utc = self._clock()
@@ -689,6 +759,8 @@ class BacktestService:
                         f"Backtest timed out after {self._settings.backtest_timeout_sec}s"
                     )
                 return
+
+            bars = load_task.result()
 
             if job.status != "RUNNING":
                 return
