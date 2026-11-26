@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import ctypes
 import json
 import os
+import tempfile
+import threading
 import time
 from collections.abc import Mapping, Sequence
 from contextlib import asynccontextmanager
@@ -96,8 +99,40 @@ def _ict_long_setup_bars(start_ts: int = 1_760_000_000, step: int = 300) -> list
 
 
 # Top-level picklable worker stubs for Windows `spawn` ProcessPoolExecutor tests.
+def _is_pid_alive(pid: int) -> bool:
+    if os.name == "nt":
+        from ctypes import wintypes
+
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        k32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        k32.OpenProcess.restype = wintypes.HANDLE
+        k32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+        k32.WaitForSingleObject.restype = wintypes.DWORD
+        k32.CloseHandle.argtypes = [wintypes.HANDLE]
+        k32.CloseHandle.restype = wintypes.BOOL
+
+        handle = k32.OpenProcess(0x00100000, False, int(pid))  # SYNCHRONIZE
+        if not handle:
+            return False
+        try:
+            wait_res = k32.WaitForSingleObject(handle, 0)
+            return wait_res == 0x00000102  # WAIT_TIMEOUT -> still running
+        finally:
+            k32.CloseHandle(handle)
+
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
 def worker_slow_success(payload: dict[str, Any]) -> dict[str, Any]:
-    """Simulate CPU-bound backtest taking ~0.6s in isolated worker process."""
+    """Write handshake PID marker and simulate CPU-bound backtest in isolated worker."""
+    marker = Path(tempfile.gettempdir()) / f"topstep_bp5_{payload['contract_id']}.pid"
+    marker.write_text(str(os.getpid()), encoding="utf-8")
     time.sleep(0.6)
     return {
         "strategy_id": payload["strategy_id"],
@@ -142,6 +177,8 @@ def worker_slow_success(payload: dict[str, Any]) -> dict[str, Any]:
 def worker_hang_or_fast(payload: dict[str, Any]) -> dict[str, Any]:
     """Sleep long when strategy param max_wait_bars == 49, else finish immediately."""
     if int(payload["params"].get("max_wait_bars", 5)) == 49:
+        marker = Path(tempfile.gettempdir()) / f"topstep_hang_{payload['contract_id']}.pid"
+        marker.write_text(str(os.getpid()), encoding="utf-8")
         time.sleep(15.0)
     return {
         "strategy_id": payload["strategy_id"],
@@ -357,6 +394,7 @@ async def _async_client(
     backtest_max_date_range_days: int = 365,
     backtest_timeout_sec: float = 30.0,
     backtest_max_result_bytes: int = 5_000_000,
+    backtest_max_jobs_retained: int = 64,
     worker_fn: Any = None,
 ):
     settings = Settings(
@@ -369,6 +407,7 @@ async def _async_client(
         backtest_max_date_range_days=backtest_max_date_range_days,
         backtest_timeout_sec=backtest_timeout_sec,
         backtest_max_result_bytes=backtest_max_result_bytes,
+        backtest_max_jobs_retained=backtest_max_jobs_retained,
     )
     upstream = httpx.AsyncClient(
         transport=httpx.MockTransport(lambda _r: httpx.Response(404, json={}))
@@ -765,6 +804,19 @@ def test_indicators_and_strategy_param_validation() -> None:
     rsi_pts = rsi(bars, 3)
     assert all(val == 100.0 for _, val in rsi_pts)
 
+    # Alternating up/down Wilder-smoothing RSI check against hand-calculated values:
+    # closes = [100, 102, 101, 104, 102, 105], period=3
+    # bar[3]: avg_gain=5/3, avg_loss=1/3 -> RS=5 -> 100 - 100/6
+    # bar[4]: avg_gain=10/9, avg_loss=8/9 -> RS=1.25 -> 100 - 100/2.25
+    # bar[5]: avg_gain=47/27, avg_loss=16/27 -> RS=47/16 -> 100 * 47 / 63
+    alt_closes = [100.0, 102.0, 101.0, 104.0, 102.0, 105.0]
+    alt_bars = [_bar(t0 + i * 60, c, c, c, c) for i, c in enumerate(alt_closes)]
+    alt_rsi = rsi(alt_bars, 3)
+    assert [ts for ts, _ in alt_rsi] == [t0 + 180, t0 + 240, t0 + 300]
+    assert alt_rsi[0][1] == pytest.approx(100.0 - (100.0 / 6.0))
+    assert alt_rsi[1][1] == pytest.approx(100.0 - (100.0 / 2.25))
+    assert alt_rsi[2][1] == pytest.approx((47.0 / 63.0) * 100.0)
+
     flat_bars = [_bar(t0 + i * 60, 100.0, 100.0, 100.0, 100.0) for i in range(5)]
     assert rsi(flat_bars, 3)[-1][1] == 50.0
 
@@ -862,51 +914,62 @@ async def test_backtest_routes_require_session_and_csrf(tmp_path: Path) -> None:
 
 
 async def test_worker_subprocess_isolation_keeps_health_fast(tmp_path: Path) -> None:
-    """Contract: Long worker backtest runs in a separate process and never blocks /api/health.
+    """Contract: Worker handshake proves /api/health stays fast while subprocess executes.
 
     Defect caught: CPU-bound backtest starving FastAPI event loop / SignalR heartbeats (R02).
     """
-    async with _async_client(tmp_path, worker_fn=worker_slow_success) as (client, app):
-        csrf = await _login(client)
-        t0 = 1_760_000_000
-        key = StorageDatasetKey("topstepx", False, "CON.F.US.MES.Z26", "5m")
-        await app.state.parquet_store.upsert_bars(key, _ict_long_setup_bars(t0, 300))
+    cid = "CON.F.US.MES.ISO"
+    marker = Path(tempfile.gettempdir()) / f"topstep_bp5_{cid}.pid"
+    marker.unlink(missing_ok=True)
+    try:
+        async with _async_client(tmp_path, worker_fn=worker_slow_success) as (client, app):
+            csrf = await _login(client)
+            t0 = 1_760_000_000
+            key = StorageDatasetKey("topstepx", False, cid, "5m")
+            await app.state.parquet_store.upsert_bars(
+                key, _ict_long_setup_bars(t0, 300), root_symbol="MES"
+            )
 
-        submit_resp = await client.post(
-            "/api/backtest",
-            headers={"X-CSRF-Token": csrf},
-            json={
-                "contract_id": "CON.F.US.MES.Z26",
-                "timeframe": "5m",
-                "start_time": t0,
-                "end_time": t0 + 5000,
-            },
-        )
-        assert submit_resp.status_code == 202
-        job_id = submit_resp.json()["job_id"]
+            submit_resp = await client.post(
+                "/api/backtest",
+                headers={"X-CSRF-Token": csrf},
+                json={
+                    "contract_id": cid,
+                    "root_symbol": "MES",
+                    "timeframe": "5m",
+                    "start_time": t0,
+                    "end_time": t0 + 5000,
+                },
+            )
+            assert submit_resp.status_code == 202
+            job_id = submit_resp.json()["job_id"]
 
-        # Wait until RUNNING and probe /api/health concurrently.
-        for _ in range(50):
-            cur = (await client.get(f"/api/backtest/{job_id}")).json()
-            if cur["status"] == "RUNNING":
-                break
-            await asyncio.sleep(0.02)
+            # Wait until worker subprocess writes PID handshake marker (genuinely executing).
+            for _ in range(100):
+                if marker.is_file():
+                    break
+                await asyncio.sleep(0.02)
+            assert marker.is_file()
+            worker_pid = int(marker.read_text(encoding="utf-8").strip())
+            assert worker_pid != os.getpid()
 
-        t_start = time.monotonic()
-        health_resp = await client.get("/api/health")
-        elapsed = time.monotonic() - t_start
-        assert health_resp.status_code == 200
-        assert elapsed < 0.5
+            t_start = time.monotonic()
+            health_resp = await client.get("/api/health")
+            elapsed = time.monotonic() - t_start
+            assert health_resp.status_code == 200
+            assert elapsed < 0.5
 
-        detail: dict[str, Any] = {}
-        for _ in range(100):
-            detail = (await client.get(f"/api/backtest/{job_id}")).json()
-            if detail["status"] == "COMPLETED":
-                break
-            await asyncio.sleep(0.05)
+            detail: dict[str, Any] = {}
+            for _ in range(100):
+                detail = (await client.get(f"/api/backtest/{job_id}")).json()
+                if detail["status"] == "COMPLETED":
+                    break
+                await asyncio.sleep(0.05)
 
-        assert detail["status"] == "COMPLETED"
-        assert detail["result"]["worker_pid"] != os.getpid()
+            assert detail["status"] == "COMPLETED"
+            assert detail["result"]["worker_pid"] == worker_pid
+    finally:
+        marker.unlink(missing_ok=True)
 
 
 async def test_timeout_and_cancel_kill_worker_and_respawn_cleanly(tmp_path: Path) -> None:
@@ -1269,3 +1332,501 @@ async def test_end_to_end_parquet_resample_backtest_api(tmp_path: Path) -> None:
         # Strict JSON compliance (zero NaN/Inf)
         encoded = json.dumps(result, allow_nan=False, separators=(",", ":"))
         assert len(encoded.encode("utf-8")) == detail["result_bytes"]
+
+
+def test_ict_short_fvg_ce_and_mgc_decimal_snapping() -> None:
+    """Contract: ICT FVG+Sweep handles SHORT + fvg_ce mode and exact Decimal MGC tick snapping.
+
+    Defect caught: Float precision loss (1850.4499999999998 rounding down to 1850.4) or broken
+    SHORT / fvg_ce limit entry logic.
+    """
+    t0 = 1_760_000_000
+    # 1) SHORT + entry_mode="fvg_ce" on MES (tick_size=0.25, tick_value=$1.25)
+    # Bars 0..4: swing high at 105.00 (bar 2)
+    # Bar 5: bearish BSL sweep (high=105.50 > 105.00, close=104.50 < 105.00, low=104.25)
+    # Bar 6: bearish impulse
+    # Bar 7: bearish FVG (high=103.50 < bar 5 low=104.25 -> FVG [103.50, 104.25], CE=103.875)
+    # Bar 8: pullback into CE=103.875 (high=104.00, low=103.50) -> limit fill at 103.875
+    # Bar 9: drop hitting TP
+    short_specs = [
+        (104.00, 104.50, 103.50, 104.00),  # 0
+        (104.00, 104.75, 103.75, 104.50),  # 1
+        (104.50, 105.00, 104.00, 104.50),  # 2: prior swing high = 105.00
+        (104.50, 104.75, 103.75, 104.00),  # 3
+        (104.00, 104.50, 103.75, 104.25),  # 4
+        (104.25, 105.50, 104.25, 104.50),  # 5: BSL sweep (high=105.50 > 105.00)
+        (104.50, 104.50, 103.25, 103.50),  # 6
+        (103.25, 103.50, 102.75, 103.00),  # 7: bearish FVG [103.50, 104.25], midpoint=103.875
+        (103.00, 104.00, 102.75, 103.25),  # 8: intrabar limit fill @ 103.875
+        (103.25, 103.50, 99.00, 99.50),    # 9: hits TP
+    ]
+    short_bars = [_bar(t0 + i * 300, o, h, low, c) for i, (o, h, low, c) in enumerate(short_specs)]
+    short_res = run_backtest(
+        short_bars,
+        contract_id="CON.F.US.MES.Z26",
+        timeframe="5m",
+        strategy_id="ict_fvg_sweep",
+        params={
+            "swing_lookback": 5,
+            "entry_mode": "fvg_ce",
+            "sl_buffer_ticks": 1.0,
+            "risk_reward": 2.0,
+            "quantity": 2,
+        },
+    )
+    assert len(short_res.trades) == 1
+    tr = short_res.trades[0]
+    assert tr.direction == "SHORT"
+    assert tr.quantity == 2
+    assert tr.entry_price == 103.875
+    # SL = 105.50 + 0.25 = 105.75; risk = 105.75 - 103.875 = 1.875;
+    # raw_tp = 103.875 - 3.75 = 100.125 -> snaps ROUND_HALF_UP on 0.25 tick to 100.25
+    assert tr.stop_loss == 105.75
+    assert tr.take_profit == 100.25
+    assert tr.exit_price == 100.25
+    assert tr.exit_reason == "take_profit"
+    assert tr.pnl_ticks == 14.5
+    assert tr.pnl_dollars == 36.25
+
+    # 2) MGC half-tick Decimal regression: sweep_extreme=1850.0, close=1850.3, sl_buf=0, rr=0.5
+    # Exact raw_tp = 1850.3 + (1850.3 - 1850.0) * 0.5 = 1850.45 -> snaps ROUND_HALF_UP to 1850.5
+    mgc_specs = [
+        (1850.2, 1850.4, 1850.1, 1850.2),   # 0
+        (1850.2, 1850.3, 1850.1, 1850.2),   # 1
+        (1850.2, 1850.4, 1850.1, 1850.2),   # 2: prior swing low = 1850.1
+        (1850.2, 1850.3, 1850.1, 1850.2),   # 3
+        (1850.2, 1850.3, 1850.1, 1850.15),  # 4
+        (1850.15, 1850.15, 1850.0, 1850.15),# 5: SSL sweep (low=1850.0 < 1850.1)
+        (1850.15, 1850.3, 1850.1, 1850.25), # 6
+        (1850.25, 1850.4, 1850.25, 1850.3), # 7: bullish FVG (1850.25 > 1850.15), close=1850.3
+        (1850.3, 1850.6, 1850.2, 1850.5),   # 8: entry @ 1850.3, hits TP=1850.5
+    ]
+    mgc_bars = [_bar(t0 + i * 60, o, h, low, c) for i, (o, h, low, c) in enumerate(mgc_specs)]
+    mgc_res = run_backtest(
+        mgc_bars,
+        contract_id="CON.F.US.MGC.Z26",
+        timeframe="1m",
+        strategy_id="ict_fvg_sweep",
+        params={
+            "swing_lookback": 5,
+            "sl_buffer_ticks": 0.0,
+            "risk_reward": 0.5,
+            "min_fvg_ticks": 1.0,
+        },
+    )
+    assert len(mgc_res.trades) == 1
+    assert mgc_res.trades[0].stop_loss == 1850.0
+    assert mgc_res.trades[0].take_profit == 1850.5
+
+
+async def test_cancel_cleanup_serializes_before_next_queued_job_starts(tmp_path: Path) -> None:
+    """Contract: Dispatcher waits for cancel worker cleanup before starting the next queued job.
+
+    Defect caught: Concurrent cancel + dispatcher race spawning next job while old worker lives.
+    """
+    async with _async_client(
+        tmp_path,
+        backtest_timeout_sec=30.0,
+        worker_fn=worker_hang_or_fast,
+    ) as (client, app):
+        csrf = await _login(client)
+        t0 = 1_760_000_000
+        svc = app.state.backtest_service
+
+        cleanup_entered = threading.Event()
+        cleanup_release = threading.Event()
+        real_cleanup = svc._terminate_and_reset_executor_sync
+
+        def _gated_cleanup() -> None:
+            cleanup_entered.set()
+            cleanup_release.wait(timeout=5.0)
+            real_cleanup()
+
+        svc._terminate_and_reset_executor_sync = _gated_cleanup
+
+        r1 = await client.post(
+            "/api/backtest",
+            headers={"X-CSRF-Token": csrf},
+            json={
+                "contract_id": "CON.F.US.MES.RACE",
+                "root_symbol": "MES",
+                "timeframe": "5m",
+                "start_time": t0,
+                "end_time": t0 + 3600,
+                "params": {"max_wait_bars": 49},
+            },
+        )
+        job1_id = r1.json()["job_id"]
+        marker = Path(tempfile.gettempdir()) / "topstep_hang_CON.F.US.MES.RACE.pid"
+        try:
+            for _ in range(100):
+                if marker.is_file():
+                    break
+                await asyncio.sleep(0.02)
+            assert marker.is_file()
+
+            r2 = await client.post(
+                "/api/backtest",
+                headers={"X-CSRF-Token": csrf},
+                json={
+                    "contract_id": "CON.F.US.MES.RACE",
+                    "root_symbol": "MES",
+                    "timeframe": "5m",
+                    "start_time": t0,
+                    "end_time": t0 + 3600,
+                    "params": {"max_wait_bars": 5},
+                },
+            )
+            job2_id = r2.json()["job_id"]
+
+            cancel_task = asyncio.create_task(
+                client.delete(f"/api/backtest/{job1_id}", headers={"X-CSRF-Token": csrf})
+            )
+            for _ in range(100):
+                if cleanup_entered.is_set():
+                    break
+                await asyncio.sleep(0.01)
+            assert cleanup_entered.is_set()
+
+            # While cleanup is blocked behind barrier, job2 must remain QUEUED.
+            await asyncio.sleep(0.15)
+            assert (await client.get(f"/api/backtest/{job2_id}")).json()["status"] == "QUEUED"
+
+            cleanup_release.set()
+            del_resp = await cancel_task
+            assert del_resp.status_code == 200
+            assert del_resp.json()["status"] == "CANCELLED"
+
+            for _ in range(100):
+                st2 = (await client.get(f"/api/backtest/{job2_id}")).json()
+                if st2["status"] == "COMPLETED":
+                    break
+                await asyncio.sleep(0.05)
+            assert st2["status"] == "COMPLETED"
+        finally:
+            cleanup_release.set()
+            marker.unlink(missing_ok=True)
+
+
+async def test_load_closed_bars_timeout_and_idle_worker_crash_recovery(tmp_path: Path) -> None:
+    """Contract: Wall-clock timeout covers _load_closed_bars and broken idle pools respawn.
+
+    Defect caught: Stalled Parquet reads hanging RUNNING or idle pool crashes bricking queue.
+    """
+    # 1) _load_closed_bars stall triggers TIMED_OUT and allows next job to complete.
+    async with _async_client(
+        tmp_path / "load_timeout",
+        backtest_timeout_sec=2.0,
+        worker_fn=worker_hang_or_fast,
+    ) as (client, app):
+        csrf = await _login(client)
+        t0 = 1_760_000_000
+        orig_read_bars = app.state.parquet_store.read_bars
+        slow_flag = {"slow": True}
+
+        async def _maybe_slow_read_bars(*args: Any, **kwargs: Any) -> Any:
+            if slow_flag["slow"]:
+                await asyncio.sleep(5.0)
+            return await orig_read_bars(*args, **kwargs)
+
+        app.state.parquet_store.read_bars = _maybe_slow_read_bars
+        r_slow = await client.post(
+            "/api/backtest",
+            headers={"X-CSRF-Token": csrf},
+            json={
+                "contract_id": "CON.F.US.MES.Z26",
+                "timeframe": "5m",
+                "start_time": t0,
+                "end_time": t0 + 3600,
+            },
+        )
+        slow_id = r_slow.json()["job_id"]
+        for _ in range(80):
+            st_slow = (await client.get(f"/api/backtest/{slow_id}")).json()
+            if st_slow["status"] == "TIMED_OUT":
+                break
+            await asyncio.sleep(0.05)
+        assert st_slow["status"] == "TIMED_OUT"
+
+        slow_flag["slow"] = False
+        r_next = await client.post(
+            "/api/backtest",
+            headers={"X-CSRF-Token": csrf},
+            json={
+                "contract_id": "CON.F.US.MES.Z26",
+                "timeframe": "5m",
+                "start_time": t0,
+                "end_time": t0 + 3600,
+            },
+        )
+        next_id = r_next.json()["job_id"]
+        for _ in range(100):
+            st_next = (await client.get(f"/api/backtest/{next_id}")).json()
+            if st_next["status"] == "COMPLETED":
+                break
+            await asyncio.sleep(0.05)
+        assert st_next["status"] == "COMPLETED"
+
+    # 2) Idle worker killed between jobs -> B recovers or fails cleanly, C always COMPLETED.
+    async with _async_client(
+        tmp_path / "idle_kill",
+        worker_fn=worker_hang_or_fast,
+    ) as (client, app):
+        csrf = await _login(client)
+        t0 = 1_760_000_000
+        ra = await client.post(
+            "/api/backtest",
+            headers={"X-CSRF-Token": csrf},
+            json={
+                "contract_id": "CON.F.US.MES.Z26",
+                "timeframe": "5m",
+                "start_time": t0,
+                "end_time": t0 + 3600,
+            },
+        )
+        ja = ra.json()["job_id"]
+        for _ in range(100):
+            sta = (await client.get(f"/api/backtest/{ja}")).json()
+            if sta["status"] == "COMPLETED":
+                break
+            await asyncio.sleep(0.05)
+        assert sta["status"] == "COMPLETED"
+        idle_pid = int(sta["result"]["worker_pid"])
+
+        # Kill the idle worker process directly behind the pool's back.
+        from app.services.backtest_service import _terminate_pid_tree
+
+        _terminate_pid_tree(idle_pid)
+        for _ in range(40):
+            if not _is_pid_alive(idle_pid):
+                break
+            await asyncio.sleep(0.05)
+        assert not _is_pid_alive(idle_pid)
+
+        rb = await client.post(
+            "/api/backtest",
+            headers={"X-CSRF-Token": csrf},
+            json={
+                "contract_id": "CON.F.US.MES.Z26",
+                "timeframe": "5m",
+                "start_time": t0,
+                "end_time": t0 + 3600,
+            },
+        )
+        rc = await client.post(
+            "/api/backtest",
+            headers={"X-CSRF-Token": csrf},
+            json={
+                "contract_id": "CON.F.US.MES.Z26",
+                "timeframe": "5m",
+                "start_time": t0,
+                "end_time": t0 + 3600,
+            },
+        )
+        jb = rb.json()["job_id"]
+        jc = rc.json()["job_id"]
+        for _ in range(100):
+            stb = (await client.get(f"/api/backtest/{jb}")).json()
+            stc = (await client.get(f"/api/backtest/{jc}")).json()
+            if stb["status"] in {"COMPLETED", "FAILED"} and stc["status"] == "COMPLETED":
+                break
+            await asyncio.sleep(0.05)
+        assert stb["status"] in {"COMPLETED", "FAILED"}
+        assert stc["status"] == "COMPLETED"
+        assert stc["result"]["worker_pid"] != idle_pid
+
+
+async def test_metadata_mismatch_max_bars_pruning_and_worker_pid_death(tmp_path: Path) -> None:
+    """Contract: Non-resampled root_symbol mismatch, max_bars cap, job retention pruning, PID death.
+
+    Defect caught: Cross-symbol Parquet metadata bypass, unbounded bars/jobs, or zombie workers.
+    """
+    # 1) Opaque contract_id root_symbol mismatch on non-resampled read_bars + max_bars cap
+    async with _async_client(
+        tmp_path / "meta",
+        backtest_max_bars=10,
+        backtest_max_jobs_retained=2,
+    ) as (client, app):
+        csrf = await _login(client)
+        t0 = int(datetime(2025, 10, 10, 14, 0, tzinfo=UTC).timestamp())
+        bars_12 = _ict_long_setup_bars(t0, 300)
+        opaque_key = StorageDatasetKey("topstepx", False, "OPAQUE.12345", "5m")
+        await app.state.parquet_store.upsert_bars(opaque_key, bars_12, root_symbol="MES")
+
+        # Requesting MNQ against stored MES metadata must fail cleanly.
+        r_mismatch = await client.post(
+            "/api/backtest",
+            headers={"X-CSRF-Token": csrf},
+            json={
+                "contract_id": "OPAQUE.12345",
+                "root_symbol": "MNQ",
+                "timeframe": "5m",
+                "start_time": t0,
+                "end_time": t0 + 12 * 300,
+            },
+        )
+        assert r_mismatch.status_code == 202
+        mismatch_id = r_mismatch.json()["job_id"]
+        for _ in range(100):
+            st_m = (await client.get(f"/api/backtest/{mismatch_id}")).json()
+            if st_m["status"] == "FAILED":
+                break
+            await asyncio.sleep(0.05)
+        assert st_m["status"] == "FAILED"
+        assert "conflicts with stored root_symbol" in st_m["error"]
+
+        # Requesting 12 bars with max_bars=5 must fail at max_bars cap.
+        r_cap = await client.post(
+            "/api/backtest",
+            headers={"X-CSRF-Token": csrf},
+            json={
+                "contract_id": "OPAQUE.12345",
+                "root_symbol": "MES",
+                "timeframe": "5m",
+                "start_time": t0,
+                "end_time": t0 + 12 * 300,
+                "max_bars": 5,
+            },
+        )
+        cap_id = r_cap.json()["job_id"]
+        for _ in range(100):
+            st_cap = (await client.get(f"/api/backtest/{cap_id}")).json()
+            if st_cap["status"] == "FAILED":
+                break
+            await asyncio.sleep(0.05)
+        assert st_cap["status"] == "FAILED"
+        assert "exceeds max_bars cap" in st_cap["error"]
+
+        # Submit a 3rd valid job -> backtest_max_jobs_retained=2 prunes oldest terminal job.
+        r_ok = await client.post(
+            "/api/backtest",
+            headers={"X-CSRF-Token": csrf},
+            json={
+                "contract_id": "OPAQUE.12345",
+                "root_symbol": "MES",
+                "timeframe": "5m",
+                "start_time": t0,
+                "end_time": t0 + 4 * 300,
+                "max_bars": 5,
+            },
+        )
+        ok_id = r_ok.json()["job_id"]
+        for _ in range(100):
+            st_ok = (await client.get(f"/api/backtest/{ok_id}")).json()
+            if st_ok["status"] == "COMPLETED":
+                break
+            await asyncio.sleep(0.05)
+        assert st_ok["status"] == "COMPLETED"
+        listed = (await client.get("/api/backtest")).json()
+        assert listed["count"] == 2
+        assert (await client.get(f"/api/backtest/{mismatch_id}")).status_code == 404
+
+    # 2) Real execute_backtest_in_worker checks max_result_bytes in subprocess without blocking.
+    async with _async_client(
+        tmp_path / "real_cap",
+        backtest_max_result_bytes=1024,
+    ) as (client, app):
+        csrf = await _login(client)
+        t0 = int(datetime(2025, 10, 10, 14, 0, tzinfo=UTC).timestamp())
+        mes_key = StorageDatasetKey("topstepx", False, "CON.F.US.MES.Z26", "5m")
+        await app.state.parquet_store.upsert_bars(mes_key, _ict_long_setup_bars(t0, 300))
+        r_big = await client.post(
+            "/api/backtest",
+            headers={"X-CSRF-Token": csrf},
+            json={
+                "contract_id": "CON.F.US.MES.Z26",
+                "timeframe": "5m",
+                "start_time": t0,
+                "end_time": t0 + 12 * 300,
+            },
+        )
+        big_id = r_big.json()["job_id"]
+        for _ in range(100):
+            st_big = (await client.get(f"/api/backtest/{big_id}")).json()
+            if st_big["status"] == "FAILED":
+                break
+            await asyncio.sleep(0.05)
+        assert st_big["status"] == "FAILED"
+        assert "exceeds cap" in st_big["error"]
+
+    # 3) Explicit old worker PID death check after timeout and after cancel
+    async with _async_client(
+        tmp_path / "pid_death",
+        backtest_timeout_sec=1.5,
+        worker_fn=worker_hang_or_fast,
+    ) as (client, _app):
+        csrf = await _login(client)
+        t0 = 1_760_000_000
+        cid_to = "CON.F.US.MES.PIDTO"
+        marker_to = Path(tempfile.gettempdir()) / f"topstep_hang_{cid_to}.pid"
+        marker_to.unlink(missing_ok=True)
+        try:
+            r_to = await client.post(
+                "/api/backtest",
+                headers={"X-CSRF-Token": csrf},
+                json={
+                    "contract_id": cid_to,
+                    "root_symbol": "MES",
+                    "timeframe": "5m",
+                    "start_time": t0,
+                    "end_time": t0 + 3600,
+                    "params": {"max_wait_bars": 49},
+                },
+            )
+            to_id = r_to.json()["job_id"]
+            for _ in range(100):
+                if marker_to.is_file():
+                    break
+                await asyncio.sleep(0.02)
+            assert marker_to.is_file()
+            to_pid = int(marker_to.read_text(encoding="utf-8").strip())
+
+            for _ in range(100):
+                if (await client.get(f"/api/backtest/{to_id}")).json()["status"] == "TIMED_OUT":
+                    break
+                await asyncio.sleep(0.05)
+            for _ in range(40):
+                if not _is_pid_alive(to_pid):
+                    break
+                await asyncio.sleep(0.05)
+            assert not _is_pid_alive(to_pid)
+        finally:
+            marker_to.unlink(missing_ok=True)
+
+        cid_del = "CON.F.US.MES.PIDDEL"
+        marker_del = Path(tempfile.gettempdir()) / f"topstep_hang_{cid_del}.pid"
+        marker_del.unlink(missing_ok=True)
+        try:
+            r_del = await client.post(
+                "/api/backtest",
+                headers={"X-CSRF-Token": csrf},
+                json={
+                    "contract_id": cid_del,
+                    "root_symbol": "MES",
+                    "timeframe": "5m",
+                    "start_time": t0,
+                    "end_time": t0 + 3600,
+                    "params": {"max_wait_bars": 49},
+                },
+            )
+            del_id = r_del.json()["job_id"]
+            for _ in range(100):
+                if marker_del.is_file():
+                    break
+                await asyncio.sleep(0.02)
+            assert marker_del.is_file()
+            del_pid = int(marker_del.read_text(encoding="utf-8").strip())
+
+            resp_del = await client.delete(
+                f"/api/backtest/{del_id}",
+                headers={"X-CSRF-Token": csrf},
+            )
+            assert resp_del.status_code == 200
+            assert resp_del.json()["status"] == "CANCELLED"
+            for _ in range(40):
+                if not _is_pid_alive(del_pid):
+                    break
+                await asyncio.sleep(0.05)
+            assert not _is_pid_alive(del_pid)
+        finally:
+            marker_del.unlink(missing_ok=True)

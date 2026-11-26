@@ -41,10 +41,9 @@ _FLOAT_PARAM_BOUNDS: dict[str, tuple[float, float, float]] = {
 }
 
 
-def _snap_to_tick(price: float, tick_size: float) -> float:
-    tick_d = Decimal(str(tick_size))
-    steps = (Decimal(str(price)) / tick_d).quantize(Decimal("1"), rounding=ROUND_HALF_UP)
-    return float(steps * tick_d)
+def _snap_decimal_to_tick(price_d: Decimal, tick_d: Decimal) -> Decimal:
+    steps = (price_d / tick_d).quantize(Decimal("1"), rounding=ROUND_HALF_UP)
+    return steps * tick_d
 
 
 class IctFvgSweepStrategy(BaseStrategy):
@@ -234,26 +233,31 @@ class IctFvgSweepStrategy(BaseStrategy):
             and not ctx.has_pending_order
             and i >= 2
         ):
+            tick_d = Decimal(str(tick_size))
+            sl_buf_d = Decimal(str(sl_buffer_ticks))
+            rr_d = Decimal(str(risk_reward))
             if (
                 fvg.direction == "bullish"
                 and self._last_bullish_sweep is not None
                 and not self._bullish_sweep_consumed
                 and (i - self._last_bullish_sweep.bar_index) <= sweep_window
             ):
-                ref_entry = fvg.midpoint if entry_mode == "fvg_ce" else float(current.close)
-                raw_sl = (
-                    min(
-                        self._last_bullish_sweep.sweep_extreme,
-                        float(bars[i - 2].low),
-                        float(bars[i - 1].low),
-                    )
-                    - sl_buffer_ticks * tick_size
+                ref_entry_d = (
+                    Decimal(str(fvg.midpoint))
+                    if entry_mode == "fvg_ce"
+                    else Decimal(str(current.close))
                 )
-                stop_loss = _snap_to_tick(raw_sl, tick_size)
-                if 0.0 < stop_loss < ref_entry:
-                    raw_tp = ref_entry + (ref_entry - stop_loss) * risk_reward
-                    take_profit = _snap_to_tick(raw_tp, tick_size)
-                    if take_profit > ref_entry:
+                min_low_d = min(
+                    Decimal(str(self._last_bullish_sweep.sweep_extreme)),
+                    Decimal(str(bars[i - 2].low)),
+                    Decimal(str(bars[i - 1].low)),
+                )
+                raw_sl_d = min_low_d - (sl_buf_d * tick_d)
+                stop_loss_d = _snap_decimal_to_tick(raw_sl_d, tick_d)
+                if Decimal("0") < stop_loss_d < ref_entry_d:
+                    raw_tp_d = ref_entry_d + (ref_entry_d - stop_loss_d) * rr_d
+                    take_profit_d = _snap_decimal_to_tick(raw_tp_d, tick_d)
+                    if take_profit_d > ref_entry_d:
                         self._bullish_sweep_consumed = True
                         signal = StrategySignal(
                             direction="LONG",
@@ -261,8 +265,8 @@ class IctFvgSweepStrategy(BaseStrategy):
                             signal_time=current.time,
                             order_type="limit" if entry_mode == "fvg_ce" else "market",
                             limit_price=fvg.midpoint if entry_mode == "fvg_ce" else None,
-                            stop_loss=stop_loss,
-                            take_profit=take_profit,
+                            stop_loss=float(stop_loss_d),
+                            take_profit=float(take_profit_d),
                             quantity=quantity,
                             max_wait_bars=max_wait_bars,
                             reason="Bullish FVG + Liquidity Sweep",
@@ -273,20 +277,22 @@ class IctFvgSweepStrategy(BaseStrategy):
                 and not self._bearish_sweep_consumed
                 and (i - self._last_bearish_sweep.bar_index) <= sweep_window
             ):
-                ref_entry = fvg.midpoint if entry_mode == "fvg_ce" else float(current.close)
-                raw_sl = (
-                    max(
-                        self._last_bearish_sweep.sweep_extreme,
-                        float(bars[i - 2].high),
-                        float(bars[i - 1].high),
-                    )
-                    + sl_buffer_ticks * tick_size
+                ref_entry_d = (
+                    Decimal(str(fvg.midpoint))
+                    if entry_mode == "fvg_ce"
+                    else Decimal(str(current.close))
                 )
-                stop_loss = _snap_to_tick(raw_sl, tick_size)
-                if stop_loss > ref_entry:
-                    raw_tp = ref_entry - (stop_loss - ref_entry) * risk_reward
-                    take_profit = _snap_to_tick(raw_tp, tick_size)
-                    if 0.0 < take_profit < ref_entry:
+                max_high_d = max(
+                    Decimal(str(self._last_bearish_sweep.sweep_extreme)),
+                    Decimal(str(bars[i - 2].high)),
+                    Decimal(str(bars[i - 1].high)),
+                )
+                raw_sl_d = max_high_d + (sl_buf_d * tick_d)
+                stop_loss_d = _snap_decimal_to_tick(raw_sl_d, tick_d)
+                if stop_loss_d > ref_entry_d:
+                    raw_tp_d = ref_entry_d - (stop_loss_d - ref_entry_d) * rr_d
+                    take_profit_d = _snap_decimal_to_tick(raw_tp_d, tick_d)
+                    if Decimal("0") < take_profit_d < ref_entry_d:
                         self._bearish_sweep_consumed = True
                         signal = StrategySignal(
                             direction="SHORT",
@@ -294,8 +300,8 @@ class IctFvgSweepStrategy(BaseStrategy):
                             signal_time=current.time,
                             order_type="limit" if entry_mode == "fvg_ce" else "market",
                             limit_price=fvg.midpoint if entry_mode == "fvg_ce" else None,
-                            stop_loss=stop_loss,
-                            take_profit=take_profit,
+                            stop_loss=float(stop_loss_d),
+                            take_profit=float(take_profit_d),
                             quantity=quantity,
                             max_wait_bars=max_wait_bars,
                             reason="Bearish FVG + Liquidity Sweep",

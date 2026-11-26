@@ -17,7 +17,10 @@ from concurrent.futures import ProcessPoolExecutor
 from concurrent.futures.process import BrokenProcessPool
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any, Literal
+
+import pyarrow.parquet as pq
 
 from app.config import Settings
 from app.engine.backtester import run_backtest
@@ -39,6 +42,7 @@ BacktestJobStatus = Literal[
     "FAILED",
 ]
 _TERMINAL_STATUSES = frozenset({"COMPLETED", "CANCELLED", "TIMED_OUT", "FAILED"})
+_ENVELOPE_FLAG = "__backtest_worker_envelope__"
 
 
 class BacktestServiceError(RuntimeError):
@@ -59,6 +63,18 @@ class BacktestJobNotFoundError(BacktestServiceError):
 
 class BacktestJobNotCancellableError(BacktestServiceError):
     """Raised when DELETE targets a non-cancellable terminal job (COMPLETED/FAILED/TIMED_OUT)."""
+
+
+def _init_worker_process() -> None:
+    """Place POSIX worker processes into a dedicated session/group for tree cleanup."""
+    if os.name != "nt" and hasattr(os, "setsid"):
+        with contextlib.suppress(OSError):
+            os.setsid()
+
+
+def _measure_result_bytes(result_dict: dict[str, Any]) -> int:
+    encoded = json.dumps(result_dict, allow_nan=False, separators=(",", ":")).encode("utf-8")
+    return len(encoded)
 
 
 def execute_backtest_in_worker(payload: dict[str, Any]) -> dict[str, Any]:
@@ -90,7 +106,31 @@ def execute_backtest_in_worker(payload: dict[str, Any]) -> dict[str, Any]:
         params=dict(payload.get("params") or {}),
         include_provisional=bool(payload.get("include_provisional", False)),
     )
-    return result.to_dict()
+    result_dict = result.to_dict()
+    result_bytes = _measure_result_bytes(result_dict)
+    max_result_bytes = payload.get("max_result_bytes")
+    if max_result_bytes is not None and result_bytes > int(max_result_bytes):
+        raise ValueError(
+            f"Backtest result size ({result_bytes} bytes) exceeds cap "
+            f"({int(max_result_bytes)} bytes)"
+        )
+    return {
+        _ENVELOPE_FLAG: True,
+        "result": result_dict,
+        "result_bytes": result_bytes,
+    }
+
+
+def _read_parquet_stored_root(target: Path) -> str | None:
+    if not target.is_file():
+        return None
+    schema = pq.read_schema(target)
+    meta = schema.metadata or {}
+    raw_root = meta.get(b"topstep_root_symbol")
+    if not raw_root:
+        return None
+    decoded = raw_root.decode("utf-8", errors="replace").strip()
+    return decoded or None
 
 
 def _win32_descendant_pids(root_pid: int) -> list[int]:
@@ -173,8 +213,38 @@ def _win32_terminate_pid(pid: int) -> None:
         k32.CloseHandle(handle)
 
 
+def _posix_descendant_pids(root_pid: int) -> list[int]:
+    """Collect descendant PIDs via /proc on Linux without spawning external shells."""
+    proc_root = Path("/proc")
+    if not proc_root.is_dir():
+        return []
+    children_map: dict[int, list[int]] = {}
+    for entry in proc_root.iterdir():
+        if not entry.name.isdigit():
+            continue
+        pid = int(entry.name)
+        with contextlib.suppress(OSError, ValueError):
+            status_text = (entry / "status").read_text(encoding="utf-8", errors="replace")
+            for line in status_text.splitlines():
+                if line.startswith("PPid:"):
+                    ppid = int(line.split(":", 1)[1].strip())
+                    children_map.setdefault(ppid, []).append(pid)
+                    break
+    descendants: list[int] = []
+    queue: deque[int] = deque([root_pid])
+    seen: set[int] = {root_pid}
+    while queue:
+        cur = queue.popleft()
+        for child_pid in children_map.get(cur, ()):
+            if child_pid not in seen:
+                seen.add(child_pid)
+                descendants.append(child_pid)
+                queue.append(child_pid)
+    return descendants
+
+
 def _terminate_pid_tree(pid: int) -> None:
-    """Forcefully terminate `pid` and any descendant processes cleanly."""
+    """Forcefully terminate `pid`, its process group, and any descendant processes."""
     if os.name == "nt":
         descendants = _win32_descendant_pids(pid)
         for child_pid in reversed(descendants):
@@ -182,7 +252,14 @@ def _terminate_pid_tree(pid: int) -> None:
         _win32_terminate_pid(pid)
         return
 
-    with contextlib.suppress(ProcessLookupError, OSError):
+    descendants = _posix_descendant_pids(pid)
+    if hasattr(os, "killpg"):
+        with contextlib.suppress(ProcessLookupError, PermissionError, OSError):
+            os.killpg(pid, signal.SIGKILL)
+    for child_pid in reversed(descendants):
+        with contextlib.suppress(ProcessLookupError, PermissionError, OSError):
+            os.kill(child_pid, signal.SIGKILL)
+    with contextlib.suppress(ProcessLookupError, PermissionError, OSError):
         os.kill(pid, signal.SIGKILL)
 
 
@@ -257,6 +334,7 @@ class BacktestService:
         self._worker_fn = worker_fn or execute_backtest_in_worker
         self._mp_context = multiprocessing.get_context("spawn")
         self._executor: ProcessPoolExecutor | None = None
+        self._cleanup_lock = asyncio.Lock()
 
         self._jobs: dict[str, BacktestJobRecord] = {}
         self._queue: deque[str] = deque()
@@ -284,29 +362,42 @@ class BacktestService:
             self._executor = ProcessPoolExecutor(
                 max_workers=1,
                 mp_context=self._mp_context,
+                initializer=_init_worker_process,
             )
         return self._executor
 
     def _terminate_and_reset_executor_sync(self) -> None:
         executor = self._executor
-        self._executor = None
         if executor is None:
             return
-        procs = list(getattr(executor, "_processes", {}).values())
-        for proc in procs:
-            pid = getattr(proc, "pid", None)
-            if pid is not None:
-                _terminate_pid_tree(int(pid))
+        try:
+            procs = list(getattr(executor, "_processes", {}).values())
+            for proc in procs:
+                pid = getattr(proc, "pid", None)
+                if pid is not None:
+                    _terminate_pid_tree(int(pid))
+                with contextlib.suppress(Exception):
+                    proc.kill()
             with contextlib.suppress(Exception):
-                proc.kill()
-        with contextlib.suppress(Exception):
-            executor.shutdown(wait=False, cancel_futures=True)
-        for proc in procs:
-            with contextlib.suppress(Exception):
-                proc.join(timeout=1.0)
+                executor.shutdown(wait=False, cancel_futures=True)
+            for proc in procs:
+                with contextlib.suppress(Exception):
+                    proc.join(timeout=1.0)
+        finally:
+            if self._executor is executor:
+                self._executor = None
 
-    async def _terminate_and_reset_executor(self) -> None:
-        await asyncio.to_thread(self._terminate_and_reset_executor_sync)
+    async def _terminate_and_reset_executor(
+        self,
+        *,
+        target_executor: ProcessPoolExecutor | None = None,
+    ) -> None:
+        async with self._cleanup_lock:
+            if target_executor is not None and self._executor is not target_executor:
+                return
+            if self._executor is None:
+                return
+            await asyncio.to_thread(self._terminate_and_reset_executor_sync)
 
     def _queued_count(self) -> int:
         return sum(
@@ -352,8 +443,10 @@ class BacktestService:
                     job.status = "CANCELLED"
                     job.finished_at_utc = self._clock()
                     job.error = "Cancelled on service shutdown"
-            active_task.cancel()
-            await self._terminate_and_reset_executor()
+            async with self._cleanup_lock:
+                if self._executor is not None:
+                    await asyncio.to_thread(self._terminate_and_reset_executor_sync)
+                active_task.cancel()
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await active_task
 
@@ -365,17 +458,18 @@ class BacktestService:
         self._active_exec_task = None
         self._running_job_id = None
 
-        if self._executor is not None:
-            executor = self._executor
-            self._executor = None
-            try:
-                await asyncio.wait_for(
-                    asyncio.to_thread(executor.shutdown, wait=True, cancel_futures=True),
-                    timeout=3.0,
-                )
-            except (TimeoutError, Exception):
-                self._executor = executor
-                await self._terminate_and_reset_executor()
+        async with self._cleanup_lock:
+            if self._executor is not None:
+                executor = self._executor
+                try:
+                    await asyncio.wait_for(
+                        asyncio.to_thread(executor.shutdown, wait=True, cancel_futures=True),
+                        timeout=3.0,
+                    )
+                    if self._executor is executor:
+                        self._executor = None
+                except (TimeoutError, Exception):
+                    await asyncio.to_thread(self._terminate_and_reset_executor_sync)
 
     def submit_job(
         self,
@@ -511,14 +605,17 @@ class BacktestService:
             self._prune_terminal_jobs()
             return job
 
-        # Running job: transition first so late completions cannot overwrite CANCELLED.
+        # Running job: transition first and hold _cleanup_lock until worker termination completes
+        # so the dispatcher cannot start the next queued job concurrently.
         job.status = "CANCELLED"
         job.finished_at_utc = self._clock()
         job.error = "Cancelled by caller"
         active_task = self._active_exec_task
-        if active_task is not None and not active_task.done():
-            active_task.cancel()
-        await self._terminate_and_reset_executor()
+        async with self._cleanup_lock:
+            if self._executor is not None:
+                await asyncio.to_thread(self._terminate_and_reset_executor_sync)
+            if active_task is not None and not active_task.done():
+                active_task.cancel()
         self._prune_terminal_jobs()
         return job
 
@@ -556,6 +653,13 @@ class BacktestService:
             job.contract_id,
             job.timeframe,
         )
+        target_path = self._parquet_store.resolve_path(dataset_key)
+        stored_root = await asyncio.to_thread(_read_parquet_stored_root, target_path)
+        validate_root_symbol(
+            job.contract_id,
+            job.root_symbol,
+            stored_root_symbol=stored_root,
+        )
         return await self._parquet_store.read_bars(
             dataset_key,
             start_ts=job.start_time,
@@ -565,8 +669,27 @@ class BacktestService:
         )
 
     async def _execute_job(self, job: BacktestJobRecord) -> None:
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + float(self._settings.backtest_timeout_sec)
+
+        def _remaining_timeout() -> float:
+            return max(0.0, deadline - loop.time())
+
         try:
-            bars = await self._load_closed_bars(job)
+            try:
+                bars = await asyncio.wait_for(
+                    self._load_closed_bars(job),
+                    timeout=_remaining_timeout(),
+                )
+            except TimeoutError:
+                if job.status == "RUNNING":
+                    job.status = "TIMED_OUT"
+                    job.finished_at_utc = self._clock()
+                    job.error = (
+                        f"Backtest timed out after {self._settings.backtest_timeout_sec}s"
+                    )
+                return
+
             if job.status != "RUNNING":
                 return
 
@@ -591,20 +714,25 @@ class BacktestService:
                 "strategy_id": job.strategy_id,
                 "params": dict(job.params),
                 "include_provisional": False,
+                "max_result_bytes": self._settings.backtest_max_result_bytes,
             }
 
-            loop = asyncio.get_running_loop()
             executor = self._ensure_executor()
-            exec_future = loop.run_in_executor(executor, self._worker_fn, payload)
+            exec_future: asyncio.Future[dict[str, Any]] | None = None
             try:
-                result_dict = await asyncio.wait_for(
+                remaining = _remaining_timeout()
+                if remaining <= 0.0:
+                    raise TimeoutError
+                exec_future = loop.run_in_executor(executor, self._worker_fn, payload)
+                raw_output = await asyncio.wait_for(
                     exec_future,
-                    timeout=self._settings.backtest_timeout_sec,
+                    timeout=remaining,
                 )
             except TimeoutError:
-                await self._terminate_and_reset_executor()
-                with contextlib.suppress(BaseException):
-                    await exec_future
+                await self._terminate_and_reset_executor(target_executor=executor)
+                if exec_future is not None:
+                    with contextlib.suppress(BaseException):
+                        await exec_future
                 if job.status == "RUNNING":
                     job.status = "TIMED_OUT"
                     job.finished_at_utc = self._clock()
@@ -613,16 +741,17 @@ class BacktestService:
                     )
                 return
             except asyncio.CancelledError:
-                await self._terminate_and_reset_executor()
-                with contextlib.suppress(BaseException):
-                    await exec_future
+                await self._terminate_and_reset_executor(target_executor=executor)
+                if exec_future is not None:
+                    with contextlib.suppress(BaseException):
+                        await exec_future
                 if job.status == "RUNNING":
                     job.status = "CANCELLED"
                     job.finished_at_utc = self._clock()
                     job.error = "Cancelled by caller"
                 raise
             except BrokenProcessPool as exc:
-                await self._terminate_and_reset_executor()
+                await self._terminate_and_reset_executor(target_executor=executor)
                 if job.status == "RUNNING":
                     job.status = "FAILED"
                     job.finished_at_utc = self._clock()
@@ -632,22 +761,24 @@ class BacktestService:
             if job.status != "RUNNING":
                 return
 
-            encoded = json.dumps(
-                result_dict,
-                allow_nan=False,
-                separators=(",", ":"),
-            ).encode("utf-8")
-            if len(encoded) > self._settings.backtest_max_result_bytes:
+            if isinstance(raw_output, dict) and raw_output.get(_ENVELOPE_FLAG) is True:
+                result_dict = raw_output["result"]
+                result_bytes = int(raw_output["result_bytes"])
+            else:
+                result_dict = raw_output
+                result_bytes = await asyncio.to_thread(_measure_result_bytes, result_dict)
+
+            if result_bytes > self._settings.backtest_max_result_bytes:
                 job.status = "FAILED"
                 job.finished_at_utc = self._clock()
                 job.error = (
-                    f"Backtest result size ({len(encoded)} bytes) exceeds cap "
+                    f"Backtest result size ({result_bytes} bytes) exceeds cap "
                     f"({self._settings.backtest_max_result_bytes} bytes)"
                 )
                 return
 
             job.result = result_dict
-            job.result_bytes = len(encoded)
+            job.result_bytes = result_bytes
             job.status = "COMPLETED"
             job.finished_at_utc = self._clock()
         except asyncio.CancelledError:
@@ -692,8 +823,9 @@ class BacktestService:
                 if not self._running:
                     raise
             finally:
-                if self._active_exec_task is exec_task:
-                    self._active_exec_task = None
-                if self._running_job_id == next_job.job_id:
-                    self._running_job_id = None
-                self._prune_terminal_jobs()
+                async with self._cleanup_lock:
+                    if self._active_exec_task is exec_task:
+                        self._active_exec_task = None
+                    if self._running_job_id == next_job.job_id:
+                        self._running_job_id = None
+                    self._prune_terminal_jobs()
