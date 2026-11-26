@@ -1,6 +1,6 @@
 # Task List: TopstepX Futures Terminal (`topstep-chart-app`)
 
-> **Status**: Phase 1 `VERIFIED` (`1918f9156d45`, `7d724bc79a76`); Phase 2 (`F03`, `R06`, `F07`) `VERIFIED` (`84abff087ab3`, `bb81eb9add7d`); Phase 3 Part 1 (`447d74adda07`) & Phase 3 Part 2 (`F06`, 1–8 Pane Layouts & 5 `SYNC IN LAYOUT` Toggles) **`VERIFIED`** (`238c9bf0bec9`: 206 harness, 262 backend, 99 frontend tests passed; native 2-pass Codex CLI review `PASSED` with 0 findings; immutable receipt `VERIFIED`; live browser check passed). Ready for Phase 4 (Interactive Drawing Primitives & Unified `CommandService`).
+> **Status**: Phase 1 `VERIFIED` (`1918f9156d45`, `7d724bc79a76`); Phase 2 (`F03`, `R06`, `F07`) `VERIFIED` (`84abff087ab3`, `bb81eb9add7d`); Phase 3 (`F06`, 1–8 Pane Layouts & 5 `SYNC IN LAYOUT` Toggles) `VERIFIED` (`447d74adda07`, `238c9bf0bec9`); Phase 4 Part 1 (`7d4bd0bea595`) & Phase 4 Part 2 (`012beed9b598`) **`VERIFIED`** (`206` harness, `273` backend, `124` frontend tests passed; G4 `PASSED` with `0` findings; immutable G5 `receipt.json` `VERIFIED`; `verify_app.py` runtime smoke & live browser persistence verification passed with `0` console errors). Ready for Phase 5 (Bar Replay, Python Backtest & 24/7 Kit).
 
 ## Phase 1 — Backend FastAPI, Parquet Cache, Security & Contract Integrity (F01, F02, F04, F05, R03, R04, R05)
 - [x] Initialize `topstep-chart-app/backend/` with `uv` (`pyproject.toml`, FastAPI, Polars, PyArrow, SQLite, httpx, argon2-cffi, pytest) and remove temporary `server.mjs`
@@ -27,9 +27,9 @@
 - [x] Verify `tsc` typecheck, Vite build, and manual browser testing of 1–8 panes & 5 sync toggles
 
 ## Phase 4 — Interactive Drawing Primitives & Unified Command Service
-- [ ] Build Unified `CommandService` (backend + SQLite) with `revision` optimistic concurrency (`409` on stale revision), `idempotency_key`, Undo/Redo stack, and WebSocket broadcast
-- [ ] Implement Lightweight Charts v5 `ISeriesPrimitive` drawing tools: Cursor, Trendline, Ray, HLine, **FVG Box (with 50% CE)**, **Order Block**, **Long/Short Position Tool**, Measure, Magnet
-- [ ] Persist drawings in time–price coordinates (never pixels) per `(contract_id, pane)` and verify survival across zoom/layout switch/reload
+- [x] Build Unified `CommandService` (backend + SQLite) with `revision` optimistic concurrency (`409` on stale revision), `idempotency_key`, Undo/Redo stack, and WebSocket broadcast (`7d4bd0bea595`)
+- [x] Implement Lightweight Charts v5 `ISeriesPrimitive` drawing tools: Cursor, Trendline, Ray, HLine, **FVG Box (with 50% CE)**, **Order Block**, **Long/Short Position Tool**, Measure, Magnet (`012beed9b598`)
+- [x] Persist drawings in time–price coordinates (never pixels) per `(contract_id, pane)` and verify survival across zoom/layout switch/reload (`012beed9b598`)
 
 ## Phase 5 — Bar Replay, Python Backtest (`ICT FVG + Sweep`) & Self-Hosted 24/7 Kit (F08, R02)
 - [ ] **[R02]** Isolate backtest execution in a bounded `ProcessPoolExecutor(max_workers=1)` with max queue depth, bar/date/memory/runtime caps, `202 Accepted` + `job_id`, cancellation, worker respawn, and `BACKTEST_ENABLED` kill-switch

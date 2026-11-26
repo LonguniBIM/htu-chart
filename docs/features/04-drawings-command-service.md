@@ -1,4 +1,6 @@
-# 04 — Interactive Drawing Primitives & Unified Command Service (Phase 4)
+# 04 — Interactive Drawing Primitives & Unified Command Service (Phase 4 — `VERIFIED`)
+
+> Verified commits: Part 1 Backend `7d4bd0bea59545272a0f42dce5380ce1cc169adf` (`receipt.json` `VERIFIED`) · Part 2 Frontend & Docs `012beed9b598e9578cb565bbc97c8be364a8c761` (`receipt.json` `VERIFIED`).
 
 ## 1. Sub-features
 - **Lightweight Charts v5 `ISeriesPrimitive` Tools**: `Cursor` (select, anchor handle drag, whole-body drag with 5px deadzone), `Trendline`, `Ray`, `Horizontal Line` (price tag on right axis), `FVG Box` (Bullish/Bearish + 50% CE dashed line & formatted CE price label), `Order Block (OB)` (optional Extend Right + customizable label), `Long / Short Position Tool` (Entry/TP/SL right-axis tags, ticks, dollar risk/reward, R:R HUD, >= `1 * tickSize` directional clamping), `Measure Tool` (bars, duration, price delta, % change, ticks), `Magnet Mode` (nearest bar OHLC snap), `Undo / Redo`, `Delete / Clear`.
