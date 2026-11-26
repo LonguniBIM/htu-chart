@@ -1,6 +1,6 @@
 # Task List: TopstepX Futures Terminal (`topstep-chart-app`)
 
-> **Status**: Phase 1 `VERIFIED` (`1918f9156d45`, `7d724bc79a76`); Phase 2 (`F03`, `R06`, `F07`) `VERIFIED` (`84abff087ab3`, `bb81eb9add7d`); Phase 3 (`F06`, 1–8 Pane Layouts & 5 `SYNC IN LAYOUT` Toggles) `VERIFIED` (`447d74adda07`, `238c9bf0bec9`); Phase 4 Part 1 (`7d4bd0bea595`) & Phase 4 Part 2 (`012beed9b598`) **`VERIFIED`** (`206` harness, `273` backend, `124` frontend tests passed; G4 `PASSED` with `0` findings; immutable G5 `receipt.json` `VERIFIED`; `verify_app.py` runtime smoke & live browser persistence verification passed with `0` console errors). Ready for Phase 5 (Bar Replay, Python Backtest & 24/7 Kit).
+> **Status**: Phase 1 `VERIFIED` (`1918f9156d45`, `7d724bc79a76`); Phase 2 (`F03`, `R06`, `F07`) `VERIFIED` (`84abff087ab3`, `bb81eb9add7d`); Phase 3 (`F06`, 1–8 Pane Layouts & 5 `SYNC IN LAYOUT` Toggles) `VERIFIED` (`447d74adda07`, `238c9bf0bec9`); Phase 4 Part 1 (`7d4bd0bea595`) & Phase 4 Part 2 (`012beed9b598`) `VERIFIED`; **Phase 5 Part 1 (`725b935fc202`) & Phase 5 Part 2 (`4759bc0f9fe1`) `VERIFIED`** (`206` harness, `312` backend, `141` frontend tests passed; G4 `PASSED` with `0` blocking findings; immutable G5 `receipt.json` `VERIFIED`). Ready for Phase 6 (Chart Agent Workspace & MCP Integration).
 
 ## Phase 1 — Backend FastAPI, Parquet Cache, Security & Contract Integrity (F01, F02, F04, F05, R03, R04, R05)
 - [x] Initialize `topstep-chart-app/backend/` with `uv` (`pyproject.toml`, FastAPI, Polars, PyArrow, SQLite, httpx, argon2-cffi, pytest) and remove temporary `server.mjs`
@@ -32,11 +32,11 @@
 - [x] Persist drawings in time–price coordinates (never pixels) per `(contract_id, pane)` and verify survival across zoom/layout switch/reload (`012beed9b598`)
 
 ## Phase 5 — Bar Replay, Python Backtest (`ICT FVG + Sweep`) & Self-Hosted 24/7 Kit (F08, R02)
-- [ ] **[R02]** Isolate backtest execution in a bounded `ProcessPoolExecutor(max_workers=1)` with max queue depth, bar/date/memory/runtime caps, `202 Accepted` + `job_id`, cancellation, worker respawn, and `BACKTEST_ENABLED` kill-switch
-- [ ] **[F08]** Implement deterministic `backtester.py` & `ict_fvg_sweep.py` with strict causality (`bar[i+1]` earliest fill), zone `detected_at_time`, conservative both-hit SL/TP policy (`ambiguous_fill` flag), CME `tickValue` P&L, `markers`, `trade_lines`, `zones`, and `indicators`
-- [ ] **[F08]** Implement Bar Replay UI (`Play/Pause/Step Forward/Step Back/Speed`) with checkpoint rewind, simulated Long/Short orders, live P&L, and strict `replay_cursor_time` visibility filtering
-- [ ] Add `Dockerfile`, `docker-compose.yml`, `.env.example`, and 24/7 Home Host + Tailscale runbook
-- [ ] Write & pass Phase 5 `pytest` suite (causality, both-hit fills, rewind accuracy, P&L arithmetic, backtest isolation/cancellation under simulated live feed)
+- [x] **[R02]** Isolate backtest execution in a bounded `ProcessPoolExecutor(max_workers=1)` with max queue depth, bar/date/memory/runtime caps, `202 Accepted` + `job_id`, cancellation, worker respawn, and `BACKTEST_ENABLED` kill-switch (`725b935fc202`)
+- [x] **[F08]** Implement deterministic `backtester.py` & `ict_fvg_sweep.py` with strict causality (`bar[i+1]` earliest fill), zone `detected_at_time`, conservative both-hit SL/TP policy (`ambiguous_fill` flag), CME `tickValue` P&L, `markers`, `trade_lines`, `zones`, and `indicators` (`725b935fc202`)
+- [x] **[F08]** Implement Bar Replay UI (`Play/Pause/Step Forward/Step Back/Speed`) with checkpoint rewind, simulated Long/Short orders, live P&L, and strict `replay_cursor_time` visibility filtering (`4759bc0f9fe1`)
+- [x] Add `Dockerfile`, `docker-compose.yml`, `.env.example`, and 24/7 Home Host + Tailscale runbook (`4759bc0f9fe1`)
+- [x] Write & pass Phase 5 `pytest` suite (causality, both-hit fills, rewind accuracy, P&L arithmetic, backtest isolation/cancellation under simulated live feed) (`725b935fc202`, `4759bc0f9fe1`)
 
 ## Phase 6 — Chart Agent Workspace & MCP Integration (Module 7, R01)
 - [ ] Build `ChartContextService` exposing shared workspace/pane/contract/timeframe/visible range/replay cursor/selected objects/OHLCV/drawings with stable IDs & revisions

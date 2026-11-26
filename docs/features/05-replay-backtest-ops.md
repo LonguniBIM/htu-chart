@@ -1,20 +1,27 @@
-# 05 — Bar Replay, Backtest Engine & 24/7 Self-Hosted Kit (Phase 5)
+# 05 — Bar Replay, Backtest Engine & 24/7 Self-Hosted Kit (Phase 5 `VERIFIED`)
 
 ## 1. Sub-features
-- **Isolated Backtest Worker (`R02`)**: `POST /api/backtest` validates date/bar caps, enqueues into `ProcessPoolExecutor(max_workers=1)` (`queue_depth <= 3`), returns `202 Accepted` + `job_id`, supports `DELETE /api/backtest/{job_id}` cancellation & worker respawn, plus `BACKTEST_ENABLED` kill-switch.
-- **Deterministic Causality & `ICT FVG + Sweep` (`F08`)**: Signals at `bar[i]` close fill no earlier than `bar[i+1].open`; zones carry `detected_at_time`; conservative both-hit SL/TP (SL first + `ambiguous_fill=true`); exact CME `tickSize`/`tickValue` P&L (`MES $1.25`, `MNQ $0.50`, `MYM $0.50`, `MGC $1.00`); outputs `markers`, `trade_lines`, `zones`, `indicators`, `summary`.
-- **Bar Replay UI (`F08`)**: Click-to-start, `Play/Pause`, `Step Forward (+1)`, `Step Back (-1)` via immutable action log + checkpoints, `0.5x..10x` speeds, simulated Long/Short Market/SL/TP orders + Live Replay Stats.
-- **24/7 Home Host Kit**: `Dockerfile`, `docker-compose.yml`, `.env.example`, Tailscale residential deployment runbook.
+- **Isolated Backtest Worker (`R02`, `F01`, `SEC-001`)**: `BacktestService` executes jobs inside a bounded `ProcessPoolExecutor(max_workers=1)` with `max_queue_depth <= 3`, `backtest_max_bars` / `backtest_max_date_range_days` / `backtest_timeout_sec` caps, process-tree cancellation + worker respawn on timeout or crash, `BACKTEST_ENABLED` kill-switch (reflected in `/api/status` and `GET /api/backtest`), and session/CSRF-authenticated routes (`GET /api/backtest/strategies`, `GET /api/backtest`, `POST /api/backtest` returning `202 Accepted` + `job_id`, `GET /api/backtest/{job_id}`, `DELETE /api/backtest/{job_id}`). Strictly simulation-only with zero `/api/Order/*` calls.
+- **Deterministic Causality & `ICT FVG + Sweep` (`F08`, `ARCH-001`, `ARCH-005`)**: Pure domain modules (`engine/indicators.py`, `engine/strategy_base.py`, `engine/strategies/ict_fvg_sweep.py`, `engine/backtester.py`) carry zero FastAPI/httpx/storage imports and use `session_calendar.py` (`America/New_York` 18:00 ET Globex sessions). Strategy evaluation uses `CausalBarView` (`bar[i]` signals fill no earlier than `bar[i+1].open`), zones carry `detected_at_time`, conservative both-hit SL/TP tie-breaking exits SL first with `ambiguous_fill=true` + summary `ambiguous_fill_count`, and exact `Decimal` CME `tickSize`/`tickValue` P&L across `MES`, `MNQ`, `MYM`, and `MGC`, outputting `markers`, `trade_lines`, `zones`, `indicators`, and `summary`.
+- **Bar Replay Engine & UI (`F08`, `ARCH-004`, `SLOP-002`)**: Interactive `Click-to-start` bar selection (`armPickStart` / `startReplayAtTime`), `Play/Pause`, `Step Forward (+1)`, `Step Back (-1)` powered by an immutable `ReplayAction` log with checkpoints every `25` bars (`CHECKPOINT_INTERVAL = 25`), speeds `0.5x..10x`, simulated local paper Long/Short positions with SL/TP and Live Replay Stats, and strict `detected_at_time <= replayCursorTime` filtering across bars, persisted drawings, and backtest overlays.
+- **Backtest Runner UI & Chart Overlays (`ARCH-004`, `SLOP-002`)**: `BacktestPanel` (`BacktestPanel.tsx`), `useBacktestStore` (`backtestStore.ts`), `BacktestOverlayPrimitive` (`BacktestOverlayPrimitive.ts`), and `ChartPane.tsx` overlay integration for zones, trade lines, markers, and indicator series with independent visibility toggles (`showZones`, `showTradeLines`, `showMarkers`, `showIndicators`). Playback and polling timers live strictly in `replayStore.ts` / `backtestStore.ts`, never inside `chart/` or `drawings/`.
+- **Static SPA Serving & 24/7 Home Host Kit (`F01`, `SEC-003`)**: `backend/app/main.py` mounts built `frontend/dist/assets` and serves `index.html` fallback for SPA navigation while reserving `/api/*` and `/ws/*`; `Dockerfile`, `Dockerfile.dockerignore`, `docker-compose.yml` (explicit `127.0.0.1` or Tailscale IP bind via `${APP_BIND_HOST:-127.0.0.1}`, never `0.0.0.0`), `.env.example`, and `SETUP.md` provide single-worker 24/7 home-host + Tailscale deployment.
 
 ## 2. Entry Points
-- `backend/app/engine/backtester.py`, `backend/app/engine/strategy_base.py`, `backend/app/engine/strategies/ict_fvg_sweep.py`, `backend/app/engine/indicators.py`
-- `backend/app/api/routes_backtest.py`
-- `frontend/src/replay/`, `frontend/src/backtest/`
+- **Backend Pure Engine & API**:
+  - `backend/app/engine/indicators.py`, `backend/app/engine/strategy_base.py`, `backend/app/engine/strategies/__init__.py`, `backend/app/engine/strategies/ict_fvg_sweep.py`, `backend/app/engine/backtester.py`
+  - `backend/app/services/backtest_service.py`
+  - `backend/app/api/routes_backtest.py`, `backend/app/api/routes_status.py`, `backend/app/config.py`, `backend/app/main.py`
+- **Frontend Replay, Backtest & Layout Integration**:
+  - `frontend/src/replay/replayEngine.ts`, `frontend/src/replay/replayStore.ts`, `frontend/src/replay/ReplayControlBar.tsx`
+  - `frontend/src/backtest/backtestStore.ts`, `frontend/src/backtest/BacktestOverlayPrimitive.ts`, `frontend/src/backtest/BacktestPanel.tsx`
+  - `frontend/src/chart/ChartPane.tsx`, `frontend/src/layout/TopToolbar.tsx`, `frontend/src/App.tsx`, `frontend/src/api/client.ts`, `frontend/src/api/types.ts`, `frontend/src/styles/app.css`
+- **24/7 Ops & Deployment**:
+  - `Dockerfile`, `Dockerfile.dockerignore`, `docker-compose.yml`, `.env.example`, `SETUP.md`
 
 ## 3. Driving & Verification
-- `arch_check.py`: enforces pure `engine/` layer (`ARCH-001`) and CME calendar (`ARCH-005`).
-- Pytest suite: causality (zero future look-ahead), conservative both-hit fill count, checkpoint rewind accuracy, P&L arithmetic for all 4 contracts, worker timeout/cancellation without stalling async event loop.
-
-## 4. Gotchas & Invariants
-- Never compute indicator/strategy fills using `bar[i].close` from future information (`F08`).
-- Never block FastAPI event loop with synchronous Parquet backtests (`R02`).
+- **Static Gates (`arch_check.py`)**: Enforces pure `engine/` boundary (`ARCH-001`), CME session calendar (`ARCH-005`), isolated `drawings/` boundary (`ARCH-004`), zero timers in `chart/`/`drawings/` (`SLOP-002`), zero order endpoints (`SEC-001`), zero frontend secrets (`SEC-002`), and explicit loopback/Tailscale bind (`SEC-003`).
+- **Automated Suites**:
+  - Backend `pytest`: `backend/tests/test_backtest_engine_worker.py` (causality, `ambiguous_fill` SL-first tie-breaking, CME `tickValue` P&L across `MES`/`MNQ`/`MYM`/`MGC`, worker queue/timeout/cancellation/respawn isolation, `BACKTEST_ENABLED`, auth/CSRF) and `backend/tests/test_static_spa_ops.py` (SPA asset/fallback serving, Docker bind hygiene).
+  - Frontend `vitest` & `vite build`: `frontend/src/replay/replayEngine.test.ts`, `frontend/src/backtest/backtestUi.test.tsx`, `frontend/src/chart/ChartPane.test.tsx`, `frontend/src/layout/LayoutUi.test.tsx`, `frontend/src/App.test.tsx`.
+- **Gate & Runtime Evidence**: `harness/runs/phase5-part1-backtest-engine-worker/receipt.json` (`725b935fc202`, `VERIFIED`), `harness/runs/phase5-part2-replay-backtest-ui-ops/receipt.json` (`4759bc0f9fe1`, `VERIFIED`), `harness/runs/phase5-part2-replay-backtest-ui-ops/final-head-verifier.json`, `verify_app.py` (`doctor`, `launch`, `smoke`, `cleanup`), and live browser verification (`0` console errors).

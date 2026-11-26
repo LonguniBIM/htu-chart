@@ -204,3 +204,52 @@ stateDiagram-v2
 - **Per-Scope Serialized Queue & `mutationEpoch` (`drawingStore.ts`)**: `createDrawing`, `updateDrawing`, `deleteDrawing`, `clearScopeDrawings`, `undoScope`, and `redoScope` synchronously increment `mutationEpoch` before awaiting the per-scope promise queue (`deleteDrawing` and `clearScopeDrawings` also clear `selectedByScope` synchronously). `updateDrawing(..., { expectedDrawingRevision })` re-checks the drawing's live revision inside the queue before setting `mutating: true` or issuing `POST`.
 - **Synchronous Mid-Drag Guard (`ChartPane.tsx`)**: Active drags capture `startMutationEpoch` and `originalDrawing.revision` on `pointerdown`. `useDrawingStore.subscribe` immediately aborts the drag, restores `handleScroll`/`handleScale`, and reverts the overlay preview if `activeTool !== "cursor"`, selection is lost, `mutationEpoch` advances, or `liveDrawing.revision` changes; `handlePointerUp` enforces the same guard plus `anchorsEqual(...)`.
 - **Plot-Area Axis Isolation (`ChartPane.tsx` + `DrawingsOverlayPrimitive.ts` + `geometry.ts`)**: Canvas rendering and `hitTestAt` clip strictly to `[0, plotWidth) x [0, plotHeight)` derived from `timeScale().width()` / `timeScale().height()`, leaving Right Price Scale and Bottom Time Scale native interactions unobstructed.
+
+---
+
+## 8. Bar Replay & Backtest UI Lifecycle (`F08`, `ARCH-004`, `SLOP-002`, Phase 5)
+
+### 8.1 Bar Replay Store & Checkpoint Engine (`replayStore.ts` + `replayEngine.ts`)
+
+```mermaid
+stateDiagram-v2
+    [*] --> IDLE: "Replay bar closed or exited"
+    IDLE --> PANEL_OPEN: "togglePanel() -> ReplayControlBar visible"
+    PANEL_OPEN --> PICK_START_ARMED: "armPickStart() -> awaiting chart bar click"
+    PICK_START_ARMED --> PAUSED: "startReplayAtTime/Bar() initializes checkpoints & cursor"
+    PANEL_OPEN --> PAUSED: "Start at loaded bar index directly"
+    PICK_START_ARMED --> PANEL_OPEN: "cancelPickStart()"
+    PAUSED --> PLAYING: "play() starts interval in replayStore (0.5x..10x)"
+    PLAYING --> PAUSED: "pause() or cursor reaches final loaded bar"
+    PAUSED --> PAUSED: "stepForward() / stepBack() (checkpoint rewind <= 25 bars)"
+    PAUSED --> PAUSED: "openPaperTrade() / flattenPaperTrade() logs ReplayAction"
+    PLAYING --> PLAYING: "stepForward() updates open position & realized PnL"
+    PLAYING --> IDLE: "exitReplay() / reset() clears playback timer"
+    PAUSED --> IDLE: "exitReplay() / reset()"
+```
+
+### 8.2 Backtest Panel & Polling Store (`backtestStore.ts` + `BacktestPanel.tsx`)
+
+```mermaid
+stateDiagram-v2
+    [*] --> IDLE: "BacktestPanel closed"
+    IDLE --> LOADING_STRATEGIES: "togglePanel() opens drawer -> GET /api/backtest/strategies"
+    LOADING_STRATEGIES --> READY: "Strategies & job list loaded"
+    LOADING_STRATEGIES --> LOGIN_GATE: "401/403 on matching sessionEpoch -> onAuthError"
+    READY --> SUBMITTING: "runBacktest() -> POST /api/backtest (202 Accepted)"
+    SUBMITTING --> POLLING: "job_id received -> schedule 500ms poll timer"
+    SUBMITTING --> READY: "Validation/queue-full error stored or request aborted"
+    POLLING --> POLLING: "QUEUED or RUNNING -> reschedule poll while sessionEpoch unchanged"
+    POLLING --> COMPLETED: "Job reaches COMPLETED -> populate markers, trade_lines, zones, indicators"
+    POLLING --> TERMINAL_ERROR: "Job reaches CANCELLED / TIMED_OUT / FAILED / 404"
+    POLLING --> CANCELLED: "cancelActiveJob() -> DELETE /api/backtest/{job_id}"
+    TERMINAL_ERROR --> READY: "clearResult() or selectJob()"
+    COMPLETED --> READY: "toggleOverlayFlag() or submit next run"
+    POLLING --> IDLE: "reset() on Logout aborts AbortControllers & clears poll timer"
+```
+
+**Invariants**:
+- **Timer Layer Isolation (`SLOP-002`)**: All `setInterval` / `setTimeout` scheduling for Bar Replay playback and Backtest polling lives strictly inside `frontend/src/replay/replayStore.ts` and `frontend/src/backtest/backtestStore.ts`; `frontend/src/chart/` and `frontend/src/drawings/` contain zero raw timers.
+- **No Future Leakage in Bar Replay (`F08`)**: `ChartPane.tsx` filters bars, drawings, and Backtest overlays (`zones`, `markers`, `trade_lines`, `indicators`) against `replayCursorTime` (`detected_at_time <= replayCursorTime` and `time <= replayCursorTime`) whenever replay is active.
+- **Read-Only Paper Orders (`SEC-001`)**: Replay Long/Short Market/SL/TP simulation executes 100% locally in `replayEngine.ts` with deterministic checkpoint rewind (`CHECKPOINT_INTERVAL = 25`), never calling `/api/Order/*` or `/api/Position/*`.
+
