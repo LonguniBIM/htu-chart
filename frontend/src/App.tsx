@@ -18,11 +18,15 @@ import type {
   Timeframe,
 } from "./api/types";
 import { MarketWsClient, type WsConnectionState } from "./api/wsClient";
+import { BacktestPanel, type BacktestPaneTarget } from "./backtest/BacktestPanel";
+import { useBacktestStore } from "./backtest/backtestStore";
 import { PaneFetchCoordinator } from "./chart/fetchGuard";
 import { DrawingToolbar } from "./drawings/DrawingToolbar";
 import { LayoutSyncController } from "./layout/syncController";
 import { TopToolbar } from "./layout/TopToolbar";
 import { WorkspaceGrid } from "./layout/WorkspaceGrid";
+import { ReplayControlBar } from "./replay/ReplayControlBar";
+import { useReplayStore, type ReplayTarget } from "./replay/replayStore";
 import {
   buildDrawingScopeKey,
   useDrawingStore,
@@ -72,6 +76,8 @@ export function App() {
 
   const activeLayout = useLayoutStore((state) => state.activeLayout);
   const activePaneId = useLayoutStore((state) => state.activePaneId);
+  const isReplayOpen = useReplayStore((state) => state.isOpen);
+  const isBacktestOpen = useBacktestStore((state) => state.isOpen);
 
   const wsClient = useMemo(
     () =>
@@ -167,6 +173,9 @@ export function App() {
       useLayoutStore.getState().reset();
       useDrawingStore.getState().setAuthErrorHandler(null);
       useDrawingStore.getState().reset();
+      useBacktestStore.getState().setAuthErrorHandler(null);
+      useBacktestStore.getState().reset();
+      useReplayStore.getState().reset();
     };
   }, [abortAllLayoutControllers, abortAndClearController, coordinator, wsClient]);
 
@@ -194,6 +203,8 @@ export function App() {
       coordinator.dispose();
       useLayoutStore.getState().reset();
       useDrawingStore.getState().reset();
+      useBacktestStore.getState().reset();
+      useReplayStore.getState().reset();
       activeLayoutRef.current = null;
       prevActiveLayoutIdRef.current = null;
       setContracts({});
@@ -210,6 +221,7 @@ export function App() {
     };
     useLayoutStore.getState().setAuthErrorHandler(authHandler);
     useDrawingStore.getState().setAuthErrorHandler(authHandler);
+    useBacktestStore.getState().setAuthErrorHandler(authHandler);
   }, [invalidateSessionLocally]);
 
   const fetchContractsForModes = useCallback(
@@ -908,6 +920,43 @@ export function App() {
     };
   }, [activeLayout, activePaneId, contracts]);
 
+  const activePaneTarget = useMemo<BacktestPaneTarget | null>(() => {
+    if (activeLayout === null || activeLayout.panes.length === 0) {
+      return null;
+    }
+    const targetPane =
+      activeLayout.panes.find((p) => p.pane_id === activePaneId) ?? activeLayout.panes[0];
+    if (targetPane === undefined) {
+      return null;
+    }
+    const cacheKey = `${targetPane.live_mode ? "live" : "sim"}:${targetPane.root_symbol}`;
+    const entry = contracts[cacheKey];
+    const resolvedContractId =
+      entry?.selected !== null && entry?.selected !== undefined
+        ? (entry.selected.id ?? entry.selected.contractId ?? null)
+        : null;
+    return {
+      paneId: targetPane.pane_id,
+      contractId: resolvedContractId,
+      rootSymbol: targetPane.root_symbol,
+      timeframe: targetPane.timeframe,
+      liveMode: targetPane.live_mode,
+    };
+  }, [activeLayout, activePaneId, contracts]);
+
+  const activeReplayTarget = useMemo<ReplayTarget | null>(() => {
+    if (activePaneTarget === null || !activePaneTarget.contractId) {
+      return null;
+    }
+    return {
+      paneId: activePaneTarget.paneId,
+      contractId: activePaneTarget.contractId,
+      rootSymbol: activePaneTarget.rootSymbol,
+      timeframe: activePaneTarget.timeframe,
+      liveMode: activePaneTarget.liveMode,
+    };
+  }, [activePaneTarget]);
+
   useEffect(() => {
     if (authStage !== "authenticated") {
       return;
@@ -1026,7 +1075,12 @@ export function App() {
         onSelectLayout={handleLayoutChange}
         onRetryContracts={() => void retryUnresolvedContracts({ resetAttempt: true })}
         onLogout={() => void handleLogout()}
+        isReplayOpen={isReplayOpen}
+        onToggleReplay={() => useReplayStore.getState().togglePanel()}
+        isBacktestOpen={isBacktestOpen}
+        onToggleBacktest={() => useBacktestStore.getState().togglePanel()}
       />
+      <ReplayControlBar activeTarget={activeReplayTarget} />
       <div className="terminal-body">
         <DrawingToolbar activeScope={activeDrawingScope} />
         <WorkspaceGrid
@@ -1042,6 +1096,7 @@ export function App() {
           onTimeframeChange={handlePaneTimeframeChange}
           onAuthError={handlePaneAuthError}
         />
+        <BacktestPanel activeTarget={activePaneTarget} />
       </div>
     </div>
   );

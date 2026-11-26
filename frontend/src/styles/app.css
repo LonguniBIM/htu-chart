@@ -524,3 +524,270 @@ body,
   color: #f87171;
   font-size: 12px;
 }
+
+.terminal-button--active {
+  background: #1d4ed8;
+  border-color: #60a5fa;
+  color: #ffffff;
+}
+
+.replay-bar {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 8px 14px;
+  background: #0b1220;
+  border-bottom: 1px solid #1e293b;
+}
+
+.replay-bar__row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px 12px;
+}
+
+.replay-bar__group {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+}
+
+.replay-bar__title {
+  font-size: 12px;
+  font-weight: 700;
+  color: #f8fafc;
+}
+
+.replay-bar__readout,
+.replay-bar__stats {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+  font-size: 12px;
+  color: #cbd5e1;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+
+.replay-bar__field {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 11px;
+  color: #94a3b8;
+}
+
+.replay-bar__field input {
+  width: 60px;
+  padding: 3px 6px;
+  border-radius: 4px;
+  border: 1px solid #334155;
+  background: #090d12;
+  color: #e2e8f0;
+  font-size: 12px;
+}
+
+.replay-bar__btn--active {
+  background: #d97706;
+  border-color: #fbbf24;
+  color: #ffffff;
+}
+
+.replay-bar__btn--buy {
+  border-color: #22c55e;
+  color: #86efac;
+}
+
+.replay-bar__btn--sell {
+  border-color: #ef4444;
+  color: #fca5a5;
+}
+
+.replay-bar__trades {
+  max-height: 150px;
+  overflow-y: auto;
+  border-top: 1px solid #1e293b;
+  padding-top: 6px;
+}
+
+.backtest-drawer {
+  width: 340px;
+  flex-shrink: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 12px;
+  background: #0f172a;
+  border-left: 1px solid #1e293b;
+  overflow-y: auto;
+}
+
+.backtest-drawer__header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.backtest-drawer__header > div {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.backtest-drawer__form {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.backtest-grid-2 {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.backtest-field {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  font-size: 11px;
+  color: #94a3b8;
+}
+
+.backtest-field input,
+.backtest-field select {
+  width: 100%;
+  min-width: 0;
+  padding: 4px 6px;
+  border-radius: 4px;
+  border: 1px solid #334155;
+  background: #090d12;
+  color: #e2e8f0;
+  font-size: 12px;
+}
+
+.backtest-drawer__actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.backtest-run-btn {
+  background: #1d4ed8;
+  border-color: #60a5fa;
+  color: #ffffff;
+}
+
+.backtest-status-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  font-size: 12px;
+  color: #cbd5e1;
+}
+
+.backtest-badge {
+  display: inline-block;
+  padding: 1px 6px;
+  border-radius: 999px;
+  font-size: 10px;
+  font-weight: 700;
+  background: #1e293b;
+  color: #e2e8f0;
+  margin-left: 4px;
+}
+
+.backtest-badge--completed {
+  background: rgba(34, 197, 94, 0.2);
+  color: #86efac;
+}
+
+.backtest-badge--failed,
+.backtest-badge--timed_out {
+  background: rgba(239, 68, 68, 0.2);
+  color: #fca5a5;
+}
+
+.backtest-badge--warn {
+  background: rgba(245, 158, 11, 0.22);
+  color: #fbbf24;
+}
+
+.backtest-toggles {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.backtest-metrics {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 6px;
+}
+
+.backtest-metric {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 6px 8px;
+  border-radius: 6px;
+  background: #090d12;
+  border: 1px solid #1e293b;
+  font-size: 11px;
+  color: #94a3b8;
+}
+
+.backtest-metric strong {
+  font-size: 13px;
+  color: #f8fafc;
+}
+
+.backtest-trades-wrap {
+  max-height: 240px;
+  overflow: auto;
+  border: 1px solid #1e293b;
+  border-radius: 6px;
+}
+
+.backtest-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 11px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+
+.backtest-table th,
+.backtest-table td {
+  padding: 4px 6px;
+  text-align: left;
+  border-bottom: 1px solid #1e293b;
+  white-space: nowrap;
+}
+
+.backtest-table th {
+  color: #94a3b8;
+  background: #0b1220;
+}
+
+.backtest-empty {
+  margin: 0;
+  padding: 10px;
+  font-size: 12px;
+  color: #94a3b8;
+}
+
+@media (max-width: 900px) {
+  .terminal-body {
+    flex-wrap: wrap;
+  }
+
+  .backtest-drawer {
+    width: 100%;
+    border-left: none;
+    border-top: 1px solid #1e293b;
+  }
+}

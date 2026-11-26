@@ -368,3 +368,195 @@ export type WsInboundMessage =
   | WsDrawingsUpdateMessage
   | WsErrorMessage
   | WsPongMessage;
+
+export type BacktestJobStatus =
+  | "QUEUED"
+  | "RUNNING"
+  | "COMPLETED"
+  | "CANCELLED"
+  | "TIMED_OUT"
+  | "FAILED";
+
+export interface BacktestParamSchemaField {
+  type: "integer" | "number" | "string" | "boolean";
+  min?: number;
+  max?: number;
+  enum?: readonly string[];
+  default: number | string | boolean;
+}
+
+export interface BacktestStrategyInfo {
+  strategy_id: string;
+  strategy_version: string;
+  name: string;
+  description: string;
+  default_params: Record<string, unknown>;
+  param_schema: Record<string, BacktestParamSchemaField>;
+}
+
+export interface BacktestStrategiesResponse {
+  strategies: BacktestStrategyInfo[];
+  count: number;
+}
+
+export interface BacktestSubmitRequest {
+  contract_id: string;
+  root_symbol?: RootSymbol;
+  timeframe?: Timeframe;
+  resample_from?: Timeframe | null;
+  live_mode?: boolean;
+  start_time: number;
+  end_time: number;
+  strategy_id?: string;
+  params?: Record<string, unknown> | null;
+  max_bars?: number | null;
+}
+
+export interface BacktestTrade {
+  trade_id: string;
+  direction: "LONG" | "SHORT";
+  signal_time: number;
+  entry_time: number;
+  entry_price: number;
+  exit_time: number;
+  exit_price: number;
+  stop_loss: number;
+  take_profit: number;
+  quantity: number;
+  pnl_ticks: number;
+  pnl_dollars: number;
+  exit_reason: "stop_loss" | "take_profit" | "end_of_data";
+  ambiguous_fill: boolean;
+  reason: string;
+}
+
+export interface BacktestMarker {
+  time: number;
+  position: "aboveBar" | "belowBar" | "inBar";
+  color: string;
+  shape: "arrowUp" | "arrowDown" | "circle" | "square";
+  text: string;
+}
+
+export interface BacktestTradeLine {
+  trade_id: string;
+  direction: "LONG" | "SHORT";
+  entry_time: number;
+  entry_price: number;
+  exit_time: number;
+  exit_price: number;
+  pnl_dollars: number;
+  pnl_ticks: number;
+  color: string;
+  ambiguous_fill: boolean;
+}
+
+export interface BacktestZone {
+  kind: "fvg" | "order_block" | "liquidity_level";
+  direction: "bullish" | "bearish";
+  start_time: number;
+  end_time: number;
+  detected_at_time: number;
+  top: number;
+  bottom: number;
+  midpoint: number | null;
+  label: string;
+}
+
+export interface BacktestIndicatorPoint {
+  time: number;
+  value: number;
+}
+
+export interface BacktestIndicatorSeries {
+  id: string;
+  name: string;
+  color: string;
+  overlay: boolean;
+  points: BacktestIndicatorPoint[];
+}
+
+export interface BacktestEquityPoint {
+  time: number;
+  equity_dollars: number;
+  trade_id: string;
+}
+
+export interface BacktestSummary {
+  net_profit_dollars: number;
+  gross_profit_dollars: number;
+  gross_loss_dollars: number;
+  win_rate_pct: number;
+  profit_factor: number | null;
+  max_drawdown_dollars: number;
+  total_trades: number;
+  winning_trades: number;
+  losing_trades: number;
+  breakeven_trades: number;
+  ambiguous_fill_count: number;
+  equity_curve: BacktestEquityPoint[];
+}
+
+export interface BacktestInstrumentSpec {
+  root_symbol: RootSymbol;
+  name: string;
+  exchange: string;
+  tick_size: number;
+  tick_value: number;
+  currency: string;
+}
+
+export interface BacktestResultPayload {
+  strategy_id: string;
+  strategy_version: string;
+  contract_id: string;
+  root_symbol: RootSymbol;
+  timeframe: Timeframe;
+  live_mode: boolean;
+  params: Record<string, unknown>;
+  instrument: BacktestInstrumentSpec;
+  bar_count: number;
+  start_time: number | null;
+  end_time: number | null;
+  excluded_provisional_count: number;
+  trades: BacktestTrade[];
+  markers: BacktestMarker[];
+  trade_lines: BacktestTradeLine[];
+  zones: BacktestZone[];
+  indicators: BacktestIndicatorSeries[];
+  summary: BacktestSummary;
+}
+
+export interface BacktestJobSummary {
+  job_id: string;
+  status: BacktestJobStatus;
+  contract_id: string;
+  root_symbol: RootSymbol;
+  timeframe: Timeframe;
+  resample_from: Timeframe | null;
+  live_mode: boolean;
+  start_time: number;
+  end_time: number;
+  strategy_id: string;
+  params: Record<string, unknown>;
+  max_bars: number;
+  created_at_utc: number;
+  started_at_utc: number | null;
+  finished_at_utc: number | null;
+  error: string | null;
+  result_bytes: number | null;
+  summary: BacktestSummary | null;
+}
+
+export interface BacktestJobDetail extends BacktestJobSummary {
+  result: BacktestResultPayload | null;
+}
+
+export interface BacktestJobListResponse {
+  items: BacktestJobSummary[];
+  count: number;
+  enabled: boolean;
+  running_job_id: string | null;
+  queue_depth: number;
+  max_queue_depth: number;
+}

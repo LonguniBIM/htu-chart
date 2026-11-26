@@ -211,7 +211,18 @@ class Settings(BaseSettings):
     backtest_max_result_bytes: int = Field(default=5_000_000, ge=1024, le=50_000_000)
     backtest_max_jobs_retained: int = Field(default=64, ge=1, le=500)
 
+    frontend_dist_dir: Path | None = None
     data_dir: Path = Path("data")
+
+    @field_validator("frontend_dist_dir", mode="before")
+    @classmethod
+    def _validate_frontend_dist_dir(cls, value: object) -> Path | None:
+        if value is None:
+            return None
+        if isinstance(value, Path):
+            return value
+        cleaned = str(value).strip()
+        return Path(cleaned) if cleaned else None
 
     @field_validator("app_env", mode="before")
     @classmethod

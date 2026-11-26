@@ -8,6 +8,7 @@ import { PaneFetchCoordinator } from "../chart/fetchGuard";
 import { useLayoutStore } from "../store/layoutStore";
 import { LayoutPicker } from "./LayoutPicker";
 import { SyncControls } from "./SyncControls";
+import { TopToolbar } from "./TopToolbar";
 import { LayoutSyncController } from "./syncController";
 import { WorkspaceGrid } from "./WorkspaceGrid";
 
@@ -31,11 +32,18 @@ const mockChartInstances: MockChartInstance[] = [];
 vi.mock("lightweight-charts", () => {
   const CandlestickSeries = Symbol("CandlestickSeries");
   const HistogramSeries = Symbol("HistogramSeries");
+  const LineSeries = Symbol("LineSeries");
   return {
     CandlestickSeries,
     HistogramSeries,
+    LineSeries,
     ColorType: { Solid: "solid" },
     CrosshairMode: { Normal: 0 },
+    createSeriesMarkers: vi.fn(() => ({
+      setMarkers: vi.fn(),
+      markers: () => [],
+      detach: vi.fn(),
+    })),
     createChart: vi.fn(() => {
       const candleSeries = {
         setData: vi.fn(),
@@ -542,5 +550,54 @@ describe("WorkspaceGrid UI and ChartPane LayoutSyncController integration (Phase
       to: 1700000500,
     });
     expect(chart1.setVisibleRange).not.toHaveBeenCalled();
+  });
+
+  it("renders TopToolbar with optional Replay and Backtest toggles cleanly", () => {
+    /**
+     * Contract: TopToolbar renders cleanly when Replay/Backtest props are omitted and triggers
+     * optional toggle callbacks with aria-pressed state when provided.
+     * Defect caught: Breaking callers omitting new optional props or wiring toggle buttons wrongly.
+     */
+    const onToggleReplay = vi.fn();
+    const onToggleBacktest = vi.fn();
+
+    const { rerender } = render(
+      <TopToolbar
+        wsState="connected"
+        statusData={{ feed_state: "LIVE" }}
+        contractsPendingRetry={false}
+        loadError={null}
+        onSelectLayout={vi.fn()}
+        onRetryContracts={vi.fn()}
+        onLogout={vi.fn()}
+      />,
+    );
+    expect(screen.queryByRole("button", { name: "Replay" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Backtest" })).toBeNull();
+
+    rerender(
+      <TopToolbar
+        wsState="connected"
+        statusData={{ feed_state: "LIVE" }}
+        contractsPendingRetry={false}
+        loadError={null}
+        onSelectLayout={vi.fn()}
+        onRetryContracts={vi.fn()}
+        onLogout={vi.fn()}
+        isReplayOpen={true}
+        onToggleReplay={onToggleReplay}
+        isBacktestOpen={false}
+        onToggleBacktest={onToggleBacktest}
+      />,
+    );
+
+    const replayBtn = screen.getByRole("button", { name: "Replay" });
+    const backtestBtn = screen.getByRole("button", { name: "Backtest" });
+    expect(replayBtn.getAttribute("aria-pressed")).toBe("true");
+    expect(backtestBtn.getAttribute("aria-pressed")).toBe("false");
+    fireEvent.click(replayBtn);
+    fireEvent.click(backtestBtn);
+    expect(onToggleReplay).toHaveBeenCalledTimes(1);
+    expect(onToggleBacktest).toHaveBeenCalledTimes(1);
   });
 });

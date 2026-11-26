@@ -1,0 +1,20 @@
+services:
+  topstep-chart-app:
+    build:
+      context: ..
+      dockerfile: topstep-chart-app/Dockerfile
+    container_name: topstep-chart-app
+    # Host networking lets uvicorn bind strictly to 127.0.0.1 or the Tailscale interface IP
+    # configured via APP_BIND_HOST in .env, without publishing wildcard ports.
+    network_mode: host
+    restart: unless-stopped
+    init: true
+    env_file:
+      - .env
+    environment:
+      ENVIRONMENT: production
+      APP_ENV: production
+      DATA_DIR: /app/data
+      FRONTEND_DIST_DIR: /app/frontend/dist
+    volumes:
+      - ./data:/app/data

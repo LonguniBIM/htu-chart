@@ -22,6 +22,8 @@ import type {
 } from "./api/types";
 import type { WsConnectionState } from "./api/wsClient";
 import { App } from "./App";
+import { useBacktestStore } from "./backtest/backtestStore";
+import { useReplayStore } from "./replay/replayStore";
 import { buildDrawingScopeKey, useDrawingStore } from "./store/drawingStore";
 import { useLayoutStore } from "./store/layoutStore";
 
@@ -132,11 +134,18 @@ const appApplyOptionsMock = vi.fn();
 vi.mock("lightweight-charts", () => {
   const CandlestickSeries = Symbol("CandlestickSeries");
   const HistogramSeries = Symbol("HistogramSeries");
+  const LineSeries = Symbol("LineSeries");
   return {
     CandlestickSeries,
     HistogramSeries,
+    LineSeries,
     ColorType: { Solid: "solid" },
     CrosshairMode: { Normal: 0 },
+    createSeriesMarkers: vi.fn(() => ({
+      setMarkers: vi.fn(),
+      markers: () => [],
+      detach: vi.fn(),
+    })),
     createChart: vi.fn(() => {
       let candleSeriesApi: unknown;
       const timeScaleApi = {
@@ -3778,7 +3787,7 @@ describe("App bootstrap and R03 503 recovery (P1-R3-03, P1-R3-04, P2-005)", () =
       await flushMicrotasks();
     });
 
-    expect(appAttachPrimitiveMock).toHaveBeenCalledTimes(1);
+    expect(appAttachPrimitiveMock).toHaveBeenCalledTimes(2);
     expect(useDrawingStore.getState().scopes[pane1ScopeKey]?.drawings).toEqual([persistedHline]);
 
     // Expand 1-single -> 4-grid-2x2
@@ -3789,7 +3798,7 @@ describe("App bootstrap and R03 503 recovery (P1-R3-03, P1-R3-04, P2-005)", () =
     });
 
     expect(document.querySelectorAll("[data-pane-id]")).toHaveLength(4);
-    expect(appAttachPrimitiveMock).toHaveBeenCalledTimes(4);
+    expect(appAttachPrimitiveMock).toHaveBeenCalledTimes(8);
     expect(useDrawingStore.getState().scopes[pane1ScopeKey]?.drawings).toEqual([persistedHline]);
 
     // Shrink 4-grid-2x2 -> 1-single -> 3 panes detach, pane-1 retains persisted drawing
@@ -3799,7 +3808,7 @@ describe("App bootstrap and R03 503 recovery (P1-R3-03, P1-R3-04, P2-005)", () =
     });
 
     expect(document.querySelectorAll("[data-pane-id]")).toHaveLength(1);
-    expect(appDetachPrimitiveMock).toHaveBeenCalledTimes(3);
+    expect(appDetachPrimitiveMock).toHaveBeenCalledTimes(6);
     expect(useDrawingStore.getState().scopes[pane1ScopeKey]?.drawings).toEqual([persistedHline]);
   });
 
@@ -4048,3 +4057,137 @@ function setupPreOpenWsIntegrationMocks(secondSessionError: ApiError) {
 
   return FakeWebSocket;
 }
+
+describe("App Replay & Backtest Integration (Phase 5 Part 2)", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.stubGlobal("ResizeObserver", MockResizeObserver);
+    useLayoutStore.getState().setAuthErrorHandler(null);
+    useLayoutStore.getState().reset();
+    useDrawingStore.getState().setAuthErrorHandler(null);
+    useDrawingStore.getState().reset();
+    useBacktestStore.getState().setAuthErrorHandler(null);
+    useBacktestStore.getState().reset();
+    useReplayStore.getState().reset();
+  });
+
+  afterEach(() => {
+    cleanup();
+    useBacktestStore.getState().reset();
+    useReplayStore.getState().reset();
+    vi.unstubAllGlobals();
+  });
+
+  it("toggles ReplayControlBar & BacktestPanel from TopToolbar and resets both stores on logout", async () => {
+    /**
+     * Contract: Clicking Replay and Backtest in TopToolbar toggles their panels inside App,
+     * and logging out resets both useReplayStore and useBacktestStore cleanly.
+     * Defect caught: Unmounted panels, missing toolbar handlers, or stale replay/backtest state surviving logout.
+     */
+    fetchSessionMock.mockResolvedValue({
+      authenticated: true,
+      csrf_token: "csrf-token-1234567890",
+    });
+    fetchStatusMock.mockResolvedValue({
+      connected: true,
+      live: false,
+      feed_state: "LIVE",
+    });
+    listLayoutsMock.mockResolvedValue([
+      {
+        id: "layout-1",
+        name: "Default",
+        template_id: "1-single",
+        panes: [
+          {
+            pane_id: "pane-1",
+            root_symbol: "MES",
+            timeframe: "5m",
+            live_mode: false,
+            playback_mode: "live",
+          },
+        ],
+        sync_config: {
+          symbol: false,
+          interval: false,
+          crosshair: false,
+          time: false,
+          dateRange: false,
+        },
+        is_default: true,
+        created_at_utc: 1700000000,
+        updated_at_utc: 1700000000,
+      },
+    ]);
+    fetchContractsMock.mockResolvedValue({
+      live: false,
+      contracts: {
+        MES: {
+          selected: { id: "CON.F.US.MES.H26" },
+          error_type: null,
+          error: null,
+        },
+      },
+    });
+    fetchBarsMock.mockResolvedValue({
+      provider: "topstepx",
+      live: false,
+      contract_id: "CON.F.US.MES.H26",
+      root_symbol: "MES",
+      timeframe: "5m",
+      start_time: 1700000000,
+      end_time: 1700000300,
+      count: 2,
+      include_partial: true,
+      quality: {
+        is_complete: true,
+        truncated: false,
+        provider_gap: false,
+        quarantined_count: 0,
+      },
+      bars: [
+        { time: 1700000000, open: 5000, high: 5002, low: 4999, close: 5001, volume: 10, is_closed: true },
+        { time: 1700000300, open: 5001, high: 5003, low: 5000, close: 5002, volume: 12, is_closed: true },
+      ],
+    });
+    fetchDrawingsMock.mockResolvedValue({
+      symbol: "MES",
+      contract_id: "CON.F.US.MES.H26",
+      pane_id: "pane-1",
+      instrument: {
+        root_symbol: "MES",
+        name: "Micro E-mini S&P 500",
+        exchange: "CME",
+        tick_size: 0.25,
+        tick_value: 1.25,
+        currency: "USD",
+      },
+      scope_revision: 0,
+      can_undo: false,
+      can_redo: false,
+      drawings: [],
+    });
+    logoutMock.mockResolvedValue({ authenticated: false });
+
+    render(<App />);
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: "Replay" }));
+    expect(screen.getByLabelText("Bar Replay Controls")).toBeTruthy();
+
+    fireEvent.click(screen.getByRole("button", { name: "Backtest" }));
+    expect(screen.getByLabelText("Backtest Runner")).toBeTruthy();
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Logout" }));
+      await Promise.resolve();
+    });
+
+    expect(useReplayStore.getState().isOpen).toBe(false);
+    expect(useBacktestStore.getState().isOpen).toBe(false);
+  });
+});

@@ -1,4 +1,10 @@
 import type {
+  BacktestJobDetail,
+  BacktestJobListResponse,
+  BacktestJobStatus,
+  BacktestJobSummary,
+  BacktestStrategiesResponse,
+  BacktestSubmitRequest,
   BarsResponse,
   ContractsResponse,
   DrawingBatchOperation,
@@ -468,6 +474,80 @@ export async function clearDrawings(
   }
   return apiRequest<DrawingCommandResponse>(
     `/api/drawings/${encodeURIComponent(symbol)}?${query.toString()}`,
+    opts,
+  );
+}
+
+export async function fetchBacktestStrategies(
+  signal?: AbortSignal,
+): Promise<BacktestStrategiesResponse> {
+  const opts: RequestOptions = {};
+  if (signal !== undefined) {
+    opts.signal = signal;
+  }
+  return apiRequest<BacktestStrategiesResponse>("/api/backtest/strategies", opts);
+}
+
+export async function listBacktestJobs(
+  params?: { status?: BacktestJobStatus; limit?: number },
+  signal?: AbortSignal,
+): Promise<BacktestJobListResponse> {
+  const query = new URLSearchParams();
+  if (params?.status !== undefined) {
+    query.set("status", params.status);
+  }
+  if (params?.limit !== undefined) {
+    query.set("limit", String(params.limit));
+  }
+  const qs = query.toString();
+  const url = qs ? `/api/backtest?${qs}` : "/api/backtest";
+  const opts: RequestOptions = {};
+  if (signal !== undefined) {
+    opts.signal = signal;
+  }
+  return apiRequest<BacktestJobListResponse>(url, opts);
+}
+
+export async function submitBacktestJob(
+  payload: BacktestSubmitRequest,
+  signal?: AbortSignal,
+): Promise<BacktestJobSummary> {
+  const opts: RequestOptions = {
+    method: "POST",
+    body: payload,
+  };
+  if (signal !== undefined) {
+    opts.signal = signal;
+  }
+  return apiRequest<BacktestJobSummary>("/api/backtest", opts);
+}
+
+export async function getBacktestJob(
+  jobId: string,
+  signal?: AbortSignal,
+): Promise<BacktestJobDetail> {
+  const opts: RequestOptions = {};
+  if (signal !== undefined) {
+    opts.signal = signal;
+  }
+  return apiRequest<BacktestJobDetail>(
+    `/api/backtest/${encodeURIComponent(jobId)}`,
+    opts,
+  );
+}
+
+export async function cancelBacktestJob(
+  jobId: string,
+  signal?: AbortSignal,
+): Promise<BacktestJobSummary> {
+  const opts: RequestOptions = {
+    method: "DELETE",
+  };
+  if (signal !== undefined) {
+    opts.signal = signal;
+  }
+  return apiRequest<BacktestJobSummary>(
+    `/api/backtest/${encodeURIComponent(jobId)}`,
     opts,
   );
 }

@@ -16,7 +16,9 @@ import type {
   WsSubscribedMessage,
 } from "../api/types";
 import type { MarketWsClient, WsConnectionState } from "../api/wsClient";
+import { useBacktestStore } from "../backtest/backtestStore";
 import { LayoutSyncController } from "../layout/syncController";
+import { useReplayStore } from "../replay/replayStore";
 import { buildDrawingScopeKey, useDrawingStore } from "../store/drawingStore";
 import { ChartPane } from "./ChartPane";
 import { PaneFetchCoordinator } from "./fetchGuard";
@@ -25,6 +27,10 @@ const candleSetData = vi.fn();
 const candleUpdate = vi.fn();
 const volumeSetData = vi.fn();
 const volumeUpdate = vi.fn();
+const lineSetData = vi.fn();
+const removeSeriesMock = vi.fn();
+const setMarkersMock = vi.fn();
+const markersDetachMock = vi.fn();
 const fitContentMock = vi.fn();
 const applyOptionsMock = vi.fn();
 const attachPrimitiveMock = vi.fn();
@@ -48,11 +54,21 @@ let visibleRangeHandlers: Array<(range: { from: number; to: number } | null) => 
 vi.mock("lightweight-charts", () => {
   const CandlestickSeries = Symbol("CandlestickSeries");
   const HistogramSeries = Symbol("HistogramSeries");
+  const LineSeries = Symbol("LineSeries");
   return {
     CandlestickSeries,
     HistogramSeries,
+    LineSeries,
     ColorType: { Solid: "solid" },
     CrosshairMode: { Normal: 0 },
+    createSeriesMarkers: vi.fn((_series: unknown, initialMarkers: unknown[] = []) => {
+      setMarkersMock(initialMarkers);
+      return {
+        setMarkers: setMarkersMock,
+        markers: () => [],
+        detach: markersDetachMock,
+      };
+    }),
     createChart: vi.fn(() => {
       let candleSeriesApi: unknown;
       const timeScaleApi = {
@@ -101,12 +117,19 @@ vi.mock("lightweight-charts", () => {
             };
             return candleSeriesApi;
           }
+          if (seriesType === LineSeries) {
+            return {
+              setData: lineSetData,
+              priceScale: () => ({ applyOptions: vi.fn() }),
+            };
+          }
           return {
             setData: volumeSetData,
             update: volumeUpdate,
             priceScale: () => ({ applyOptions: vi.fn() }),
           };
         }),
+        removeSeries: removeSeriesMock,
         subscribeCrosshairMove: vi.fn((handler: (param: unknown) => void) => {
           crosshairMoveHandlers.push(handler);
         }),
@@ -310,6 +333,13 @@ describe("ChartPane (F06, P1-R3-01, P1-R3-02)", () => {
     });
     useDrawingStore.getState().setAuthErrorHandler(null);
     useDrawingStore.getState().reset();
+    useBacktestStore.getState().setAuthErrorHandler(null);
+    useBacktestStore.getState().reset();
+    useReplayStore.getState().reset();
+    lineSetData.mockReset();
+    removeSeriesMock.mockReset();
+    setMarkersMock.mockReset();
+    markersDetachMock.mockReset();
     crosshairMoveHandlers = [];
     clickHandlers = [];
     visibleRangeHandlers = [];
@@ -2069,7 +2099,7 @@ describe("ChartPane (F06, P1-R3-01, P1-R3-02)", () => {
       await Promise.resolve();
     });
 
-    expect(attachPrimitiveMock).toHaveBeenCalledTimes(1);
+    expect(attachPrimitiveMock).toHaveBeenCalledTimes(2);
     expect(fetchDrawingsMock).toHaveBeenCalledWith(
       "MES",
       { contract_id: "CON.F.US.MES.H26", pane_id: "pane-1" },
@@ -2168,7 +2198,7 @@ describe("ChartPane (F06, P1-R3-01, P1-R3-02)", () => {
     expect(postDrawingCommandMock).toHaveBeenCalledTimes(2);
 
     unmount();
-    expect(detachPrimitiveMock).toHaveBeenCalledTimes(1);
+    expect(detachPrimitiveMock).toHaveBeenCalledTimes(2);
   });
 
   it("persists explicit metadata.direction for auto FVG, places hline/order_block/long_position, discards stale draft/drag across tool & symbol switches, restores empty-pane Time sync, and resyncs 3m panes (Phase 4 Part 2)", async () => {
@@ -3393,6 +3423,163 @@ describe("ChartPane (F06, P1-R3-01, P1-R3-02)", () => {
     expect(useDrawingStore.getState().scopes[scopeKey]?.scopeRevision).toBe(2);
     expect(useDrawingStore.getState().scopes[scopeKey]?.drawings.map((d) => d.id)).toEqual([
       "hl-missed-handshake",
+    ]);
+  });
+
+  it("isolates live WS bar_update past replayCursorTime and renders full bars on exitReplay (F06, F08)", async () => {
+    /**
+     * Contract: While Replay Mode is active on ChartPane, live WS bar_update events past
+     * replayCursorTime merge into fullBars without leaking onto visible candleSeries, and
+     * immediately render once exitReplay() runs. Backtest markers and indicator LineSeries
+     * are likewise causally filtered by replayCursorTime.
+     * Defect caught: Live WS bars leaking past replay cursor or losing live bars on exitReplay.
+     */
+    const bars = [
+      makeBar(1700000000, 5000),
+      makeBar(1700000300, 5002),
+      makeBar(1700000600, 5004),
+    ];
+    fetchBarsMock.mockResolvedValue(makeBarsResponse("CON.F.US.MES.H26", bars));
+
+    const coordinator = new PaneFetchCoordinator();
+    const fakeWs = createFakeWsClient();
+    const pane: PaneConfig = {
+      pane_id: "pane-1",
+      root_symbol: "MES",
+      timeframe: "5m",
+      live_mode: false,
+      playback_mode: "live",
+    };
+
+    useBacktestStore.setState({
+      activeJob: {
+        job_id: "bt-1",
+        status: "COMPLETED",
+        contract_id: "CON.F.US.MES.H26",
+        root_symbol: "MES",
+        timeframe: "5m",
+        resample_from: null,
+        live_mode: false,
+        start_time: 1700000000,
+        end_time: 1700000600,
+        strategy_id: "ict_fvg_sweep",
+        params: {},
+        max_bars: 50000,
+        created_at_utc: 1700000600,
+        started_at_utc: 1700000600,
+        finished_at_utc: 1700000601,
+        error: null,
+        result_bytes: 512,
+        summary: null,
+        result: {
+          strategy_id: "ict_fvg_sweep",
+          strategy_version: "1.0.0",
+          contract_id: "CON.F.US.MES.H26",
+          root_symbol: "MES",
+          timeframe: "5m",
+          live_mode: false,
+          params: {},
+          instrument: {
+            root_symbol: "MES",
+            name: "Micro E-mini S&P 500",
+            exchange: "CME",
+            tick_size: 0.25,
+            tick_value: 1.25,
+            currency: "USD",
+          },
+          bar_count: 3,
+          start_time: 1700000000,
+          end_time: 1700000600,
+          excluded_provisional_count: 0,
+          trades: [],
+          markers: [
+            { time: 1700000000, position: "belowBar", color: "#22c55e", shape: "arrowUp", text: "M1" },
+            { time: 1700000600, position: "aboveBar", color: "#ef4444", shape: "arrowDown", text: "M2" },
+          ],
+          trade_lines: [],
+          zones: [],
+          indicators: [
+            {
+              id: "ema_20",
+              name: "EMA (20)",
+              color: "#f59e0b",
+              overlay: true,
+              points: [
+                { time: 1700000000, value: 5000 },
+                { time: 1700000600, value: 5003 },
+              ],
+            },
+          ],
+          summary: {
+            net_profit_dollars: 0,
+            gross_profit_dollars: 0,
+            gross_loss_dollars: 0,
+            win_rate_pct: 0,
+            profit_factor: null,
+            max_drawdown_dollars: 0,
+            total_trades: 0,
+            winning_trades: 0,
+            losing_trades: 0,
+            breakeven_trades: 0,
+            ambiguous_fill_count: 0,
+            equity_curve: [],
+          },
+        },
+      },
+    });
+
+    render(
+      <ChartPane
+        pane={pane}
+        contractId="CON.F.US.MES.H26"
+        activeFeedLive={false}
+        wsClient={fakeWs.client}
+        coordinator={coordinator}
+      />,
+    );
+
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(setMarkersMock.mock.calls.at(-1)?.[0]).toHaveLength(2);
+    expect(lineSetData.mock.calls.at(-1)?.[0]).toHaveLength(2);
+
+    // Arm click-to-start replay and click bar at 1700000000
+    act(() => {
+      useReplayStore.getState().armPickStart();
+      clickHandlers[0]?.({ time: 1700000000 });
+    });
+
+    expect(useReplayStore.getState().session?.cursorIndex).toBe(0);
+    const replayVisible = candleSetData.mock.calls.at(-1)?.[0] as Array<{ time: number }>;
+    expect(replayVisible.map((b) => b.time)).toEqual([1700000000]);
+    expect(setMarkersMock.mock.calls.at(-1)?.[0]).toHaveLength(1);
+    expect(lineSetData.mock.calls.at(-1)?.[0]).toHaveLength(1);
+
+    // Live WS bar past cursor must NOT call candleUpdate
+    candleUpdate.mockClear();
+    act(() => {
+      fakeWs.emitBarUpdate({
+        type: "bar_update",
+        contract_id: "CON.F.US.MES.H26",
+        live_mode: false,
+        timeframe: "5m",
+        is_recovered_historical: false,
+        recovery_tag: null,
+        bar: makeBar(1700000900, 5010),
+      });
+    });
+    expect(candleUpdate).not.toHaveBeenCalled();
+
+    // Exiting replay immediately restores full bars including the WS bar
+    act(() => {
+      useReplayStore.getState().exitReplay();
+    });
+    const restored = candleSetData.mock.calls.at(-1)?.[0] as Array<{ time: number }>;
+    expect(restored.map((b) => b.time)).toEqual([
+      1700000000, 1700000300, 1700000600, 1700000900,
     ]);
   });
 });

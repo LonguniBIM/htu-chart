@@ -4,13 +4,17 @@ import {
   ColorType,
   CrosshairMode,
   HistogramSeries,
+  LineSeries,
   createChart,
+  createSeriesMarkers,
   type CandlestickData,
   type HistogramData,
   type IChartApi,
   type IRange,
   type ISeriesApi,
+  type ISeriesMarkersPluginApi,
   type MouseEventParams,
+  type SeriesMarker,
   type Time,
   type UTCTimestamp,
 } from "lightweight-charts";
@@ -27,6 +31,8 @@ import {
   type Timeframe,
 } from "../api/types";
 import type { MarketWsClient } from "../api/wsClient";
+import { BacktestOverlayPrimitive } from "../backtest/BacktestOverlayPrimitive";
+import { useBacktestStore } from "../backtest/backtestStore";
 import { DrawingsOverlayPrimitive } from "../drawings/DrawingsOverlayPrimitive";
 import {
   MIN_DRAWING_TIMESTAMP_SEC,
@@ -43,6 +49,15 @@ import {
   type DrawingRecord,
 } from "../drawings/types";
 import type { ChartPaneSyncHandle, LayoutSyncController } from "../layout/syncController";
+import {
+  filterBarsByReplayCursor,
+  filterDrawingsByReplayCursor,
+  filterIndicatorsByReplayCursor,
+  filterMarkersByReplayCursor,
+  filterTradeLinesByReplayCursor,
+  filterZonesByReplayCursor,
+} from "../replay/replayEngine";
+import { useReplayStore } from "../replay/replayStore";
 import {
   buildDrawingScopeKey,
   useDrawingStore,
@@ -207,6 +222,9 @@ export function ChartPane({
   const chartRef = useRef<IChartApi | null>(null);
   const candleSeriesRef = useRef<ISeriesApi<"Candlestick"> | null>(null);
   const volumeSeriesRef = useRef<ISeriesApi<"Histogram"> | null>(null);
+  const fullBarsRef = useRef<OhlcvBar[]>([]);
+  const latestFullBarRef = useRef<OhlcvBar | null>(null);
+  const lastFullBarTimeRef = useRef<number | null>(null);
   const barsRef = useRef<OhlcvBar[]>([]);
   const barCloseByTimeRef = useRef<Map<number, number>>(new Map());
   const latestBarRef = useRef<OhlcvBar | null>(null);
@@ -222,6 +240,10 @@ export function ChartPane({
   const suppressRangeEchoRef = useRef(false);
   const suppressRangeRafRef = useRef<number | null>(null);
   const primitiveRef = useRef<DrawingsOverlayPrimitive | null>(null);
+  const backtestPrimitiveRef = useRef<BacktestOverlayPrimitive | null>(null);
+  const markersPluginRef = useRef<ISeriesMarkersPluginApi<Time> | null>(null);
+  const indicatorSeriesMapRef = useRef<Map<string, ISeriesApi<"Line">>>(new Map());
+  const wasReplayActiveRef = useRef<boolean>(false);
   const suppressTimeClickRef = useRef(false);
   const draftRef = useRef<DrawingDraft | null>(null);
   const placementStartPxRef = useRef<{ px: number; py: number } | null>(null);
@@ -297,12 +319,61 @@ export function ChartPane({
   timeframeRef.current = pane.timeframe;
   const paneIdRef = useRef<string>(pane.pane_id);
   paneIdRef.current = pane.pane_id;
+  const paneLiveModeRef = useRef<boolean>(pane.live_mode);
+  paneLiveModeRef.current = pane.live_mode;
   const syncControllerRef = useRef<LayoutSyncController | undefined>(syncController);
   syncControllerRef.current = syncController;
   const onAuthErrorRef = useRef(onAuthError);
   onAuthErrorRef.current = onAuthError;
 
   const resolvedContractIdForScope = contractId?.trim() ? contractId.trim().toUpperCase() : "";
+  const resolvedContractIdRef = useRef<string>(resolvedContractIdForScope);
+  resolvedContractIdRef.current = resolvedContractIdForScope;
+
+  const replayTarget = useReplayStore((s) => s.target);
+  const replaySession = useReplayStore((s) => s.session);
+  const isReplayActiveOnPane =
+    replaySession !== null &&
+    replayTarget !== null &&
+    replayTarget.paneId === pane.pane_id &&
+    replayTarget.contractId.trim().toUpperCase() === resolvedContractIdForScope &&
+    replayTarget.timeframe === pane.timeframe &&
+    replayTarget.liveMode === pane.live_mode;
+  const replayCursorTime = isReplayActiveOnPane
+    ? (replaySession.bars[replaySession.cursorIndex]?.time ?? null)
+    : null;
+  const replayOpenPosition = isReplayActiveOnPane ? replaySession.openPosition : null;
+  const replayCursorTimeRef = useRef<number | null>(replayCursorTime);
+  replayCursorTimeRef.current = replayCursorTime;
+
+  const backtestActiveJob = useBacktestStore((s) => s.activeJob);
+  const showZones = useBacktestStore((s) => s.showZones);
+  const showTradeLines = useBacktestStore((s) => s.showTradeLines);
+  const showMarkers = useBacktestStore((s) => s.showMarkers);
+  const showIndicators = useBacktestStore((s) => s.showIndicators);
+
+  const matchingBacktestResult = useMemo(() => {
+    if (backtestActiveJob?.status !== "COMPLETED" || backtestActiveJob.result === null) {
+      return null;
+    }
+    const res = backtestActiveJob.result;
+    if (
+      !resolvedContractIdForScope ||
+      res.contract_id.trim().toUpperCase() !== resolvedContractIdForScope ||
+      res.timeframe !== pane.timeframe ||
+      res.live_mode !== pane.live_mode ||
+      res.root_symbol !== pane.root_symbol
+    ) {
+      return null;
+    }
+    return res;
+  }, [
+    backtestActiveJob,
+    pane.live_mode,
+    pane.root_symbol,
+    pane.timeframe,
+    resolvedContractIdForScope,
+  ]);
   const drawingScope: DrawingScopeTarget | null = resolvedContractIdForScope
     ? {
         symbol: pane.root_symbol,
@@ -355,9 +426,12 @@ export function ChartPane({
       scope !== null
         ? buildDrawingScopeKey(scope.symbol, scope.contractId, scope.paneId)
         : "";
-    const drawings = scopeKey
+    const rawDrawings = scopeKey
       ? (storeState.scopes[scopeKey]?.drawings ?? persistedDrawingsRef.current)
       : persistedDrawingsRef.current;
+    const cursorTime = replayCursorTimeRef.current;
+    const drawings =
+      cursorTime !== null ? filterDrawingsByReplayCursor(rawDrawings, cursorTime) : rawDrawings;
     const selectedId = scopeKey
       ? (storeState.selectedByScope[scopeKey] ?? null)
       : selectedDrawingIdRef.current;
@@ -374,17 +448,35 @@ export function ChartPane({
   }, []);
 
   const applyLiveBarUpdate = useCallback((bar: OhlcvBar) => {
-    if (lastBarTimeRef.current !== null && bar.time < lastBarTimeRef.current) {
+    if (lastFullBarTimeRef.current !== null && bar.time < lastFullBarTimeRef.current) {
       return;
     }
     if (
-      lastBarTimeRef.current !== null &&
-      bar.time === lastBarTimeRef.current &&
-      latestBarRef.current?.is_closed === true &&
+      lastFullBarTimeRef.current !== null &&
+      bar.time === lastFullBarTimeRef.current &&
+      latestFullBarRef.current?.is_closed === true &&
       !bar.is_closed
     ) {
       return;
     }
+    const nextFullBars = fullBarsRef.current;
+    if (
+      nextFullBars.length > 0 &&
+      nextFullBars[nextFullBars.length - 1]!.time === bar.time
+    ) {
+      nextFullBars[nextFullBars.length - 1] = bar;
+    } else {
+      nextFullBars.push(bar);
+    }
+    latestFullBarRef.current = bar;
+    lastFullBarTimeRef.current = bar.time;
+    useReplayStore.getState().registerPaneBars(paneIdRef.current, nextFullBars);
+
+    const activeCursorTime = replayCursorTimeRef.current;
+    if (activeCursorTime !== null && bar.time > activeCursorTime) {
+      return;
+    }
+
     candleSeriesRef.current?.update(toCandleDatum(bar));
     volumeSeriesRef.current?.update(toVolumeDatum(bar));
     barCloseByTimeRef.current.set(bar.time, bar.close);
@@ -482,6 +574,16 @@ export function ChartPane({
     if (typeof candleSeries.attachPrimitive === "function") {
       candleSeries.attachPrimitive(primitive);
     }
+    const backtestPrimitive = new BacktestOverlayPrimitive();
+    backtestPrimitive.setViewportSize(initialBounds.plotWidth, initialBounds.plotHeight);
+    backtestPrimitiveRef.current = backtestPrimitive;
+    if (typeof candleSeries.attachPrimitive === "function") {
+      candleSeries.attachPrimitive(backtestPrimitive);
+    }
+    markersPluginRef.current =
+      typeof createSeriesMarkers === "function"
+        ? createSeriesMarkers(candleSeries, [])
+        : null;
 
     const handleCrosshair = (param: MouseEventParams<Time>) => {
       const legendEl = legendRef.current;
@@ -515,6 +617,22 @@ export function ChartPane({
     chart.subscribeCrosshairMove(handleCrosshair);
 
     const handleClick = (param: MouseEventParams<Time>) => {
+      const replayState = useReplayStore.getState();
+      if (replayState.pickStartArmed) {
+        if (typeof param.time === "number" && resolvedContractIdRef.current) {
+          replayState.startReplayAtTime(
+            {
+              paneId: paneIdRef.current,
+              contractId: resolvedContractIdRef.current,
+              rootSymbol: symbolRef.current,
+              timeframe: timeframeRef.current,
+              liveMode: paneLiveModeRef.current,
+            },
+            param.time,
+          );
+        }
+        return;
+      }
       if (
         suppressTimeClickRef.current ||
         useDrawingStore.getState().activeTool !== "cursor" ||
@@ -632,6 +750,9 @@ export function ChartPane({
     };
 
     const handlePointerDown = (event: PointerEvent) => {
+      if (useReplayStore.getState().pickStartArmed) {
+        return;
+      }
       if (event.pointerType === "mouse" && event.button !== 0) {
         return;
       }
@@ -1031,9 +1152,12 @@ export function ChartPane({
         chart.applyOptions({ width: nextWidth, height: nextHeight });
         const nextBounds = getPlotBounds(nextWidth, nextHeight);
         primitive.setViewportSize(nextBounds.plotWidth, nextBounds.plotHeight);
+        backtestPrimitive.setViewportSize(nextBounds.plotWidth, nextBounds.plotHeight);
       }
     });
     resizeObserver.observe(container);
+
+    const indicatorSeriesMap = indicatorSeriesMapRef.current;
 
     return () => {
       unsubscribeDrawingStore();
@@ -1056,12 +1180,20 @@ export function ChartPane({
       timeScale.unsubscribeVisibleTimeRangeChange(handleVisibleTimeRangeChange);
       if (typeof candleSeries.detachPrimitive === "function") {
         candleSeries.detachPrimitive(primitive);
+        candleSeries.detachPrimitive(backtestPrimitive);
       }
+      markersPluginRef.current?.detach();
+      markersPluginRef.current = null;
+      indicatorSeriesMap.clear();
+      backtestPrimitiveRef.current = null;
       primitiveRef.current = null;
       chart.remove();
       chartRef.current = null;
       candleSeriesRef.current = null;
       volumeSeriesRef.current = null;
+      fullBarsRef.current = [];
+      latestFullBarRef.current = null;
+      lastFullBarTimeRef.current = null;
       barsRef.current = [];
       barCloseByTimeRef.current.clear();
       latestBarRef.current = null;
@@ -1232,10 +1364,14 @@ export function ChartPane({
       retryCancelRef.current = null;
       candleSeriesRef.current?.setData([]);
       volumeSeriesRef.current?.setData([]);
+      fullBarsRef.current = [];
+      latestFullBarRef.current = null;
+      lastFullBarTimeRef.current = null;
       barsRef.current = [];
       barCloseByTimeRef.current.clear();
       latestBarRef.current = null;
       lastBarTimeRef.current = null;
+      useReplayStore.getState().registerPaneBars(pane.pane_id, []);
       setBarsQuality(null);
       if (legendRef.current !== null) {
         legendRef.current.textContent = formatLegendText(pane.root_symbol, pane.timeframe, null);
@@ -1251,8 +1387,12 @@ export function ChartPane({
       activeGenerationRef.current += 1;
       pendingWsBarsRef.current = [];
       bufferOverflowRef.current = false;
+      fullBarsRef.current = [];
+      latestFullBarRef.current = null;
+      lastFullBarTimeRef.current = null;
       barsRef.current = [];
       barCloseByTimeRef.current.clear();
+      useReplayStore.getState().registerPaneBars(pane.pane_id, []);
       setBarsQuality(null);
       if (legendRef.current !== null) {
         legendRef.current.textContent = formatLegendText(pane.root_symbol, pane.timeframe, null);
@@ -1287,14 +1427,24 @@ export function ChartPane({
           response.bars,
           pendingWsBarsRef.current,
         );
-        const candles = mergedBars.map(toCandleDatum);
-        const volumes = mergedBars.map(toVolumeDatum);
+        fullBarsRef.current = mergedBars;
+        latestFullBarRef.current = mergedBars[mergedBars.length - 1] ?? null;
+        lastFullBarTimeRef.current = latestFullBarRef.current?.time ?? null;
+        useReplayStore.getState().registerPaneBars(pane.pane_id, mergedBars);
+
+        const activeCursorTime = replayCursorTimeRef.current;
+        const visibleBars =
+          activeCursorTime !== null
+            ? filterBarsByReplayCursor(mergedBars, activeCursorTime)
+            : mergedBars;
+        const candles = visibleBars.map(toCandleDatum);
+        const volumes = visibleBars.map(toVolumeDatum);
         candleSeriesRef.current?.setData(candles);
         volumeSeriesRef.current?.setData(volumes);
-        barsRef.current = mergedBars;
+        barsRef.current = visibleBars;
         syncOverlayPrimitive();
         const closeMap = new Map<number, number>();
-        for (const bar of mergedBars) {
+        for (const bar of visibleBars) {
           closeMap.set(bar.time, bar.close);
         }
         barCloseByTimeRef.current = closeMap;
@@ -1306,7 +1456,7 @@ export function ChartPane({
         pendingWsBarsRef.current = [];
         const didOverflow = bufferOverflowRef.current;
         bufferOverflowRef.current = false;
-        const lastBar = mergedBars[mergedBars.length - 1] ?? null;
+        const lastBar = visibleBars[visibleBars.length - 1] ?? null;
         latestBarRef.current = lastBar;
         lastBarTimeRef.current = lastBar?.time ?? null;
         if (legendRef.current !== null) {
@@ -1316,7 +1466,9 @@ export function ChartPane({
             lastBar,
           );
         }
-        chartRef.current?.timeScale().fitContent();
+        if (activeCursorTime === null) {
+          chartRef.current?.timeScale().fitContent();
+        }
         setBarsQuality(response.quality ?? null);
         setLoadStatus(`${mergedBars.length} bars`);
         if (didOverflow) {
@@ -1336,10 +1488,14 @@ export function ChartPane({
           pendingWsBarsRef.current = [];
           bufferOverflowRef.current = false;
           hasLoadedTargetKeyRef.current = "";
+          fullBarsRef.current = [];
+          latestFullBarRef.current = null;
+          lastFullBarTimeRef.current = null;
           barsRef.current = [];
           barCloseByTimeRef.current.clear();
           latestBarRef.current = null;
           lastBarTimeRef.current = null;
+          useReplayStore.getState().registerPaneBars(pane.pane_id, []);
           if (legendRef.current !== null) {
             legendRef.current.textContent = formatLegendText(pane.root_symbol, pane.timeframe, null);
           }
@@ -1393,6 +1549,150 @@ export function ChartPane({
     pane.timeframe,
     resyncNonce,
     syncOverlayPrimitive,
+  ]);
+
+  useEffect(() => {
+    const id = pane.pane_id;
+    return () => {
+      useReplayStore.getState().unregisterPaneBars(id);
+    };
+  }, [pane.pane_id]);
+
+  useEffect(() => {
+    const isReplayNow = replayCursorTime !== null;
+    if (!isReplayNow && !wasReplayActiveRef.current) {
+      return;
+    }
+    wasReplayActiveRef.current = isReplayNow;
+    const visibleBars =
+      replayCursorTime !== null
+        ? filterBarsByReplayCursor(fullBarsRef.current, replayCursorTime)
+        : [...fullBarsRef.current];
+    candleSeriesRef.current?.setData(visibleBars.map(toCandleDatum));
+    volumeSeriesRef.current?.setData(visibleBars.map(toVolumeDatum));
+    barsRef.current = visibleBars;
+    const closeMap = new Map<number, number>();
+    for (const bar of visibleBars) {
+      closeMap.set(bar.time, bar.close);
+    }
+    barCloseByTimeRef.current = closeMap;
+    const lastBar = visibleBars[visibleBars.length - 1] ?? null;
+    latestBarRef.current = lastBar;
+    lastBarTimeRef.current = lastBar?.time ?? null;
+    if (legendRef.current !== null) {
+      legendRef.current.textContent = formatLegendText(
+        pane.root_symbol,
+        pane.timeframe,
+        lastBar,
+      );
+    }
+    syncOverlayPrimitive();
+  }, [pane.root_symbol, pane.timeframe, replayCursorTime, syncOverlayPrimitive]);
+
+  useEffect(() => {
+    const btPrimitive = backtestPrimitiveRef.current;
+    const filteredZones =
+      matchingBacktestResult !== null
+        ? replayCursorTime !== null
+          ? filterZonesByReplayCursor(matchingBacktestResult.zones, replayCursorTime)
+          : matchingBacktestResult.zones
+        : [];
+    const filteredLines =
+      matchingBacktestResult !== null
+        ? replayCursorTime !== null
+          ? filterTradeLinesByReplayCursor(matchingBacktestResult.trade_lines, replayCursorTime)
+          : matchingBacktestResult.trade_lines
+        : [];
+    btPrimitive?.setData({
+      zones: filteredZones,
+      tradeLines: filteredLines,
+      showZones,
+      showTradeLines,
+      replayPosition: replayOpenPosition,
+      bars: barsRef.current,
+      timeframeSec: TIMEFRAME_SECONDS[pane.timeframe],
+      tickSize: INSTRUMENT_SPECS[pane.root_symbol].tickSize,
+    });
+
+    const markersPlugin = markersPluginRef.current;
+    if (markersPlugin !== null) {
+      if (matchingBacktestResult !== null && showMarkers) {
+        const filteredMarkers =
+          replayCursorTime !== null
+            ? filterMarkersByReplayCursor(matchingBacktestResult.markers, replayCursorTime)
+            : matchingBacktestResult.markers;
+        const lwcMarkers: SeriesMarker<Time>[] = filteredMarkers.map((m) => ({
+          time: m.time as UTCTimestamp,
+          position: m.position,
+          color: m.color,
+          shape: m.shape,
+          text: m.text,
+        }));
+        markersPlugin.setMarkers(lwcMarkers);
+      } else {
+        markersPlugin.setMarkers([]);
+      }
+    }
+
+    const chart = chartRef.current;
+    const seriesMap = indicatorSeriesMapRef.current;
+    const hasLineSeries = (LineSeries as unknown) !== undefined;
+    if (chart === null || !hasLineSeries || matchingBacktestResult === null || !showIndicators) {
+      if (chart !== null) {
+        for (const series of seriesMap.values()) {
+          if (typeof chart.removeSeries === "function") {
+            chart.removeSeries(series);
+          }
+        }
+      }
+      seriesMap.clear();
+      return;
+    }
+
+    const rawIndicators = matchingBacktestResult.indicators.filter((ind) => ind.overlay);
+    const filteredIndicators =
+      replayCursorTime !== null
+        ? filterIndicatorsByReplayCursor(rawIndicators, replayCursorTime)
+        : rawIndicators;
+    const nextIds = new Set(filteredIndicators.map((ind) => ind.id));
+    for (const [id, series] of Array.from(seriesMap.entries())) {
+      if (!nextIds.has(id)) {
+        if (typeof chart.removeSeries === "function") {
+          chart.removeSeries(series);
+        }
+        seriesMap.delete(id);
+      }
+    }
+    for (const ind of filteredIndicators) {
+      let lineSeries = seriesMap.get(ind.id);
+      if (lineSeries === undefined) {
+        lineSeries = chart.addSeries(LineSeries, {
+          color: ind.color,
+          lineWidth: 2,
+          title: ind.name,
+          priceLineVisible: false,
+          lastValueVisible: false,
+        });
+        seriesMap.set(ind.id, lineSeries);
+      }
+      lineSeries.setData(
+        ind.points.map((pt) => ({
+          time: pt.time as UTCTimestamp,
+          value: pt.value,
+        })),
+      );
+    }
+  }, [
+    loadStatus,
+    matchingBacktestResult,
+    pane.root_symbol,
+    pane.timeframe,
+    replayCursorTime,
+    replayOpenPosition,
+    showIndicators,
+    showMarkers,
+    showTradeLines,
+    showZones,
   ]);
 
   const isModeMismatch = activeFeedLive !== null && pane.live_mode !== activeFeedLive;

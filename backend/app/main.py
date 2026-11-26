@@ -7,13 +7,15 @@ import contextlib
 import logging
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import Any
 
 import httpx
 import uvicorn
-from fastapi import FastAPI, Request, status
+from fastapi import FastAPI, HTTPException, Request, status
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import JSONResponse
+from fastapi.responses import FileResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
 
 from app.api import (
     routes_alerts,
@@ -84,6 +86,19 @@ async def _background_auto_connect(
             "TopstepX background auto-connect unexpected error: %s",
             redact_secrets(str(exc)),
         )
+
+
+def _resolve_frontend_dist_dir(settings: Settings) -> Path | None:
+    """Resolve optional built SPA distribution directory if it contains index.html."""
+    candidate = (
+        settings.frontend_dist_dir
+        if settings.frontend_dist_dir is not None
+        else Path(__file__).resolve().parents[2] / "frontend" / "dist"
+    )
+    resolved = candidate.resolve()
+    if resolved.is_dir() and (resolved / "index.html").is_file():
+        return resolved
+    return None
 
 
 def create_app(
@@ -292,6 +307,53 @@ def create_app(
     application.include_router(routes_layout.router)
     application.include_router(routes_market.router)
     application.include_router(routes_market.ws_router)
+
+    dist_dir = _resolve_frontend_dist_dir(resolved_settings)
+    if dist_dir is not None:
+        assets_dir = dist_dir / "assets"
+        if assets_dir.is_dir():
+            application.mount(
+                "/assets",
+                StaticFiles(directory=str(assets_dir)),
+                name="spa-assets",
+            )
+
+        @application.get("/{full_path:path}", include_in_schema=False)
+        async def _serve_spa(full_path: str) -> FileResponse:
+            cleaned = full_path.lstrip("/")
+            if (
+                cleaned == "api"
+                or cleaned.startswith("api/")
+                or cleaned == "ws"
+                or cleaned.startswith("ws/")
+            ):
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail="Not Found",
+                )
+            if ".." in cleaned.replace("\\", "/").split("/"):
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail="Not Found",
+                )
+            dist_root = dist_dir.resolve()
+            if cleaned:
+                candidate = (dist_root / cleaned).resolve()
+                if not candidate.is_relative_to(dist_root):
+                    raise HTTPException(
+                        status_code=status.HTTP_404_NOT_FOUND,
+                        detail="Not Found",
+                    )
+                if candidate.is_file():
+                    return FileResponse(candidate)
+            index_path = dist_root / "index.html"
+            if not index_path.is_file():
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail="Not Found",
+                )
+            return FileResponse(index_path)
+
     return application
 
 

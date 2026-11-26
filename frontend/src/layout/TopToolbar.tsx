@@ -12,6 +12,10 @@ export interface TopToolbarProps {
   onSelectLayout: (layoutId: string) => void;
   onRetryContracts: () => void;
   onLogout: () => void;
+  isReplayOpen?: boolean | undefined;
+  onToggleReplay?: (() => void) | undefined;
+  isBacktestOpen?: boolean | undefined;
+  onToggleBacktest?: (() => void) | undefined;
 }
 
 export function TopToolbar({
@@ -22,6 +26,10 @@ export function TopToolbar({
   onSelectLayout,
   onRetryContracts,
   onLogout,
+  isReplayOpen = false,
+  onToggleReplay,
+  isBacktestOpen = false,
+  onToggleBacktest,
 }: TopToolbarProps) {
   const layouts = useLayoutStore((state) => state.layouts);
   const activeLayout = useLayoutStore((state) => state.activeLayout);
@@ -57,6 +65,26 @@ export function TopToolbar({
       <SyncControls />
 
       <div className="terminal-topbar__meta">
+        {onToggleReplay !== undefined && (
+          <button
+            type="button"
+            className={`terminal-button ${isReplayOpen ? "terminal-button--active" : ""}`}
+            aria-pressed={isReplayOpen}
+            onClick={onToggleReplay}
+          >
+            Replay
+          </button>
+        )}
+        {onToggleBacktest !== undefined && (
+          <button
+            type="button"
+            className={`terminal-button ${isBacktestOpen ? "terminal-button--active" : ""}`}
+            aria-pressed={isBacktestOpen}
+            onClick={onToggleBacktest}
+          >
+            Backtest
+          </button>
+        )}
         <span>WS: {wsState}</span>
         <span>Feed: {String(statusData?.feed_state ?? "DISCONNECTED")}</span>
         {statusData?.key_rotation_due === true && (
