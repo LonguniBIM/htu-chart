@@ -255,6 +255,11 @@ function createFakeWsClient() {
         listener(msg);
       }
     },
+    emitResyncRequired: (msg: WsResyncRequiredMessage) => {
+      for (const listener of resyncListeners) {
+        listener(msg);
+      }
+    },
   };
 }
 
@@ -2148,5 +2153,295 @@ describe("ChartPane (F06, P1-R3-01, P1-R3-02)", () => {
 
     unmount();
     expect(detachPrimitiveMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("persists explicit metadata.direction for auto FVG, places hline/order_block/long_position, discards stale draft/drag across tool & symbol switches, restores empty-pane Time sync, and resyncs 3m panes (Phase 4 Part 2)", async () => {
+    /**
+     * Contract:
+     * 1. Placing fvg_box under "auto" preset persists metadata.direction ("bullish" when end >= start, "bearish" when end < start).
+     * 2. hline, order_block, and long_position placement persist exact domain coordinates and directional >=1*tickSize clamping.
+     * 3. Switching tools mid-draft (trendline -> fvg_box) clears Anchor 1 so the second tool starts fresh.
+     * 4. Switching pane symbol/contract mid-draft/mid-drag (MES -> MYM) aborts stale draft/drag and restores handleScroll/handleScale.
+     * 5. Empty-pane click in cursor mode triggers syncController.onTimeClick even after drag or pointercancel.
+     * 6. Non-live-WS 3m pane re-fetches drawings on wsClient.onResyncRequired.
+     * Defect caught: P1-001, P1-002, P1-003, P2-001, P2-002 regressions.
+     */
+    const bars = [
+      { time: 1700000000, open: 5000, high: 5012, low: 4996, close: 5005, volume: 25, is_closed: true },
+      { time: 1700000300, open: 5005, high: 5020, low: 5002, close: 5015, volume: 30, is_closed: true },
+    ];
+    fetchBarsMock.mockResolvedValue(makeBarsResponse("CON.F.US.MES.H26", bars));
+    postDrawingCommandMock.mockImplementation(async (symbol, cmd) => ({
+      symbol,
+      contract_id: cmd.contract_id ?? null,
+      pane_id: cmd.pane_id ?? null,
+      instrument: {
+        root_symbol: symbol,
+        name: symbol,
+        exchange: "CME",
+        tick_size: symbol === "MYM" ? 1 : 0.25,
+        tick_value: 1.25,
+        currency: "USD",
+      },
+      scope_revision: cmd.expected_revision + 1,
+      can_undo: true,
+      can_redo: false,
+      deduplicated: false,
+      affected_ids: ["draw-1"],
+      drawings:
+        cmd.action === "create"
+          ? [
+              {
+                id: "draw-1",
+                revision: cmd.expected_revision + 1,
+                type: cmd.drawing.type,
+                symbol,
+                contract_id: cmd.contract_id ?? null,
+                pane_id: cmd.pane_id ?? null,
+                created_by: "user",
+                source_bar_refs: [],
+                coordinates: cmd.drawing.coordinates,
+                style: {},
+                metadata: cmd.drawing.metadata ?? {},
+                created_at_utc: 1700000000,
+                updated_at_utc: 1700000000,
+              },
+            ]
+          : [],
+    }));
+
+    const coordinator = new PaneFetchCoordinator();
+    const fakeWs = createFakeWsClient();
+    const syncController = new LayoutSyncController({
+      symbol: false,
+      interval: false,
+      crosshair: false,
+      time: true,
+      dateRange: false,
+    });
+    const siblingPane = {
+      paneId: "pane-2",
+      applyCrosshairTime: vi.fn(),
+      applyVisibleTimeRange: vi.fn(),
+      centerOnTime: vi.fn(),
+    };
+    syncController.registerPane(siblingPane);
+
+    const mesPane: PaneConfig = {
+      pane_id: "pane-1",
+      root_symbol: "MES",
+      timeframe: "3m",
+      live_mode: false,
+      playback_mode: "live",
+    };
+
+    const { rerender } = render(
+      <ChartPane
+        pane={mesPane}
+        contractId="CON.F.US.MES.H26"
+        activeFeedLive={false}
+        wsClient={fakeWs.client}
+        coordinator={coordinator}
+        syncController={syncController}
+      />,
+    );
+
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    // 3m non-live-WS pane still re-fetches drawings on wsClient.onResyncRequired (P2-001)
+    expect(fetchDrawingsMock).toHaveBeenCalledTimes(1);
+    act(() => {
+      fakeWs.emitResyncRequired({
+        type: "resync_required",
+        reason: "slow_consumer_disconnect",
+        contract_id: "CON.F.US.MES.H26",
+      });
+    });
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(fetchDrawingsMock).toHaveBeenCalledTimes(2);
+
+    const canvas = document.querySelector(".chart-pane__canvas") as HTMLElement;
+    vi.spyOn(canvas, "getBoundingClientRect").mockReturnValue({
+      left: 0,
+      top: 0,
+      right: 600,
+      bottom: 400,
+      width: 600,
+      height: 400,
+      x: 0,
+      y: 0,
+      toJSON: () => ({}),
+    });
+
+    // 1. Place bullish auto-FVG (y=200 -> 5000, y=160 -> 5010)
+    useDrawingStore.getState().setFvgPreset("auto");
+    useDrawingStore.getState().setActiveTool("fvg_box");
+    await act(async () => {
+      fireEvent.pointerDown(canvas, { clientX: 100, clientY: 200, button: 0, pointerType: "mouse", pointerId: 1 });
+      fireEvent.pointerMove(canvas, { clientX: 130, clientY: 160, button: 0, pointerType: "mouse", pointerId: 1 });
+      fireEvent.pointerUp(canvas, { clientX: 130, clientY: 160, button: 0, pointerType: "mouse", pointerId: 1 });
+      await Promise.resolve();
+    });
+    expect(postDrawingCommandMock).toHaveBeenLastCalledWith(
+      "MES",
+      expect.objectContaining({
+        action: "create",
+        drawing: expect.objectContaining({
+          type: "fvg_box",
+          metadata: { direction: "bullish" },
+        }),
+      }),
+      expect.any(AbortSignal),
+    );
+
+    // 2. Place bearish auto-FVG (y=160 -> 5010, y=200 -> 5000)
+    useDrawingStore.getState().setActiveTool("fvg_box");
+    await act(async () => {
+      fireEvent.pointerDown(canvas, { clientX: 100, clientY: 160, button: 0, pointerType: "mouse", pointerId: 2 });
+      fireEvent.pointerMove(canvas, { clientX: 130, clientY: 200, button: 0, pointerType: "mouse", pointerId: 2 });
+      fireEvent.pointerUp(canvas, { clientX: 130, clientY: 200, button: 0, pointerType: "mouse", pointerId: 2 });
+      await Promise.resolve();
+    });
+    expect(postDrawingCommandMock).toHaveBeenLastCalledWith(
+      "MES",
+      expect.objectContaining({
+        action: "create",
+        drawing: expect.objectContaining({
+          type: "fvg_box",
+          metadata: { direction: "bearish" },
+        }),
+      }),
+      expect.any(AbortSignal),
+    );
+
+    // 3. Place hline, order_block, and long_position
+    useDrawingStore.getState().setActiveTool("hline");
+    await act(async () => {
+      fireEvent.pointerDown(canvas, { clientX: 100, clientY: 200, button: 0, pointerType: "mouse", pointerId: 3 });
+      fireEvent.pointerUp(canvas, { clientX: 100, clientY: 200, button: 0, pointerType: "mouse", pointerId: 3 });
+      await Promise.resolve();
+    });
+    expect(postDrawingCommandMock).toHaveBeenLastCalledWith(
+      "MES",
+      expect.objectContaining({
+        action: "create",
+        drawing: expect.objectContaining({
+          type: "hline",
+          coordinates: { anchors: [{ role: "level", time: 1700000000, price: 5000 }] },
+        }),
+      }),
+      expect.any(AbortSignal),
+    );
+
+    useDrawingStore.getState().setActiveTool("order_block");
+    await act(async () => {
+      fireEvent.pointerDown(canvas, { clientX: 100, clientY: 200, button: 0, pointerType: "mouse", pointerId: 4 });
+      fireEvent.pointerMove(canvas, { clientX: 130, clientY: 180, button: 0, pointerType: "mouse", pointerId: 4 });
+      fireEvent.pointerUp(canvas, { clientX: 130, clientY: 180, button: 0, pointerType: "mouse", pointerId: 4 });
+      await Promise.resolve();
+    });
+    expect(postDrawingCommandMock).toHaveBeenLastCalledWith(
+      "MES",
+      expect.objectContaining({
+        action: "create",
+        drawing: expect.objectContaining({
+          type: "order_block",
+          metadata: { extend_right: true, label: "OB" },
+        }),
+      }),
+      expect.any(AbortSignal),
+    );
+
+    useDrawingStore.getState().setActiveTool("long_position");
+    await act(async () => {
+      fireEvent.pointerDown(canvas, { clientX: 100, clientY: 200, button: 0, pointerType: "mouse", pointerId: 5 });
+      fireEvent.pointerUp(canvas, { clientX: 100, clientY: 200, button: 0, pointerType: "mouse", pointerId: 5 });
+      await Promise.resolve();
+    });
+    const lastPosCmd = postDrawingCommandMock.mock.calls[postDrawingCommandMock.mock.calls.length - 1]![1];
+    expect(lastPosCmd.action).toBe("create");
+    if (lastPosCmd.action === "create") {
+      expect(lastPosCmd.drawing.type).toBe("long_position");
+      const entry = lastPosCmd.drawing.coordinates.anchors.find((a) => a.role === "entry")!;
+      const target = lastPosCmd.drawing.coordinates.anchors.find((a) => a.role === "target")!;
+      const stop = lastPosCmd.drawing.coordinates.anchors.find((a) => a.role === "stop")!;
+      expect(target.price).toBeGreaterThanOrEqual(entry.price + 0.25);
+      expect(stop.price).toBeLessThanOrEqual(entry.price - 0.25);
+    }
+
+    // 4. Empty-pane click after placement/pointercancel still fires syncController.onTimeClick (P1-003)
+    await act(async () => {
+      fireEvent.pointerCancel(canvas, { pointerId: 5 });
+      fireEvent.pointerDown(canvas, { clientX: 450, clientY: 50, button: 0, pointerType: "mouse", pointerId: 6 });
+      fireEvent.pointerUp(canvas, { clientX: 450, clientY: 50, button: 0, pointerType: "mouse", pointerId: 6 });
+      clickHandlers[0]?.({ time: 1700000300 });
+      await Promise.resolve();
+    });
+    expect(siblingPane.centerOnTime).toHaveBeenCalledWith(1700000300);
+
+    // 5. Tool-to-tool switch mid-draft discards stale Anchor 1 (P1-001)
+    const callsBeforeSwitch = postDrawingCommandMock.mock.calls.length;
+    await act(async () => {
+      useDrawingStore.getState().setActiveTool("trendline");
+      await Promise.resolve();
+    });
+    act(() => {
+      // Click 1 of trendline at x=100, y=220 (price=4995)
+      fireEvent.pointerDown(canvas, { clientX: 100, clientY: 220, button: 0, pointerType: "mouse", pointerId: 7 });
+      fireEvent.pointerUp(canvas, { clientX: 100, clientY: 220, button: 0, pointerType: "mouse", pointerId: 7 });
+    });
+    await act(async () => {
+      useDrawingStore.getState().setActiveTool("fvg_box");
+      await Promise.resolve();
+    });
+    await act(async () => {
+      // Click 1 & 2 of fvg_box at (130, 180 -> 5005) and (160, 140 -> 5015)
+      fireEvent.pointerDown(canvas, { clientX: 130, clientY: 180, button: 0, pointerType: "mouse", pointerId: 8 });
+      fireEvent.pointerUp(canvas, { clientX: 130, clientY: 180, button: 0, pointerType: "mouse", pointerId: 8 });
+      fireEvent.pointerDown(canvas, { clientX: 160, clientY: 140, button: 0, pointerType: "mouse", pointerId: 8 });
+      fireEvent.pointerUp(canvas, { clientX: 160, clientY: 140, button: 0, pointerType: "mouse", pointerId: 8 });
+      await Promise.resolve();
+    });
+    expect(postDrawingCommandMock).toHaveBeenCalledTimes(callsBeforeSwitch + 1);
+    const switchedCmd = postDrawingCommandMock.mock.calls[postDrawingCommandMock.mock.calls.length - 1]![1];
+    if (switchedCmd.action === "create") {
+      expect(switchedCmd.drawing.type).toBe("fvg_box");
+      expect(switchedCmd.drawing.coordinates.anchors[0]!.price).toBe(5005);
+      expect(switchedCmd.drawing.coordinates.anchors[1]!.price).toBe(5015);
+    }
+
+    // 6. Symbol/contract switch mid-drag aborts drag & restores handleScroll/handleScale without leaking update (P2-002)
+    const callsBeforeSymbolSwitch = postDrawingCommandMock.mock.calls.length;
+    applyOptionsMock.mockClear();
+    // Start dragging the newly selected fvg-box anchor at (130, 180)
+    act(() => {
+      fireEvent.pointerDown(canvas, { clientX: 130, clientY: 180, button: 0, pointerType: "mouse", pointerId: 9 });
+      fireEvent.pointerMove(canvas, { clientX: 160, clientY: 160, button: 0, pointerType: "mouse", pointerId: 9 });
+    });
+    expect(applyOptionsMock).toHaveBeenCalledWith({ handleScroll: false, handleScale: false });
+
+    const mymPane: PaneConfig = { ...mesPane, root_symbol: "MYM" };
+    await act(async () => {
+      rerender(
+        <ChartPane
+          pane={mymPane}
+          contractId="CON.F.US.MYM.H26"
+          activeFeedLive={false}
+          wsClient={fakeWs.client}
+          coordinator={coordinator}
+          syncController={syncController}
+        />,
+      );
+      await Promise.resolve();
+    });
+    expect(applyOptionsMock).toHaveBeenCalledWith({ handleScroll: true, handleScale: true });
+    fireEvent.pointerUp(canvas, { clientX: 160, clientY: 160, button: 0, pointerType: "mouse", pointerId: 9 });
+    expect(postDrawingCommandMock).toHaveBeenCalledTimes(callsBeforeSymbolSwitch);
   });
 });

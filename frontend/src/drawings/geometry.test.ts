@@ -127,6 +127,37 @@ describe("drawing geometry and domain math (Phase 4 Part 2)", () => {
     const zeroRisk = computePositionMetrics("short_position", 5000, 4990, 5000, INSTRUMENT_SPECS.MNQ);
     expect(zeroRisk.rrRatio).toBe(0);
 
+    const mnqMetrics = computePositionMetrics("short_position", 18000, 17980, 18010, INSTRUMENT_SPECS.MNQ);
+    expect(mnqMetrics).toEqual({
+      riskPrice: 10,
+      rewardPrice: 20,
+      riskTicks: 40,
+      rewardTicks: 80,
+      dollarRisk: 20,
+      dollarReward: 40,
+      rrRatio: 2,
+    });
+
+    const mymMetrics = computePositionMetrics("long_position", 42000, 42030, 41990, INSTRUMENT_SPECS.MYM);
+    expect(mymMetrics).toEqual({
+      riskPrice: 10,
+      rewardPrice: 30,
+      riskTicks: 10,
+      rewardTicks: 30,
+      dollarRisk: 5,
+      dollarReward: 15,
+      rrRatio: 3,
+    });
+
+    const mgcMetrics = computePositionMetrics("short_position", 2400, 2394, 2403, INSTRUMENT_SPECS.MGC, 2);
+    expect(mgcMetrics.riskPrice).toBeCloseTo(3, 6);
+    expect(mgcMetrics.rewardPrice).toBeCloseTo(6, 6);
+    expect(mgcMetrics.riskTicks).toBeCloseTo(30, 6);
+    expect(mgcMetrics.rewardTicks).toBeCloseTo(60, 6);
+    expect(mgcMetrics.dollarRisk).toBeCloseTo(60, 6);
+    expect(mgcMetrics.dollarReward).toBeCloseTo(120, 6);
+    expect(mgcMetrics.rrRatio).toBeCloseTo(2, 6);
+
     const bars5m = [
       makeBar(1700000000, 5000, 5002, 4998, 5001),
       makeBar(1700000300, 5001, 5005, 5000, 5004),

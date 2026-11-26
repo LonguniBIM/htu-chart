@@ -218,9 +218,10 @@ function renderProjectedItem(
     context.stroke();
     context.restore();
 
+    const ceLabel = `${isBullish ? "Bullish" : "Bearish"} FVG · CE ${midPrice.toFixed(Math.max(2, decimals))}`;
     drawBadge(
       context,
-      "50% CE",
+      ceLabel,
       minX + 4,
       Math.max(2, midY - 18),
       isBullish ? "rgba(21, 128, 61, 0.85)" : "rgba(185, 28, 28, 0.85)",

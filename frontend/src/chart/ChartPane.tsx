@@ -213,6 +213,8 @@ export function ChartPane({
   const placementStartPxRef = useRef<{ px: number; py: number } | null>(null);
   const dragRef = useRef<{
     drawingId: string;
+    scope: DrawingScopeTarget;
+    scopeKey: string;
     originalDrawing: DrawingRecord;
     anchorRole: string | null;
     startTime: number;
@@ -307,6 +309,8 @@ export function ChartPane({
 
   const drawingScopeRef = useRef<DrawingScopeTarget | null>(drawingScope);
   drawingScopeRef.current = drawingScope;
+  const drawingScopeKeyRef = useRef<string>(drawingScopeKey);
+  drawingScopeKeyRef.current = drawingScopeKey;
   const persistedDrawingsRef = useRef<readonly DrawingRecord[]>(persistedDrawings);
   persistedDrawingsRef.current = persistedDrawings;
   const selectedDrawingIdRef = useRef<string | null>(selectedDrawingId);
@@ -539,8 +543,14 @@ export function ChartPane({
         endTime = start.time + Math.max(1, tfSec);
       }
       const metadata: Record<string, unknown> = {};
-      if (draft.tool === "fvg_box" && draft.fvgPreset !== undefined && draft.fvgPreset !== "auto") {
-        metadata.direction = draft.fvgPreset;
+      if (draft.tool === "fvg_box") {
+        const resolvedDirection =
+          draft.fvgPreset === "bullish" || draft.fvgPreset === "bearish"
+            ? draft.fvgPreset
+            : endPrice >= start.price
+              ? "bullish"
+              : "bearish";
+        metadata.direction = resolvedDirection;
       }
       if (draft.tool === "order_block") {
         metadata.extend_right = draft.extendRight ?? true;
@@ -597,6 +607,7 @@ export function ChartPane({
         const py = event.clientY - rect.top;
         const hit = primitive.hitTestAt(px, py);
         if (hit === null) {
+          suppressTimeClickRef.current = false;
           if (liveSelectedId !== null) {
             storeState.setSelectedDrawing(scope, null);
           }
@@ -610,6 +621,8 @@ export function ChartPane({
         }
         dragRef.current = {
           drawingId: targetDrawing.id,
+          scope,
+          scopeKey,
           originalDrawing: targetDrawing,
           anchorRole: hit.anchorRole,
           startTime: pt.time,
@@ -707,6 +720,12 @@ export function ChartPane({
     const handlePointerMove = (event: PointerEvent) => {
       const activeDrag = dragRef.current;
       if (activeDrag !== null) {
+        if (activeDrag.scopeKey !== drawingScopeKeyRef.current) {
+          dragRef.current = null;
+          restoreChartInteraction();
+          syncOverlayPrimitive(null);
+          return;
+        }
         const pt = resolveChartPoint(event.clientX, event.clientY);
         if (pt === null) {
           return;
@@ -784,10 +803,13 @@ export function ChartPane({
       if (finishedDrag !== null) {
         dragRef.current = null;
         syncOverlayPrimitive();
-        if (finishedDrag.hasMoved && drawingScopeRef.current !== null) {
+        if (
+          finishedDrag.hasMoved &&
+          finishedDrag.scopeKey === drawingScopeKeyRef.current
+        ) {
           void useDrawingStore
             .getState()
-            .updateDrawing(drawingScopeRef.current, finishedDrag.drawingId, {
+            .updateDrawing(finishedDrag.scope, finishedDrag.drawingId, {
               coordinates: { anchors: finishedDrag.currentAnchors },
             });
         }
@@ -817,6 +839,7 @@ export function ChartPane({
       dragRef.current = null;
       draftRef.current = null;
       placementStartPxRef.current = null;
+      suppressTimeClickRef.current = false;
       setDraftState(null);
       syncOverlayPrimitive(null);
     };
@@ -892,13 +915,25 @@ export function ChartPane({
   }, [cancelPendingRangeSuppressionRaf, syncOverlayPrimitive]);
 
   useEffect(() => {
-    if (activeTool === "cursor" && draftRef.current !== null) {
+    if (draftRef.current !== null && activeTool !== draftRef.current.tool) {
       draftRef.current = null;
       placementStartPxRef.current = null;
+      suppressTimeClickRef.current = false;
       setDraftState(null);
+      syncOverlayPrimitive(null);
       chartRef.current?.applyOptions({ handleScroll: true, handleScale: true });
     }
-  }, [activeTool]);
+  }, [activeTool, syncOverlayPrimitive]);
+
+  useEffect(() => {
+    dragRef.current = null;
+    draftRef.current = null;
+    placementStartPxRef.current = null;
+    suppressTimeClickRef.current = false;
+    setDraftState(null);
+    syncOverlayPrimitive(null);
+    chartRef.current?.applyOptions({ handleScroll: true, handleScale: true });
+  }, [drawingScopeKey, pane.root_symbol, pane.pane_id, syncOverlayPrimitive]);
 
   useEffect(() => {
     syncOverlayPrimitive(draftState);
@@ -1194,6 +1229,21 @@ export function ChartPane({
 
   useEffect(() => {
     const resolvedContractId = contractId?.trim() ?? "";
+    if (!resolvedContractId) {
+      return;
+    }
+    return wsClient.onResyncRequired((msg) => {
+      if (
+        msg.contract_id === null ||
+        msg.contract_id.toUpperCase() === resolvedContractId.toUpperCase()
+      ) {
+        setResyncNonce((n) => n + 1);
+      }
+    });
+  }, [contractId, wsClient]);
+
+  useEffect(() => {
+    const resolvedContractId = contractId?.trim() ?? "";
     if (!resolvedContractId || !canSubscribeWs) {
       return;
     }
@@ -1220,19 +1270,10 @@ export function ChartPane({
         setResyncNonce((n) => n + 1);
       }
     });
-    const removeResyncListener = wsClient.onResyncRequired((msg) => {
-      if (
-        msg.contract_id === null ||
-        msg.contract_id.toUpperCase() === resolvedContractId.toUpperCase()
-      ) {
-        setResyncNonce((n) => n + 1);
-      }
-    });
 
     return () => {
       removeBarListener();
       removeSubscribedListener();
-      removeResyncListener();
       unsubscribeWs();
     };
   }, [applyLiveBarUpdate, canSubscribeWs, contractId, pane.live_mode, pane.timeframe, wsClient]);
