@@ -1,6 +1,6 @@
 # Task List: TopstepX Futures Terminal (`topstep-chart-app`)
 
-> **Status**: Phase 1 `VERIFIED` (`1918f9156d45`, `7d724bc79a76`); Phase 2 (`F03`, `R06`, `F07`: SignalR Market Hub, Reconnect Recovery, `BarAggregator`, Local WS `/ws/market`, Durable SQLite Telegram Alert Outbox & Weekend Key Rotation Reminder) **`VERIFIED`** (`84abff087ab3`, `bb81eb9add7d`; 239 backend tests passed, native 2-pass Codex CLI review `PASSED` with 0 findings, immutable receipt `VERIFIED`). Ready for Phase 3 (`F06` Frontend React+TS+Vite, 1–8 Panes & 5 Sync Toggles).
+> **Status**: Phase 1 `VERIFIED` (`1918f9156d45`, `7d724bc79a76`); Phase 2 (`F03`, `R06`, `F07`) `VERIFIED` (`84abff087ab3`, `bb81eb9add7d`); Phase 3 Part 1 (`447d74adda07`) & Phase 3 Part 2 (`F06`, 1–8 Pane Layouts & 5 `SYNC IN LAYOUT` Toggles) **`VERIFIED`** (`238c9bf0bec9`: 206 harness, 262 backend, 99 frontend tests passed; native 2-pass Codex CLI review `PASSED` with 0 findings; immutable receipt `VERIFIED`; live browser check passed). Ready for Phase 4 (Interactive Drawing Primitives & Unified `CommandService`).
 
 ## Phase 1 — Backend FastAPI, Parquet Cache, Security & Contract Integrity (F01, F02, F04, F05, R03, R04, R05)
 - [x] Initialize `topstep-chart-app/backend/` with `uv` (`pyproject.toml`, FastAPI, Polars, PyArrow, SQLite, httpx, argon2-cffi, pytest) and remove temporary `server.mjs`
@@ -20,11 +20,11 @@
 - [x] Write & pass Phase 2 `pytest` suite (reconnect outage simulation, bar aggregation, slow-client containment, outbox crash-recovery & TTL expiry)
 
 ## Phase 3 — Frontend React+TS+Vite, Layout Setup (1–8 Panes) & Sync in Layout (F06)
-- [ ] Scaffold `topstep-chart-app/frontend/` (React + TypeScript + Vite + Zustand + local `lightweight-charts` v5)
-- [ ] Build Layout Picker (`1–8 panes`, `4 Future` default 2×2) + Named Layout persistence in SQLite
-- [ ] Implement all 5 `SYNC IN LAYOUT` toggles (`Symbol`, `Interval`, `Crosshair`, `Time`, `Date range`) with re-entrancy guards
-- [ ] **[F06]** Implement `AbortController` + `(pane_id, contract_id, timeframe, mode, generation)` response ownership guard on all pane data fetches
-- [ ] Verify `tsc` typecheck, Vite build, and manual browser testing of 1–8 panes & 5 sync toggles
+- [x] Scaffold `topstep-chart-app/frontend/` (React + TypeScript + Vite + Zustand + local `lightweight-charts` v5)
+- [x] Build Layout Picker (`1–8 panes`, `4 Future` default 2×2) + Named Layout persistence in SQLite
+- [x] Implement all 5 `SYNC IN LAYOUT` toggles (`Symbol`, `Interval`, `Crosshair`, `Time`, `Date range`) with re-entrancy guards
+- [x] **[F06]** Implement `AbortController` + `(pane_id, contract_id, timeframe, mode, generation)` response ownership guard on all pane data fetches
+- [x] Verify `tsc` typecheck, Vite build, and manual browser testing of 1–8 panes & 5 sync toggles
 
 ## Phase 4 — Interactive Drawing Primitives & Unified Command Service
 - [ ] Build Unified `CommandService` (backend + SQLite) with `revision` optimistic concurrency (`409` on stale revision), `idempotency_key`, Undo/Redo stack, and WebSocket broadcast

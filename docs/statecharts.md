@@ -133,3 +133,29 @@ stateDiagram-v2
 - `ws_max_clients` (default `32`, bounded `1..256`) is enforced atomically per-process (valid under single-worker `--workers 1` `F03`) before allocating `_CoalescingClientQueue` or `ws-sender-*` tasks; authenticated `(N+1)`th connections hitting `WsCapacityExceededError` complete `accept() -> immediate close(1013)` with zero queue/task allocation so real RFC 6455 clients receive close frame `1013` instead of HTTP `403`. `defer_sender_start=True` ensures accepted clients never receive `ws-sender-*` frames before `accept()` completes, and `try / finally` releases the slot if `accept()` fails.
 - `subscribe` never mutates `session.subscriptions` or emits `{"type": "subscribed"}` until `subscribe_ws_contract(..., broadcast_status=False)` succeeds; `"subscribed"` confirms local + hub contract registration and always precedes the post-subscribe `"feed_status"` snapshot, while upstream SignalR connection health is conveyed via `"feed_status"` (`NC-12`).
 - Any `BaseException` during `subscribe_ws_contract` rolls back only newly added `_ws_contracts` / `_contracts` / pending tick / aggregator state while preserving pre-existing shared or `_explicit_contracts` entries.
+
+---
+
+## 6. Frontend Workspace, Layout Store & `F06` Chart Pane Lifecycle (`F01, F06, SLOP-002`, Phase 3)
+
+```mermaid
+stateDiagram-v2
+    [*] --> AUTH_CHECK: "Bootstrap GET /api/auth/session"
+    AUTH_CHECK --> LOGIN_GATE: "401 / unauthenticated (clearCsrfToken + layoutStore.reset)"
+    AUTH_CHECK --> HYDRATED: "Session valid & GET /api/layouts loads default 4 Future"
+    LOGIN_GATE --> HYDRATED: "POST /api/auth/login OK -> hydrateLayouts + WS connect"
+    HYDRATED --> DRAFT_DIRTY: "setTemplate(1..8) / setPaneSymbol / setPaneTimeframe / toggleSync"
+    DRAFT_DIRTY --> SAVING: "Save / Save As / Rename / Set Default (guards sessionEpoch + draftRevision)"
+    HYDRATED --> SAVING: "Set Default / Delete named layout"
+    SAVING --> HYDRATED: "HTTP 2xx matching sessionEpoch & clean/matching draftRevision"
+    SAVING --> DRAFT_DIRTY: "409 / transient error OR newer draftRevision edited in flight"
+    SAVING --> LOGIN_GATE: "401/403 on matching sessionEpoch -> invalidateSessionLocally()"
+    HYDRATED --> LOGIN_GATE: "Logout or WS 1008/session_expired -> abort all controllers + reset()"
+    DRAFT_DIRTY --> LOGIN_GATE: "Logout or session invalidation -> abort all controllers + reset()"
+```
+
+**Invariants**:
+- **Zustand Layout CRUD Isolation (`layoutStore.ts`)**: Mutations serialize under `saving`, track `sessionEpoch` + `draftRevision` + `AbortController`, preserve newer dirty drafts if edited while a save/rename is in flight, promote oldest remaining layout (`created_at_utc ASC, id ASC`) when deleting an active default if `listLayouts()` refresh hits a non-auth error, and invoke `onAuthError` fail-closed on matching `sessionEpoch` `401`/`403`.
+- **Isolated Contract Resolution & Retry (`App.tsx`)**: Mode fetches are tracked per `AbortController` (removed immediately on abort and in `.finally()`). `retryGenerationRef` (`retryUnresolvedContracts`) stays isolated from `layoutResolveGenerationRef` unless `cancelRetry` is set, and aborted mixed batches immediately re-dispatch still-needed modes even when already listed in `unresolvedModesRef`.
+- **Stale Response Guard (`F06`, `ChartPane.tsx` + `fetchGuard.ts`)**: Rapid symbol/timeframe/template/mode changes abort prior `fetchBars` calls and increment monotonic `requestGeneration` per pane so stale responses never mutate canvas series or `barsRef`.
+- **Loop-Free 5-Channel Sync (`syncController.ts` + `ChartPane.tsx`)**: Synchronous `activeCrosshairSource`/`activeRangeSource`/`activeTimeSource` guards pair with per-pane `suppressRangeEchoRef` + `requestAnimationFrame` cleanup (`SLOP-002`-compliant, zero `setTimeout`/`setInterval` inside `frontend/src/chart/`) so Lightweight Charts v5 async next-frame `subscribeVisibleTimeRangeChange` callbacks never bounce back to the source pane or cross-trigger `Date range` from `Time` centering.
